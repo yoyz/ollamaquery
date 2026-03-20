@@ -1,6 +1,7 @@
 # ollamaquery
 
 A lightweight, feature-rich command-line interface for interacting with local LLMs via Ollama. It supports single-shot queries, batch processing, and an advanced interactive chat mode with OS integration.
+It is fully developped using gemini with few tweak here and there.
 
 ## Requirements
 
