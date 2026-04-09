@@ -3,6 +3,14 @@ import os
 import sys
 import json
 import argparse
+# Optional YAML support – fall back to JSON if PyYAML not installed
+try:
+    import yaml
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
+import yaml  # optional, may be unavailable
+
 import urllib.request
 import urllib.error
 from urllib.parse import urljoin
@@ -20,6 +28,7 @@ try:
     import readline
     READLINE_AVAILABLE = True
 except ImportError:
+    readline = None
     READLINE_AVAILABLE = False
 
 # Handle Unix PTY for the /spawnshell command
@@ -27,6 +36,7 @@ try:
     import pty
     PTY_AVAILABLE = True
 except ImportError:
+    pty = None
     PTY_AVAILABLE = False
 
 # --- CONFIGURATION & COLORS ---
@@ -62,9 +72,9 @@ class FallbackHTMLStripper(HTMLParser):
     def handle_endtag(self, tag):
         self.current_tag = ""
 
-    def handle_data(self, d):
+    def handle_data(self, data):
         if self.current_tag not in self.skip_tags:
-            cleaned = d.strip()
+            cleaned = data.strip()
             if cleaned:
                 self.text.append(cleaned)
 
@@ -140,6 +150,29 @@ def fetch_models_ollama(base_url):
     except Exception:
         return []
 
+def fetch_model_info_ollama(base_url, model_name):
+    """Fetch detailed model information via Ollama /api/show endpoint.
+    
+    Returns a dict with model metadata or empty dict on failure.
+    """
+    try:
+        url = f"{base_url}/api/show"
+        payload = json.dumps({"name": model_name}).encode('utf-8')
+        req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'}, method='POST')
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return data
+    except Exception:
+        return {}
+
+    try:
+        url = f"{base_url}/api/tags"
+        with urllib.request.urlopen(url) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return data.get('models', [])
+    except Exception:
+        return []
+
 def fetch_models_llamacpp(base_url):
     try:
         url = f"{base_url}/v1/models"
@@ -149,7 +182,7 @@ def fetch_models_llamacpp(base_url):
     except Exception:
         return []
 
-def list_models_ollama(base_url, filter_arg=None):
+def list_models_ollama(base_url, filter_arg=None, include_capabilities=False):
     models = fetch_models_ollama(base_url)
     if not models:
         print(f"\n{YELLOW}No models found via Ollama API at {base_url}. Check if the server is running.{RESET}\n")
@@ -176,8 +209,10 @@ def list_models_ollama(base_url, filter_arg=None):
             return
 
     for m in models:
-        try: m['size_bytes'] = int(m.get('size', 0))
-        except (TypeError, ValueError): m['size_bytes'] = 0
+        try:
+            m['size_bytes'] = int(m.get('size', 0))
+        except (TypeError, ValueError):
+            m['size_bytes'] = 0
 
     if sort_by == 'size':
         models.sort(key=lambda x: x['size_bytes'], reverse=True)
@@ -191,13 +226,32 @@ def list_models_ollama(base_url, filter_arg=None):
     else:
         print()
 
-    print(f"{'NAME':<40} | {'SIZE':<10} | {'MODIFIED'}")
-    print("-" * 75)
-    for m in models:
-        size_str = f"{m['size_bytes'] / (1024**3):>8.2f} GB" if m['size_bytes'] > 0 else f"{'N/A':>11}"
-        modified = m.get('modified_at', 'Unknown')[:10]
-        print(f"{m['name']:<40} | {size_str} | {modified}")
+    if include_capabilities:
+        # Retrieve capabilities for each model (extra API calls)
+        for m in models:
+            try:
+                info = fetch_model_info_ollama(base_url, m['name'])
+                m['capabilities'] = ",".join(info.get('capabilities', []))
+            except Exception:
+                m['capabilities'] = ''
+        header = f"{'NAME':<40} | {'SIZE':<10} | {'MODIFIED':<10} | {'CAPABILITIES'}"
+        print(header)
+        print("-" * 95)
+        for m in models:
+            size_str = f"{m['size_bytes'] / (1024**3):>8.2f} GB" if m['size_bytes'] > 0 else f"{'N/A':>11}"
+            modified = m.get('modified_at', 'Unknown')[:10]
+            caps = m.get('capabilities', '')
+            print(f"{m['name']:<40} | {size_str} | {modified} | {caps}")
+    else:
+        print(f"{'NAME':<40} | {'SIZE':<10} | {'MODIFIED'}")
+        print("-" * 75)
+        for m in models:
+            size_str = f"{m['size_bytes'] / (1024**3):>8.2f} GB" if m['size_bytes'] > 0 else f"{'N/A':>11}"
+            modified = m.get('modified_at', 'Unknown')[:10]
+            print(f"{m['name']:<40} | {size_str} | {modified}")
     print()
+
+
 
 def list_models_llamacpp(base_url, filter_arg=None):
     models = fetch_models_llamacpp(base_url)
@@ -277,7 +331,7 @@ class ChatCompleter:
             self.models = [m['name'] for m in fetch_models_ollama(self.base_url)]
 
     def complete(self, text, state):
-        buffer = readline.get_line_buffer()
+        buffer = readline.get_line_buffer() if readline else ''
         if buffer.startswith('/switchmodel '):
             matches = [m for m in self.models if m.startswith(text)]
         elif buffer.startswith('/cwd ') or buffer.startswith('/ls '):
@@ -305,7 +359,7 @@ class ChatCompleter:
         return matches[state] if state < len(matches) else None
 
 def setup_readline(base_url, backend):
-    if READLINE_AVAILABLE:
+    if READLINE_AVAILABLE and readline is not None:
         completer = ChatCompleter(base_url, backend)
         completer.fetch_models()
         readline.set_completer_delims(' \t\n')
@@ -316,16 +370,19 @@ def setup_readline(base_url, backend):
         histdir = os.path.dirname(histfile)
         if not os.path.exists(histdir):
             os.makedirs(histdir, exist_ok=True)
-            
-        try: readline.read_history_file(histfile)
-        except FileNotFoundError: pass
-            
+        
+        try:
+            readline.read_history_file(histfile)
+        except Exception:
+            pass
+        
         readline.set_history_length(1000)
         atexit.register(readline.write_history_file, histfile)
-
+        
         print(f"{DARK_GRAY}[Tab Autocomplete & Persistent History Enabled]{RESET}\n")
     else:
         print()
+
 
 def gather_user_input(model):
     user_input_lines = []
@@ -478,7 +535,7 @@ def handle_spawnshell():
     
     shell_cmd = os.environ.get('SHELL', '/bin/bash')
     try:
-        pty.spawn(shell_cmd, read_and_capture)
+        pty.spawn(shell_cmd, read_and_capture) if pty else None
     except KeyboardInterrupt:
         pass
     except Exception as e:
@@ -849,6 +906,7 @@ def main():
     parser.add_argument("-b", "--backend", choices=["ollama", "llamacpp"], default="ollama", help="API backend to use (default: ollama).")
     parser.add_argument("-H", "--host", help="Custom API URL (e.g. http://127.0.0.1:8080). Overrides environment variables.")
     parser.add_argument("-l", "--list", action="store_true", help="List all available local models and exit.")
+    parser.add_argument("-la", "--list-all", action="store_true", help="List all models with capabilities (may be slower).")
     
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument("-I", "--input-text", help="Direct string input for the query.")
@@ -860,6 +918,10 @@ def main():
     parser.add_argument("--output-dir", help="Directory to save output files (required for --input-dir).")
     parser.add_argument("-p", "--prompt", default=DEFAULT_SYSTEM_PROMPT, help="The system prompt.")
     parser.add_argument("-m", "--model", default="llama3", help="Ollama model (default: llama3).")
+    parser.add_argument("--show", action="store_true", help="Show concise model details (details, model_info, capabilities).")
+    parser.add_argument("--show-details", action="store_true", help="Show full model information (all fields).")
+    parser.add_argument("--output-format", choices=["json", "yaml"], default="json", help="Format for --show output (default: json).")
+
     parser.add_argument("--no-stream", action="store_true", help="Disable real-time streaming output.")
     parser.add_argument("--debug", action="store_true", help="Print raw JSON API chunks to stderr.")
     args = parser.parse_args()
@@ -882,8 +944,61 @@ def main():
             list_models_ollama(base_url)
         sys.exit(0)
 
-    if not (args.input_text or args.input_file or args.input_dir or args.chat):
-        parser.error("You must provide an input (-I, -i, --input-dir), start a chat (-c), or list models (-l).")
+    if args.list_all:
+        # List all models with capabilities (slower)
+        if args.backend == "llamacpp":
+            sys.stderr.write(f"{YELLOW}List-all not implemented for llamacpp backend.{RESET}\n")
+            sys.exit(1)
+        else:
+            list_models_ollama(base_url, include_capabilities=True)
+        sys.exit(0)
+
+    # Concise... (rest unchanged)
+
+    # Concise flag to show selected fields (details, model_info, capabilities)
+    if args.show:
+        if args.backend == "llamacpp":
+            sys.stderr.write(f"{YELLOW}Show not implemented for llamacpp backend.{RESET}\n")
+        else:
+            info = fetch_model_info_ollama(base_url, args.model)
+            if info:
+                subset = {
+                    "details": info.get('details', {}),
+                    "model_info": info.get('model_info', {}),
+                    "capabilities": info.get('capabilities', [])
+                }
+                if args.output_format == "yaml" and HAVE_YAML:
+                    print(yaml.safe_dump(subset, sort_keys=False))
+                else:
+                    print(json.dumps(subset, indent=2))
+            else:
+                sys.stderr.write(f"{YELLOW}No model info returned for '{args.model}'.{RESET}\n")
+                print(json.dumps({}, indent=2))
+        sys.exit(0)
+
+    # Full detailed flag
+    if args.show_details:
+        if args.backend == "llamacpp":
+            sys.stderr.write(f"{YELLOW}Show details not implemented for llamacpp backend.{RESET}\n")
+        else:
+            info = fetch_model_info_ollama(base_url, args.model)
+            if info:
+                if not info.get('model_info'):
+                    sys.stderr.write(f"{YELLOW}Model '{args.model}' may not be downloaded locally; limited info returned.{RESET}\n")
+                if args.output_format == "yaml" and HAVE_YAML:
+                    print(yaml.safe_dump(info, sort_keys=False))
+                else:
+                    print(json.dumps(info, indent=2))
+            else:
+                sys.stderr.write(f"{YELLOW}No model info returned for '{args.model}'. Ensure the Ollama server is running and the model name is correct.{RESET}\n")
+                print(json.dumps({}, indent=2))
+        sys.exit(0)
+
+
+
+
+
+
 
     is_tty = sys.stdout.isatty()
     should_stream = is_tty and not args.no_stream and not args.output and not args.output_dir
@@ -943,6 +1058,12 @@ def main():
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(response)
                 print(f"  -> Saved to {output_path}")
+
+    if not (args.input_text or args.input_file or args.input_dir or args.chat):
+      parser.error("You must provide an input (-I, -i, --input-dir), start a chat (-c), or list models (-l).")
+
+
+
 
 if __name__ == "__main__":
     try:
