@@ -12,8 +12,11 @@ import html
 import base64
 import argparse
 import subprocess
+import shutil
 import threading
 import time
+from html.parser import HTMLParser
+from typing import Optional, Dict, Any
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -49,6 +52,116 @@ DEFAULT_SYSTEM_PROMPT = (
 MAX_CONTEXT_SIZE = 4192000  # 4M tokens maximum limit (prevent OOM)
 DEFAULT_OLLAMA_HOST = 'http://127.0.0.1:11434'
 DEFAULT_LLAMACPP_HOST = 'http://127.0.0.1:8080'
+
+
+# ============================================================================
+# ============= THEME & COLOR CONFIGURATION ==================================
+# ============================================================================
+
+BUILTIN_THEMES = {
+    "default": {
+        "muted": "\033[90m",
+        "info": "\033[36m",
+        "success": "\033[32;1m",
+        "warning": "\033[33;1m",
+        "error": "\033[31;1m",
+        "reset": "\033[0m"
+    },
+    "minimal": {
+        "muted": "",
+        "info": "",
+        "success": "",
+        "warning": "",
+        "error": "",
+        "reset": ""
+    },
+    "emacs_dark": {
+        "muted": "\033[90m",
+        "info": "\033[94m",
+        "success": "\033[92m",
+        "warning": "\033[93m",
+        "error": "\033[91m",
+        "reset": "\033[0m"
+    },
+    "vim_dark": {
+        "muted": "\033[38;5;245m",
+        "info": "\033[38;5;75m",
+        "success": "\033[38;5;71m",
+        "warning": "\033[38;5;221m",
+        "error": "\033[38;5;196m",
+        "reset": "\033[0m"
+    },
+    "high_contrast": {
+        "muted": "\033[90m",
+        "info": "\033[96m",
+        "success": "\033[92;1m",
+        "warning": "\033[93;1m",
+        "error": "\033[91;1m",
+        "reset": "\033[0m"
+    }
+}
+
+THEME_FILE = os.path.expanduser("~/.ollamaquery/themes.json")
+
+
+def colors_enabled():
+    """Check if colors should be used (TTY check + NO_COLOR env var)."""
+    if os.environ.get('NO_COLOR'):
+        return False
+    return sys.stdout.isatty()
+
+
+def load_custom_themes():
+    """Load custom themes from JSON file."""
+    if not os.path.exists(THEME_FILE):
+        return {}
+    try:
+        with open(THEME_FILE, 'r') as f:
+            custom = json.load(f)
+            if isinstance(custom, dict):
+                return custom
+    except Exception:
+        pass
+    return {}
+
+
+def get_theme(theme_name: str = "default"):
+    """Get theme color dictionary."""
+    if os.environ.get('NO_COLOR'):
+        return BUILTIN_THEMES["minimal"]
+    
+    custom_themes = load_custom_themes()
+    if theme_name in custom_themes:
+        theme = custom_themes[theme_name]
+        for key in ["muted", "info", "success", "warning", "error", "reset"]:
+            if key not in theme:
+                theme[key] = BUILTIN_THEMES["default"][key]
+        return theme
+    
+    return BUILTIN_THEMES.get(theme_name, BUILTIN_THEMES["default"])
+
+
+def colorize(text, role, theme=None, force_color=False):
+    """Apply color to text using active theme."""
+    if theme is None:
+        theme = ACTIVE_THEME
+    
+    if not colors_enabled() and not force_color:
+        return text
+    
+    return f"{theme.get(role, '')}{text}{theme['reset']}"
+
+
+def c(role, theme=None):
+    """Get color code from active theme."""
+    if theme is None:
+        theme = ACTIVE_THEME
+    if not colors_enabled():
+        return ''
+    return theme.get(role, '')
+
+
+ACTIVE_THEME = get_theme()
 
 
 # ============================================================================
@@ -128,7 +241,7 @@ def prepare_image_data(image_path):
         with open(image_path, "rb") as img_file:
             return base64.b64encode(img_file.read()).decode('utf-8')
     except Exception as e:
-        print(f"[ERROR] Loading image {image_path}: {e}", file=sys.stderr)
+        print(colorize(f"[ERROR] Loading image {image_path}: {e}", 'error'), file=sys.stderr)
         return None
 
 
@@ -211,26 +324,44 @@ class ModelQuery:
     def print_stats_display(self, stats):
         """Print formatted stats to stderr."""
         if stats and stats.get("eval_count", 0):
-            sys.stderr.write(
+            sys.stderr.write(colorize(
                 f"\n--- Stats: {stats['total_time']:.2f}s total | "
                 f"{stats['tps']:.2f} t/s | "
                 f"Context: {stats.get('prompt_eval_count', 0) + stats['eval_count']} tokens ---\n",
-                flush=True
-            )
+                'muted'
+            ))
         elif stats and not stats["eval_count"]:
-            # No token tracking, just show content length
-            sys.stderr.write(
+            sys.stderr.write(colorize(
                 f"\n--- Stats: {stats['total_time']:.2f}s total | "
                 f"Content: {stats.get('content_length', 0)} chars ---\n",
-                flush=True
-            )
+                'muted'
+            ))
         else:
-            # Minimal stats when streaming without usage data
-            sys.stderr.write(
+            sys.stderr.write(colorize(
                 f"\n--- Stats: {stats['total_time']:.2f}s total | "
-                f"Tokens processed: {len(stats.get('content', '').split()) if stats.get('content') else 0} ---\n",
-                flush=True
-            )
+                f"Tokens processed: {len(stats.get('content', '').split()) if stats and stats.get('content') else 0} ---\n",
+                'muted'
+            ))
+
+    def build_request_payload(self, messages, model, stream_enabled=False, **kwargs):
+        """Build request payload for the backend."""
+        if images := kwargs.get('images'):
+            if messages and len(messages) > 1:
+                messages[1]["images"] = images
+        
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": stream_enabled
+        }
+        
+        if context_size := kwargs.get('context_size'):
+            if self.backend == "ollama":
+                payload["options"] = {"num_ctx": context_size}
+            else:  # llamacpp
+                payload["max_tokens"] = context_size
+        
+        return payload
 
     def query_sync(self, messages, model, stream_enabled=False, **kwargs):
         """Non-streaming sync query wrapper."""
@@ -246,7 +377,77 @@ class ModelQuery:
             with urlopen(req) as response:
                 return json.loads(response.read().decode('utf-8'))
         except Exception as e:
-            sys.stderr.write(f"[ERROR] Sync query failed: {e}\n")
+            sys.stderr.write(colorize(f"[ERROR] Sync query failed: {e}\n", 'error'))
+            return ""
+
+
+    # ==========================================
+    # === OLLAMA STREAMING FUNCTION ===
+    # ==========================================
+
+    @staticmethod
+    def calculate_stats(total_time, content, usage=None):
+        """Calculate and return stats dictionary for display."""
+        eval_count = 0
+        prompt_tokens = 0
+
+        if usage:
+            eval_count = usage.get("completion_tokens", 0) or len(content.split())
+            prompt_tokens = usage.get("prompt_tokens", 0)
+
+        elif content:
+            # Fallback to word count if no token data available
+            eval_count = len(content.split())
+
+        tps = 0.0
+        if eval_count > 0 and total_time > 0:
+            tps = eval_count / total_time
+
+        return {
+            "eval_count": eval_count,
+            "prompt_eval_count": prompt_tokens,
+            "total_time": total_time,
+            "tps": tps,
+            "content_length": len(content)
+        }
+
+    def print_stats_display(self, stats):
+        """Print formatted stats to stderr."""
+        if stats and stats.get("eval_count", 0):
+            sys.stderr.write(colorize(
+                f"\n--- Stats: {stats['total_time']:.2f}s total | "
+                f"{stats['tps']:.2f} t/s | "
+                f"Context: {stats.get('prompt_eval_count', 0) + stats['eval_count']} tokens ---\n",
+                'muted'
+            ))
+        elif stats and not stats["eval_count"]:
+            sys.stderr.write(colorize(
+                f"\n--- Stats: {stats['total_time']:.2f}s total | "
+                f"Content: {stats.get('content_length', 0)} chars ---\n",
+                'muted'
+            ))
+        else:
+            sys.stderr.write(colorize(
+                f"\n--- Stats: {stats['total_time']:.2f}s total | "
+                f"Tokens processed: {len(stats.get('content', '').split()) if stats and stats.get('content') else 0} ---\n",
+                'muted'
+            ))
+
+    def query_sync(self, messages, model, stream_enabled=False, **kwargs):
+        """Non-streaming sync query wrapper."""
+        payload = self.build_request_payload(messages, model, stream_enabled=False, **kwargs)
+
+        try:
+            url = f"{self.base_url}/api/chat" if self.backend == "ollama" else \
+                  f"{self.base_url}/v1/chat/completions"
+
+            data = json.dumps(payload).encode('utf-8')
+            req = Request(url, data=data, headers={'Content-Type': 'application/json'})
+
+            with urlopen(req) as response:
+                return json.loads(response.read().decode('utf-8'))
+        except Exception as e:
+            sys.stderr.write(colorize(f"[ERROR] Sync query failed: {e}\n", 'error'))
             return ""
 
 
@@ -299,8 +500,8 @@ class ModelQuery:
                                    chunk.get("message", {}).get("thinking")) or ""
                         content = chunk.get("message", {}).get("content", "")
 
-                        # Track usage stats from Ollama response
-                        if "usage" in chunk:
+                        # Track usage stats from Ollama response (only in final chunk with done=True)
+                        if chunk.get("done", False) and "usage" in chunk:
                             usage_stats = chunk["usage"]
 
                         # Handle thinking with buffered display
@@ -340,7 +541,7 @@ class ModelQuery:
             return full_content
 
         except Exception as e:
-            sys.stderr.write(f"\n[ERROR] Ollama streaming failed: {e}\n")
+            sys.stderr.write(colorize(f"\n[ERROR] Ollama streaming failed: {e}\n", 'error'))
             return full_content
 
     # ==========================================
@@ -376,6 +577,7 @@ class ModelQuery:
             started_content = False
             completion_data = {}
             finish_reason = None
+            content = ""
 
             with urlopen(req) as response:
                 for line in response:
@@ -439,7 +641,7 @@ class ModelQuery:
             return full_content
 
         except Exception as e:
-            sys.stderr.write(f"\n[ERROR] Llama.cpp streaming failed: {e}\n", file=sys.stderr)
+            sys.stderr.write(colorize(f"\n[ERROR] Llama.cpp streaming failed: {e}\n", 'error'))
             return full_content
 
     # ==========================================
@@ -703,7 +905,7 @@ class FallbackHTMLStripper:
 
     def reset(self):
         """Reset stripper state."""
-        self.reset()
+        super(FallbackHTMLStripper, self).reset()
         self.strict = False
         self.convert_charrefs = True
         self.text = []
@@ -913,17 +1115,17 @@ class ChatLoop:
 
                 readline.set_history_length(1000)
             except Exception as e:
-                print(f"[ERROR] Readline setup failed: {e}", file=sys.stderr)
+                print(colorize(f"[ERROR] Readline setup failed: {e}", 'error'), file=sys.stderr)
 
         messages = [{'role': 'system', 'content': self.system_prompt}]
 
         # Print welcome message
-        print(f"\n[{self.backend.upper()} Chat Mode]", file=sys.stderr)
-        print(f"Commands: /?, /help, /listmodel, /switchmodel", file=sys.stderr)
-        print(f"          /cwd, /ls, /clear, /quit\n", file=sys.stderr)
+        print(colorize(f"\n[{self.backend.upper()} Chat Mode]", 'info'), file=sys.stderr)
+        print(colorize(f"Commands: /?, /help, /listmodel, /switchmodel", 'muted'), file=sys.stderr)
+        print(colorize(f"          /cwd, /ls, /clear, /quit\n", 'muted'), file=sys.stderr)
 
         if images:
-            print("[Image loaded for session]", file=sys.stderr)
+            print(colorize("[Image loaded for session]", 'success'), file=sys.stderr)
 
         while True:
             try:
@@ -933,14 +1135,14 @@ class ChatLoop:
 
                 # Handle exit commands
                 if full_input.lower() in ['exit', 'quit', '/exit', '/quit']:
-                    print("\n[Goodbye!]", file=sys.stderr)
+                    print(colorize("\n[Goodbye!]", 'info'), file=sys.stderr)
                     break
 
                 # Handle help command
                 if full_input in ['/?', '/help']:
-                    print(f"\nCommands: {', '.join(self.commands[:6])}", file=sys.stderr)
-                    print("  ! <cmd> - Execute shell", file=sys.stderr)
-                    print("  /curl <url> - Fetch web content\n", file=sys.stderr)
+                    print(colorize(f"\nCommands: {', '.join(self.commands[:6])}", 'muted'), file=sys.stderr)
+                    print(colorize("  ! <cmd> - Execute shell", 'info'), file=sys.stderr)
+                    print(colorize("  /curl <url> - Fetch web content\n", 'info'), file=sys.stderr)
                     continue
 
                 # Handle model listing
@@ -957,26 +1159,28 @@ class ChatLoop:
                 # Handle clear command
                 if full_input == '/clear':
                     messages = [{'role': 'system', 'content': self.system_prompt}]
-                    print("[Context memory wiped clean]", file=sys.stderr)
+                    print(colorize("[Context memory wiped clean]", 'success'), file=sys.stderr)
                     continue
 
                 # Handle debug mode
                 if full_input.lower() == '/debug on':
                     debug = True
                     debug_mode = True
+                    print(colorize("[Debug mode ENABLED]", 'success'), file=sys.stderr)
                     continue
                 elif full_input.lower() == '/debug off':
                     debug = False
+                    print(colorize("[Debug mode DISABLED]", 'info'), file=sys.stderr)
                     continue
 
                 # Handle thinking control
                 if full_input == '/thinkingoff':
                     self.force_no_thinking = True
-                    print("[Model will skip reasoning phase]", file=sys.stderr)
+                    print(colorize("[Model will skip reasoning phase]", 'warning'), file=sys.stderr)
                     continue
                 elif full_input == '/thinkingon':
                     self.force_no_thinking = False
-                    print("[Reasoning phase enabled]", file=sys.stderr)
+                    print(colorize("[Reasoning phase enabled]", 'success'), file=sys.stderr)
                     continue
 
                 # Handle directory change
@@ -986,8 +1190,8 @@ class ChatLoop:
                         try:
                             os.chdir(os.path.expanduser(parts[1]))
                         except Exception as e:
-                            print(f"[ERROR] {e}", file=sys.stderr)
-                    print(f"[Current directory: {os.getcwd()}]", file=sys.stderr)
+                            print(colorize(f"[ERROR] {e}", 'error'), file=sys.stderr)
+                    print(colorize(f"[Current directory: {os.getcwd()}]", 'info'), file=sys.stderr)
                     continue
 
                 # Handle ls command
@@ -995,7 +1199,7 @@ class ChatLoop:
                     try:
                         subprocess.run("ls" + full_input[3:], shell=True, check=False)
                     except Exception as e:
-                        print(f"[ERROR] {e}", file=sys.stderr)
+                        print(colorize(f"[ERROR] {e}", 'error'), file=sys.stderr)
                     continue
 
                 # Handle model switch
@@ -1003,7 +1207,7 @@ class ChatLoop:
                     parts = full_input.split()
                     if len(parts) > 1:
                         self.model = parts[1]
-                        print(f"[Switched to '{self.model}']", file=sys.stderr)
+                        print(colorize(f"[Switched to '{self.model}']", 'success'), file=sys.stderr)
                     continue
 
                 # Handle spawnshell command
@@ -1054,7 +1258,7 @@ class ChatLoop:
                     print(f"[EOF - Goodbye!]", file=sys.stderr)
                     break
                 else:
-                    print(f"[ERROR] {e}", file=sys.stderr)
+                    print(colorize(f"[ERROR] {e}", 'error'), file=sys.stderr)
 
         return
 
@@ -1066,11 +1270,11 @@ class ChatLoop:
             models = fetch_models_ollama(self.base_url)
 
         if not models:
-            print(f"\n[No models found via {self.backend} API]", file=sys.stderr)
+            print(colorize(f"\n[No models found via {self.backend} API]", 'warning'), file=sys.stderr)
             return
 
+        search_term = None
         if filter_arg:
-            search_term = None
             parts = filter_arg.lower().split()
             if 'name' in parts:
                 parts.remove('name')
@@ -1084,8 +1288,8 @@ class ChatLoop:
         # Sort and display
         models.sort(key=lambda x: x.get('name', ''))
 
-        print(f"\n{'NAME':<50} | {'SIZE' if self.backend == 'ollama' else 'OWNED BY'}")
-        print("-" * 60)
+        print(colorize(f"\n{'NAME':<50} | {'SIZE' if self.backend == 'ollama' else 'OWNED BY'}", 'muted'))
+        print(colorize("-" * 60, 'muted'))
         for m in models:
             size_str = f"{m['size_bytes'] / (1024**3):>8.2f} GB" if m.get('size_bytes', 0) > 0 else 'N/A'
             owned_by = m.get('owned_by', '')
@@ -1107,8 +1311,7 @@ class ChatLoop:
                 print("[Context size reset to default]", file=sys.stderr)
             else:
                 if val > MAX_CONTEXT_SIZE:
-                    print(f"[ERROR] Context size {val} exceeds maximum {MAX_CONTEXT_SIZE}",
-                          file=sys.stderr)
+                    print(colorize(f"[ERROR] Context size {val} exceeds maximum {MAX_CONTEXT_SIZE}", 'error'), file=sys.stderr)
                     return
                 self.context_size = val
                 print(f"[Context size set to {val}]", file=sys.stderr)
@@ -1225,7 +1428,7 @@ def list_models_llamacpp(base_url, filter_arg=None):
 def list_models_ollama(base_url, filter_arg=None, include_capabilities=False):
     models = fetch_models_ollama(base_url)
     if not models:
-        print(f"\n{YELLOW}No models found via Ollama API at {base_url}. Check if the server is running.{RESET}\n")
+        print(colorize(f"\nNo models found via Ollama API at {base_url}. Check if the server is running.\n", 'warning'))
         return
 
     sort_by = 'name'
@@ -1245,7 +1448,7 @@ def list_models_ollama(base_url, filter_arg=None, include_capabilities=False):
     if search_term:
         models = [m for m in models if search_term in m['name'].lower()]
         if not models:
-            print(f"\n{YELLOW}No models found matching '{search_term}'.{RESET}\n")
+            print(colorize(f"\nNo models found matching '{search_term}'.\n", 'warning'))
             return
 
     for m in models:
@@ -1402,9 +1605,30 @@ def main():
                        help='Print raw JSON to stderr')
     parser.add_argument('--format', choices=["json", "yaml"], default="json",
                        help='Output format for model info (default: json)')
+    parser.add_argument('--theme', default=None,
+                       choices=["default", "minimal", "emacs_dark", "vim_dark", "high_contrast"],
+                       help='Color theme for output')
+    parser.add_argument('--no-color', action="store_true",
+                       help='Disable colored output')
 
     # Parse arguments
     args = parser.parse_args()
+
+    # Initialize theme system
+    global ACTIVE_THEME
+    theme_to_use = "default"
+    if args.no_color:
+        os.environ['NO_COLOR'] = '1'
+        theme_to_use = "minimal"
+    elif args.theme is not None:
+        theme_to_use = args.theme
+    elif os.environ.get('OLLAMAQUERY_THEME'):
+        theme_to_use = os.environ.get('OLLAMAQUERY_THEME')
+        # Ensure we have a string value
+        if theme_to_use is None:
+            theme_to_use = "default"
+    
+    ACTIVE_THEME = get_theme(theme_to_use)
 
     # Determine base URL
     backend = args.backend
