@@ -3,13 +3,13 @@ import os
 import sys
 import json
 import argparse
+import base64
 # Optional YAML support – fall back to JSON if PyYAML not installed
 try:
     import yaml
     HAVE_YAML = True
 except ImportError:
     HAVE_YAML = False
-import yaml  # optional, may be unavailable
 
 import urllib.request
 import urllib.error
@@ -40,17 +40,28 @@ except ImportError:
     PTY_AVAILABLE = False
 
 # --- CONFIGURATION & COLORS ---
-DEFAULT_SYSTEM_PROMPT = "You are a chatbot trying to help user. Try to reply to the question as best as your knowledge goes but reply politely that you don't know if it is the case."
-
+DEFAULT_SYSTEM_PROMPT = "You are a chatbot trying to help user. Try to rebound to the question as best as your knowledge goes but reply politely that you don't know if it is the case."
 DARK_GRAY = "\033[90m"
 CYAN = "\033[36m"
 GREEN = "\033[32;1m"
 YELLOW = "\033[33;1m"
 RESET = "\033[0m"
 
-# ==========================================
-# UTILITIES & API HELPERS
-# ==========================================
+def prepare_image_data(image_path):
+    """Reads an image file and returns its base64 encoded string."""
+    if not image_path:
+        return None
+    try:
+        with open(image_path, "rb") as img_file:
+            #data = img_file.read()
+            #data_b64_utf8=base64.b64encode(data).encode('utf-8')
+            #print(data_b64_utf8)
+            #return data_b64_utf8
+            #return base64.b64encode(img_file.read().encode('utf-8'))
+            return base64.b64encode(img_file.read()).decode('utf-8')
+    except Exception as e:
+        sys.stderr.write(f"{YELLOW}Error loading image {image_path}: {e}{RESET}\n")
+        return None
 
 def strip_ansi(text):
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -556,16 +567,27 @@ def handle_spawnshell():
 # BACKEND: OLLAMA
 # ==========================================
 
-def query_ollama(base_url, messages, model, stream_enabled=False, debug=False, show_thinking=True, context_size=None):
+def query_ollama(base_url, messages, model, stream_enabled=False, debug=False, show_thinking=True, context_size=None, images=None):
     start_time = time.time()
     full_content = ""
     try:
+        # Try to insert the image into messages
+        #     "messages": [{
+        #                      "role": "user",
+        #                      "content": "What is in this image?",
+        #                      "images": ["'"$IMG"'"]
+        #                  }],
+
+        if images:
+            messages[1]["images"] = images
         payload = {"model": model, "messages": messages, "stream": stream_enabled}
         if context_size is not None:
             payload["options"] = {"num_ctx": context_size}
-
+        
         api_url = f"{base_url}/api/chat"
         data = json.dumps(payload).encode('utf-8')
+        if debug:
+            print(json.dumps(payload,indent=2))
         req = urllib.request.Request(api_url, data=data, headers={'Content-Type': 'application/json'})
 
         with urllib.request.urlopen(req) as response:
@@ -608,19 +630,22 @@ def query_ollama(base_url, messages, model, stream_enabled=False, debug=False, s
         sys.stdout.flush()
         return full_content 
     except Exception as e:
-        sys.stderr.write(f"\n{YELLOW}Ollama Request Error: {e}{RESET}\n")
+        sys.stderr.write(f"\n{YELLOW}query_ollama Request Error: {e}{RESET}\n")
     return full_content
 
-def chat_loop_ollama(base_url, system_prompt, initial_model, stream_enabled, debug):
-    model = initial_model
-    force_no_thinking = False
-    context_size = None
+def chat_loop_ollama(base_url, system_prompt, initial_model, stream_enabled, debug, images=None):
+      model = initial_model
+      force_no_thinking = False
+      context_size = None
     
-    print(f"{CYAN}Entering Ollama chat mode. Type '/?' for help.{RESET}")
-    setup_readline(base_url, "ollama")
-    messages = [{'role': 'system', 'content': system_prompt}]
+      print(f"{CYAN}Entering Llama.cpp chat mode. Type '/?' for help.{RESET}")
+      setup_readline(base_url, "llamacpp")
+      messages = [{'role': 'system', 'content': system_prompt}]
     
-    while True:
+      if images:
+        print(f"{GREEN}Image loaded for session.{RESET}")
+
+      while True:
         try:
             full_input = gather_user_input(model)
             if full_input is None:
@@ -684,9 +709,9 @@ def chat_loop_ollama(base_url, system_prompt, initial_model, stream_enabled, deb
                 print(f"{GREEN}Directory: {os.getcwd()}{RESET}\n")
                 continue
             elif full_input_stripped.startswith('/ls'):
-                try: subprocess.run("ls" + full_input_stripped[3:], shell=True)
+                try: subprocess.run("ls " + full_input_stripped[3:], shell=True)
                 except Exception as e: print(f"{YELLOW}Error: {e}{RESET}")
-                print() 
+                print()
                 continue
             elif full_input_stripped.startswith('/switchmodel'):
                 parts = full_input_stripped.split()
@@ -710,7 +735,295 @@ def chat_loop_ollama(base_url, system_prompt, initial_model, stream_enabled, deb
                 payload_messages.append({'role': 'system', 'content': 'CRITICAL INSTRUCTION: Do NOT output any internal thoughts, <think> tags, or reasoning. Output the final answer directly and immediately.'})
             
             if messages[-1]['role'] == 'user':
-                assistant_response = query_ollama(base_url, payload_messages, model, stream_enabled, debug, show_thinking=True, context_size=context_size)
+                assistant_response = query_ollama(base_url, payload_messages, model, stream_enabled, debug, images=images)
+                if assistant_response:
+                    messages.append({'role': 'assistant', 'content': assistant_response})
+                print() 
+
+        except Exception as e:
+            if isinstance(e, KeyboardInterrupt):
+                sys.stdout.write(f"\n{YELLOW}[Action Interrupted]{RESET}\n")
+                continue
+            elif isinstance(e, EOFError):
+                print(f"\n{CYAN}Goodbye!{RESET}")
+                break
+            else:
+                raise e
+            
+            full_input_stripped = full_input.strip()
+            if not full_input_stripped: continue
+            
+            # Pure local commands
+            if full_input_stripped.lower() in ['exit', 'quit', '/exit', '/quit']:
+                print(f"{CYAN}Goodbye!{RESET}"); break
+            elif full_input_stripped in ['/?', '/help']:
+                print(f"\n{CYAN}Commands:{RESET} /listmodel, /switchmodel, /contextsizeset <int>, /cwd, /ls, /clear, /thinkingoff, /thinkingon, /debug on, /debug off, /quit\n")
+                print(f"  {YELLOW}! <command>{RESET}        - Execute a shell command inline")
+                print(f"  {YELLOW}/curl <url>{RESET}        - Fetch and extract text from a URL inline")
+                print(f"  {YELLOW}/spawnshell{RESET}        - Capture a full interactive shell session\n")
+                continue
+            elif full_input_stripped.startswith('/listmodel'):
+                parts = full_input_stripped.split(maxsplit=1)
+                list_models_ollama(base_url, parts[1] if len(parts) > 1 else None)
+                continue
+            elif full_input_stripped.startswith('/contextsizeset'):
+                parts = full_input_stripped.split()
+                if len(parts) > 1 and parts[1].isdigit():
+                    val = int(parts[1])
+                    if val == 0:
+                        context_size = None
+                        print(f"{GREEN}Context size reset to default.{RESET}\n")
+                    else:
+                        context_size = val
+                        print(f"{GREEN}Context size set to {context_size}.{RESET}\n")
+                else:
+                    print(f"{YELLOW}Usage: /contextsizeset <integer> (use 0 for default){RESET}\n")
+                continue
+            elif full_input_stripped == '/clear':
+                messages = [{'role': 'system', 'content': system_prompt}]
+                print(f"{GREEN}Context memory wiped clean.{RESET}\n")
+                continue
+            elif full_input_stripped.lower() == '/debug on':
+                debug = True
+                print(f"{GREEN}Debug mode ENABLED.{RESET}\n")
+                continue
+            elif full_input_stripped.lower() == '/debug off':
+                debug = False
+                print(f"{GREEN}Debug mode DISABLED.{RESET}\n")
+                continue
+            elif full_input_stripped == '/thinkingoff':
+                force_no_thinking = True
+                print(f"{GREEN}Instructing model to SKIP the reasoning phase.{RESET}\n")
+                continue
+            elif full_input_stripped == '/thinkingon':
+                force_no_thinking = False
+                print(f"{GREEN}Allowing model to use reasoning phase normally.{RESET}\n")
+                continue
+            elif full_input_stripped.startswith('/cwd'):
+                parts = full_input_stripped.split(maxsplit=1)
+                if len(parts) > 1:
+                    try: os.chdir(os.path.expanduser(parts[1]))
+                    except Exception as e: print(f"{YELLOW}Error: {e}{RESET}")
+                print(f"{GREEN}Directory: {os.getcwd()}{RESET}\n")
+                continue
+            elif full_input_stripped.startswith('/ls'):
+                try: subprocess.run("ls " + full_input_stripped[3:], shell=True)
+                except Exception as e: print(f"{YELLOW}Error: {e}{RESET}")
+                print()
+                continue
+            elif full_input_stripped.startswith('/switchmodel'):
+                parts = full_input_stripped.split()
+                if len(parts) > 1:
+                    model = parts[1]
+                    print(f"{GREEN}Switched model to '{model}'.{RESET}\n")
+                continue
+            
+            # Commands that interact with the LLM
+            elif full_input_stripped == '/spawnshell':
+                shell_msg = handle_spawnshell()
+                if not shell_msg: continue
+                messages.append({'role': 'user', 'content': shell_msg})
+            else:
+                final_user_content = process_inline_commands(full_input)
+                if not final_user_content.strip(): continue
+                messages.append({'role': 'user', 'content': final_user_content})
+            
+            payload_messages = list(messages)
+            if force_no_thinking:
+                payload_messages.append({'role': 'system', 'content': 'CRITICAL INSTRUCTION: Do NOT output any internal thoughts, <think> tags, or reasoning. Output the final answer directly and immediately.'})
+            
+            if messages[-1]['role'] == 'user':
+                assistant_response = query_llamacpp(base_url, payload_messages, model, stream_enabled, debug, images=images)
+                if assistant_response:
+                    messages.append({'role': 'assistant', 'content': assistant_response})
+                print() 
+
+        except KeyboardInterrupt:
+            sys.stdout.write(f"\n{YELLOW}[Action Interrupted]{RESET}\n")
+            continue
+        except EOFError:
+            print(f"\n{CYAN}Goodbye!{RESET}")
+            break
+            
+            full_input_stripped = full_input.strip()
+            if not full_input_stripped: continue
+            
+            # Pure local commands
+            if full_input_stripped.lower() in ['exit', 'quit', '/exit', '/quit']:
+                print(f"{CYAN}Goodbye!{RESET}"); break
+            elif full_input_stripped in ['/?', '/help']:
+                print(f"\n{CYAN}Commands:{RESET} /listmodel, /switchmodel, /contextsizeset <int>, /cwd, /ls, /clear, /thinkingoff, /thinkingon, /debug on, /debug off, /quit\n")
+                print(f"  {YELLOW}! <command>{RESET}        - Execute a shell command inline")
+                print(f"  {YELLOW}/curl <url>{RESET}        - Fetch and extract text from a URL inline")
+                print(f"  {YELLOW}/spawnshell{RESET}        - Capture a full interactive shell session\n")
+                continue
+            elif full_input_stripped.startswith('/listmodel'):
+                parts = full_input_stripped.split(maxsplit=1)
+                list_models_ollama(base_url, parts[1] if len(parts) > 1 else None)
+                continue
+            elif full_input_stripped.startswith('/contextsizeset'):
+                parts = full_input_stripped.split()
+                if len(parts) > 1 and parts[1].isdigit():
+                    val = int(parts[1])
+                    if val == 0:
+                        context_size = None
+                        print(f"{GREEN}Context size reset to default.{RESET}\n")
+                    else:
+                        context_size = val
+                        print(f"{GREEN}Context size set to {context_size}.{RESET}\n")
+                else:
+                    print(f"{YELLOW}Usage: /contextsizeset <integer> (use 0 for default){RESET}\n")
+                continue
+            elif full_input_stripped == '/clear':
+                messages = [{'role': 'system', 'content': system_prompt}]
+                print(f"{GREEN}Context memory wiped clean.{RESET}\n")
+                continue
+            elif full_input_stripped.lower() == '/debug on':
+                debug = True
+                print(f"{GREEN}Debug mode ENABLED.{RESET}\n")
+                continue
+            elif full_input_stripped.lower() == '/debug off':
+                debug = False
+                print(f"{GREEN}Debug mode DISABLED.{RESET}\n")
+                continue
+            elif full_input_stripped == '/thinkingoff':
+                force_no_thinking = True
+                print(f"{GREEN}Instructing model to SKIP the reasoning phase.{RESET}\n")
+                continue
+            elif full_input_stripped == '/thinkingon':
+                force_no_thinking = False
+                print(f"{GREEN}Allowing model to use reasoning phase normally.{RESET}\n")
+                continue
+            elif full_input_stripped.startswith('/cwd'):
+                parts = full_input_stripped.split(maxsplit=1)
+                if len(parts) > 1:
+                    try: os.chdir(os.path.expanduser(parts[1]))
+                    except Exception as e: print(f"{YELLOW}Error: {e}{RESET}")
+                print(f"{GREEN}Directory: {os.getcwd()}{RESET}\n")
+                continue
+            elif full_input_stripped.startswith('/ls'):
+                try: subprocess.run("ls " + full_input_stripped[3:], shell=True)
+                except Exception as e: print(f"{YELLOW}Error: {e}{RESET}")
+                print()
+                continue
+            elif full_input_stripped.startswith('/switchmodel'):
+                parts = full_input_stripped.split()
+                if len(parts) > 1:
+                    model = parts[1]
+                    print(f"{GREEN}Switched model to '{model}'.{RESET}\n")
+                continue
+            
+            # Commands that interact with the LLM
+            elif full_input_stripped == '/spawnshell':
+                shell_msg = handle_spawnshell()
+                if not shell_msg: continue
+                messages.append({'role': 'user', 'content': shell_msg})
+            else:
+                final_user_content = process_inline_commands(full_input)
+                if not final_user_content.strip(): continue
+                messages.append({'role': 'user', 'content': final_user_content})
+            
+            payload_messages = list(messages)
+            if force_no_thinking:
+                payload_messages.append({'role': 'system', 'content': 'CRITICAL INSTRUCTION: Do NOT output any internal thoughts, <think> tags, or reasoning. Output the final answer directly and immediately.'})
+            
+            if messages[-1]['role'] == 'user':
+                assistant_response = query_llamacpp(base_url, payload_messages, model, stream_enabled, debug, images=images)
+                if assistant_response:
+                    messages.append({'role': 'assistant', 'content': assistant_response})
+                print() 
+
+        except KeyboardInterrupt:
+            sys.stdout.write(f"\n{YELLOW}[Action Interrupted]{RESET}\n")
+            continue
+        except EOFError:
+            print(f"\n{CYAN}Goodbye!{RESET}")
+            break
+            
+            full_input_stripped = full_input.strip()
+            if not full_input_stripped: continue
+            
+            # Pure local commands
+            if full_input_stripped.lower() in ['exit', 'quit', '/exit', '/quit']:
+                print(f"{CYAN}Goodbye!{RESET}"); break
+            elif full_input_stripped in ['/?', '/help']:
+                print(f"\n{CYAN}Commands:{RESET} /listmodel, /switchmodel, /contextsizeset <int>, /cwd, /ls, /clear, /thinkingoff, /thinkingon, /debug on, /debug off, /quit\n")
+                print(f"  {YELLOW}! <command>{RESET}        - Execute a shell command inline")
+                print(f"  {YELLOW}/curl <url>{RESET}        - Fetch and extract text from a URL inline")
+                print(f"  {YELLOW}/spawnshell{RESET}        - Capture a full interactive shell session\n")
+                continue
+            elif full_input_stripped.startswith('/listmodel'):
+                parts = full_input_stripped.split(maxsplit=1)
+                list_models_ollama(base_url, parts[1] if len(parts) > 1 else None)
+                continue
+            elif full_input_stripped.startswith('/contextsizeset'):
+                parts = full_input_stripped.split()
+                if len(parts) > 1 and parts[1].isdigit():
+                    val = int(parts[1])
+                    if val == 0:
+                        context_size = None
+                        print(f"{GREEN}Context size reset to default.{RESET}\n")
+                    else:
+                        context_size = val
+                        print(f"{GREEN}Context size set to {context_size}.{RESET}\n")
+                else:
+                    print(f"{YELLOW}Usage: /contextsizeset <integer> (use 0 for default){RESET}\n")
+                continue
+            elif full_input_stripped == '/clear':
+                messages = [{'role': 'system', 'content': system_prompt}]
+                print(f"{GREEN}Context memory wiped clean.{RESET}\n")
+                continue
+            elif full_input_stripped.lower() == '/debug on':
+                debug = True
+                print(f"{GREEN}Debug mode ENABLED.{RESET}\n")
+                continue
+            elif full_input_stripped.lower() == '/debug off':
+                debug = False
+                print(f"{GREEN}Debug mode DISABLED.{RESET}\n")
+                continue
+            elif full_input_stripped == '/thinkingoff':
+                force_no_thinking = True
+                print(f"{GREEN}Instructing model to SKIP the reasoning phase.{RESET}\n")
+                continue
+            elif full_input_stripped == '/thinkingon':
+                force_no_thinking = False
+                print(f"{GREEN}Allowing model to use reasoning phase normally.{RESET}\n")
+                continue
+            elif full_input_stripped.startswith('/cwd'):
+                parts = full_input_stripped.split(maxsplit=1)
+                if len(parts) > 1:
+                    try: os.chdir(os.path.expanduser(parts[1]))
+                    except Exception as e: print(f"{YELLOW}Error: {e}{RESET}")
+                print(f"{GREEN}Directory: {os.getcwd()}{RESET}\n")
+                continue
+            elif full_input_stripped.startswith('/ls'):
+                try: subprocess.run("ls " + full_input_stripped[3:], shell=True)
+                except Exception as e: print(f"{YELLOW}Error: {e}{RESET}")
+                print()
+                continue
+            elif full_input_stripped.startswith('/switchmodel'):
+                parts = full_input_stripped.split()
+                if len(parts) > 1:
+                    model = parts[1]
+                    print(f"{GREEN}Switched model to '{model}'.{RESET}\n")
+                continue
+            
+            # Commands that interact with the LLM
+            elif full_input_stripped == '/spawnshell':
+                shell_msg = handle_spawnshell()
+                if not shell_msg: continue
+                messages.append({'role': 'user', 'content': shell_msg})
+            else:
+                final_user_content = process_inline_commands(full_input)
+                if not final_user_content.strip(): continue
+                messages.append({'role': 'user', 'content': final_user_content})
+            
+            payload_messages = list(messages)
+            if force_no_thinking:
+                payload_messages.append({'role': 'system', 'content': 'CRITICAL INSTRUCTION: Do NOT output any internal thoughts, <think> tags, or reasoning. Output the final answer directly and immediately.'})
+            
+            if messages[-1]['role'] == 'user':
+                assistant_response = query_llamacpp(base_url, payload_messages, model, stream_enabled, debug, images=images)
                 if assistant_response:
                     messages.append({'role': 'assistant', 'content': assistant_response})
                 print() 
@@ -726,16 +1039,30 @@ def chat_loop_ollama(base_url, system_prompt, initial_model, stream_enabled, deb
 # BACKEND: LLAMA.CPP / OPENAI-COMPATIBLE
 # ==========================================
 
-def query_llamacpp(base_url, messages, model, stream_enabled=False, debug=False, show_thinking=True, context_size=None):
+def query_llamacpp(base_url, messages, model, stream_enabled=False, debug=False, show_thinking=True, context_size=None, images=None):
     start_time = time.time()
     full_content = ""
     try:
+        # Try to insert the image into messages
+        #     "messages": [{
+        #                      "role": "user",
+        #                      "content": "What is in this image?",
+        #                      "images": ["'"$IMG"'"]
+        #                  }],
+
+        if images:
+            messages[1]["images"] = images
         payload = {"model": model, "messages": messages, "stream": stream_enabled}
         if context_size is not None:
             payload["max_tokens"] = context_size
-
+    #    if image:
+    #        payload["image"] = image
+            
         api_url = f"{base_url}/v1/chat/completions"
         data = json.dumps(payload).encode('utf-8')
+        if debug:
+            print(json.dumps(payload,indent=2))
+
         req = urllib.request.Request(api_url, data=data, headers={'Content-Type': 'application/json'})
 
         with urllib.request.urlopen(req) as response:
@@ -785,20 +1112,23 @@ def query_llamacpp(base_url, messages, model, stream_enabled=False, debug=False,
         sys.stdout.flush()
         return full_content 
     except Exception as e:
-        sys.stderr.write(f"\n{YELLOW}llama.cpp Request Error: {e}{RESET}\n")
+        sys.stderr.write(f"\n{YELLOW}query_llamacpp Request Error: {e}{RESET}\n")
     return full_content
 
-def chat_loop_llamacpp(base_url, system_prompt, initial_model, stream_enabled, debug):
-    model = initial_model
-    force_no_thinking = False
-    context_size = None
-    
-    print(f"{CYAN}Entering Llama.cpp chat mode. Type '/?' for help.{RESET}")
-    setup_readline(base_url, "llamacpp")
-    messages = [{'role': 'system', 'content': system_prompt}]
-    
-    while True:
-        try:
+def chat_loop_llamacpp(base_url, system_prompt, initial_model, stream_enabled, debug, images=None):
+        model = initial_model
+        force_no_thinking = False
+        context_size = None
+        
+        print(f"{CYAN}Entering Llama.cpp chat mode. Type '/?' for help.{RESET}")
+        setup_readline(base_url, "llamacpp")
+        messages = [{'role': 'system', 'content': system_prompt}]
+        
+        if images:
+            print(f"{GREEN}Image loaded for session.{RESET}")
+
+        while True:
+          try:
             full_input = gather_user_input(model)
             if full_input is None:
                 print(f"\n{CYAN}Goodbye!{RESET}")
@@ -885,15 +1215,15 @@ def chat_loop_llamacpp(base_url, system_prompt, initial_model, stream_enabled, d
                 payload_messages.append({'role': 'system', 'content': 'CRITICAL INSTRUCTION: Do NOT output any internal thoughts, <think> tags, or reasoning. Output the final answer directly and immediately.'})
             
             if messages[-1]['role'] == 'user':
-                assistant_response = query_llamacpp(base_url, payload_messages, model, stream_enabled, debug, show_thinking=True, context_size=context_size)
+                assistant_response = query_llamacpp(base_url, payload_messages, model, stream_enabled, debug, show_thinking=True, context_size=context_size,images=images)
                 if assistant_response:
                     messages.append({'role': 'assistant', 'content': assistant_response})
                 print() 
 
-        except KeyboardInterrupt:
+          except KeyboardInterrupt:
             sys.stdout.write(f"\n{YELLOW}[Action Interrupted]{RESET}\n")
             continue
-        except EOFError:
+          except EOFError:
             print(f"\n{CYAN}Goodbye!{RESET}")
             break
 
@@ -918,6 +1248,7 @@ def main():
     parser.add_argument("--output-dir", help="Directory to save output files (required for --input-dir).")
     parser.add_argument("-p", "--prompt", default=DEFAULT_SYSTEM_PROMPT, help="The system prompt.")
     parser.add_argument("-m", "--model", default="llama3", help="Ollama model (default: llama3).")
+    parser.add_argument("--image", help="Path to an image file to include in the prompt (for multimodal models).")
     parser.add_argument("--show", action="store_true", help="Show concise model details (details, model_info, capabilities).")
     parser.add_argument("--show-details", action="store_true", help="Show full model information (all fields).")
     parser.add_argument("--output-format", choices=["json", "yaml"], default="json", help="Format for --show output (default: json).")
@@ -968,6 +1299,7 @@ def main():
                     "capabilities": info.get('capabilities', [])
                 }
                 if args.output_format == "yaml" and HAVE_YAML:
+                    import yaml
                     print(yaml.safe_dump(subset, sort_keys=False))
                 else:
                     print(json.dumps(subset, indent=2))
@@ -983,31 +1315,31 @@ def main():
         else:
             info = fetch_model_info_ollama(base_url, args.model)
             if info:
-                if not info.get('model_info'):
-                    sys.stderr.write(f"{YELLOW}Model '{args.model}' may not be downloaded locally; limited info returned.{RESET}\n")
                 if args.output_format == "yaml" and HAVE_YAML:
+                    import yaml
                     print(yaml.safe_dump(info, sort_keys=False))
                 else:
                     print(json.dumps(info, indent=2))
             else:
-                sys.stderr.write(f"{YELLOW}No model info returned for '{args.model}'. Ensure the Ollama server is running and the model name is correct.{RESET}\n")
+                sys.stderr.write(f"{YELLOW}No model info returned for '{args.model}'. Ensure the Ollata server is running and the model name is correct.{RESET}\n")
                 print(json.dumps({}, indent=2))
         sys.exit(0)
-
-
-
-
-
-
 
     is_tty = sys.stdout.isatty()
     should_stream = is_tty and not args.no_stream and not args.output and not args.output_dir
 
     if args.chat:
+        image_data = None
+        if args.image:
+            image_data = prepare_image_data(args.image)
+            if image_data:
+                print(f"{GREEN}Image loaded: {args.image}{RESET}")
+
+        images_list = [image_data] if image_data else None
         if args.backend == "llamacpp":
-            chat_loop_llamacpp(base_url, args.prompt, args.model, should_stream, args.debug)
-        else:
-            chat_loop_ollama(base_url, args.prompt, args.model, should_stream, args.debug)
+            chat_loop_llamacpp(base_url, args.prompt, args.model, should_stream, args.debug,images=images_list)
+        if args.backend == "ollama":
+            chat_loop_ollama(base_url,   args.prompt, args.model, should_stream, args.debug,images=images_list)
         sys.exit(0)
 
     input_data = ""
@@ -1022,10 +1354,19 @@ def main():
 
     if input_data:
         messages = [{'role': 'system', 'content': args.prompt}, {'role': 'user', 'content': input_data}]
+        
+        image_data = None
+        if args.image:
+            image_data = prepare_image_data(args.image)
+            if image_data:
+                print(f"{GREEN}Image loaded: {args.image}{RESET}")
+
         if args.backend == "llamacpp":
-            response = query_llamacpp(base_url, messages, args.model, stream_enabled=should_stream, debug=args.debug)
+            response = query_llamacpp(base_url, messages, args.model, stream_enabled=should_stream, debug=args.debug, images=image_data)
         else:
-            response = query_ollama(base_url, messages, args.model, stream_enabled=should_stream, debug=args.debug)
+            # For ollama, we need to pass images as a list
+            images_list = [image_data] if image_data else None
+            response = query_ollama(base_url, messages, args.model, stream_enabled=should_stream, debug=args.debug, images=images_list)
         
         if args.output:
             with open(args.output, 'w', encoding='utf-8') as f:
