@@ -5,6 +5,7 @@
 # ============================================================================
 
 import os
+import socket
 import sys
 import json
 import re
@@ -50,8 +51,11 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 MAX_CONTEXT_SIZE = 4192000  # 4M tokens maximum limit (prevent OOM)
-DEFAULT_OLLAMA_HOST = 'http://127.0.0.1:11434'
-DEFAULT_LLAMACPP_HOST = 'http://127.0.0.1:8080'
+DEFAULT_OLLAMA_HOST    = 'http://127.0.0.1:11434'
+DEFAULT_LLAMACPP_HOST  = 'http://127.0.0.1:8080'
+DEFAULT_OLLAMA_PORT    =  11434
+DEFAULT_LLAMACPP_PORT  =  8080
+
 
 
 # ============================================================================
@@ -1543,8 +1547,92 @@ def show_model_details(base_url, model, args):
         print(yaml.safe_dump(info, sort_keys=False))
     else:
         print(json.dumps(info, indent=2))
-
     sys.exit(0)
+
+def check_backend_with_head(url, server_marker):
+    """Attempt HEAD request to URL and check for server header."""
+    try:
+        request = Request(url, method='HEAD')
+        with urlopen(request, timeout=1.0) as response:
+            server_header = response.headers.get('Server', '').lower()
+            return server_marker.lower() in server_header
+    except (HTTPError, URLError, OSError, TimeoutError, Exception):
+        return False
+
+
+
+def check_backend_with_get(url, server_marker):
+    """Attempt HEAD request to URL and check for server header."""
+    try:
+        request = Request(url, method='GET')
+        with urlopen(request, timeout=1.0) as response:
+            my_response = str(response.read())
+            my_response = my_response.lower()
+            #print(my_response)
+            if my_response.find("ollama"):
+                return True
+    except (HTTPError, URLError, OSError, TimeoutError, Exception):
+        return False
+ 
+
+def auto_detect_backend():
+    """Auto-detect backend based on default ports using HEAD request.
+    
+    Checks if both backends are running at their default ports:
+    - 127.0.0.1:8080 for llama.cpp
+    - 127.0.0.1:11434 for ollama
+    
+    Uses HTTP HEAD request with timeout of 1 second and checks for
+    'Server: llama.cpp' or 'Server: ollama' headers.
+    
+    Returns:
+        str: 'llamacpp', 'ollama', or None if neither detected
+    """
+   
+    # Default URLs
+    llama_cpp_url = DEFAULT_LLAMACPP_HOST
+    ollama_url =    DEFAULT_OLLAMA_HOST
+    
+    # Check which backend is running
+
+    sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + llama_cpp_url + " ", 'info'))
+    if check_backend_with_head(llama_cpp_url, 'llama.cpp'):
+        sys.stderr.write(colorize(f"Success\n", 'info'))
+        return True,'llamacpp',llama_cpp_url
+    else:
+        sys.stderr.write(colorize(f"Fail\n", 'info'))
+
+    sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + ollama_url    + " ", 'info'))
+    if check_backend_with_get(ollama_url,     'ollama'):
+        sys.stderr.write(colorize(f"Success\n", 'info'))
+        return True,'ollama',ollama_url
+    else:
+        sys.stderr.write(colorize(f"Fail\n", 'info'))
+
+
+    # grab the ip of the host 
+    #  socket.gethostbyname_ex(socket.gethostname())[-1] 
+    # ('myhost.home', [], ['192.168.1.19', '192.168.1.20'])
+    list_of_ip = socket.gethostbyname_ex(socket.gethostname())[-1]
+    for ip in list_of_ip:
+        
+        url="http://"+ip + ":" + str(DEFAULT_LLAMACPP_PORT)
+        sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + url    + " ", 'info'))
+        if check_backend_with_head(url, 'llama.cpp'):
+            sys.stderr.write(colorize(f"Success\n", 'info'))
+            return True,'llamacpp',url
+        else:
+            sys.stderr.write(colorize(f"Fail\n", 'info'))
+
+        url="http://"+ip + ":" + str(DEFAULT_LLAMACPP_PORT)
+        sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + url    + " ", 'info'))
+        if check_backend_with_get("http://"+ip + ":" +  str(DEFAULT_OLLAMA_PORT),   'ollama'):
+            sys.stderr.write(colorize(f"Success\n", 'info'))
+            return True,'ollama',url
+        else:
+            sys.stderr.write(colorize(f"Fail\n", 'info'))
+
+    return None,'',''
 
 
 # ============================================================================
@@ -1560,7 +1648,7 @@ def main():
     # Backend selection
     group = parser.add_argument_group('Backend')
     group.add_argument('-b', '--backend', choices=["ollama", "llamacpp"],
-                      default="ollama", help='API backend (default: ollama)')
+                      help='API backend')
     group.add_argument('-H', '--host', help='Custom API URL')
 
     # Listing operations
@@ -1631,14 +1719,24 @@ def main():
     ACTIVE_THEME = get_theme(theme_to_use)
 
     # Determine base URL
-    backend = args.backend
+    #backend = 'ollama'
+
+    if args.backend != None:
+        backend = args.backend
+
+    if args.backend == None and args.host == None:
+        autodetected, backend, url = auto_detect_backend()
+        if autodetected == True:
+            print(f"[INFO] Auto-detected backend: {backend}", file=sys.stderr)
+
+    #backend = args.backend
     base_url = get_base_url(args, backend)
 
     # Handle listing operations
     if args.list or args.list_all:
-        if args.backend == "llamacpp":
+        if backend == "llamacpp":
             list_models_llamacpp(base_url, filter_arg=args.model)
-        if args.backend == "ollama":
+        if backend == "ollama":
             if args.list_all:
               list_models_ollama(
                   base_url,
