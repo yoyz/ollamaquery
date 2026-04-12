@@ -548,7 +548,8 @@ class ModelQuery:
             sys.stderr.write(colorize(f"\n[ERROR] Ollama streaming failed: {e}\n", 'error'))
             return full_content
 
-    # ==========================================
+
+# ==========================================
     # === LLAMA.CPP STREAMING FUNCTION ===
     # ==========================================
 
@@ -577,65 +578,69 @@ class ModelQuery:
             data = json.dumps(payload).encode('utf-8')
             req = Request(api_url, data=data, headers={'Content-Type': 'application/json'})
 
-            thinking_buffer = ""
+            start_thinking = False
             started_content = False
             completion_data = {}
-            finish_reason = None
-            content = ""
 
             with urlopen(req) as response:
                 for line in response:
                     decoded_line = line.decode('utf-8').strip()
-                    if not decoded_line or decoded_line == '[DONE]':
+
+                    if not decoded_line:
+                        continue
+
+                    # Strip SSE 'data: ' prefix
+                    if decoded_line.startswith('data: '):
+                        decoded_line = decoded_line[6:].strip()
+
+                    if decoded_line == '[DONE]':
                         continue
 
                     try:
                         chunk = json.loads(decoded_line)
 
+                        # Grab usage stats if present (often sent in the final chunk)
+                        if "usage" in chunk and chunk["usage"]:
+                            completion_data.update(chunk["usage"])
+
                         choices = chunk.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})
 
-                            # Extract thinking/reasoning content
+                            # Extract content
                             thought = delta.get("reasoning_content") or ""
                             content = delta.get("content") or ""
-                            finish_reason = choices[0].get("finish_reason")
 
-                            # Track usage stats from Llama.cpp response
-                            if "usage" in chunk:
-                                completion_data.update(chunk["usage"])
-
-                            # Handle thinking with buffered display
+                            # 1. Print thinking in real-time as it arrives
                             if thought and show_thinking:
-                                thinking_buffer += thought
+                                if not start_thinking:
+                                    sys.stderr.write(colorize("\n<thinking>\n", 'muted'))
+                                    start_thinking = True
+                                sys.stderr.write(colorize(thought, 'muted'))
+                                sys.stderr.flush()
 
-                        # Flush accumulated thinking when content arrives
-                        if content:
-                            if thinking_buffer.strip() and started_content:
-                                sys.stderr.write(f"\n<thinking>{thinking_buffer}</thinking>\n")
-                                thinking_buffer = ""
+                            # 2. Print content in real-time
+                            if content:
+                                # Close the thinking block if it was open
+                                if start_thinking and not started_content:
+                                    sys.stderr.write(colorize("\n</thinking>\n", 'muted'))
 
-                            # Strip only leading/trailing whitespace, preserve internal spaces
-                            clean_content = content.strip(' \t\n\r\x0c')
+                                # Print response header once
+                                if not started_content:
+                                    print(colorize("\n[--- Response ---]", 'success'), file=sys.stdout)
+                                    started_content = True
 
-                            if not started_content:
-                                print("\n[--- Response ---]", file=sys.stdout)
-                                started_content = True
-
-                            sys.stdout.write(clean_content)
-                            sys.stdout.flush()
-                            full_content += clean_content
+                                # DO NOT strip spaces here, or words will mash together!
+                                sys.stdout.write(content)
+                                sys.stdout.flush()
+                                full_content += content
 
                     except json.JSONDecodeError:
                         continue
 
-            # === Check for completion signal ===
-            #if finish_reason and choices:
-            #    break
-
-            # === Display buffered thinking at end (if any remains) ===
-            if thinking_buffer.strip():
-                sys.stderr.write(f"\n<thinking>{thinking_buffer}</thinking>\n")
+            # Failsafe: close thinking block if the model thought but generated no content
+            if start_thinking and not started_content:
+                sys.stderr.write(colorize("\n</thinking>\n", 'muted'))
 
             # === Calculate and print final stats ===
             total_time = time.time() - start_time
@@ -647,6 +652,8 @@ class ModelQuery:
         except Exception as e:
             sys.stderr.write(colorize(f"\n[ERROR] Llama.cpp streaming failed: {e}\n", 'error'))
             return full_content
+
+
 
     # ==========================================
     # === GENERIC STREAMING WRAPPER FUNCTION ===
