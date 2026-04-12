@@ -16,12 +16,14 @@ import subprocess
 import shutil
 import threading
 import time
+
 from html.parser import HTMLParser
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-
+from urllib.parse import urlparse
+        
 try:
     import yaml
     HAVE_YAML = True
@@ -714,16 +716,10 @@ class ChatCompleter:
 # ============= INPUT HANDLING CLASS =========================================
 # ============================================================================
 
-def gather_user_input(model, show_multiline=True):
+
+def gather_user_input(prompt_prefix, show_multiline=True):
     """
     Gather user input with multiline support.
-
-    Args:
-        model (str): Current model name for prompt display
-        show_multiline (bool): Whether to enable multiline mode
-
-    Returns:
-        str or None: User input or None if cancelled/EOF
     """
     ctrl_c_count = 0
     ctrl_d_count = 0
@@ -732,11 +728,11 @@ def gather_user_input(model, show_multiline=True):
         try:
             # Use readline if available, fallback to input()
             if READLINE_AVAILABLE:
-                prompt_str = f"you@{model} > "
+                prompt_str = colorize(f"{prompt_prefix} > ", 'warning')
                 line = input(prompt_str)
                 ctrl_c_count = 0
             else:
-                prompt_str = f"you@{model}: "
+                prompt_str = colorize(f"{prompt_prefix}: ", 'warning')
                 line = input(prompt_str)
 
             if not show_multiline or line.strip() != '"""':
@@ -753,13 +749,11 @@ def gather_user_input(model, show_multiline=True):
             print(f"\n(Press Ctrl+C again to exit)", file=sys.stderr)
 
         except EOFError:
-            print(f"\n[EOF received, one more and it exit]", file=sys.stderr)
+            print(f"\n[EOF received, one more and it exits]", file=sys.stderr)
             ctrl_d_count += 1
             if ctrl_d_count >= 2:
                 print(f"\n[Exiting]", file=sys.stderr)
                 sys.exit(1)
-
-
 
 def process_inline_commands(full_input):
     """
@@ -1064,11 +1058,17 @@ class ChatLoop:
         self.force_no_thinking = False
 
     def fetch_models(self):
-        """Fetch available models from the backend."""
+        """Fetch available models from the backend and auto-select if needed."""
         if self.backend == "llamacpp":
             self.models = [m['name'] for m in fetch_models_llamacpp(self.base_url)]
         else:
             self.models = [m['name'] for m in fetch_models_ollama(self.base_url)]
+            
+        # NEW: Auto-select the first available model if the current one doesn't exist
+        if self.models and self.model not in self.models:
+            old_model = self.model
+            self.model = self.models[0]
+            print(colorize(f"[INFO] Model '{old_model}' not found on server. Auto-selecting '{self.model}']", 'warning'), file=sys.stderr)
 
     def run(self, stream_enabled=True, debug=False, images=None):
         """Main chat loop - handles interactive session."""
@@ -1138,9 +1138,17 @@ class ChatLoop:
         if images:
             print(colorize("[Image loaded for session]", 'success'), file=sys.stderr)
 
+        from urllib.parse import urlparse
+        host_clean = urlparse(self.base_url).netloc
+
         while True:
             try:
-                full_input = gather_user_input(self.model)
+                # Build the dynamic prompt: backend@IPv4/model
+                prompt_prefix = f"{self.backend}@{host_clean}/{self.model}"
+
+                 # PASS THE NEW PREFIX HERE, NOT self.model
+                #full_input = gather_user_input(self.model)
+                full_input = gather_user_input(prompt_prefix)
                 if full_input is None or not full_input.strip():
                     continue
 
@@ -1269,7 +1277,7 @@ class ChatLoop:
                     print(f"[EOF - Goodbye!]", file=sys.stderr)
                     break
                 else:
-                    print(colorize(f"[ERROR] {e}", 'error'), file=sys.stderr)
+                    print(colorize(f"[ERROR] ChatLoop->run {e}", 'error'), file=sys.stderr)
 
         return
 
@@ -1641,6 +1649,100 @@ def auto_detect_backend():
 
     return None,'',''
 
+def load_saved_backends():
+    """Load the list of previously successful backend configurations."""
+    config_file = os.path.expanduser("~/.ollamaquery.d/backends.json")
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+    return []
+
+def save_backend_config(backend, host):
+    """Save a successful connection to the top of the history list."""
+    config_file = os.path.expanduser("~/.ollamaquery.d/backends.json")
+    try:
+        os.makedirs(os.path.dirname(config_file), exist_ok=True)
+        history = load_saved_backends()
+        
+        new_entry = {"backend": backend, "host": host}
+        
+        # Remove it if it already exists so we can bump it to the top
+        history = [entry for entry in history if entry != new_entry]
+        history.insert(0, new_entry)
+        
+        # Keep only the last 10 known servers to avoid bloat
+        history = history[:10]
+        
+        with open(config_file, 'w') as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        sys.stderr.write(colorize(f"[WARNING] Failed to save config: {e}\n", 'warning'))
+
+def resolve_connection(args):
+    """
+    Determines the correct backend and host by prioritizing:
+    1. Explicit CLI overrides (-H and -b)
+    2. Previously working configurations (tried Most Recently Used first)
+    3. Network Auto-discovery
+    4. Hardcoded defaults
+    """
+    # 1. Explicit user override (-H)
+    if args.host:
+        base_url = args.host if args.host.startswith(('http://', 'https://')) else f"http://{args.host}"
+        selected_backend = args.backend or "ollama"  # Default to ollama if only host is provided
+        save_backend_config(selected_backend, base_url)
+        return selected_backend, base_url
+
+    saved_backends = load_saved_backends()
+    
+    # 2. Iterate through history
+    for config in saved_backends:
+        s_backend = config.get('backend')
+        s_host = config.get('host')
+        
+        # If user explicitly passed `-b`, skip history entries that don't match
+        if args.backend and args.backend != s_backend:
+            continue
+
+        sys.stderr.write(colorize(f"[INFO] Testing known server: {s_backend} @ {s_host} ... ", 'muted'))
+        
+        is_valid = False
+        if s_backend == 'llamacpp':
+            is_valid = check_backend_with_head(s_host, 'llama.cpp')
+        elif s_backend == 'ollama':
+            is_valid = check_backend_with_get(s_host, 'ollama')
+
+        if is_valid:
+            sys.stderr.write(colorize("Success\n", 'success'))
+            save_backend_config(s_backend, s_host) # Bump to top of list
+            return s_backend, s_host
+        else:
+            sys.stderr.write(colorize("Offline\n", 'warning'))
+
+    # 3. If history failed or is empty, trigger Auto-Discovery
+    sys.stderr.write(colorize(f"\n[INFO] Known servers offline. Initiating auto-discovery...\n", 'info'))
+    autodetected, d_backend, d_url = auto_detect_backend()
+    if autodetected:
+        # If user explicitly passed `-b`, ensure the autodetected backend matches
+        if not args.backend or args.backend == d_backend:
+            save_backend_config(d_backend, d_url)
+            return d_backend, d_url
+
+    # 4. Ultimate Fallback
+    sys.stderr.write(colorize(f"[WARNING] Auto-discovery failed. Falling back to defaults.\n", 'error'))
+    fallback_backend = args.backend or "ollama"
+    if fallback_backend == "llamacpp":
+        fallback_host = os.environ.get('LLAMACPP_HOST', DEFAULT_LLAMACPP_HOST)
+    else:
+        fallback_host = os.environ.get('OLLAMA_HOST', DEFAULT_OLLAMA_HOST)
+
+    return fallback_backend, fallback_host
+
 
 # ============================================================================
 # ============= ARGUMENT PARSER ==============================================
@@ -1654,8 +1756,7 @@ def main():
 
     # Backend selection
     group = parser.add_argument_group('Backend')
-    group.add_argument('-b', '--backend', choices=["ollama", "llamacpp"],
-                      help='API backend')
+    parser.add_argument("-b", "--backend", choices=["ollama", "llamacpp"], default=None, help="API backend to use (auto-detected if omitted).")
     group.add_argument('-H', '--host', help='Custom API URL')
 
     # Listing operations
@@ -1725,19 +1826,8 @@ def main():
     
     ACTIVE_THEME = get_theme(theme_to_use)
 
-    # Determine base URL
-    #backend = 'ollama'
-
-    if args.backend != None:
-        backend = args.backend
-
-    if args.backend == None and args.host == None:
-        autodetected, backend, url = auto_detect_backend()
-        if autodetected == True:
-            print(f"[INFO] Auto-detected backend: {backend}", file=sys.stderr)
-
-    #backend = args.backend
-    base_url = get_base_url(args, backend)
+    # determine backend
+    backend, base_url = resolve_connection(args)
 
     # Handle listing operations
     if args.list or args.list_all:
