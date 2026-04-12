@@ -712,6 +712,56 @@ class ChatCompleter:
             self.models = [m['name'] for m in fetch_models_ollama(self.base_url)]
 
 
+    def complete(self, text, state):
+        """The core readline autocompletion hook."""
+        buffer = readline.get_line_buffer()
+
+        # 1. Model Autocompletion
+        if buffer.startswith('/switchmodel '):
+            matches = [m for m in self.models if m.startswith(text)]
+
+        # 2. File Path Autocompletion (/cwd, /ls, and inline @)
+        elif buffer.startswith('/cwd ') or buffer.startswith('/ls ') or text.startswith('@'):
+            # Determine how much of the text is the actual path
+            if text.startswith('@'):
+                path_input = text[1:]
+            else:
+                path_input = text
+
+            path = os.path.expanduser(path_input)
+            dirname = os.path.dirname(path)
+            basename = os.path.basename(path)
+            if not dirname: dirname = '.'
+
+            matches = []
+            try:
+                if os.path.exists(dirname) and os.path.isdir(dirname):
+                    for item in os.listdir(dirname):
+                        if item.startswith(basename):
+                            full_path = os.path.join(dirname, item)
+                            prefix = os.path.dirname(path_input)
+
+                            if os.path.isdir(full_path):
+                                matches.append(os.path.join(prefix, item) + '/' if prefix else item + '/')
+                            else:
+                                matches.append(os.path.join(prefix, item) if prefix else item)
+            except PermissionError:
+                pass
+
+            # Re-attach the @ symbol if we are completing an @ file inclusion
+            if text.startswith('@'):
+                matches = ['@' + m for m in matches]
+
+        # 3. Command Autocompletion
+        elif not text or text.startswith('/') or text in ['e', 'ex', 'exi', 'q', 'qu', 'qui']:
+            matches = [c for c in self.commands if c.startswith(text)]
+            
+        else:
+            matches = []
+
+        return matches[state] if state < len(matches) else None
+
+
 # ============================================================================
 # ============= INPUT HANDLING CLASS =========================================
 # ============================================================================
@@ -757,15 +807,39 @@ def gather_user_input(prompt_prefix, show_multiline=True):
 
 def process_inline_commands(full_input):
     """
-    Process inline commands (!, /curl) within user input.
-
-    Args:
-        full_input (str): Raw user input
-
-    Returns:
-        str: Processed content with command outputs included
+    Process inline commands (!, /curl, @) within user input.
     """
     processed_lines = []
+    file_inclusions = []
+    
+    # 1. Scan for inline @filepath mentions anywhere in the text
+    # We split by whitespace to extract words starting with '@'
+    for word in full_input.split():
+        if word.startswith('@') and len(word) > 1:
+            filepath = word[1:]
+            expanded_path = os.path.expanduser(filepath)
+            
+            # Only attempt to load if it actually exists as a file
+            if os.path.isfile(expanded_path):
+                print(colorize(f"[--- Loading file: {filepath} ---]", 'muted'), file=sys.stderr)
+                try:
+                    with open(expanded_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read()
+                    
+                    lines_count = len(file_content.splitlines())
+                    print(colorize(f"Successfully loaded {lines_count} lines ({len(file_content)} chars).", 'info'), file=sys.stderr)
+                    
+                    file_inclusions.append(f"\n[Content of local file `{filepath}`]:\n```text\n{file_content}\n```\n")
+                except UnicodeDecodeError:
+                    err_msg = f"[Failed to load `{filepath}`: Appears to be a binary or non-UTF-8 file]"
+                    print(colorize(err_msg, 'error'), file=sys.stderr)
+                    file_inclusions.append(err_msg + "\n")
+                except Exception as e:
+                    err_msg = f"[Failed to load `{filepath}`: {e}]"
+                    print(colorize(err_msg, 'error'), file=sys.stderr)
+                    file_inclusions.append(err_msg + "\n")
+
+    # 2. Process line-by-line commands (! and /curl)
     for line in full_input.split('\n'):
         stripped_line = line.lstrip()
 
@@ -790,16 +864,23 @@ def process_inline_commands(full_input):
             try:
                 text_content = fetch_and_convert_url(url)
                 word_count = len(text_content.split()) if text_content else 0
-                output_str = f"\n[Content from `{url}`]: {word_count} words"
+                output_str = f"\n[Content from `{url}`]: {word_count} words\n```text\n{text_content}\n```\n"
                 processed_lines.append(output_str)
             except Exception as e:
                 output_str = f"[Failed to fetch URL: {e}]"
                 processed_lines.append(output_str)
 
         else:
+            # Append normal text (including the text containing the @ tag itself)
             processed_lines.append(line)
 
-    return "\n".join(processed_lines)
+    # 3. Combine the user's original prompt with the loaded file contents at the bottom
+    final_output = "\n".join(processed_lines)
+    if file_inclusions:
+        final_output += "\n" + "".join(file_inclusions)
+        
+    return final_output
+
 
 
 def execute_os_command(command):
@@ -1090,41 +1171,17 @@ class ChatLoop:
         # Setup readline completer if available
         if READLINE_AVAILABLE:
             try:
+                # Tell readline what characters break words
                 readline.set_completer_delims(' \t\n')
-
-                def completer(text, state):
-                    buffer = readline.get_line_buffer()
-
-                    if buffer.startswith('/switchmodel '):
-                        matches = [m for m in self.models if m.startswith(text)]
-                    elif buffer.startswith('/cwd ') or buffer.startswith('/ls '):
-                        path = os.path.expanduser(text)
-                        dirname = os.path.dirname(path)
-                        basename = os.path.basename(path)
-                        if not dirname: dirname = '.'
-
-                        matches = []
-                        try:
-                            if os.path.exists(dirname) and os.path.isdir(dirname):
-                                for item in os.listdir(dirname):
-                                    if item.startswith(basename):
-                                        full_path = os.path.join(dirname, item)
-                                        prefix = os.path.dirname(text)
-                                        if os.path.isdir(full_path):
-                                            matches.append(os.path.join(prefix, item) + '/' if prefix else item + '/')
-                                        elif not buffer.startswith('/cwd '):
-                                            matches.append(os.path.join(prefix, item) if prefix else item)
-                        except PermissionError:
-                            pass
-                    elif text.startswith('/') or text in ['e', 'ex', 'exi', 'q', 'qu', 'qui']:
-                        matches = [c for c in self.commands if c.startswith(text)]
-
-                    return matches[state] if state < len(matches) else None
-
-                readline.set_completer(completer)
+                
+                # Load the models into the completer memory
+                self.completer.fetch_models()
+                
+                # Bind the Tab key to our new class method
+                readline.set_completer(self.completer.complete)
                 readline.parse_and_bind('tab: complete')
 
-                # Load history
+                # Load persistent history
                 histfile = os.path.expanduser("~/.ollamaquery.d/session")
                 histdir = os.path.dirname(histfile)
                 if not os.path.exists(histdir):
@@ -1138,7 +1195,6 @@ class ChatLoop:
                 readline.set_history_length(1000)
             except Exception as e:
                 print(colorize(f"[ERROR] Readline setup failed: {e}", 'error'), file=sys.stderr)
-
         messages = [{'role': 'system', 'content': self.system_prompt}]
 
         # Print welcome message
