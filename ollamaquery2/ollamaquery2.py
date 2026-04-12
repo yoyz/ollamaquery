@@ -814,6 +814,8 @@ def execute_os_command(command):
     """
     # Validate command safety
     if not validate_shell_command_safety(command, max_length=500):
+        msg = "[Command rejected: Invalid characters]"
+        print(colorize(msg, 'error'), file=sys.stderr)
         return "[Command rejected: Invalid characters]"
 
     print(f"[--- Executing (max 5s): {command} ---]", file=sys.stderr)
@@ -830,8 +832,17 @@ def execute_os_command(command):
             timeout=5
         )
 
-        output_lines.extend(process.stdout.splitlines())
-        output = "\n".join(output_lines) or "[Command executed successfully with no output]"
+        raw_output = process.stdout if process.stdout else ""
+        
+        # --- THE FIX: Print the output to the user's terminal! ---
+        if raw_output.strip():
+            print(colorize(raw_output, 'info'))
+        else:
+            print(colorize("[Command executed successfully with no output]", 'muted'))
+        # ---------------------------------------------------------
+
+        
+        output = raw_output or "[Command executed successfully with no output]"
 
     except subprocess.TimeoutExpired:
         print("[Command timed out after 5 seconds!]", file=sys.stderr)
