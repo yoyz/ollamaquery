@@ -1065,28 +1065,62 @@ class ChatCompleter:
 def gather_user_input(prompt_prefix, show_multiline=True):
     """
     Gather user input with multiline support.
+    it support three double quote
+    it support backslash
     """
     ctrl_c_count = 0
     ctrl_d_count = 0
 
     while True:
         try:
-            # Use readline if available, fallback to input()
+            # Setup prompts
             if READLINE_AVAILABLE:
                 prompt_str = colorize(f"{prompt_prefix} > ", 'warning')
-                line = input(prompt_str)
-                ctrl_c_count = 0
+                cont_prompt_str = colorize(f"... > ", 'warning')
             else:
                 prompt_str = colorize(f"{prompt_prefix}: ", 'warning')
-                line = input(prompt_str)
+                cont_prompt_str = colorize(f"... : ", 'warning')
 
-            if not show_multiline or line.strip() != '"""':
+            line = input(prompt_str)
+            ctrl_c_count = 0
+
+            if not line.strip():
                 return line
 
-        except KeyboardInterrupt:
-            if not show_multiline:
-                continue
+            # 1. Handle """ Block Multiline
+            if show_multiline and line.strip() == '"""':
+                lines = []
+                while True:
+                    try:
+                        m_line = input(cont_prompt_str)
+                        if m_line.strip() == '"""':
+                            break
+                        lines.append(m_line)
+                    except KeyboardInterrupt:
+                        print(colorize("\n[Multiline entry cancelled]", 'warning'), file=sys.stderr)
+                        return None # Escape out of multiline without quitting
+                return "\n".join(lines)
 
+            # 2. Handle \ Line Continuation
+            if line.endswith('\\'):
+                lines = [line[:-1]]  # Strip the trailing backslash
+                while True:
+                    try:
+                        m_line = input(cont_prompt_str)
+                        if m_line.endswith('\\'):
+                            lines.append(m_line[:-1])
+                        else:
+                            lines.append(m_line)
+                            break
+                    except KeyboardInterrupt:
+                        print(colorize("\n[Multiline entry cancelled]", 'warning'), file=sys.stderr)
+                        return None
+                return "\n".join(lines)
+
+            # 3. Standard Single Line
+            return line
+
+        except KeyboardInterrupt:
             ctrl_c_count += 1
             if ctrl_c_count >= 2:
                 print(f"\n[Cancelled]", file=sys.stderr)
