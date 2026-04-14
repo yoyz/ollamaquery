@@ -342,15 +342,23 @@ def get_theme(theme_name: str = "default"):
     return BUILTIN_THEMES.get(theme_name, BUILTIN_THEMES["default"])
 
 
-def colorize(text, role, theme=None, force_color=False):
+def colorize(text, role, theme=None, force_color=False, is_prompt=False):
     """Apply color to text using active theme."""
     if theme is None:
         theme = ACTIVE_THEME
     
     if not colors_enabled() and not force_color:
         return text
+
+    start_code = theme.get(role, '')
+    reset_code = theme['reset']
     
-    return f"{theme.get(role, '')}{text}{theme['reset']}"
+    # Wrap color codes in \x01 and \x02 so readline ignores their length
+    if is_prompt and READLINE_AVAILABLE:
+        start_code = f"\x01{start_code}\x02" if start_code else ""
+        reset_code = f"\x01{reset_code}\x02" if reset_code else ""
+        
+    return f"{start_code}{text}{reset_code}"
 
 
 def c(role, theme=None):
@@ -1075,8 +1083,8 @@ def gather_user_input(prompt_prefix, show_multiline=True):
         try:
             # Setup prompts
             if READLINE_AVAILABLE:
-                prompt_str = colorize(f"{prompt_prefix} > ", 'warning')
-                cont_prompt_str = colorize(f"... > ", 'warning')
+                prompt_str = colorize(f"{prompt_prefix} > ", 'warning',is_prompt=True)
+                cont_prompt_str = colorize(f"... > ", 'warning', is_prompt=True)
             else:
                 prompt_str = colorize(f"{prompt_prefix}: ", 'warning')
                 cont_prompt_str = colorize(f"... : ", 'warning')
@@ -1536,7 +1544,7 @@ class ChatLoop:
                 # Build the dynamic prompt: backend@IPv4/model
                 prompt_prefix = f"{self.backend}@{host_clean}/{self.model}"
                 if self.current_images:
-                    prompt_prefix += colorize("[🖼️]", 'info')  # Visual indicator
+                    prompt_prefix += colorize("[🖼️]", 'info', is_prompt=True)  # Visual indicator
 
                  # PASS THE NEW PREFIX HERE, NOT self.model
                 #full_input = gather_user_input(self.model)
@@ -1989,6 +1997,17 @@ def show_model_details(base_url, model, args):
         print(json.dumps(info, indent=2))
     sys.exit(0)
 
+
+def fetch_loaded_models_ollama(base_url):
+    """Fetch models currently loaded in memory via Ollama /api/ps."""
+    try:
+        url = f"{base_url}/api/ps"
+        with urlopen(Request(url, headers={'User-Agent': 'Mozilla/5.0'})) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return data.get('models', [])
+    except Exception:
+        return []
+
 def check_backend_with_head(url, server_marker):
     """Attempt HEAD request to URL and check for server header."""
     try:
@@ -2251,10 +2270,28 @@ def main():
     
     ACTIVE_THEME = get_theme(theme_to_use)
 
-    # Set fallback target model for chat/queries, but leave args.model raw for filtering
-    target_model = args.model or "llama3"
-    # determine backend
+    # determine backend first so we know where to check for loaded models
     backend, base_url = resolve_connection(args)
+
+    # 1. Use explicitly requested model if provided via -m
+    if args.model:
+        target_model = args.model
+    # 2. Check for an already loaded model in memory for Ollama on^ly
+    elif backend == "ollama":
+        loaded_models = fetch_loaded_models_ollama(base_url)
+        if loaded_models:
+            target_model = loaded_models[0]['name']
+            sys.stderr.write(colorize(f"[INFO] Auto-selected active model in memory: '{target_model}'\n", 'success'))
+        else:
+            target_model = "llama3" # Fallback if nothing is in memory
+    # 3. Fetch the currently hosted model (Llama.cpp)
+    elif backend == "llamacpp":
+        available_models = fetch_models_llamacpp(base_url)
+        if available_models:
+            target_model = available_models[0]['name']
+            sys.stderr.write(colorize(f"[INFO] Auto-selected hosted model: '{target_model}'\n", 'success'))
+        else:
+            target_model = "llama3" # Fallback
 
     # Handle listing operations
     if args.list or args.list_all:
