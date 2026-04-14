@@ -109,6 +109,201 @@ BUILTIN_THEMES = {
 
 THEME_FILE = os.path.expanduser("~/.ollamaquery/themes.json")
 
+# ============================================================================
+# ============= COMMAND REGISTRY =============================================
+# ============================================================================
+
+COMMANDS = {
+    # === Core Commands ===
+    'help': {
+        'aliases': ['/?', '/help'],
+        'category': 'Core',
+        'description': 'Show this help message',
+        'usage': '/help',
+        'handler': None  # Handled inline in ChatLoop
+    },
+    'quit': {
+        'aliases': ['/quit', '/exit', 'quit', 'exit'],
+        'category': 'Core', 
+        'description': 'Exit the chat session',
+        'usage': '/quit',
+        'handler': None
+    },
+    'clear': {
+        'aliases': ['/clear'],
+        'category': 'Core',
+        'description': 'Clear conversation context and attached image',
+        'usage': '/clear',
+        'handler': None
+    },
+    'stats': {
+        'aliases': ['/stats', '/usage'],
+        'category': 'Core',
+        'description': 'Show usage statistics',
+        'usage': '/stats [reset]',
+        'handler': None
+    },
+    
+    # === Model Management ===
+    'listmodel': {
+        'aliases': ['/listmodel'],
+        'category': 'Model',
+        'description': 'List available models',
+        'usage': '/listmodel [filter]',
+        'handler': None
+    },
+    'switchmodel': {
+        'aliases': ['/switchmodel'],
+        'category': 'Model',
+        'description': 'Switch to another model',
+        'usage': '/switchmodel <model_name>',
+        'handler': None
+    },
+    
+    # === Settings ===
+    'contextsizeset': {
+        'aliases': ['/contextsizeset'],
+        'category': 'Settings',
+        'description': 'Set context window size (0 for default)',
+        'usage': '/contextsizeset <tokens>',
+        'handler': None
+    },
+    'thinkingon': {
+        'aliases': ['/thinkingon'],
+        'category': 'Settings',
+        'description': 'Enable reasoning/thinking output',
+        'usage': '/thinkingon',
+        'handler': None
+    },
+    'thinkingoff': {
+        'aliases': ['/thinkingoff'],
+        'category': 'Settings',
+        'description': 'Disable reasoning/thinking output',
+        'usage': '/thinkingoff',
+        'handler': None
+    },
+    'debug': {
+        'aliases': ['/debug on', '/debug off'],
+        'category': 'Settings',
+        'description': 'Toggle debug mode (raw JSON output)',
+        'usage': '/debug on|off',
+        'handler': None
+    },
+    
+    # === I/O Operations ===
+    'image': {
+        'aliases': ['/image'],
+        'category': 'I/O',
+        'description': 'Attach or clear an image for multimodal models',
+        'usage': '/image <path> | /image clear',
+        'handler': None
+    },
+    'curl': {
+        'aliases': ['/curl'],
+        'category': 'I/O',
+        'description': 'Fetch and convert web content to plain text',
+        'usage': '/curl <url>',
+        'handler': None
+    },
+    'cwd': {
+        'aliases': ['/cwd'],
+        'category': 'I/O',
+        'description': 'Change working directory',
+        'usage': '/cwd [path]',
+        'handler': None
+    },
+    'ls': {
+        'aliases': ['/ls'],
+        'category': 'I/O',
+        'description': 'List directory contents',
+        'usage': '/ls [args]',
+        'handler': None
+    },
+    
+    # === Advanced ===
+    'spawnshell': {
+        'aliases': ['/spawnshell'],
+        'category': 'Advanced',
+        'description': 'Spawn interactive shell session (exit to return)',
+        'usage': '/spawnshell',
+        'handler': None
+    },
+}
+
+# Category order for help display
+COMMAND_CATEGORIES = ['Core', 'Model', 'Settings', 'I/O', 'Advanced']
+
+
+def get_command_aliases():
+    """Return flat list of all command aliases for readline completion."""
+    aliases = []
+    for cmd in COMMANDS.values():
+        aliases.extend(cmd['aliases'])
+    return aliases
+
+
+def get_commands_by_category(category=None):
+    """Return commands grouped by category, or filtered by category."""
+    if category:
+        return {k: v for k, v in COMMANDS.items() if v['category'] == category}
+    
+    # Group by category in defined order
+    grouped = {}
+    for cat in COMMAND_CATEGORIES:
+        cat_cmds = {k: v for k, v in COMMANDS.items() if v['category'] == cat}
+        if cat_cmds:
+            grouped[cat] = sorted(cat_cmds.items(), key=lambda x: x[0])
+    return grouped
+
+
+def format_help_text(compact=False):
+    """Generate formatted help text for display."""
+    lines = []
+    grouped = get_commands_by_category()
+    
+    for category in COMMAND_CATEGORIES:
+        if category not in grouped:
+            continue
+        
+        if compact:
+            # One-liner format for welcome message
+            cmds = [info['aliases'][0] for _, info in grouped[category]]
+            lines.append(colorize(f"{category}: " + ', '.join(cmds), 'muted'))
+        else:
+            # Detailed format for /help
+            lines.append(f"\n{colorize(category + ':', 'info')}")
+            for name, info in grouped[category]:
+                aliases = ', '.join(info['aliases'])
+                desc = info['description']
+                lines.append(f"  {colorize(f'{aliases:<28}', 'success')} {desc}")
+                if info.get('usage') and info['usage'] != info['aliases'][0]:
+                    lines.append(f"    {colorize('Usage: ' + info['usage'], 'muted')}")
+    
+    return '\n'.join(lines)
+
+
+def is_known_command(text):
+    """Check if text matches any known command or alias."""
+    text_lower = text.lower().strip()
+    for cmd in COMMANDS.values():
+        if text_lower in [a.lower() for a in cmd['aliases']]:
+            return True, cmd
+    return False, None
+
+
+def get_command_by_alias(alias):
+    """Look up command metadata by any of its aliases."""
+    alias_lower = alias.lower().strip()
+    for name, info in COMMANDS.items():
+        if alias_lower in [a.lower() for a in info['aliases']]:
+            return name, info
+    return None, None
+
+
+#
+# === Color management 
+# 
+
 
 def colors_enabled():
     """Check if colors should be used (TTY check + NO_COLOR env var)."""
@@ -297,63 +492,168 @@ class ModelQuery:
         self.base_url = base_url
         self.backend = backend
 
+        self.total_queries = 0
+        self.total_tokens_generated = 0      # completion_tokens
+        self.total_prompt_tokens = 0         # prompt_tokens
+        self.total_time_spent = 0.0
+        self.total_chars_generated = 0
+        self.query_history = []
+        self.max_history = 50                # prevent unbounded growth
+        self.debug_mode = False
+
+
     # ==========================================
     # === STATISTICS TRACKING HELPER FUNCTIONS ===
     # ==========================================
 
-    @staticmethod
-    def calculate_stats(total_time, content, usage=None):
-        """Calculate and return stats dictionary for display."""
+
+    def estimate_tokens(self, text):
+        """
+        Estimate token count from text.
+        Heuristic: ~4 chars per token for English, adjusted for code/punctuation.
+        """
+        if not text:
+            return 0
+        # Count words + punctuation as rough token proxy
+        tokens = len(re.findall(r'\b\w+\b|[^\w\s]', text))
+        # Adjust for typical tokenization overhead
+        return max(1, int(tokens * 1.1))
+
+    def calculate_context_tokens(self, messages):
+        """Calculate estimated total tokens in conversation context."""
+        total = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            total += self.estimate_tokens(content)
+            # Add small overhead for role labels and message structure
+            total += 2
+        return total
+
+
+    def calculate_stats(self, total_time, content, usage=None,messages=None):
+        """Calculate stats for current query AND update cumulative totals."""
+        
+        # Extract token counts from usage dict (backend-specific)
         eval_count = 0
         prompt_tokens = 0
-
+        total_context_tokens = 0  # Track full context window size
+        
         if usage:
-            eval_count = usage.get("completion_tokens", 0) or len(content.split())
-            prompt_tokens = usage.get("prompt_tokens", 0)
+            # Ollama uses: completion_tokens, prompt_tokens
+            # Llama.cpp may use: completion_tokens, prompt_tokens (OpenAI-compatible)
+            eval_count = usage.get("completion_tokens", 0) or usage.get("eval_count", 0)
+            prompt_tokens = usage.get("prompt_tokens", 0) or usage.get("prompt_eval_count", 0)
+            # Total tokens = full context sent to model (prompt + completion)
+            total_context_tokens = usage.get("total_tokens", 0) or (prompt_tokens + eval_count)
+        
 
-        elif content:
-            # Fallback to word count if no token data available
+        # ← NEW: Fallback to local estimation if API didn't provide context size
+        if not total_context_tokens and messages:
+            total_context_tokens = self.calculate_context_tokens(messages)
+
+        # Fallback: estimate from word count if no token data
+        if not eval_count and content:
             eval_count = len(content.split())
-
-        tps = 0.0
-        if eval_count > 0 and total_time > 0:
-            tps = eval_count / total_time
-
-        return {
+    
+        # Calculate current query metrics
+        tps = eval_count / total_time if eval_count > 0 and total_time > 0 else 0.0
+        
+        current_stats = {
             "eval_count": eval_count,
             "prompt_eval_count": prompt_tokens,
+            "total_context_tokens": total_context_tokens,
             "total_time": total_time,
             "tps": tps,
-            "content_length": len(content)
+            "content_length": len(content),
+            # Cumulative totals (updated below)
+            "cumulative_queries": 0,
+            "cumulative_tokens": 0,
+            "cumulative_avg_tps": 0.0
         }
+    
+        # === Update instance variables ===
+        self.total_queries += 1
+        self.total_tokens_generated += eval_count
+        self.total_prompt_tokens += prompt_tokens
+        self.total_time_spent += total_time
+        self.total_chars_generated += len(content)
+        
+        # Update rolling history
+        entry = {
+            "timestamp": time.time(),
+            "tokens": eval_count,
+            "prompt_tokens": prompt_tokens,
+            "time": total_time,
+            "tps": tps
+        }
+        self.query_history.append(entry)
+        if len(self.query_history) > self.max_history:
+            self.query_history.pop(0)
+        
+        # Add cumulative stats to return value
+        current_stats["cumulative_queries"] = self.total_queries
+        current_stats["cumulative_tokens"] = self.total_tokens_generated
+        current_stats["cumulative_avg_tps"] = (
+            self.total_tokens_generated / self.total_time_spent 
+            if self.total_time_spent > 0 else 0.0
+        )
+        
+        return current_stats
+    
 
-    def print_stats_display(self, stats):
+    def print_stats_display(self, stats, show_cumulative=False):
         """Print formatted stats to stderr."""
-        if stats and stats.get("eval_count", 0):
-            sys.stderr.write(colorize(
-                f"\n--- Stats: {stats['total_time']:.2f}s total | "
-                f"{stats['tps']:.2f} t/s | "
-                f"Context: {stats.get('prompt_eval_count', 0) + stats['eval_count']} tokens ---\n",
-                'muted'
-            ))
-        elif stats and not stats["eval_count"]:
-            sys.stderr.write(colorize(
-                f"\n--- Stats: {stats['total_time']:.2f}s total | "
-                f"Content: {stats.get('content_length', 0)} chars ---\n",
-                'muted'
-            ))
+        if not stats:
+            return
+            
+        # Current query stats
+        parts = [f"{stats['total_time']:.2f}s total"]
+        
+        if stats.get("eval_count", 0) > 0:
+            parts.append(f"{stats['tps']:.2f} t/s")
+            # Show real context size from backend, with fallback
+            ctx = stats.get("total_context_tokens", 0)
+            if not ctx:  # Fallback if backend didn't provide total_tokens
+                ctx = stats.get("prompt_eval_count", 0) + stats['eval_count']
+            parts.append(f"Context: {ctx} tokens")
         else:
-            sys.stderr.write(colorize(
-                f"\n--- Stats: {stats['total_time']:.2f}s total | "
-                f"Tokens processed: {len(stats.get('content', '').split()) if stats and stats.get('content') else 0} ---\n",
-                'muted'
-            ))
+            parts.append(f"Content: {stats.get('content_length', 0)} chars")
+        
+        # Append cumulative stats if requested
+        if show_cumulative and stats.get("cumulative_queries", 0) > 1:
+            parts.append(f"Cum: {stats['cumulative_queries']}q | "
+                        f"{stats['cumulative_tokens']} tok | "
+                        f"{stats['cumulative_avg_tps']:.2f} avg t/s")
+        sys.stderr.write(colorize(f"\n--- Stats: {' | '.join(parts)} ---\n", 'muted'))
+
+
+    def get_cumulative_stats(self):
+        """Return a summary of all tracked usage."""
+        return {
+            "total_queries": self.total_queries,
+            "total_completion_tokens": self.total_tokens_generated,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_tokens": self.total_tokens_generated + self.total_prompt_tokens,
+            "total_time_seconds": self.total_time_spent,
+            "avg_tps": self.total_tokens_generated / self.total_time_spent if self.total_time_spent > 0 else 0.0,
+            "avg_tokens_per_query": self.total_tokens_generated / self.total_queries if self.total_queries > 0 else 0.0
+        }
+    
+    def reset_stats(self):
+        """Reset all cumulative tracking."""
+        self.total_queries = 0
+        self.total_tokens_generated = 0
+        self.total_prompt_tokens = 0
+        self.total_time_spent = 0.0
+        self.total_chars_generated = 0
+        self.query_history = []   
+       
 
     def build_request_payload(self, messages, model, stream_enabled=False, **kwargs):
         """Build request payload for the backend."""
         if images := kwargs.get('images'):
-            if messages and len(messages) > 1:
-                messages[1]["images"] = images
+            if messages and messages[-1].get("role") == "user":
+                messages[-1]["images"] = images
         
         payload = {
             "model": model,
@@ -391,77 +691,6 @@ class ModelQuery:
     # === OLLAMA STREAMING FUNCTION ===
     # ==========================================
 
-    @staticmethod
-    def calculate_stats(total_time, content, usage=None):
-        """Calculate and return stats dictionary for display."""
-        eval_count = 0
-        prompt_tokens = 0
-
-        if usage:
-            eval_count = usage.get("completion_tokens", 0) or len(content.split())
-            prompt_tokens = usage.get("prompt_tokens", 0)
-
-        elif content:
-            # Fallback to word count if no token data available
-            eval_count = len(content.split())
-
-        tps = 0.0
-        if eval_count > 0 and total_time > 0:
-            tps = eval_count / total_time
-
-        return {
-            "eval_count": eval_count,
-            "prompt_eval_count": prompt_tokens,
-            "total_time": total_time,
-            "tps": tps,
-            "content_length": len(content)
-        }
-
-    def print_stats_display(self, stats):
-        """Print formatted stats to stderr."""
-        if stats and stats.get("eval_count", 0):
-            sys.stderr.write(colorize(
-                f"\n--- Stats: {stats['total_time']:.2f}s total | "
-                f"{stats['tps']:.2f} t/s | "
-                f"Context: {stats.get('prompt_eval_count', 0) + stats['eval_count']} tokens ---\n",
-                'muted'
-            ))
-        elif stats and not stats["eval_count"]:
-            sys.stderr.write(colorize(
-                f"\n--- Stats: {stats['total_time']:.2f}s total | "
-                f"Content: {stats.get('content_length', 0)} chars ---\n",
-                'muted'
-            ))
-        else:
-            sys.stderr.write(colorize(
-                f"\n--- Stats: {stats['total_time']:.2f}s total | "
-                f"Tokens processed: {len(stats.get('content', '').split()) if stats and stats.get('content') else 0} ---\n",
-                'muted'
-            ))
-
-    def query_sync(self, messages, model, stream_enabled=False, **kwargs):
-        """Non-streaming sync query wrapper."""
-        payload = self.build_request_payload(messages, model, stream_enabled=False, **kwargs)
-
-        try:
-            url = f"{self.base_url}/api/chat" if self.backend == "ollama" else \
-                  f"{self.base_url}/v1/chat/completions"
-
-            data = json.dumps(payload).encode('utf-8')
-            req = Request(url, data=data, headers={'Content-Type': 'application/json'})
-
-            with urlopen(req) as response:
-                return json.loads(response.read().decode('utf-8'))
-        except Exception as e:
-            sys.stderr.write(colorize(f"[ERROR] Sync query failed: {e}\n", 'error'))
-            return ""
-
-
-
-    # ==========================================
-    # === OLLAMA STREAMING FUNCTION ===
-    # ==========================================
-
     def query_stream_ollama(
         self,
         messages, model, stream_enabled=True, debug=False,
@@ -470,10 +699,15 @@ class ModelQuery:
         """Stream response from Ollama API with thinking support."""
         full_content = ""
         start_time = time.time()
+        # Always confirm debug mode at start
+        if debug:
+            sys.stderr.write(colorize(f"\n[DEBUG] Stream started | model={model} | messages={len(messages)}\n", 'muted'))
 
         try:
             # === Build payload for Ollama ===
-            if images: messages[1]["images"] = images
+            #if images: messages[1]["images"] = images
+            if images and messages and messages[-1].get("role") == "user":
+                messages[-1]["images"] = images
             payload = {
                 "model": model,
                 "messages": messages,
@@ -501,14 +735,40 @@ class ModelQuery:
                     try:
                         chunk = json.loads(decoded_line)
 
-                        # Extract thinking/reasoning content
+
+                        # === DEBUG: Log final chunk to see usage structure ===
+                        if debug and chunk.get("done", False):
+                            #sys.stderr.write(colorize(f"\n[DEBUG] Final chunk keys: {list(chunk.keys())}\n", 'muted'))
+                            formatted_json = json.dumps(chunk, indent=4)
+                            sys.stderr.write(colorize(f"\n[DEBUG] Final JSON chunk from server:\n{formatted_json}\n", 'muted'))
+                            if "usage" in chunk:
+                                sys.stderr.write(colorize(f"[DEBUG] usage: {chunk['usage']}\n", 'muted'))
+                                # Ollama sometimes puts usage fields at root level
+                            #if "prompt_eval_count" in chunk or "eval_count" in chunk:
+                            #    sys.stderr.write(colorize(f"[DEBUG] root usage fields: prompt_eval_count={chunk.get('prompt_eval_count')}, eval_count={chunk.get('eval_count')}\n", 'muted'))
+                        # =====================================================
+
+
+                        # Extract thinking/reasoning content in query_stream_ollama
                         thought = (chunk.get("message", {}).get("thought") or
                                    chunk.get("message", {}).get("thinking")) or ""
                         content = chunk.get("message", {}).get("content", "")
 
                         # Track usage stats from Ollama response (only in final chunk with done=True)
-                        if chunk.get("done", False) and "usage" in chunk:
-                            usage_stats = chunk["usage"]
+                        if chunk.get("done", False):
+                            if "usage" in chunk:
+                                usage_stats = chunk["usage"]
+                            # Fallback to root level keys if no usage block exists
+                            else:
+                                # Ollama streaming often puts stats at the root level
+                                usage_stats = {
+                                    "prompt_eval_count": chunk.get("prompt_eval_count", 0),
+                                    "eval_count": chunk.get("eval_count", 0),
+                                    "total_tokens": chunk.get("prompt_eval_count", 0) + chunk.get("eval_count", 0)
+                                }
+
+                            if debug:  # ← Only print if --debug flag is used
+                                sys.stderr.write(colorize(f"\n[DEBUG] Usage: {usage_stats}\n", 'muted'))
 
                         # Handle thinking with buffered display
                         if thought and show_thinking:
@@ -541,7 +801,8 @@ class ModelQuery:
 
             # === Calculate and print final stats ===
             total_time = time.time() - start_time
-            usage = self.calculate_stats(total_time, full_content, usage_stats)
+            #usage = self.calculate_stats(total_time, full_content, usage_stats)
+            usage = self.calculate_stats(total_time, full_content, usage_stats, messages )
             self.print_stats_display(usage)
 
             return full_content
@@ -551,7 +812,7 @@ class ModelQuery:
             return full_content
 
 
-# ==========================================
+    # ==========================================
     # === LLAMA.CPP STREAMING FUNCTION ===
     # ==========================================
 
@@ -564,9 +825,15 @@ class ModelQuery:
         full_content = ""
         start_time = time.time()
 
+        # 1. ADD DEBUG START LOG
+        if debug:
+            sys.stderr.write(colorize(f"\n[DEBUG] Llama.cpp Stream started | model={model} | messages={len(messages)}\n", 'muted'))
+
         try:
             # === Build payload for Llama.cpp ===
-            if images: messages[1]["images"] = images
+            #if images: messages[1]["images"] = images
+            if images and messages and messages[-1].get("role") == "user":
+                messages[-1]["images"] = images
             payload = {
                 "model": model,
                 "messages": messages,
@@ -602,8 +869,34 @@ class ModelQuery:
                         chunk = json.loads(decoded_line)
 
                         # Grab usage stats if present (often sent in the final chunk)
+                        #if "usage" in chunk and chunk["usage"]:
+                        #    completion_data.update(chunk["usage"])
+
+                        #if debug:
+                        #    formatted_json = json.dumps(chunk, indent=4)
+                        #    sys.stderr.write(colorize(f"\n[DEBUG] Final JSON chunk from server:\n{formatted_json}\n", 'muted'))
+                                                # Grab usage stats if present (often sent in the final chunk)
+                        is_final_chunk = False
+                        
+                        # Standard OpenAI-style usage
                         if "usage" in chunk and chunk["usage"]:
                             completion_data.update(chunk["usage"])
+                            is_final_chunk = True
+                        # Native Llama.cpp style timings
+                        elif "timings" in chunk:
+                            completion_data["prompt_eval_count"] = chunk["timings"].get("prompt_n", 0)
+                            completion_data["eval_count"] = chunk["timings"].get("predicted_n", 0)
+                            is_final_chunk = True
+                            
+                        # Detect the end of the stream
+                        choices = chunk.get("choices", [])
+                        if choices and choices[0].get("finish_reason") is not None:
+                            is_final_chunk = True
+
+                        if debug and is_final_chunk:
+                            formatted_json = json.dumps(chunk, indent=4)
+                            sys.stderr.write(colorize(f"\n[DEBUG] Final JSON chunk from server:\n{formatted_json}\n", 'muted'))
+
 
                         choices = chunk.get("choices", [])
                         if choices:
@@ -646,7 +939,8 @@ class ModelQuery:
 
             # === Calculate and print final stats ===
             total_time = time.time() - start_time
-            usage = self.calculate_stats(total_time, full_content, completion_data)
+            #usage = self.calculate_stats(total_time, full_content, completion_data)
+            usage = self.calculate_stats(total_time, full_content, completion_data, messages)
             self.print_stats_display(usage)
 
             return full_content
@@ -696,12 +990,13 @@ class ChatCompleter:
     def __init__(self, base_url, backend):
         self.base_url = base_url
         self.backend = backend
-        self.commands = [
-            '/?', '/help', '/listmodel', '/switchmodel',
-            '/cwd', '/ls', '/curl', '/spawnshell', '/clear',
-            '/thinkingon', '/thinkingoff', '/contextsizeset',
-            '/debug on', '/debug off', '/quit', '/exit'
-        ]
+#        self.commands = [
+#            '/?', '/help', '/listmodel', '/switchmodel',
+#            '/cwd', '/ls', '/curl', '/spawnshell', '/clear',
+#            '/thinkingon', '/thinkingoff', '/contextsizeset',
+#            '/debug on', '/debug off', '/stats', '/quit', '/exit'
+#        ]
+        self.commands = get_command_aliases()  # ✅ Use registry function
         self.models = []
 
     def fetch_models(self):
@@ -720,8 +1015,8 @@ class ChatCompleter:
         if buffer.startswith('/switchmodel '):
             matches = [m for m in self.models if m.startswith(text)]
 
-        # 2. File Path Autocompletion (/cwd, /ls, and inline @)
-        elif buffer.startswith('/cwd ') or buffer.startswith('/ls ') or text.startswith('@'):
+        # 2. File Path Autocompletion (/cwd, /ls, /image and inline @)
+        elif buffer.startswith('/cwd ') or buffer.startswith('/ls ') or buffer.startswith('/image ') or buffer.startswith('@'):
             # Determine how much of the text is the actual path
             if text.startswith('@'):
                 path_input = text[1:]
@@ -1091,26 +1386,6 @@ class FallbackHTMLStripper:
 
 
 # ============================================================================
-# ============= STATISTICS OUTPUT ===========================================
-# ============================================================================
-
-def print_stats(total_time, chunk_or_result):
-    """Print generation statistics to stderr."""
-    try:
-        eval_count = chunk_or_result.get("eval_count", 0) or \
-                     chunk_or_result.get("usage", {}).get("completion_tokens", 0)
-
-        tps = 0.0
-        if eval_count > 0 and total_time > 0:
-            tps = eval_count / total_time
-
-        sys.stderr.write(f"\n[--- Stats: {total_time:.2f}s total | "
-                         f"{tps:.2f} t/s ---]\n", flush=True)
-    except Exception:
-        pass
-
-
-# ============================================================================
 # ============= CHAT LOOP CLASS ============================================
 # ============================================================================
 
@@ -1138,16 +1413,16 @@ class ChatLoop:
         self.query_handler = ModelQuery(base_url, backend)
 
         # State management
-        self.commands = [
-            '/?', '/help', '/listmodel', '/switchmodel',
-            '/cwd', '/ls', '/curl', '/spawnshell', '/clear',
-            '/thinkingon', '/thinkingoff', '/contextsizeset',
-            '/debug on', '/debug off', '/quit', '/exit'
-        ]
+        self.commands = get_command_aliases()  # ✅ Use registry function
         self.models = []
         self.context_size = None
         self.debug_mode = False
         self.force_no_thinking = False
+        self.current_images = []
+
+    def get_commands_list(self):
+        return self.commands
+
 
     def fetch_models(self):
         """Fetch available models from the backend and auto-select if needed."""
@@ -1167,6 +1442,16 @@ class ChatLoop:
 
         # Initialize model list
         self.fetch_models()
+        self.debug_mode = debug
+
+        # Print welcome message using command registry
+        print(colorize(f"\n[{self.backend.upper()} Chat Mode]", 'info'), file=sys.stderr)
+        print(format_help_text(compact=True), file=sys.stderr)  # ✅ One-liner help
+        print(colorize("Type /help for details\n", 'muted'), file=sys.stderr)
+
+        # Load startup image if provided via --image
+        if images:
+            self.current_images = images
 
         # Setup readline completer if available
         if READLINE_AVAILABLE:
@@ -1197,10 +1482,14 @@ class ChatLoop:
                 print(colorize(f"[ERROR] Readline setup failed: {e}", 'error'), file=sys.stderr)
         messages = [{'role': 'system', 'content': self.system_prompt}]
 
-        # Print welcome message
-        print(colorize(f"\n[{self.backend.upper()} Chat Mode]", 'info'), file=sys.stderr)
-        print(colorize(f"Commands: /?, /help, /listmodel, /switchmodel", 'muted'), file=sys.stderr)
-        print(colorize(f"          /cwd, /ls, /clear, /quit\n", 'muted'), file=sys.stderr)
+        #print(colorize(f"\n[{self.backend.upper()} Chat Mode]", 'info'), file=sys.stderr)
+        #print(format_help_text(compact=True), file=sys.stderr)  # ✅ One-liner help
+        #print(colorize("Type /help for details\n", 'muted'), file=sys.stderr)
+        #command=""
+        #for cmd in commands_list:
+        #    command = command + " "+ cmd
+        #print(colorize(f""+command,'info'), file=sys.stderr)
+
 
         if images:
             print(colorize("[Image loaded for session]", 'success'), file=sys.stderr)
@@ -1212,6 +1501,8 @@ class ChatLoop:
             try:
                 # Build the dynamic prompt: backend@IPv4/model
                 prompt_prefix = f"{self.backend}@{host_clean}/{self.model}"
+                if self.current_images:
+                    prompt_prefix += colorize("[🖼️]", 'info')  # Visual indicator
 
                  # PASS THE NEW PREFIX HERE, NOT self.model
                 #full_input = gather_user_input(self.model)
@@ -1226,10 +1517,22 @@ class ChatLoop:
 
                 # Handle help command
                 if full_input in ['/?', '/help']:
-                    print(colorize(f"\nCommands: {', '.join(self.commands[:6])}", 'muted'), file=sys.stderr)
-                    print(colorize("  ! <cmd> - Execute shell", 'info'), file=sys.stderr)
-                    print(colorize("  /curl <url> - Fetch web content\n", 'info'), file=sys.stderr)
+                    print(format_help_text(compact=False), file=sys.stderr)  # get detailed help
                     continue
+
+                # Handle stats command
+                if full_input.lower() in ['/stats', '/usage']:
+                    cum = self.query_handler.get_cumulative_stats()
+                    print(colorize(f"\n[Usage Summary]", 'info'), file=sys.stderr)
+                    print(f"  Queries: {cum['total_queries']}", file=sys.stderr)
+                    print(f"  Tokens (completion): {cum['total_completion_tokens']:,}", file=sys.stderr)
+                    print(f"  Tokens (prompt): {cum['total_prompt_tokens']:,}", file=sys.stderr)
+                    print(f"  Total tokens: {cum['total_tokens']:,}", file=sys.stderr)
+                    print(f"  Avg throughput: {cum['avg_tps']:.2f} t/s", file=sys.stderr)
+                    print(f"  Avg tokens/query: {cum['avg_tokens_per_query']:.1f}", file=sys.stderr)
+                    print()
+                    continue
+                
 
                 # Handle model listing
                 if full_input.startswith('/listmodel'):
@@ -1245,17 +1548,38 @@ class ChatLoop:
                 # Handle clear command
                 if full_input == '/clear':
                     messages = [{'role': 'system', 'content': self.system_prompt}]
+                    self.current_images = []
                     print(colorize("[Context memory wiped clean]", 'success'), file=sys.stderr)
                     continue
 
+                # Handle image attach/clear command
+                if full_input.startswith('/image'):
+                    parts = full_input.split(maxsplit=1)
+                    if len(parts) < 2 or parts[1].strip() in ('', 'clear', 'none'):
+                        self.current_images = []
+                        print(colorize("[Image cleared]", 'info'), file=sys.stderr)
+                    else:
+                        img_path = os.path.expanduser(parts[1].strip())
+                        if os.path.isfile(img_path):
+                            img_data = prepare_image_data(img_path)
+                            if img_data:
+                                self.current_images = [img_data]
+                                print(colorize(f"[Image attached: {os.path.basename(img_path)}]", 'success'), file=sys.stderr)
+                            else:
+                                print(colorize("[Error: Could not encode image]", 'error'), file=sys.stderr)
+                        else:
+                            print(colorize(f"[Error: File not found: {img_path}]", 'error'), file=sys.stderr)
+                    continue
+
+
+
                 # Handle debug mode
                 if full_input.lower() == '/debug on':
-                    debug = True
-                    debug_mode = True
+                    self.debug_mode = True
                     print(colorize("[Debug mode ENABLED]", 'success'), file=sys.stderr)
                     continue
                 elif full_input.lower() == '/debug off':
-                    debug = False
+                    self.debug_mode = False
                     print(colorize("[Debug mode DISABLED]", 'info'), file=sys.stderr)
                     continue
 
@@ -1328,7 +1652,7 @@ class ChatLoop:
                         debug=self.debug_mode,
                         show_thinking=(not self.force_no_thinking),
                         context_size=self.context_size,
-                        images=images
+                        images=self.current_images
                     )
 
                     if response:
@@ -1651,7 +1975,7 @@ def check_backend_with_get(url, server_marker):
             my_response = str(response.read())
             my_response = my_response.lower()
             #print(my_response)
-            if my_response.find("ollama"):
+            if "ollama" in my_response:
                 return True
     except (HTTPError, URLError, OSError, TimeoutError, Exception):
         return False
@@ -1706,7 +2030,7 @@ def auto_detect_backend():
         else:
             sys.stderr.write(colorize(f"Fail\n", 'info'))
 
-        url="http://"+ip + ":" + str(DEFAULT_LLAMACPP_PORT)
+        url="http://"+ip + ":" + str(DEFAULT_OLLAMA_PORT)
         sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + url    + " ", 'info'))
         if check_backend_with_get("http://"+ip + ":" +  str(DEFAULT_OLLAMA_PORT),   'ollama'):
             sys.stderr.write(colorize(f"Success\n", 'info'))
@@ -1853,8 +2177,8 @@ def main():
     batch_group.add_argument('-o', '--output', help='Output file path')
     batch_group.add_argument('--output-dir', help='Output directory for batches')
 
-    parser.add_argument('-m', '--model', default="llama3",
-                       help='Model name (default: llama3)')  # NOT mutually exclusive
+    parser.add_argument('-m', '--model', default=None,
+                       help='Model name')  # NOT mutually exclusive
     parser.add_argument('--prompt', default=DEFAULT_SYSTEM_PROMPT,
                        help='System prompt')  # Can be used with -m independently
 
@@ -1893,6 +2217,8 @@ def main():
     
     ACTIVE_THEME = get_theme(theme_to_use)
 
+    # Set fallback target model for chat/queries, but leave args.model raw for filtering
+    target_model = args.model or "llama3"
     # determine backend
     backend, base_url = resolve_connection(args)
 
@@ -1916,9 +2242,9 @@ def main():
 
     # Handle model info operations
     if args.show or args.show_details:
-        show_model_info(base_url, args.model, args)
+        show_model_info(base_url, target_model, args)
     elif args.show_details:
-        show_model_details(base_url, args.model, args)
+        show_model_details(base_url, target_model, args)
 
     # Interactive chat mode
     if args.chat:
@@ -1928,7 +2254,7 @@ def main():
         loop = ChatLoop(
             base_url=base_url,
             backend=backend,
-            model=args.model,
+            model=target_model,
             system_prompt=args.prompt
         )
 
@@ -1978,7 +2304,7 @@ def main():
 
                 response = query_handler.query_sync(
                     messages,
-                    args.model,
+                    target_model,
                     context_size=None,
                     show_thinking=True,
                     debug=args.debug,
@@ -2016,7 +2342,7 @@ def main():
 
             response = query_handler.query_sync(
                 messages,
-                args.model,
+                target_model,
                 context_size=None,
                 show_thinking=True,
                 debug=args.debug,
