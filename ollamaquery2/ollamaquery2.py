@@ -1603,6 +1603,10 @@ class ChatLoop:
                     print(f"  Avg throughput: {cum['avg_tps']:.2f} t/s", file=sys.stderr)
                     print(f"  Avg tokens/query: {cum['avg_tokens_per_query']:.1f}", file=sys.stderr)
                     print()
+                    if self.backend == "ollama":
+                        model_ctx_list=fetch_loaded_models_context_ollama(self.base_url)
+                        for m,c in model_ctx_list:
+                            print(f"    model : {m} context : {c}", file=sys.stderr)
                     continue
                 
 
@@ -2037,6 +2041,30 @@ def fetch_loaded_models_ollama(base_url):
             return data.get('models', [])
     except Exception:
         return []
+
+def fetch_loaded_models_context_ollama(base_url: str) -> list[tuple[str, int]]:
+    """
+    Query Ollama `/api/ps` and return a list of (model_name, context_length).
+
+    Example output:
+        [ ("nemotron-cascade-2:30b", 131072),
+          ("llama2", 4096) ]
+    """
+    try:
+        url = f"{base_url}/api/ps"
+        with urlopen(
+            Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        ) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return [
+                (m["model"], m.get("context_length", 0))
+                for m in data.get("models", [])
+                if isinstance(m, dict) and "model" in m
+            ]
+    except Exception:                     # network error, parsing error, etc.
+        sys.stderr.write(colorize("[ERROR] Could not read Ollama model info", "error"))
+        return []
+
 
 def check_backend_with_head(url, server_marker):
     """Attempt HEAD request to URL and check for server header."""
