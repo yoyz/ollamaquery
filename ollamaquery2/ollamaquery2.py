@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-
+# vim: set ts=4 sw=4 sts=4 et:
 # ============================================================================
 # ============= IMPORTS & CONFIGURATION ======================================
 # ============================================================================
@@ -47,10 +47,28 @@ except ImportError:
 # ============= DEFAULT CONFIGURATION =======================================
 # ============================================================================
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a chatbot trying to help user. Try to rebound to the question as best "
-    "as your knowledge goes but reply politely that you don't know if it is the case."
-)
+BUILTIN_PROMPTS = {
+    "default": (
+        "You are a chatbot trying to help user. Try to rebound to the question as best "
+        "as your knowledge goes but reply politely that you don't know if it is the case."
+    ),
+    "coder": (
+        "You are an AI chatbot specialist in Python and C++ coding, as well as system and "
+        "software engineering. You can use emoji to emphasize titles. If you are not fully sure, "
+        "ask for more information to guide me properly."
+    ),
+    "sysadmin": (
+        "You are a Linux system administrator. Reply briefly to my questions. And don't "
+        "think too much. If I give you an image, summarize it briefly."
+    ),
+    "concise": (
+        "You are a highly efficient AI assistant. Provide direct, factual answers without "
+        "filler, pleasantries, or unnecessary explanations."
+    )
+}
+
+DEFAULT_SYSTEM_PROMPT = BUILTIN_PROMPTS["default"]
+
 
 MAX_CONTEXT_SIZE = 4192000  # 4M tokens maximum limit (prevent OOM)
 DEFAULT_OLLAMA_HOST    = 'http://127.0.0.1:11434'
@@ -1024,7 +1042,8 @@ class ChatCompleter:
             matches = [m for m in self.models if m.startswith(text)]
 
         # 2. File Path Autocompletion (/cwd, /ls, /image and inline @)
-        elif buffer.startswith('/cwd ') or buffer.startswith('/ls ') or buffer.startswith('/image ') or buffer.startswith('@'):
+        # buffer is the full line, text could be in the middle of the line
+        elif buffer.startswith('/cwd ') or buffer.startswith('/ls ') or text.startswith('/image ') or text.startswith('@'):
             # Determine how much of the text is the actual path
             if text.startswith('@'):
                 path_input = text[1:]
@@ -1189,6 +1208,7 @@ def process_inline_commands(full_input):
                 output_str = f"[Command rejected: Invalid characters]"
             processed_lines.append(output_str)
 
+
         elif stripped_line.startswith("/curl "):
             # Fetch URL content
             url = stripped_line[6:].strip()
@@ -1199,14 +1219,24 @@ def process_inline_commands(full_input):
                 url = 'https://' + url
 
             try:
+                print(colorize(f"[--- Fetching URL: {url} ---]", 'muted'), file=sys.stderr)
                 text_content = fetch_and_convert_url(url)
                 word_count = len(text_content.split()) if text_content else 0
-                output_str = f"\n[Content from `{url}`]: {word_count} words\n```text\n{text_content}\n```\n"
-                processed_lines.append(output_str)
+                if word_count>0:
+                    print(colorize(f"[Successfully fetched {word_count} words from {url}]", 'muted'), file=sys.stderr)
+                    processed_lines.append(text_content)
+                    preview_length = 500
+                    preview_text=""
+                    header_text=""
+                    if len(text_content) > preview_length:
+                        header_text += "[Output truncated for terminal display. LLM received full text.]"
+                    preview_text += text_content[:preview_length].strip()
+                    print(colorize(f"{header_text}\n```", 'muted'), file=sys.stderr)
+                    print(colorize(f"```text\n{preview_text}\n```", 'info'), file=sys.stderr)
+                else:
+                    print(colorize(f"[Warning: No text content could be extracted from {url}]", 'warning'), file=sys.stderr)
             except Exception as e:
-                output_str = f"[Failed to fetch URL: {e}]"
-                processed_lines.append(output_str)
-
+                print(colorize(f"[Failed to fetch URL: {e}]", 'error'), file=sys.stderr)
         else:
             # Append normal text (including the text containing the @ tag itself)
             processed_lines.append(line)
@@ -2232,8 +2262,11 @@ def main():
 
     parser.add_argument('-m', '--model', default=None,
                        help='Model name')  # NOT mutually exclusive
-    parser.add_argument('--prompt', default=DEFAULT_SYSTEM_PROMPT,
-                       help='System prompt')  # Can be used with -m independently
+    # System Prompt configuration
+    prompt_group = parser.add_mutually_exclusive_group()
+    prompt_group.add_argument('-P', '--profile', choices=list(BUILTIN_PROMPTS.keys()),
+                            help='Use a built-in system prompt profile')
+    prompt_group.add_argument('--prompt', help='Custom system prompt text')
 
     # Image support
     parser.add_argument('--image', help='Image file for multimodal models')
@@ -2269,6 +2302,14 @@ def main():
             theme_to_use = "default"
     
     ACTIVE_THEME = get_theme(theme_to_use)
+    if args.prompt:
+        active_prompt = args.prompt
+    elif args.profile:
+        active_prompt = BUILTIN_PROMPTS[args.profile]
+    else:
+        active_prompt = DEFAULT_SYSTEM_PROMPT
+    args.prompt = active_prompt
+    # ---------------------------------
 
     # determine backend first so we know where to check for loaded models
     backend, base_url = resolve_connection(args)
