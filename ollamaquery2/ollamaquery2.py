@@ -3,7 +3,6 @@
 # ============================================================================
 # ============= IMPORTS & CONFIGURATION ======================================
 # ============================================================================
-
 import os
 import socket
 import sys
@@ -18,12 +17,11 @@ import threading
 import time
 
 from html.parser import HTMLParser
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
-        
+
 try:
     import yaml
     HAVE_YAML = True
@@ -168,6 +166,13 @@ COMMANDS = {
         'category': 'Model',
         'description': 'List available models',
         'usage': '/listmodel [filter]',
+        'handler': None
+    },
+    'listmodelall': {
+        'aliases': ['/listmodelall'],
+        'category': 'Model',
+        'description': 'List models with capabilities',
+        'usage': '/listmodelall',
         'handler': None
     },
     'switchmodel': {
@@ -483,6 +488,19 @@ def fetch_models_ollama(base_url):
         return []
 
 
+def parse_size(size_bytes):
+    """Parse size from the API into human-readable format."""
+    if not size_bytes:
+        return "N/A"
+    try:
+        size_bytes = int(size_bytes)
+        if size_bytes > 0:
+            return f"{size_bytes / (1024**3):.1f} GB"
+    except (TypeError, ValueError):
+        pass
+    return "N/A"
+
+
 def fetch_model_info_ollama(base_url, model_name):
     """Fetch detailed model information via Ollama /api/show endpoint."""
     try:
@@ -495,16 +513,155 @@ def fetch_model_info_ollama(base_url, model_name):
         return {}
 
 
-def fetch_models_llamacpp(base_url):
-    """Fetch available models from Llama.cpp API."""
-    try:
-        url = f"{base_url}/v1/models"
-        with urlopen(Request(url, headers={'User-Agent': 'Mozilla/5.0'})) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            return [{"name": m.get("id", "unknown"),
-                     "owned_by": m.get("owned_by", "N/A")} for m in data.get('data', [])]
-    except Exception:
-        return []
+class CommandContext:
+    """Singleton that holds all shared state for the application.
+    
+    Replaces the scattered self.* attributes across ChatLoop, ModelQuery,
+    and other classes with a single centralized state object.
+    """
+    _instance = None
+    _initialized = False
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if CommandContext._initialized:
+            return
+        CommandContext._initialized = True
+        
+        # Connection info
+        self._base_url: str = ""
+        self._backend: str = "ollama"
+        self._model: str = "llama3"
+        
+        # Session state
+        self.system_prompt: str = DEFAULT_SYSTEM_PROMPT
+        self.context_size: Optional[int] = None
+        self.current_images: List[str] = []
+        self.force_no_thinking: bool = False
+        self.models: List[str] = []
+        
+        # Execution state
+        self.debug_mode: bool = False
+        self.stream_enabled: bool = True
+        
+        # Statistics (cumulative)
+        self.total_queries: int = 0
+        self.total_tokens_generated: int = 0
+        self.total_prompt_tokens: int = 0
+        self.total_time_spent: float = 0.0
+        self.total_chars_generated: int = 0
+        self.query_history: list = []
+        self.max_history: int = 50
+
+    # === Properties ===
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+    
+    @base_url.setter
+    def base_url(self, value: str):
+        self._base_url = value
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+    
+    @backend.setter
+    def backend(self, value: str):
+        self._backend = value
+
+    @property
+    def model(self) -> str:
+        return self._model
+    
+    @model.setter
+    def model(self, value: str):
+        self._model = value
+
+    # === Helper Methods ===
+    def reset(self):
+        """Reset session state without changing connection info."""
+        self.system_prompt = DEFAULT_SYSTEM_PROMPT
+        self.context_size = None
+        self.current_images = []
+        self.force_no_thinking = False
+        self.models = []
+        self.debug_mode = False
+        self.stream_enabled = True
+        self.total_queries = 0
+        self.total_tokens_generated = 0
+        self.total_prompt_tokens = 0
+        self.total_time_spent = 0.0
+        self.total_chars_generated = 0
+        self.query_history = []
+
+    def create_completer(self):
+        """Create a ChatCompleter using this context's connection info."""
+        return ChatCompleter(self.base_url, self.backend)
+    
+    def create_query_handler(self):
+        """Create a ModelQuery using this context's connection info."""
+        return ModelQuery(self.base_url, self.backend)
+
+    def update_stats(self, tokens: int, prompt_tokens: int, time_spent: float, chars: int):
+        """Update cumulative statistics."""
+        self.total_queries += 1
+        self.total_tokens_generated += tokens
+        self.total_prompt_tokens += prompt_tokens
+        self.total_time_spent += time_spent
+        self.total_chars_generated += chars
+        
+        # Rolling history
+        entry = {
+            "timestamp": time.time(),
+            "tokens": tokens,
+            "prompt_tokens": prompt_tokens,
+            "time": time_spent,
+            "tps": tokens / time_spent if time_spent > 0 else 0.0
+        }
+        self.query_history.append(entry)
+        if len(self.query_history) > self.max_history:
+            self.query_history.pop(0)
+
+    def get_cumulative_stats(self):
+        """Return summary of all tracked usage."""
+        return {
+            "total_queries": self.total_queries,
+            "total_completion_tokens": self.total_tokens_generated,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_tokens": self.total_tokens_generated + self.total_prompt_tokens,
+            "total_time_seconds": self.total_time_spent,
+            "avg_tps": self.total_tokens_generated / self.total_time_spent if self.total_time_spent > 0 else 0.0,
+            "avg_tokens_per_query": self.total_tokens_generated / self.total_queries if self.total_queries > 0 else 0.0
+        }
+
+    def estimate_tokens(self, text: str) -> int:
+        """Estimate token count from text."""
+        if not text:
+            return 0
+        tokens = len(re.findall(r'\b\w+\b|[^\w\s]', text))
+        return max(1, int(tokens * 1.1))
+
+    def calculate_context_tokens(self, messages: list) -> int:
+        """Calculate estimated total tokens in conversation context."""
+        total = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            total += self.estimate_tokens(content)
+            total += 2
+        return total
+
+    def colorize(self, text: str, role: str, force_color: bool = False, is_prompt: bool = False):
+        """Delegate colorize to ACTIVE_THEME and colors_enabled."""
+        return colorize(text, role, force_color=force_color, is_prompt=is_prompt)
+
+    def c(self, role: str):
+        """Get color code for a role."""
+        return c(role)
 
 
 # ============================================================================
@@ -514,35 +671,31 @@ def fetch_models_llamacpp(base_url):
 class ModelQuery:
     """Unified query handler for both Ollama and Llama.cpp backends."""
 
-    def __init__(self, base_url, backend):
-        self.base_url = base_url
-        self.backend = backend
+    def __init__(self, base_url=None, backend=None, context=None):
+        if context is not None:
+            self.ctx = context
+        elif base_url is not None:
+            # Legacy compatibility: create context from args if needed
+            self.ctx = CommandContext()
+            self.ctx.base_url = base_url
+            self.ctx.backend = backend or self.ctx.backend
+        else:
+            # Fallback: use global CommandContext
+            self.ctx = CommandContext()
 
-        self.total_queries = 0
-        self.total_tokens_generated = 0      # completion_tokens
-        self.total_prompt_tokens = 0         # prompt_tokens
-        self.total_time_spent = 0.0
-        self.total_chars_generated = 0
-        self.query_history = []
-        self.max_history = 50                # prevent unbounded growth
-        self.debug_mode = False
-
-
-    # ==========================================
-    # === STATISTICS TRACKING HELPER FUNCTIONS ===
-    # ==========================================
-
+    @property
+    def base_url(self):
+        return self.ctx.base_url
+    
+    @property
+    def backend(self):
+        return self.ctx.backend
 
     def estimate_tokens(self, text):
-        """
-        Estimate token count from text.
-        Heuristic: ~4 chars per token for English, adjusted for code/punctuation.
-        """
+        """Estimate token count from text. Uses CommandContext for consistency."""
         if not text:
             return 0
-        # Count words + punctuation as rough token proxy
         tokens = len(re.findall(r'\b\w+\b|[^\w\s]', text))
-        # Adjust for typical tokenization overhead
         return max(1, int(tokens * 1.1))
 
     def calculate_context_tokens(self, messages):
@@ -551,37 +704,26 @@ class ModelQuery:
         for msg in messages:
             content = msg.get("content", "")
             total += self.estimate_tokens(content)
-            # Add small overhead for role labels and message structure
             total += 2
         return total
 
-
-    def calculate_stats(self, total_time, content, usage=None,messages=None):
-        """Calculate stats for current query AND update cumulative totals."""
-        
-        # Extract token counts from usage dict (backend-specific)
+    def calculate_stats(self, total_time, content, usage=None, messages=None):
+        """Calculate stats for current query AND update cumulative totals in context."""
         eval_count = 0
         prompt_tokens = 0
-        total_context_tokens = 0  # Track full context window size
+        total_context_tokens = 0
         
         if usage:
-            # Ollama uses: completion_tokens, prompt_tokens
-            # Llama.cpp may use: completion_tokens, prompt_tokens (OpenAI-compatible)
             eval_count = usage.get("completion_tokens", 0) or usage.get("eval_count", 0)
             prompt_tokens = usage.get("prompt_tokens", 0) or usage.get("prompt_eval_count", 0)
-            # Total tokens = full context sent to model (prompt + completion)
             total_context_tokens = usage.get("total_tokens", 0) or (prompt_tokens + eval_count)
         
-
-        # ← NEW: Fallback to local estimation if API didn't provide context size
         if not total_context_tokens and messages:
             total_context_tokens = self.calculate_context_tokens(messages)
 
-        # Fallback: estimate from word count if no token data
         if not eval_count and content:
             eval_count = len(content.split())
     
-        # Calculate current query metrics
         tps = eval_count / total_time if eval_count > 0 and total_time > 0 else 0.0
         
         current_stats = {
@@ -591,20 +733,19 @@ class ModelQuery:
             "total_time": total_time,
             "tps": tps,
             "content_length": len(content),
-            # Cumulative totals (updated below)
-            "cumulative_queries": 0,
-            "cumulative_tokens": 0,
-            "cumulative_avg_tps": 0.0
+            "cumulative_queries": self.ctx.total_queries,
+            "cumulative_tokens": self.ctx.total_tokens_generated,
+            "cumulative_avg_tps": self.ctx.total_tokens_generated / self.ctx.total_time_spent if self.ctx.total_time_spent > 0 else 0.0
         }
     
-        # === Update instance variables ===
-        self.total_queries += 1
-        self.total_tokens_generated += eval_count
-        self.total_prompt_tokens += prompt_tokens
-        self.total_time_spent += total_time
-        self.total_chars_generated += len(content)
+        # Update context cumulative stats instead of instance variables
+        self.ctx.total_queries += 1
+        self.ctx.total_tokens_generated += eval_count
+        self.ctx.total_prompt_tokens += prompt_tokens
+        self.ctx.total_time_spent += total_time
+        self.ctx.total_chars_generated += len(content)
         
-        # Update rolling history
+        # Update context rolling history instead of instance variable
         entry = {
             "timestamp": time.time(),
             "tokens": eval_count,
@@ -612,16 +753,16 @@ class ModelQuery:
             "time": total_time,
             "tps": tps
         }
-        self.query_history.append(entry)
-        if len(self.query_history) > self.max_history:
-            self.query_history.pop(0)
+        self.ctx.query_history.append(entry)
+        if len(self.ctx.query_history) > self.ctx.max_history:
+            self.ctx.query_history.pop(0)
         
-        # Add cumulative stats to return value
-        current_stats["cumulative_queries"] = self.total_queries
-        current_stats["cumulative_tokens"] = self.total_tokens_generated
+        # Add cumulative stats from context to return value
+        current_stats["cumulative_queries"] = self.ctx.total_queries
+        current_stats["cumulative_tokens"] = self.ctx.total_tokens_generated
         current_stats["cumulative_avg_tps"] = (
-            self.total_tokens_generated / self.total_time_spent 
-            if self.total_time_spent > 0 else 0.0
+            self.ctx.total_tokens_generated / self.ctx.total_time_spent 
+            if self.ctx.total_time_spent > 0 else 0.0
         )
         
         return current_stats
@@ -654,25 +795,25 @@ class ModelQuery:
 
 
     def get_cumulative_stats(self):
-        """Return a summary of all tracked usage."""
+        """Return a summary of all tracked usage from the context."""
         return {
-            "total_queries": self.total_queries,
-            "total_completion_tokens": self.total_tokens_generated,
-            "total_prompt_tokens": self.total_prompt_tokens,
-            "total_tokens": self.total_tokens_generated + self.total_prompt_tokens,
-            "total_time_seconds": self.total_time_spent,
-            "avg_tps": self.total_tokens_generated / self.total_time_spent if self.total_time_spent > 0 else 0.0,
-            "avg_tokens_per_query": self.total_tokens_generated / self.total_queries if self.total_queries > 0 else 0.0
+            "total_queries": self.ctx.total_queries,
+            "total_completion_tokens": self.ctx.total_tokens_generated,
+            "total_prompt_tokens": self.ctx.total_prompt_tokens,
+            "total_tokens": self.ctx.total_tokens_generated + self.ctx.total_prompt_tokens,
+            "total_time_seconds": self.ctx.total_time_spent,
+            "avg_tps": self.ctx.total_tokens_generated / self.ctx.total_time_spent if self.ctx.total_time_spent > 0 else 0.0,
+            "avg_tokens_per_query": self.ctx.total_tokens_generated / self.ctx.total_queries if self.ctx.total_queries > 0 else 0.0
         }
     
     def reset_stats(self):
-        """Reset all cumulative tracking."""
-        self.total_queries = 0
-        self.total_tokens_generated = 0
-        self.total_prompt_tokens = 0
-        self.total_time_spent = 0.0
-        self.total_chars_generated = 0
-        self.query_history = []   
+        """Reset all cumulative tracking via the context."""
+        self.ctx.total_queries = 0
+        self.ctx.total_tokens_generated = 0
+        self.ctx.total_prompt_tokens = 0
+        self.ctx.total_time_spent = 0.0
+        self.ctx.total_chars_generated = 0
+        self.ctx.query_history = []   
        
 
     def build_request_payload(self, messages, model, stream_enabled=False, **kwargs):
@@ -876,6 +1017,7 @@ class ModelQuery:
             start_thinking = False
             started_content = False
             completion_data = {}
+            is_final_chunk = False
 
             with urlopen(req) as response:
                 for line in response:
@@ -894,17 +1036,7 @@ class ModelQuery:
                     try:
                         chunk = json.loads(decoded_line)
 
-                        # Grab usage stats if present (often sent in the final chunk)
-                        #if "usage" in chunk and chunk["usage"]:
-                        #    completion_data.update(chunk["usage"])
-
-                        #if debug:
-                        #    formatted_json = json.dumps(chunk, indent=4)
-                        #    sys.stderr.write(colorize(f"\n[DEBUG] Final JSON chunk from server:\n{formatted_json}\n", 'muted'))
-                                                # Grab usage stats if present (often sent in the final chunk)
-                        is_final_chunk = False
-                        
-                        # Standard OpenAI-style usage
+                        # Grab usage stats from the final chunk
                         if "usage" in chunk and chunk["usage"]:
                             completion_data.update(chunk["usage"])
                             is_final_chunk = True
@@ -1464,81 +1596,54 @@ class FallbackHTMLStripper:
 class ChatLoop:
     """
     Unified chat loop that handles both Ollama and Llama.cpp backends.
-
-    Features:
-    - Interactive command-line interface
-    - Model management (list/switch)
-    - Context control
-    - Debug/thinking modes
-    - Shell integration
-    - Persistent history
+    
+    State is managed through a shared CommandContext singleton instead of
+    individual self.* attributes.
     """
 
-    def __init__(self, base_url, backend, model="llama3", system_prompt=DEFAULT_SYSTEM_PROMPT):
-        self.base_url = base_url
-        self.backend = backend  # "ollama" or "llamacpp"
-        self.model = model
-        self.system_prompt = system_prompt
-
-        # Shared command handlers
-        self.completer = ChatCompleter(base_url, backend)
-        self.query_handler = ModelQuery(base_url, backend)
-
-        # State management
-        self.commands = get_command_aliases()  # ✅ Use registry function
-        self.models = []
-        self.context_size = None
-        self.debug_mode = False
-        self.force_no_thinking = False
-        self.current_images = []
-
-    def get_commands_list(self):
-        return self.commands
-
+    def __init__(self, context: CommandContext):
+        self.ctx = context
+        self.completer = context.create_completer()
+        self.query_handler = context.create_query_handler()
+        self.commands = get_command_aliases()
 
     def fetch_models(self):
         """Fetch available models from the backend and auto-select if needed."""
-        if self.backend == "llamacpp":
-            self.models = [m['name'] for m in fetch_models_llamacpp(self.base_url)]
+        if self.ctx.backend == "llamacpp":
+            self.ctx.models = [m['name'] for m in fetch_models_llamacpp(self.ctx.base_url)]
         else:
-            self.models = [m['name'] for m in fetch_models_ollama(self.base_url)]
+            self.ctx.models = [m['name'] for m in fetch_models_ollama(self.ctx.base_url)]
             
-        # NEW: Auto-select the first available model if the current one doesn't exist
-        if self.models and self.model not in self.models:
-            old_model = self.model
-            self.model = self.models[0]
-            print(colorize(f"[INFO] Model '{old_model}' not found on server. Auto-selecting '{self.model}']", 'warning'), file=sys.stderr)
+        if self.ctx.models and self.ctx.model not in self.ctx.models:
+            old_model = self.ctx.model
+            self.ctx.model = self.ctx.models[0]
+            print(colorize(f"[INFO] Model '{old_model}' not found on server. Auto-selecting '{self.ctx.model}'", 'warning'), file=sys.stderr)
 
     def run(self, stream_enabled=True, debug=False, images=None):
         """Main chat loop - handles interactive session."""
 
-        # Initialize model list
+        # Initialize state from args
         self.fetch_models()
-        self.debug_mode = debug
+        self.ctx.debug_mode = debug
+        self.ctx.stream_enabled = stream_enabled
 
         # Print welcome message using command registry
-        print(colorize(f"\n[{self.backend.upper()} Chat Mode]", 'info'), file=sys.stderr)
-        print(format_help_text(compact=True), file=sys.stderr)  # ✅ One-liner help
+        print(colorize(f"\n[{self.ctx.backend.upper()} Chat Mode]", 'info'), file=sys.stderr)
+        print(format_help_text(compact=True), file=sys.stderr)
         print(colorize("Type /help for details\n", 'muted'), file=sys.stderr)
 
         # Load startup image if provided via --image
         if images:
-            self.current_images = images
+            self.ctx.current_images = images
 
         # Setup readline completer if available
         if READLINE_AVAILABLE:
             try:
-                # Tell readline what characters break words
                 readline.set_completer_delims(' \t\n')
-                
-                # Load the models into the completer memory
                 self.completer.fetch_models()
-                
-                # Bind the Tab key to our new class method
                 readline.set_completer(self.completer.complete)
                 readline.parse_and_bind('tab: complete')
 
-                # Load persistent history
                 histfile = os.path.expanduser("~/.ollamaquery.d/session")
                 histdir = os.path.dirname(histfile)
                 if not os.path.exists(histdir):
@@ -1552,32 +1657,20 @@ class ChatLoop:
                 readline.set_history_length(1000)
             except Exception as e:
                 print(colorize(f"[ERROR] Readline setup failed: {e}", 'error'), file=sys.stderr)
-        messages = [{'role': 'system', 'content': self.system_prompt}]
-
-        #print(colorize(f"\n[{self.backend.upper()} Chat Mode]", 'info'), file=sys.stderr)
-        #print(format_help_text(compact=True), file=sys.stderr)  # ✅ One-liner help
-        #print(colorize("Type /help for details\n", 'muted'), file=sys.stderr)
-        #command=""
-        #for cmd in commands_list:
-        #    command = command + " "+ cmd
-        #print(colorize(f""+command,'info'), file=sys.stderr)
-
 
         if images:
             print(colorize("[Image loaded for session]", 'success'), file=sys.stderr)
 
         from urllib.parse import urlparse
-        host_clean = urlparse(self.base_url).netloc
+        host_clean = urlparse(self.ctx.base_url).netloc
 
         while True:
             try:
                 # Build the dynamic prompt: backend@IPv4/model
-                prompt_prefix = f"{self.backend}@{host_clean}/{self.model}"
-                if self.current_images:
-                    prompt_prefix += colorize("[🖼️]", 'info', is_prompt=True)  # Visual indicator
+                prompt_prefix = f"{self.ctx.backend}@{host_clean}/{self.ctx.model}"
+                if self.ctx.current_images:
+                    prompt_prefix += colorize("[🖼️]", 'info', is_prompt=True)
 
-                 # PASS THE NEW PREFIX HERE, NOT self.model
-                #full_input = gather_user_input(self.model)
                 full_input = gather_user_input(prompt_prefix)
                 if full_input is None or not full_input.strip():
                     continue
@@ -1589,12 +1682,12 @@ class ChatLoop:
 
                 # Handle help command
                 if full_input in ['/?', '/help']:
-                    print(format_help_text(compact=False), file=sys.stderr)  # get detailed help
+                    print(format_help_text(compact=False), file=sys.stderr)
                     continue
 
                 # Handle stats command
                 if full_input.lower() in ['/stats', '/usage']:
-                    cum = self.query_handler.get_cumulative_stats()
+                    cum = self.ctx.get_cumulative_stats()
                     print(colorize(f"\n[Usage Summary]", 'info'), file=sys.stderr)
                     print(f"  Queries: {cum['total_queries']}", file=sys.stderr)
                     print(f"  Tokens (completion): {cum['total_completion_tokens']:,}", file=sys.stderr)
@@ -1603,17 +1696,20 @@ class ChatLoop:
                     print(f"  Avg throughput: {cum['avg_tps']:.2f} t/s", file=sys.stderr)
                     print(f"  Avg tokens/query: {cum['avg_tokens_per_query']:.1f}", file=sys.stderr)
                     print()
-                    if self.backend == "ollama":
-                        model_ctx_list=fetch_loaded_models_context_ollama(self.base_url)
+                    if self.ctx.backend == "ollama":
+                        model_ctx_list=fetch_loaded_models_context_ollama(self.ctx.base_url)
                         for m,c in model_ctx_list:
                             print(f"    model : {m} context : {c}", file=sys.stderr)
                     continue
-                
+
 
                 # Handle model listing
                 if full_input.startswith('/listmodel'):
                     parts = full_input.split(maxsplit=1)
-                    self.list_models(parts[1] if len(parts) > 1 else None)
+                    if full_input.strip() == '/listmodelall':
+                        list_models_ollama(self.ctx.base_url, include_capabilities=True, file=sys.stderr)
+                    else:
+                        self.list_models(parts[1] if len(parts) > 1 else None)
                     continue
 
                 # Handle context size
@@ -1623,23 +1719,22 @@ class ChatLoop:
 
                 # Handle clear command
                 if full_input == '/clear':
-                    messages = [{'role': 'system', 'content': self.system_prompt}]
-                    self.current_images = []
                     print(colorize("[Context memory wiped clean]", 'success'), file=sys.stderr)
+                    self.ctx.reset()
                     continue
 
                 # Handle image attach/clear command
                 if full_input.startswith('/image'):
                     parts = full_input.split(maxsplit=1)
                     if len(parts) < 2 or parts[1].strip() in ('', 'clear', 'none'):
-                        self.current_images = []
+                        self.ctx.current_images = []
                         print(colorize("[Image cleared]", 'info'), file=sys.stderr)
                     else:
                         img_path = os.path.expanduser(parts[1].strip())
                         if os.path.isfile(img_path):
                             img_data = prepare_image_data(img_path)
                             if img_data:
-                                self.current_images = [img_data]
+                                self.ctx.current_images = [img_data]
                                 print(colorize(f"[Image attached: {os.path.basename(img_path)}]", 'success'), file=sys.stderr)
                             else:
                                 print(colorize("[Error: Could not encode image]", 'error'), file=sys.stderr)
@@ -1651,21 +1746,21 @@ class ChatLoop:
 
                 # Handle debug mode
                 if full_input.lower() == '/debug on':
-                    self.debug_mode = True
+                    self.ctx.debug_mode = True
                     print(colorize("[Debug mode ENABLED]", 'success'), file=sys.stderr)
                     continue
                 elif full_input.lower() == '/debug off':
-                    self.debug_mode = False
+                    self.ctx.debug_mode = False
                     print(colorize("[Debug mode DISABLED]", 'info'), file=sys.stderr)
                     continue
 
                 # Handle thinking control
                 if full_input == '/thinkingoff':
-                    self.force_no_thinking = True
+                    self.ctx.force_no_thinking = True
                     print(colorize("[Model will skip reasoning phase]", 'warning'), file=sys.stderr)
                     continue
                 elif full_input == '/thinkingon':
-                    self.force_no_thinking = False
+                    self.ctx.force_no_thinking = False
                     print(colorize("[Reasoning phase enabled]", 'success'), file=sys.stderr)
                     continue
 
@@ -1692,14 +1787,13 @@ class ChatLoop:
                 if full_input.startswith('/switchmodel'):
                     parts = full_input.split()
                     if len(parts) > 1:
-                        self.model = parts[1]
-                        print(colorize(f"[Switched to '{self.model}']", 'success'), file=sys.stderr)
+                        self.ctx.model = parts[1]
+                        print(colorize(f"[Switched to '{self.ctx.model}']", 'success'), file=sys.stderr)
                     continue
 
                 # Handle spawnshell command
                 if full_input == '/spawnshell':
                     self.handle_spawnshell()
-                    messages.append({'role': 'user', 'content': '[Shell session ended]'})
                     continue
 
                 # Process inline commands and build message
@@ -1707,33 +1801,33 @@ class ChatLoop:
                 if not final_content.strip():
                     continue
 
-                messages.append({'role': 'user', 'content': final_content})
+                # Track conversation history within ChatLoop (not in shared context)
+                if not hasattr(self, 'messages'):
+                    self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
+                self.messages.append({'role': 'user', 'content': final_content})
 
-                # Query model
-                payload_messages = list(messages)
+                payload_messages = list(self.messages)
 
-                # Add thinking suppression if requested
-                if self.force_no_thinking:
+                if self.ctx.force_no_thinking:
                     payload_messages.append({
                         'role': 'system',
                         'content': 'Do NOT output reasoning or thoughts'
                     })
 
-                # Execute query
-                if messages[-1]['role'] == 'user':
+                if payload_messages[-1]['role'] == 'user':
                     response = self.query_handler.query_stream(
                         payload_messages,
-                        self.model,
-                        stream_enabled=stream_enabled,
-                        debug=self.debug_mode,
-                        show_thinking=(not self.force_no_thinking),
-                        context_size=self.context_size,
-                        images=self.current_images
+                        self.ctx.model,
+                        stream_enabled=self.ctx.stream_enabled,
+                        debug=self.ctx.debug_mode,
+                        show_thinking=(not self.ctx.force_no_thinking),
+                        context_size=self.ctx.context_size,
+                        images=self.ctx.current_images
                     )
 
                     if response:
-                        messages.append({'role': 'assistant', 'content': response})
-                        print()  # Add spacing after response
+                        self.messages.append({'role': 'assistant', 'content': response})
+                        print()
 
             except KeyboardInterrupt:
                 print(f"\n[Interrupted]", file=sys.stderr)
@@ -1749,57 +1843,34 @@ class ChatLoop:
         return
 
     def list_models(self, filter_arg=None):
-        """List available models from the backend."""
-        if self.backend == "llamacpp":
-            models = fetch_models_llamacpp(self.base_url)
+        if self.ctx.backend == "ollama":
+            list_models_ollama(self.ctx.base_url, filter_arg, file=sys.stdout)
         else:
-            models = fetch_models_ollama(self.base_url)
-
-        if not models:
-            print(colorize(f"\n[No models found via {self.backend} API]", 'warning'), file=sys.stderr)
-            return
-
-        search_term = None
-        if filter_arg:
-            parts = filter_arg.lower().split()
-            if 'name' in parts:
-                parts.remove('name')
-
-            if parts:
-                search_term = parts[0]
-
-        if search_term:
-            models = [m for m in models if search_term in m.get('name', '').lower()]
-
-        # Sort and display
-        models.sort(key=lambda x: x.get('name', ''))
-
-        print(colorize(f"\n{'NAME':<50} | {'SIZE' if self.backend == 'ollama' else 'OWNED BY'}", 'muted'))
-        print(colorize("-" * 60, 'muted'))
-        for m in models:
-            size_str = f"{m['size_bytes'] / (1024**3):>8.2f} GB" if m.get('size_bytes', 0) > 0 else 'N/A'
-            owned_by = m.get('owned_by', '')
-            modified = m.get('modified_at', 'Unknown')[:10] if self.backend == 'ollama' else ''
-
-            print(f"{m['name']:<50} | {size_str}{modified}")
-
-        print()
+            models = fetch_models_llamacpp(self.ctx.base_url)
+            if not models:
+                print(colorize(f"\n[No models found via {self.ctx.backend} API]", 'warning'), file=sys.stderr)
+                return
+            models.sort(key=lambda x: x.get('name', ''))
+            header = f"{'NAME':<50} | {'OWNED BY'}"
+            print(colorize(header, 'muted'))
+            print(colorize("-" * len(header), 'muted'))
+            for m in models:
+                owned_by = m.get('owned_by', 'N/A')
+                print(f"{m['name']:<50} | {owned_by}")
+            print()
 
     def set_context_size(self, full_input):
-        """Set or reset context size."""
         parts = full_input.split()
         if len(parts) > 1 and parts[1].isdigit():
             val = int(parts[1])
-
-            # Bounds checking
             if val == 0:
-                self.context_size = None
+                self.ctx.context_size = None
                 print("[Context size reset to default]", file=sys.stderr)
             else:
                 if val > MAX_CONTEXT_SIZE:
                     print(colorize(f"[ERROR] Context size {val} exceeds maximum {MAX_CONTEXT_SIZE}", 'error'), file=sys.stderr)
                     return
-                self.context_size = val
+                self.ctx.context_size = val
                 print(f"[Context size set to {val}]", file=sys.stderr)
         else:
             print("[Usage: /contextsizeset <integer> (use 0 for default)]", file=sys.stderr)
@@ -1911,10 +1982,13 @@ def list_models_llamacpp(base_url, filter_arg=None):
     print()
 
 
-def list_models_ollama(base_url, filter_arg=None, include_capabilities=False):
+def list_models_ollama(base_url, filter_arg=None, include_capabilities=False, file=None):
+    if file is None:
+        file = sys.stdout
+
     models = fetch_models_ollama(base_url)
     if not models:
-        print(colorize(f"\nNo models found via Ollama API at {base_url}. Check if the server is running.\n", 'warning'))
+        print(colorize(f"\nNo models found via Ollama API at {base_url}. Check if the server is running.\n", 'warning'), file=file)
         return
 
     sort_by = 'name'
@@ -1934,12 +2008,14 @@ def list_models_ollama(base_url, filter_arg=None, include_capabilities=False):
     if search_term:
         models = [m for m in models if search_term in m['name'].lower()]
         if not models:
-            print(colorize(f"\nNo models found matching '{search_term}'.\n", 'warning'))
+            print(colorize(f"\nNo models found matching '{search_term}'.\n", 'warning'), file=file)
             return
 
     for m in models:
+        # Handle different possible size fields from the API
+        raw_size = m.get("size") or m.get("size_bytes") or m.get("model_size") or 0
         try:
-            m['size_bytes'] = int(m.get('size', 0))
+            m['size_bytes'] = int(raw_size)
         except (TypeError, ValueError):
             m['size_bytes'] = 0
 
@@ -1951,9 +2027,9 @@ def list_models_ollama(base_url, filter_arg=None, include_capabilities=False):
     largest = max(models, key=lambda x: x['size_bytes']) if models else None
     if largest and largest['size_bytes'] > 0:
         l_size_gb = largest['size_bytes'] / (1024**3)
-        print(f"\nChecking storage... Largest model in list: {largest['name']} ({l_size_gb:.2f} GB)\n")
+        print(f"\nChecking storage... Largest model in list: {largest['name']} ({l_size_gb:.2f} GB)\n", file=file)
     else:
-        print()
+        print(file=file)
 
     if include_capabilities:
         # Retrieve capabilities for each model (extra API calls)
@@ -1963,35 +2039,24 @@ def list_models_ollama(base_url, filter_arg=None, include_capabilities=False):
                 m['capabilities'] = ",".join(info.get('capabilities', []))
             except Exception:
                 m['capabilities'] = ''
-        header = f"{'NAME':<40} | {'SIZE':<10} | {'MODIFIED':<10} | {'CAPABILITIES'}"
-        print(header)
-        print("-" * 95)
+        header = f"{'NAME':<40} | {'SIZE':<12} | {'MODIFIED':<12} | {'CAPABILITIES'}"
+        print(colorize(header, 'muted'), file=file)
+        print(colorize("-" * len(header), 'muted'), file=file)
         for m in models:
-            size_str = f"{m['size_bytes'] / (1024**3):>8.2f} GB" if m['size_bytes'] > 0 else f"{'N/A':>11}"
+            size_str = parse_size(m.get('size') or m.get('size_bytes') or m.get('model_size') or 0)
             modified = m.get('modified_at', 'Unknown')[:10]
             caps = m.get('capabilities', '')
-            print(f"{m['name']:<40} | {size_str} | {modified} | {caps}")
+            print(f"{m['name']:<40} | {size_str:<12} | {modified} | {caps}", file=file)
     else:
-        print(f"{'NAME':<40} | {'SIZE':<10} | {'MODIFIED'}")
-        print("-" * 75)
+        header = f"{'NAME':<40} | {'SIZE':<12} | {'MODIFIED'}"
+        print(colorize(header, 'muted'), file=file)
+        print(colorize("-" * len(header), 'muted'), file=file)
         for m in models:
-            size_str = f"{m['size_bytes'] / (1024**3):>8.2f} GB" if m['size_bytes'] > 0 else f"{'N/A':>11}"
+            size_str = parse_size(m.get('size') or m.get('size_bytes') or m.get('model_size') or 0)
             modified = m.get('modified_at', 'Unknown')[:10]
-            print(f"{m['name']:<40} | {size_str} | {modified}")
+            print(f"{m['name']:<40} | {size_str:<12} | {modified}", file=file)
+    print(file=file)
     print()
-
-
-
-def fetch_model_info_ollama(base_url, model_name):
-    """Fetch detailed model information from Ollama."""
-    try:
-        url = f"{base_url}/api/show"
-        payload = json.dumps({"name": model_name}).encode('utf-8')
-        req = Request(url, data=payload, headers={'Content-Type': 'application/json'}, method='POST')
-        with urlopen(req) as response:
-            return json.loads(response.read().decode('utf-8'))
-    except Exception:
-        return {}
 
 
 def show_model_info(base_url, model, args):
@@ -2388,17 +2453,19 @@ def main():
 
     # Interactive chat mode
     if args.chat:
+        ctx = CommandContext()
+        ctx.base_url = base_url
+        ctx.backend = backend
+        ctx.model = target_model
+        ctx.system_prompt = args.prompt
+
         image_data = prepare_image_data(args.image) if args.image else None
         images_list = [image_data] if image_data else None
-
-        loop = ChatLoop(
-            base_url=base_url,
-            backend=backend,
-            model=target_model,
-            system_prompt=args.prompt
-        )
+        if images_list:
+            ctx.current_images = images_list
 
         should_stream = not args.no_stream and sys.stdout.isatty()
+        loop = ChatLoop(ctx)
         loop.run(stream_enabled=should_stream, debug=args.debug, images=images_list)
         sys.exit(0)
 
@@ -2422,7 +2489,7 @@ def main():
                 os.makedirs(args.output_dir, exist_ok=True)
 
             for filename in sorted(os.listdir(args.input_dir)):
-                input_path = os.path.join(args.output_dir, filename)
+                input_path = os.path.join(args.input_dir, filename)
                 print(f"[Processing: {filename}...]")
 
                 with open(input_path, 'r', encoding='utf-8') as f:
@@ -2440,7 +2507,9 @@ def main():
                 else:
                     images_list = None
 
-                query_handler = ModelQuery(base_url, backend)
+                query_handler = ModelQuery(context=CommandContext())
+                query_handler.ctx.base_url = base_url
+                query_handler.ctx.backend = backend
 
                 response = query_handler.query_sync(
                     messages,
@@ -2477,7 +2546,9 @@ def main():
             if image_data and messages[-1]['role'] == 'user':
                 messages[-1]['images'] = [image_data]
 
-            query_handler = ModelQuery(base_url, backend)
+            query_handler = ModelQuery(context=CommandContext())
+            query_handler.ctx.base_url = base_url
+            query_handler.ctx.backend = backend
             should_stream = not args.no_stream and sys.stdout.isatty()
 
             response = query_handler.query_sync(
