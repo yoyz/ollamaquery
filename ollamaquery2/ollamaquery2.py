@@ -47,8 +47,9 @@ except ImportError:
 
 BUILTIN_PROMPTS = {
     "default": (
-        "You are a chatbot trying to help user. Try to rebound to the question as best "
-        "as your knowledge goes but reply politely that you don't know if it is the case."
+        "You are an accurate chatbot."
+        "Reply accurately to the question which is ask."
+        "If you are unsure say it."
     ),
     "coder": (
         "You are an AI chatbot specialist in Python and C++ coding, as well as system and "
@@ -183,6 +184,14 @@ COMMANDS = {
         'handler': None
     },
     
+    # === context management ===
+   'dumpcontext': {
+        'aliases': ['/dumpcontext'],
+        'category': 'I/O',
+        'description': 'Dump current conversation context to a file for inspection',
+        'usage': '/dumpcontext <filepath>',
+        'handler': None
+    },
     # === Settings ===
     'contextsizeset': {
         'aliases': ['/contextsizeset'],
@@ -1446,22 +1455,28 @@ def fetch_and_convert_url(url):
             return "", "None"
 
         tool_map = {
-            'pandoc': 'pandoc',
             'html2text': 'html2text',
+            'pandoc': 'pandoc',
             'lynx': 'lynx',
         }
-        for converter in ['pandoc' ,'html2text', 'lynx']:
-            cmd = [converter, '-stdin'] if converter == 'lynx' else [converter]
+        for converter in ['html2text', 'pandoc', 'lynx']:
+            if converter == 'lynx':
+                cmd = [converter, '-stdin']             
+            if converter == 'pandoc':
+                cmd = [converter, '--from', 'html', '--to', 'markdown_strict']
+            if converter == 'html2text':
+                cmd = [converter]
             try:
-                if converter not in ('html2text', 'pandoc') and not shutil.which(converter):
+                if not shutil.which(converter):
                     continue
                 proc = subprocess.run(
                     cmd, input=html_bytes, capture_output=True,
-                    timeout=10, check=False
+                    timeout=5, check=False
                 )
                 if proc.returncode == 0 and proc.stdout.strip():
                     return proc.stdout.decode('utf-8', errors='replace'), f"{tool_map[converter]}"
             except Exception:
+                print(colorize("Exception catch in fetch_and_convert_url going back to FallbackHTMLStripper\n", 'muted'), file=sys.stderr)
                 continue
 
         # Fallback: Simple HTML strip
@@ -1617,6 +1632,27 @@ class ChatLoop:
         self.query_handler = context.create_query_handler()
         self.commands = get_command_aliases()
 
+    def dump_context_to_file(self, filepath: str) -> None:
+        """Dump current conversation history to a JSON file for browsing."""
+        import json
+
+        # Safely copy the live history
+        history = []
+        for msg in self.messages:
+            msg_copy = dict(msg)
+
+            # Sanitize large base64 image payloads to avoid massive file sizes
+            if 'images' in msg_copy:
+                msg_copy['images'] = [
+                    f"[image: {len(img)} bytes]" for img in msg_copy['images']
+                ]
+            history.append(msg_copy)
+
+        # Write formatted JSON
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+ 
+
     def fetch_models(self):
         """Fetch available models from the backend and auto-select if needed."""
         if self.ctx.backend == "llamacpp":
@@ -1752,7 +1788,20 @@ class ChatLoop:
                             print(colorize(f"[Error: File not found: {img_path}]", 'error'), file=sys.stderr)
                     continue
 
+                # Handle dumpcontext command
+                if full_input.startswith('/dumpcontext'):
+                    parts = full_input.split(maxsplit=1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        print(colorize("[Usage: /dumpcontext <filepath>]", 'warning'), file=sys.stderr)
+                        continue
 
+                    dump_path = os.path.expanduser(parts[1].strip())
+                    try:
+                        self.dump_context_to_file(dump_path)
+                        print(colorize(f"[Context dumped to {dump_path}]", 'success'), file=sys.stderr)
+                    except Exception as e:
+                        print(colorize(f"[ERROR] Failed to dump context: {e}", 'error'), file=sys.stderr)
+                    continue
 
                 # Handle debug mode
                 if full_input.lower() == '/debug on':
