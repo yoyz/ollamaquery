@@ -1352,10 +1352,13 @@ def process_inline_commands(full_input):
 
             try:
                 print(colorize(f"[--- Fetching URL: {url} ---]", 'muted'), file=sys.stderr)
-                text_content = fetch_and_convert_url(url)
+                text_content, used_tool = fetch_and_convert_url(url)
                 word_count = len(text_content.split()) if text_content else 0
+                tool_suffix = ""
+                if word_count>0 and used_tool and used_tool != "None":
+                    tool_suffix = f" (via {used_tool})"
                 if word_count>0:
-                    print(colorize(f"[Successfully fetched {word_count} words from {url}]", 'muted'), file=sys.stderr)
+                    print(colorize(f"[Successfully fetched {word_count} words from {url}{tool_suffix}]", 'muted'), file=sys.stderr)
                     processed_lines.append(text_content)
                     preview_length = 500
                     preview_text=""
@@ -1436,30 +1439,37 @@ def execute_os_command(command):
 
 
 def fetch_and_convert_url(url):
-    """Fetch HTML from URL and convert to plain text."""
+    """Fetch HTML from URL and convert to plain text. Returns (text, tool_name)."""
     try:
         html_bytes = get_html_bytes(url)
         if not html_bytes:
-            return ""
+            return "", "None"
 
-        # Try html2text, pandoc, or lynx converters
-        for converter in ['html2text', 'pandoc', 'lynx']:
+        tool_map = {
+            'pandoc': 'pandoc',
+            'html2text': 'html2text',
+            'lynx': 'lynx',
+        }
+        for converter in ['pandoc' ,'html2text', 'lynx']:
             cmd = [converter, '-stdin'] if converter == 'lynx' else [converter]
             try:
+                if converter not in ('html2text', 'pandoc') and not shutil.which(converter):
+                    continue
                 proc = subprocess.run(
                     cmd, input=html_bytes, capture_output=True,
                     timeout=10, check=False
                 )
-                return proc.stdout.decode('utf-8', errors='replace')
+                if proc.returncode == 0 and proc.stdout.strip():
+                    return proc.stdout.decode('utf-8', errors='replace'), f"{tool_map[converter]}"
             except Exception:
                 continue
 
         # Fallback: Simple HTML strip
         html_str = html_bytes.decode('utf-8', errors='ignore')
-        return FallbackHTMLStripper().get_data(html_str)
+        return FallbackHTMLStripper().get_data(html_str), "FallbackHTMLStripper"
 
     except Exception as e:
-        return f"[Failed to fetch URL: {e}]"
+        return f"[Failed to fetch URL: {e}]", "None"
 
 
 def get_html_bytes(url, depth=0):
@@ -1574,10 +1584,10 @@ class FallbackHTMLStripper:
                         html.parser.HTMLParser.handle_endtag(self, tag)
 
                 def handle_data(self, data):
-                    if self.current_tag not in self.skip_tags:
-                        cleaned = data.strip()
-                        if cleaned and text is None:
-                            self.outer_text.append(cleaned)
+                                                if self.current_tag not in self.skip_tags:
+                                                    cleaned = data.strip()
+                                                    if cleaned:
+                                                        self.outer_text.append(cleaned)
 
                 def get_outer(self):
                     return ''.join(self.outer_text)
