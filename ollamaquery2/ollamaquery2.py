@@ -15,6 +15,7 @@ import subprocess
 import shutil
 import threading
 import time
+from datetime import datetime
 
 from html.parser import HTMLParser
 from typing import Optional, Dict, Any, List
@@ -215,13 +216,12 @@ COMMANDS = {
         'handler': None
     },
     'debug': {
-        'aliases': ['/debug on', '/debug off'],
+        'aliases': ['/debug'],
         'category': 'Settings',
-        'description': 'Toggle debug mode (raw JSON output)',
-        'usage': '/debug on|off',
-        'handler': None
+        'description': 'Configure per-category debug levels',
+        'usage': '/debug <category> <level> | /debug list | /debug status',
+        'handler': 'handle_debug_command'
     },
-    
     # === I/O Operations ===
     'image': {
         'aliases': ['/image'],
@@ -406,6 +406,82 @@ ACTIVE_THEME = get_theme()
 
 
 # ============================================================================
+# ============= CONTEXT WINDOW TRACKING ======================================
+# ============================================================================
+
+def get_ollama_context_size(base_url: str, model_name: str) -> int:
+    """Get the actual context window size from Ollama's running model."""
+    try:
+        # Try /api/ps first (running models)
+        url = f"{base_url}/api/ps"
+        with urlopen(Request(url)) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            models = data.get("models", [])
+            for model in models:
+                if model.get("name", "").startswith(model_name):
+                    size = model.get("context_size", 0)
+                    if size > 0:
+                        return size
+        
+        # Fallback: try /api/show
+        url = f"{base_url}/api/show"
+        payload = json.dumps({"name": model_name}).encode('utf-8')
+        req = Request(url, data=payload, 
+                     headers={'Content-Type': 'application/json'}, method='POST')
+        with urlopen(req) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            # Some models include context_size in their info
+            return data.get("context_size", 0)
+    except:
+        pass
+    return 0
+
+def get_llamacpp_context_size(base_url: str) -> int:
+    """Get context size from llamacpp server."""
+    try:
+        url = f"{base_url}/v1/models"
+        with urlopen(Request(url)) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            models = data.get("data", [])
+            if models:
+                # Llama.cpp might report max_context or n_ctx
+                return models[0].get("max_context", 0) or models[0].get("n_ctx", 0)
+    except:
+        pass
+    return 0
+
+def update_context_window_size(ctx):
+    """Fetch and update context window size from the backend."""
+    if ctx.backend == "ollama":
+        size = get_ollama_context_size(ctx.base_url, ctx.model)
+    else:
+        size = get_llamacpp_context_size(ctx.base_url)
+    
+    if size > 0:
+        ctx.context_window_size = size
+        return True
+    return False
+
+def context_bar(current: int, maximum: int, width: int = 20) -> str:
+    """Render a simple [====    ] NN% bar."""
+    if maximum == 0:
+        return ""
+    
+    pct = min(current / maximum, 1.0)
+    filled = int(width * pct)
+    bar = "█" * filled + "░" * (width - filled)
+    
+    if pct < 0.6:
+        color = 'success'
+    elif pct < 0.8:
+        color = 'warning'
+    else:
+        color = 'error'
+    
+    return colorize(f"[{bar}] {current}/{maximum} ({pct:.0%})", color)
+
+
+# ============================================================================
 # ============= UTILITY FUNCTIONS ===========================================
 # ============================================================================
 
@@ -540,7 +616,7 @@ class CommandContext:
         if CommandContext._initialized:
             return
         CommandContext._initialized = True
-        
+        self.debug_manager = DebugManager() 
         # Connection info
         self._base_url: str = ""
         self._backend: str = "ollama"
@@ -565,6 +641,9 @@ class CommandContext:
         self.total_chars_generated: int = 0
         self.query_history: list = []
         self.max_history: int = 50
+        # Context window tracking
+        self.context_window_size: int = 0  # Will be fetched from server
+        self.current_context_tokens: int = 0  # Updated after each query
 
     # === Properties ===
     @property
@@ -607,6 +686,9 @@ class CommandContext:
         self.total_time_spent = 0.0
         self.total_chars_generated = 0
         self.query_history = []
+        self.debug_manager = DebugManager()
+        self.context_window_size = 0
+        self.current_context_tokens = 0
 
     def create_completer(self):
         """Create a ChatCompleter using this context's connection info."""
@@ -672,9 +754,117 @@ class CommandContext:
         """Get color code for a role."""
         return c(role)
 
+# ============================================================================
+# ============= DEBUGGING CLASS    ===========================================
+# ============================================================================
+
+class DebugManager:
+    """Manages per-category debug levels."""
+    
+    CATEGORIES = {
+        'network':    "HTTP requests/responses to LLM server",
+        'payload':    "Full JSON payloads sent to server",
+        'response':   "Response content and chunks from server",  # ← ADD THIS
+        'stream':     "Streaming chunks received from server", 
+        'context':    "Token estimation and message context details",
+        'thinking':   "Thinking/reasoning block extraction",
+        'commands':   "Command processing internals",
+        'urlfetch':   "URL fetching and HTML conversion",
+        'all':        "Master toggle for everything",
+    }
+    
+
+    VALID_LEVELS = {
+        'off': 0, 
+        'basic': 1, 
+        'verbose': 2, 
+        'trace': 3
+    }
+    
+    def __init__(self):
+        # Each category stores its own level
+        self._levels: Dict[str, int] = {cat: 0 for cat in self.CATEGORIES}
+    
+    def is_enabled(self, category: str) -> bool:
+        """Quick check if any debugging is active for this category."""
+        return self.get_level(category) > 0
+
+
+    def set_level(self, category: str, level: str) -> bool:
+        """Set debug level for a category. Returns True if valid."""
+        if category not in self.CATEGORIES:
+            return False
+        if level.lower() not in self.VALID_LEVELS:
+            return False
+        
+        level_int = self.VALID_LEVELS[level.lower()]
+        
+        if category == 'all':
+            for cat in self.CATEGORIES:
+                self._levels[cat] = level_int
+        else:
+            self._levels[category] = level_int
+        return True
+    
+    def get_level(self, category: str) -> int:
+        """Get current level. All respects the 'all' category master."""
+        master = self._levels.get('all', 0)
+        specific = self._levels.get(category, 0)
+        return max(master, specific)
+    
+    def should_log(self, category: str, min_level: int = 1) -> bool:
+        """Check if a debug message should be emitted."""
+        return self.get_level(category) >= min_level
+
+
+    def get_status(self) -> dict:
+        """Return current state for status display."""
+        return {
+            cat: level 
+            for cat, level in self._levels.items() 
+            if level > 0 or cat == 'all'
+        }
+
+# ============= DEBUG LOG function ============================================
+
+
+
+def debug_log(debug_mgr, category: str, level: int, message: str, 
+              data=None, prefix: str = "DEBUG"):
+    """
+    Central debug logging function.
+    
+    Args:
+        debug_mgr: The DebugManager instance
+        category: Which subsystem this belongs to
+        level: Minimum level required (1=basic, 2=verbose, 3=trace)
+        message: Human-readable description
+        data: Optional structured data to format
+        prefix: Label for the output line
+    """
+    if not debug_mgr.should_log(category, level):
+        return
+    
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    
+    # Build output
+    output = f"[{prefix}:{category}:{timestamp}] {message}"
+    
+    if data is not None and debug_mgr.get_level(category) >= 2:
+        if isinstance(data, (dict, list)):
+            formatted = json.dumps(data, indent=2, default=str)
+            output += f"\n{formatted}"
+        elif isinstance(data, bytes) and debug_mgr.get_level(category) >= 3:
+            # Trace level: show hex dump for binary data
+            output += f"\n{data[:500]!r}"
+        else:
+            output += f" | {data}"
+    
+    sys.stderr.write(colorize(f"{output}\n", 'muted'))
+
 
 # ============================================================================
-# ============= MODEL QUERY CLASS ===========================================
+# ============= MODEL QUERY CLASS ============================================
 # ============================================================================
 
 class ModelQuery:
@@ -691,6 +881,124 @@ class ModelQuery:
         else:
             # Fallback: use global CommandContext
             self.ctx = CommandContext()
+
+    def _debug_request(self, url: str, payload: dict, headers: dict = None):
+     """Log outgoing request to LLM server."""
+     debug_mgr = self.ctx.debug_manager
+     
+     if not debug_mgr or not payload:
+         return
+     
+     if headers is None:
+         headers = {'Content-Type': 'application/json'}
+     
+     if debug_mgr.should_log('network', 1):
+         try:
+             payload_size = len(json.dumps(payload))
+             debug_log(debug_mgr, 'network', 1,
+                      f"POST {url} ({payload_size} bytes)",
+                      prefix="HTTP→")
+         except Exception:
+             pass  # Silently fail debug logging
+     
+     if debug_mgr.should_log('payload', 1):
+         try:
+             # Create a safe copy for logging (mask large base64 data)
+             safe_payload = self._mask_payload(payload)
+             model_name = payload.get('model', '?') if isinstance(payload, dict) else '?'
+             msg_count = len(payload.get('messages', [])) if isinstance(payload, dict) else 0
+             
+             debug_log(debug_mgr, 'payload', 1,
+                      f"Sending to model '{model_name}' | {msg_count} messages",
+                      safe_payload,
+                      prefix="PAYLOAD")
+         except Exception:
+             pass  # Silently fail debug logging
+ 
+    def _debug_response_chunk(self, chunk: dict, is_first: bool = False, is_final: bool = False, *args, **kwargs):
+        """Log incoming streaming chunk."""
+        debug_mgr = self.ctx.debug_manager
+        
+        if not debug_mgr or chunk is None:
+            return
+        
+        try:
+            if is_first and debug_mgr.should_log('network', 1):
+                debug_log(debug_mgr, 'network', 1, "Stream started", prefix="HTTP←")
+            
+            if debug_mgr.should_log('stream', 1) and is_final:
+                debug_log(debug_mgr, 'stream', 1, "Stream completed", prefix="HTTP←")
+            
+            # --- ADD: Response content debugging ---
+            if debug_mgr.should_log('response', 1):
+                message = chunk.get('message', {}) if isinstance(chunk, dict) else {}
+                content = message.get('content', '') if isinstance(message, dict) else ''
+                thought = message.get('thought', '') or message.get('thinking', '') if isinstance(message, dict) else ''
+                
+                if content or thought:
+                    debug_log(debug_mgr, 'response', 1,
+                             f"Content: '{content[:50]}...' " if content else "Thinking block",
+                             prefix="RESP")
+            # --------------------------------------
+            
+            if debug_mgr.should_log('stream', 2) and not is_final:
+                # Show chunk structure without flooding the terminal
+                message = chunk.get('message', {}) if isinstance(chunk, dict) else {}
+                content = message.get('content', '') if isinstance(message, dict) else ''
+                
+                if content and isinstance(content, str):
+                    preview = content[:100] + ('...' if len(content) > 100 else '')
+                    debug_log(debug_mgr, 'stream', 2, 
+                             f"Content chunk: '{preview}'", prefix="CHUNK")
+        except Exception:
+            pass  # Silently fail debug logging
+       
+    def _debug_final_stats(self, usage_stats: dict):
+        """Log final usage statistics from server."""
+        debug_mgr = self.ctx.debug_manager
+        
+        if not debug_mgr or usage_stats is None:
+            return
+        
+        try:
+            if debug_mgr.should_log('network', 1):
+                debug_log(debug_mgr, 'network', 1, 
+                         "Response complete with usage stats", 
+                         usage_stats, prefix="HTTP←")
+        except Exception:
+            pass  # Silently fail debug logging
+    
+    def _mask_payload(self, payload: dict) -> dict:
+        """Replace large binary data with size indicators for logging."""
+        if payload is None:
+            return {}
+        
+        try:
+            # Deep copy to avoid modifying the original
+            safe = json.loads(json.dumps(payload))
+            
+            if isinstance(safe, dict):
+                for msg in safe.get('messages', []):
+                    if isinstance(msg, dict) and 'images' in msg and msg['images']:
+                        msg['images'] = [
+                            f"<base64_image: {len(img)} bytes>" if isinstance(img, str) else "<binary_image>"
+                            for img in msg['images']
+                        ]
+            
+            return safe
+        except Exception:
+            return {"error": "Could not mask payload for logging"}
+    
+    
+   
+    def _mask_payload_for_logging(self, payload: dict) -> dict:
+        """Replace image data with size indicator for logging."""
+        masked = json.loads(json.dumps(payload))
+        for msg in masked.get('messages', []):
+            if 'images' in msg:
+                msg['images'] = [f"<{len(img)} bytes base64>" for img in msg['images']]
+        return masked
+    
 
     @property
     def base_url(self):
@@ -875,9 +1183,11 @@ class ModelQuery:
         """Stream response from Ollama API with thinking support."""
         full_content = ""
         start_time = time.time()
+
         # Always confirm debug mode at start
-        if debug:
-            sys.stderr.write(colorize(f"\n[DEBUG] Stream started | model={model} | messages={len(messages)}\n", 'muted'))
+        debug_log(self.ctx.debug_manager, 'stream', 2, 
+             f"Stream started | model={model} | messages={len(messages)}",
+             prefix="OLLAMA")
 
         try:
             # === Build payload for Ollama ===
@@ -900,7 +1210,11 @@ class ModelQuery:
             start_thinking = False
             thinking_buffer = ""
             started_content = False
+            first_chunk=True
             usage_stats = {}
+
+            #self._debug_request(api_url, payload, {'Content-Type': 'application/json'})
+            self._debug_request(api_url, payload)
 
             with urlopen(req) as response:
                 for line in response:
@@ -910,7 +1224,17 @@ class ModelQuery:
 
                     try:
                         chunk = json.loads(decoded_line)
+                        
 
+                        if chunk:
+                        # --- ADD: Debug response chunk ---
+                            is_final = chunk.get('done', False)
+                            self._debug_response_chunk(chunk, first_chunk, is_final)
+                            first_chunk = False
+                
+                        if is_final and 'usage' in chunk:
+                            self._debug_final_stats(chunk['usage'])
+                        # ----------------------------------
 
                         # === DEBUG: Log final chunk to see usage structure ===
                         if debug and chunk.get("done", False):
@@ -934,6 +1258,11 @@ class ModelQuery:
                         if chunk.get("done", False):
                             if "usage" in chunk:
                                 usage_stats = chunk["usage"]
+                                    # === ADD THIS: Update context tracking with real server data ===
+                                total_tokens = usage_stats.get("total_tokens", 0)
+                                if total_tokens > 0:
+                                    self.ctx.current_context_tokens = total_tokens
+                            # ============================================================
                             # Fallback to root level keys if no usage block exists
                             else:
                                 # Ollama streaming often puts stats at the root level
@@ -942,7 +1271,19 @@ class ModelQuery:
                                     "eval_count": chunk.get("eval_count", 0),
                                     "total_tokens": chunk.get("prompt_eval_count", 0) + chunk.get("eval_count", 0)
                                 }
-
+                            # === FIXED: Update context tracking with proper field names ===
+                            # Ollama uses different field names than what we were checking
+                            total_tokens = (usage_stats.get("total_tokens", 0) or 
+                                           usage_stats.get("prompt_eval_count", 0) + usage_stats.get("eval_count", 0))
+                            
+                            if total_tokens > 0:
+                                self.ctx.current_context_tokens = total_tokens
+                                # Debug output to verify it's working
+                                if self.ctx.debug_manager.is_enabled('context'):
+                                    debug_log(self.ctx.debug_manager, 'context', 1,
+                                             f"Updated context tokens: {total_tokens}", prefix="CTX")
+                            # ============================================================
+                        
                             if debug:  # ← Only print if --debug flag is used
                                 sys.stderr.write(colorize(f"\n[DEBUG] Usage: {usage_stats}\n", 'muted'))
 
@@ -1021,12 +1362,19 @@ class ModelQuery:
             # === Send request and handle streaming chunks ===
             api_url = f"{self.base_url}/v1/chat/completions"
             data = json.dumps(payload).encode('utf-8')
-            req = Request(api_url, data=data, headers={'Content-Type': 'application/json'})
+            headers={'Content-Type': 'application/json'}
+            #req = Request(api_url, data=data, headers={'Content-Type': 'application/json'})
+            req = Request(api_url, data=data, headers=headers)
+
+            self._debug_request(api_url, payload)
 
             start_thinking = False
             started_content = False
             completion_data = {}
             is_final_chunk = False
+            first_chunk = True
+
+            self._debug_request(api_url, payload,headers=headers)
 
             with urlopen(req) as response:
                 for line in response:
@@ -1045,10 +1393,25 @@ class ModelQuery:
                     try:
                         chunk = json.loads(decoded_line)
 
+                        # --- ADD: Debug chunk ---
+                        choices = chunk.get("choices", [])
+                        is_final = choices and choices[0].get("finish_reason") is not None
+                        self._debug_response_chunk(chunk, first_chunk, is_final)
+                
+                        if is_final and chunk.get("usage"):
+                            self._debug_final_stats(chunk["usage"])
+                        first_chunk = False
+                        # ------------------------
+
                         # Grab usage stats from the final chunk
                         if "usage" in chunk and chunk["usage"]:
                             completion_data.update(chunk["usage"])
                             is_final_chunk = True
+                            # === ADD THIS: Update context tracking ===
+                            total_tokens = chunk["usage"].get("total_tokens", 0)
+                            if total_tokens > 0:
+                                self.ctx.current_context_tokens = total_tokens
+                            # =========================================
                         # Native Llama.cpp style timings
                         elif "timings" in chunk:
                             completion_data["prompt_eval_count"] = chunk["timings"].get("prompt_n", 0)
@@ -1632,6 +1995,35 @@ class ChatLoop:
         self.query_handler = context.create_query_handler()
         self.commands = get_command_aliases()
 
+    def handle_debug_command(self, args: str):
+        """Process /debug commands."""
+        parts = args.strip().split()
+    
+        if not parts or parts[0] == 'status':
+            self._print_debug_status()
+            return
+    
+        if parts[0] == 'list':
+            self._print_debug_categories()
+            return
+    
+        if len(parts) == 2:
+            category, level = parts
+            if self.ctx.debug_manager.set_level(category, level):
+                print(colorize(f"Debug: {category} → {level}", 'success'), 
+                    file=sys.stderr)
+            else:
+                print(colorize(f"Invalid category or level. Use '/debug list'", 
+                              'error'), file=sys.stderr)
+            return
+    
+    # Legacy fallback for old /debug on|off
+        if len(parts) == 1 and parts[0] in ('on', 'off'):
+            level = 'verbose' if parts[0] == 'on' else 'off'
+            self.ctx.debug_manager.set_level('all', level)
+            print(colorize(f"Debug: {parts[0]} (all categories)", 'success'), 
+                file=sys.stderr)
+
     def dump_context_to_file(self, filepath: str) -> None:
         """Dump current conversation history to a JSON file for browsing."""
         import json
@@ -1709,9 +2101,41 @@ class ChatLoop:
 
         from urllib.parse import urlparse
         host_clean = urlparse(self.ctx.base_url).netloc
+        
+        # === ADD THIS: Show context bar and auto-update window size ===
+        # Update context window size on first run or model switch
+        if self.ctx.context_window_size == 0:
+            update_context_window_size(self.ctx)
+        
+       
 
         while True:
             try:
+                if self.ctx.backend == "ollama" and self.ctx.context_window_size == 0:
+                    # After printing the model context info from /api/ps:
+                    model_ctx_list = fetch_loaded_models_context_ollama(self.ctx.base_url)
+                    for m, c in model_ctx_list:
+                        #print(f"    model : {m} context : {c}", file=sys.stderr)
+                        # === ADD THIS: Update our context window size ===
+                        if m.startswith(self.ctx.model.split(':')[0]):
+                            if c > 0:
+                                self.ctx.context_window_size = c
+                        # =============================================
+                               
+                # Display context bar
+                # Display context bar
+                if self.ctx.context_window_size > 0 and self.ctx.current_context_tokens > 0:
+                    bar = context_bar(self.ctx.current_context_tokens, self.ctx.context_window_size)
+                    print(bar, file=sys.stderr)
+                    
+                    # Warning at high usage
+                    pct = self.ctx.current_context_tokens / self.ctx.context_window_size
+                    if pct >= 0.80:
+                        print(colorize("⚠️  Context almost full! /clear recommended", 'error'), file=sys.stderr)
+                    elif pct >= 0.60:
+                        print(colorize("⚠️  Context getting full", 'warning'), file=sys.stderr)
+                #print(f"self.ctx.context_window_size : {self.ctx.context_window_size} self.ctx.current_context_tokens: {self.ctx.current_context_tokens}")         
+        
                 # Build the dynamic prompt: backend@IPv4/model
                 prompt_prefix = f"{self.ctx.backend}@{host_clean}/{self.ctx.model}"
                 if self.ctx.current_images:
@@ -1767,6 +2191,7 @@ class ChatLoop:
                 if full_input == '/clear':
                     print(colorize("[Context memory wiped clean]", 'success'), file=sys.stderr)
                     self.ctx.reset()
+                    self.ctx.current_context_tokens = 0  # Reset token count
                     continue
 
                 # Handle image attach/clear command
@@ -1804,14 +2229,87 @@ class ChatLoop:
                     continue
 
                 # Handle debug mode
-                if full_input.lower() == '/debug on':
-                    self.ctx.debug_mode = True
-                    print(colorize("[Debug mode ENABLED]", 'success'), file=sys.stderr)
-                    continue
-                elif full_input.lower() == '/debug off':
-                    self.ctx.debug_mode = False
-                    print(colorize("[Debug mode DISABLED]", 'info'), file=sys.stderr)
-                    continue
+                # Handle debug command
+                # Handle debug command
+                if full_input.startswith('/debug'):
+                    parts = full_input.split(maxsplit=2)
+                    
+                    if len(parts) == 1 or (len(parts) == 2 and not parts[1].strip()):
+                        # Just '/debug' or '/debug ' - show available categories
+                        print(colorize("\n[Debug Categories - Use /debug <category> <level>]", 'info'), file=sys.stderr)
+                        print("  Levels: off (0), basic (1), verbose (2), trace (3)", file=sys.stderr)
+                        print()
+                        for cat, desc in DebugManager.CATEGORIES.items():
+                            current_level = self.ctx.debug_manager.get_level(cat)
+                            level_name = {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(current_level, str(current_level))
+                            marker = '▶' if current_level > 0 else ' '
+                            print(f"  {marker} {cat:<12} [{level_name:<7}] {desc}", file=sys.stderr)
+                        print()
+                        
+                    elif len(parts) == 2:
+                        arg = parts[1].lower()
+                        
+                        if arg == 'list':
+                            # Same as above but more compact
+                            print(colorize("\n[Debug Categories]", 'info'), file=sys.stderr)
+                            for cat, desc in DebugManager.CATEGORIES.items():
+                                current_level = self.ctx.debug_manager.get_level(cat)
+                                level_name = {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(current_level, str(current_level))
+                                marker = '▶' if current_level > 0 else ' '
+                                print(f"  {marker} {cat:<12} [{level_name}]", file=sys.stderr)
+                            print()
+                        
+                        elif arg == 'status':
+                            # Show only active debug categories
+                            status = self.ctx.debug_manager.get_status()
+                            if any(level > 0 for level in status.values() if isinstance(level, int)):
+                                print(colorize("\n[Active Debug Categories]", 'info'), file=sys.stderr)
+                                for cat, level in status.items():
+                                    if isinstance(level, int) and level > 0:
+                                        level_name = {1: 'basic', 2: 'verbose', 3: 'trace'}.get(level, str(level))
+                                        print(f"  ▶ {cat}: {level_name}", file=sys.stderr)
+                                print()
+                            else:
+                                print(colorize("\n[Debug: No categories active]\n", 'muted'), file=sys.stderr)
+                        
+                        elif arg in ('on', 'off', '0', '1', '2', '3'):
+                            # Legacy support and numeric levels
+                            if arg == 'on':
+                                level = 'verbose'
+                            elif arg == 'off':
+                                level = 'off'
+                            elif arg in ('0', '1', '2', '3'):
+                                level_map = {'0': 'off', '1': 'basic', '2': 'verbose', '3': 'trace'}
+                                level = level_map[arg]
+                            else:
+                                level = arg
+                            
+                            self.ctx.debug_manager.set_level('all', level)
+                            print(colorize(f"\n[Debug: ALL categories → {level}]\n", 'success'), file=sys.stderr)
+                        
+                        else:
+                            # Just a category name with no level - show current level
+                            if arg in DebugManager.CATEGORIES:
+                                current = self.ctx.debug_manager.get_level(arg)
+                                level_name = {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(current, str(current))
+                                desc = DebugManager.CATEGORIES[arg]
+                                print(colorize(f"\n[Debug: {arg} = {level_name}] - {desc}", 'info'), file=sys.stderr)
+                                print("Usage: /debug {} [off|basic|verbose|trace]\n".format(arg), file=sys.stderr)
+                            else:
+                                print(colorize(f"\n[Unknown category: '{arg}']", 'error'), file=sys.stderr)
+                                print(colorize("Use '/debug' to see available categories\n", 'muted'), file=sys.stderr)
+                    
+                    elif len(parts) == 3:
+                        category, level = parts[1].lower(), parts[2].lower()
+                        
+                        if not self.ctx.debug_manager.set_level(category, level):
+                            print(colorize(f"\n[Invalid category '{category}' or level '{level}']", 'error'), file=sys.stderr)
+                            print(colorize("Use '/debug' to see available categories\n", 'muted'), file=sys.stderr)
+                        else:
+                            print(colorize(f"\n[Debug: {category} → {level}]\n", 'success'), file=sys.stderr)
+                    
+                    continue  # Move to next loop iteration
+                
 
                 # Handle thinking control
                 if full_input == '/thinkingoff':
@@ -1848,6 +2346,7 @@ class ChatLoop:
                     if len(parts) > 1:
                         self.ctx.model = parts[1]
                         print(colorize(f"[Switched to '{self.ctx.model}']", 'success'), file=sys.stderr)
+                        self.ctx.context_window_size = 0  # Will auto-fetch on next query
                     continue
 
                 # Handle spawnshell command
