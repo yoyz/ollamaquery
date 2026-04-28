@@ -1228,6 +1228,9 @@ class ModelQuery:
 
             data = json.dumps(payload).encode('utf-8')
             req = Request(url, data=data, headers={'Content-Type': 'application/json'})
+            if self.ctx.debug_manager.is_enabled('network') or self.ctx.debug_manager.is_enabled('payload'):
+                debug_log(self.ctx.debug_manager, 'network', 1,f"message: {messages} model: {model}")
+
 
             with urlopen(req) as response:
                 return json.loads(response.read().decode('utf-8'))
@@ -2442,6 +2445,7 @@ class ChatLoop:
                     continue
 
                 # Handle model switch
+                # with ollama this will result in sending the prompt token to preload the model
                 if full_input.startswith('/switchmodel'):
                     parts = full_input.split()
                     if len(parts) > 1 and parts[1].strip():
@@ -2456,11 +2460,22 @@ class ChatLoop:
                             self.ctx.context_window_size = 0
                             self.ctx.current_context_tokens = 0
 
-                            # force model preload to not have to wait later on 
+                            # force model preload with ollama to reduce the wait later
+                            # only the prompt will be loaded
                             if self.ctx.backend == "ollama":
                                 print(colorize(f"[Loading     '{new_model}']", 'muted'), file=sys.stderr)
                                 ping_messages = [             {"role": "system", "content": self.ctx.system_prompt} ]
-                                self.query_handler.query_sync(ping_messages, new_model, stream_enabled=False)
+                                res_ping=self.query_handler.query_sync(ping_messages, new_model, stream_enabled=False)
+
+                                #print(res_ping)
+                                # update the number of token with the new prompt token which has been submitted to the model
+                                # full chat history will be sent when user type a message
+                                ptokens = res_ping.get("prompt_eval_count", 0)
+                                if ptokens > 0:
+                                    self.ctx.current_context_tokens = ptokens
+
+                                    
+
 
                             print(colorize(f"[Switched to '{new_model}']", 'success'), file=sys.stderr)
                             continue
