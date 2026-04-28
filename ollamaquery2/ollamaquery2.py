@@ -436,20 +436,9 @@ def get_ollama_context_size(base_url: str, model_name: str) -> int:
         pass
     return 0
 
-def get_llamacpp_context_size(base_url: str) -> int:
-    """Get context size from llamacpp server."""
-    try:
-        url = f"{base_url}/v1/models"
-        with urlopen(Request(url)) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            models = data.get("data", [])
-            if models:
-                # Llama.cpp might report max_context or n_ctx
-                return models[0].get("max_context", 0) or models[0].get("n_ctx", 0)
-    except:
-        pass
-    return 0
 
+# update the ctx.context_window_size by querying the LLM server
+# ctx is an object which contain ctx.context_window_size
 def update_context_window_size(ctx):
     """Fetch and update context window size from the backend."""
     if ctx.backend == "ollama":
@@ -1409,6 +1398,39 @@ class ModelQuery:
     # === LLAMA.CPP STREAMING FUNCTION ===
     # ==========================================
 
+   
+    def _normalize_llamacpp_usage(self, chunk: dict) -> dict:
+        """
+        Extract token counts from any Llama.cpp chunk format.
+        Returns dict with standardized keys: total_tokens, prompt_tokens, completion_tokens
+        """
+        usage = {}
+        
+        # Format 1: Standard OpenAI-style usage block
+        if "usage" in chunk and chunk["usage"]:
+            u = chunk["usage"]
+            usage["prompt_tokens"] = u.get("prompt_tokens", 0)
+            usage["completion_tokens"] = u.get("completion_tokens", 0)
+            usage["total_tokens"] = u.get("total_tokens", 
+                                           usage["prompt_tokens"] + usage["completion_tokens"])
+        
+        # Format 2: Llama.cpp timings block (your server uses this)
+        if "timings" in chunk:
+            t = chunk["timings"]
+            usage["prompt_tokens"] = t.get("prompt_n", 0)
+            usage["completion_tokens"] = t.get("predicted_n", 0)
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+        
+        # Format 3: Root-level fields (some versions)
+        if "prompt_eval_count" in chunk:
+            usage["prompt_tokens"] = usage.get("prompt_tokens", 0) or chunk.get("prompt_eval_count", 0)
+        if "eval_count" in chunk:
+            usage["completion_tokens"] = usage.get("completion_tokens", 0) or chunk.get("eval_count", 0)
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+        
+        return usage if usage else None
+    
+
     def query_stream_llamacpp(
         self,
         messages, model, stream_enabled=True, debug=False,
@@ -1442,8 +1464,6 @@ class ModelQuery:
             #req = Request(api_url, data=data, headers={'Content-Type': 'application/json'})
             req = Request(api_url, data=data, headers=headers)
 
-            self._debug_request(api_url, payload)
-
             start_thinking = False
             started_content = False
             completion_data = {}
@@ -1468,43 +1488,36 @@ class ModelQuery:
 
                     try:
                         chunk = json.loads(decoded_line)
+                        #print(chunk)
 
                         # --- ADD: Debug chunk ---
                         choices = chunk.get("choices", [])
                         is_final = choices and choices[0].get("finish_reason") is not None
+
                         self._debug_response_chunk(chunk, first_chunk, is_final)
-                
+
                         if is_final and chunk.get("usage"):
                             self._debug_final_stats(chunk["usage"])
-                        first_chunk = False
-                        # ------------------------
+                        usage = self._normalize_llamacpp_usage(chunk)
+                        if usage:
+                            completion_data.update(usage)
 
-                        # Grab usage stats from the final chunk
-                        if "usage" in chunk and chunk["usage"]:
-                            completion_data.update(chunk["usage"])
-                            is_final_chunk = True
-                            # === ADD THIS: Update context tracking ===
-                            total_tokens = chunk["usage"].get("total_tokens", 0)
-                            if total_tokens > 0:
-                                self.ctx.current_context_tokens = total_tokens
+                        first_chunk = False
+               
                             # =========================================
                         # Native Llama.cpp style timings
-                        elif "timings" in chunk:
-                            completion_data["prompt_eval_count"] = chunk["timings"].get("prompt_n", 0)
-                            completion_data["eval_count"] = chunk["timings"].get("predicted_n", 0)
+                        if "timings" in chunk:
                             is_final_chunk = True
                             
+                        if debug and is_final_chunk:
+                            formatted_json = json.dumps(chunk, indent=4)
+                            sys.stderr.write(colorize(f"\n[DEBUG] Final JSON chunk from server:\n{formatted_json}\n", 'muted'))
+
                         # Detect the end of the stream
                         choices = chunk.get("choices", [])
                         if choices and choices[0].get("finish_reason") is not None:
                             is_final_chunk = True
 
-                        if debug and is_final_chunk:
-                            formatted_json = json.dumps(chunk, indent=4)
-                            sys.stderr.write(colorize(f"\n[DEBUG] Final JSON chunk from server:\n{formatted_json}\n", 'muted'))
-
-
-                        choices = chunk.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})
 
@@ -1546,6 +1559,18 @@ class ModelQuery:
             # === Calculate and print final stats ===
             total_time = time.time() - start_time
             #usage = self.calculate_stats(total_time, full_content, completion_data)
+            
+                       
+                        # === UPDATE CONTEXT TOKENS (after loop has collected all data) ===
+            if completion_data:
+                #print("completion")
+                total_tokens = (
+                    completion_data.get("total_tokens", 0) or
+                    completion_data.get("prompt_tokens", 0) + completion_data.get("completion_tokens", 0)
+                )
+                if total_tokens > 0:
+                    self.ctx.current_context_tokens = total_tokens
+            # ================================================================
             usage = self.calculate_stats(total_time, full_content, completion_data, messages)
             self.print_stats_display(usage)
 
@@ -2199,8 +2224,8 @@ class ChatLoop:
                         # =============================================
                                
                 # Display context bar
-                # Display context bar
-                if self.ctx.context_window_size > 0 and self.ctx.current_context_tokens > 0:
+                #print(f"self.ctx.context_window_size : {self.ctx.context_window_size} self.ctx.current_context_tokens {self.ctx.current_context_tokens}")
+                if self.ctx.context_window_size > 0:
                     bar = context_bar(self.ctx.current_context_tokens, self.ctx.context_window_size)
                     print(bar, file=sys.stderr)
                     
@@ -2268,6 +2293,7 @@ class ChatLoop:
                     print(colorize("[Context memory wiped clean]", 'success'), file=sys.stderr)
                     self.ctx.reset()
                     self.ctx.current_context_tokens = 0  # Reset token count
+                    update_context_window_size(self.ctx)
                     continue
 
                 # Handle image attach/clear command
@@ -2305,7 +2331,6 @@ class ChatLoop:
                     continue
 
                 # Handle debug mode
-                # Handle debug command
                 # Handle debug command
                 if full_input.startswith('/debug'):
                     parts = full_input.split(maxsplit=2)
