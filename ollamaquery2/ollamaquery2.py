@@ -573,6 +573,82 @@ def fetch_models_ollama(base_url):
         return []
 
 
+def fetch_models_llamacpp(base_url):
+    """Fetch available models from Llama.cpp API."""
+    try:
+        url = f"{base_url}/v1/models"
+        with urlopen(Request(url, headers={'User-Agent': 'Mozilla/5.0'})) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            models = data.get('data', [])
+            if not models:
+                models = data.get('models', [])
+            return [{'name': m.get('id', m.get('name', 'unknown'))} for m in models]
+    except:
+        return []
+
+def get_llamacpp_context_size(base_url: str) -> int:
+    """Get context size from Llama.cpp /slots endpoint."""
+    try:
+        url = f"{base_url}/slots"
+        with urlopen(Request(url)) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            if data and isinstance(data, list):
+                # Return the context size from the first slot
+                return data[0].get('n_ctx', 32768)
+    except:
+        pass
+    return 32768  # Default fallback
+
+def get_message_token_count_llamacpp(base_url: str, text: str) -> int:
+    """Get exact token count using the /tokenize endpoint (no GPU overhead)."""
+    try:
+        url = f"{base_url}/tokenize"
+        payload = json.dumps({"content": text}).encode('utf-8')
+        req = Request(url, data=payload, headers={'Content-Type': 'application/json'})
+        with urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return len(data.get('tokens', []))
+    except:
+        return 0
+
+
+def is_available_ollama_model(base_url: str, model_name: str) -> bool:
+    """
+    Check if a model exists on the Ollama server.
+    
+    Args:
+        base_url: Ollama server URL (e.g., 'http://192.168.1.20:11434')
+        model_name: Model name to check (e.g., 'qwen3:8b')
+    
+    Returns:
+        True if model exists, False otherwise
+    """
+    try:
+        models = fetch_models_ollama(base_url)
+        model_names = [m.get('name', '') for m in models]
+        return model_name in model_names
+    except Exception:
+        return False
+
+def is_available_llamacpp_model(base_url: str, model_name: str) -> bool:
+    """
+    Check if a model exists on the Llama.cpp server.
+    
+    Args:
+        base_url: Llama.cpp server URL
+        model_name: Model name to check
+    
+    Returns:
+        True if model exists, False otherwise
+    """
+    try:
+        models = fetch_models_llamacpp(base_url)
+        model_names = [m.get('name', '') for m in models]
+        return model_name in model_names
+    except Exception:
+        return False
+
+
 def parse_size(size_bytes):
     """Parse size from the API into human-readable format."""
     if not size_bytes:
@@ -2343,11 +2419,31 @@ class ChatLoop:
                 # Handle model switch
                 if full_input.startswith('/switchmodel'):
                     parts = full_input.split()
-                    if len(parts) > 1:
-                        self.ctx.model = parts[1]
-                        print(colorize(f"[Switched to '{self.ctx.model}']", 'success'), file=sys.stderr)
-                        self.ctx.context_window_size = 0  # Will auto-fetch on next query
-                    continue
+                    if len(parts) > 1 and parts[1].strip():
+                        new_model = parts[1].strip()
+                        if self.ctx.backend == "ollama":
+                            model_exists = is_available_ollama_model(self.ctx.base_url, new_model)
+                        else:
+                            model_exists = is_available_llamacpp_model(self.ctx.base_url, new_model)
+                        
+                        if model_exists:
+                            self.ctx.model = new_model
+                            self.ctx.context_window_size = 0
+                            self.ctx.current_context_tokens = 0
+
+                            # force model preload to not have to wait later on 
+                            if self.ctx.backend == "ollama":
+                                print(colorize(f"[Loading     '{new_model}']", 'muted'), file=sys.stderr)
+                                ping_messages = [             {"role": "system", "content": self.ctx.system_prompt} ]
+                                self.query_handler.query_sync(ping_messages, new_model, stream_enabled=False)
+
+                            print(colorize(f"[Switched to '{new_model}']", 'success'), file=sys.stderr)
+                            continue
+                        else:
+                            print(colorize(f"[ERROR] Model '{new_model}' not found on server", 'error'), file=sys.stderr)
+                            print(colorize("Use /listmodel to see available models", 'muted'), file=sys.stderr)
+                    else:
+                        print(colorize("[ERROR] Usage: /switchmodel <model_name>", 'error'), file=sys.stderr)
 
                 # Handle spawnshell command
                 if full_input == '/spawnshell':
