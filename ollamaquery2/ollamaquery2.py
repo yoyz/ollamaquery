@@ -41,6 +41,8 @@ try:
 except ImportError:
     PTY_AVAILABLE = False
 
+import atexit
+
 
 # ============================================================================
 # ============= DEFAULT CONFIGURATION =======================================
@@ -601,6 +603,21 @@ def get_message_token_count_llamacpp(base_url: str, text: str) -> int:
         return 0
 
 
+def get_message_token_count_ollama(base_url: str, text: str, model: str) -> int:
+    """Get exact token count using the /api/tokenize endpoint (no GPU overhead)."""
+    if not model:
+        return 0
+    try:
+        url = f"{base_url}/api/tokenize"
+        payload = json.dumps({"model": model, "content": text}).encode('utf-8')
+        req = Request(url, data=payload, headers={'Content-Type': 'application/json'})
+        with urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return len(data.get('tokens', []))
+    except:
+        return 0
+
+
 def is_available_ollama_model(base_url: str, model_name: str) -> bool:
     """
     Check if a model exists on the Ollama server.
@@ -649,6 +666,14 @@ def parse_size(size_bytes):
     except (TypeError, ValueError):
         pass
     return "N/A"
+
+
+def estimate_token_count(text: str) -> int:
+    """Estimate token count from text using regex-based heuristic."""
+    if not text:
+        return 0
+    tokens = len(re.findall(r'\b\w+\b|[^\w\s]', text))
+    return max(1, int(tokens * 1.1))
 
 
 def fetch_model_info_ollama(base_url, model_name):
@@ -1791,7 +1816,29 @@ def process_inline_commands(full_input):
                         file_content = f.read()
                     
                     lines_count = len(file_content.splitlines())
-                    print(colorize(f"Successfully loaded {lines_count} lines ({len(file_content)} chars).", 'info'), file=sys.stderr)
+                    char_count = len(file_content)
+                    word_count = len(file_content.split())
+                    
+                    # Count tokens using backend's tokenizer API, or fallback to estimation
+                    token_count = 0
+                    token_method = "api"
+                    if CommandContext._initialized:
+                        ctx = CommandContext()
+                        if ctx.base_url and ctx.model:
+                            if ctx.backend == "ollama":
+                                token_count = get_message_token_count_ollama(ctx.base_url, file_content, ctx.model)
+                            elif ctx.backend == "llamacpp":
+                                token_count = get_message_token_count_llamacpp(ctx.base_url, file_content)
+                    
+                    # Fallback to estimation if API failed
+                    if token_count == 0:
+                        token_count = estimate_token_count(file_content)
+                        token_method = "est"
+                    
+                    if token_method == "api":
+                        print(colorize(f"Successfully loaded {lines_count} lines ({char_count} chars, {word_count} words, ~{token_count} tokens).", 'info'), file=sys.stderr)
+                    else:
+                        print(colorize(f"Successfully loaded {lines_count} lines ({char_count} chars, {word_count} words, ~{token_count} tokens est).", 'warning'), file=sys.stderr)
                     
                     file_inclusions.append(f"\n[Content of local file `{filepath}`]:\n```text\n{file_content}\n```\n")
                 except UnicodeDecodeError:
@@ -2150,13 +2197,15 @@ class ChatLoop:
  
 
     def fetch_models(self):
-        """Fetch available models from the backend and auto-select if needed."""
+        """Fetch available models from the backend."""
         if self.ctx.backend == "llamacpp":
             self.ctx.models = [m['name'] for m in fetch_models_llamacpp(self.ctx.base_url)]
         else:
             self.ctx.models = [m['name'] for m in fetch_models_ollama(self.ctx.base_url)]
-            
-        if self.ctx.models and self.ctx.model not in self.ctx.models:
+        
+        # Only auto-select if a model WAS explicitly set but not found on server
+        # Don't auto-select if model is empty (user must pick manually)
+        if self.ctx.model and self.ctx.models and self.ctx.model not in self.ctx.models:
             old_model = self.ctx.model
             self.ctx.model = self.ctx.models[0]
             print(colorize(f"[INFO] Model '{old_model}' not found on server. Auto-selecting '{self.ctx.model}'", 'warning'), file=sys.stderr)
@@ -2197,6 +2246,16 @@ class ChatLoop:
                     pass
 
                 readline.set_history_length(1000)
+
+                # Register history save on any exit (normal, Ctrl+C, EOF, exceptions)
+                def save_history():
+                    if READLINE_AVAILABLE:
+                        try:
+                            readline.write_history_file(histfile)
+                        except Exception:
+                            pass
+
+                atexit.register(save_history)
             except Exception as e:
                 print(colorize(f"[ERROR] Readline setup failed: {e}", 'error'), file=sys.stderr)
 
@@ -2241,13 +2300,22 @@ class ChatLoop:
                 #print(f"self.ctx.context_window_size : {self.ctx.context_window_size} self.ctx.current_context_tokens: {self.ctx.current_context_tokens}")         
         
                 # Build the dynamic prompt: backend@IPv4/model
-                prompt_prefix = f"{self.ctx.backend}@{host_clean}/{self.ctx.model}"
+                if self.ctx.model:
+                    prompt_prefix = f"{self.ctx.backend}@{host_clean}/{self.ctx.model}"
+                else:
+                    prompt_prefix = f"{self.ctx.backend}@{host_clean}/(no model selected)"
                 if self.ctx.current_images:
                     prompt_prefix += colorize("[🖼️]", 'info', is_prompt=True)
 
                 full_input = gather_user_input(prompt_prefix)
                 if full_input is None or not full_input.strip():
                     continue
+
+                # If no model selected, only allow /switchmodel command
+                if not self.ctx.model:
+                    if not full_input.startswith('/switchmodel'):
+                        print(colorize("\n[ERROR] No model selected. Use /switchmodel <name> to select a model first.]", 'error'), file=sys.stderr)
+                        continue
 
                 # Handle exit commands
                 if full_input.lower() in ['exit', 'quit', '/exit', '/quit']:
@@ -2281,7 +2349,11 @@ class ChatLoop:
                 if full_input.startswith('/listmodel'):
                     parts = full_input.split(maxsplit=1)
                     if full_input.strip() == '/listmodelall':
-                        list_models_ollama(self.ctx.base_url, include_capabilities=True, file=sys.stderr)
+                        if self.ctx.backend == "ollama":
+                            list_models_ollama(self.ctx.base_url, include_capabilities=True, file=sys.stderr)
+                        else:
+                            # Llama.cpp doesn't have capabilities endpoint, fall back to basic list
+                            self.list_models()
                     else:
                         self.list_models(parts[1] if len(parts) > 1 else None)
                     continue
@@ -2460,11 +2532,25 @@ class ChatLoop:
                             self.ctx.context_window_size = 0
                             self.ctx.current_context_tokens = 0
 
-                            # force model preload with ollama to reduce the wait later
-                            # only the prompt will be loaded
+                            # Display model size before loading
                             if self.ctx.backend == "ollama":
-                                print(colorize(f"[Loading     '{new_model}']", 'muted'), file=sys.stderr)
-                                ping_messages = [             {"role": "system", "content": self.ctx.system_prompt} ]
+                                # Get model size from /api/tags (it's available there, not in /api/show)
+                                all_models = fetch_models_ollama(self.ctx.base_url)
+                                model_size = 0
+                                for m in all_models:
+                                    if m.get('name') == new_model:
+                                        model_size = m.get('size', 0)
+                                        break
+                                
+                                if model_size:
+                                    size_str = parse_size(model_size)
+                                    print(colorize(f"[Loading   '{new_model}' ({size_str})]", 'muted'), file=sys.stderr)
+                                else:
+                                    print(colorize(f"[Loading   '{new_model}']", 'muted'), file=sys.stderr)
+                                
+                                # force model preload with ollama to reduce the wait later
+                                # only the prompt will be loaded
+                                ping_messages = [{"role": "system", "content": self.ctx.system_prompt}]
                                 res_ping=self.query_handler.query_sync(ping_messages, new_model, stream_enabled=False)
 
                                 #print(res_ping)
@@ -2509,6 +2595,10 @@ class ChatLoop:
                     })
 
                 if payload_messages[-1]['role'] == 'user':
+                    # Guard: ensure model is selected before querying
+                    if not self.ctx.model:
+                        print(colorize("\n[ERROR] No model selected. Use /switchmodel <name> to select a model first.]", 'error'), file=sys.stderr)
+                        continue
                     response = self.query_handler.query_stream(
                         payload_messages,
                         self.ctx.model,
@@ -3101,17 +3191,36 @@ def main():
     # determine backend first so we know where to check for loaded models
     backend, base_url = resolve_connection(args)
 
+    # Verify server is actually reachable before proceeding
+    server_reachable = False
+    if backend == "ollama":
+        server_reachable = check_backend_with_get(base_url, 'ollama')
+    else:
+        server_reachable = check_backend_with_head(base_url, 'llama.cpp')
+
+    if not server_reachable:
+        sys.stderr.write(colorize(f"[ERROR] Cannot reach {backend} at {base_url}. Server may be offline.\n", 'error'))
+        sys.exit(1)
+
     # 1. Use explicitly requested model if provided via -m
     if args.model:
         target_model = args.model
-    # 2. Check for an already loaded model in memory for Ollama on^ly
+    # 2. Check for an already loaded model in memory for Ollama only
     elif backend == "ollama":
         loaded_models = fetch_loaded_models_ollama(base_url)
         if loaded_models:
             target_model = loaded_models[0]['name']
             sys.stderr.write(colorize(f"[INFO] Auto-selected active model in memory: '{target_model}'\n", 'success'))
         else:
-            target_model = "llama3" # Fallback if nothing is in memory
+            # No models loaded - fetch all available models for display
+            all_models = fetch_models_ollama(base_url)
+            if all_models:
+                target_model = ""  # Signal: no model pre-loaded, user must pick
+                print(colorize("\n[No model loaded in memory. Available models:]", 'info'), file=sys.stderr)
+                list_models_ollama(base_url, filter_arg=None, include_capabilities=False, file=sys.stderr)
+            else:
+                sys.stderr.write(colorize("[ERROR] No models available on Ollama server.\n", 'error'))
+                sys.exit(1)
     # 3. Fetch the currently hosted model (Llama.cpp)
     elif backend == "llamacpp":
         available_models = fetch_models_llamacpp(base_url)
@@ -3119,7 +3228,15 @@ def main():
             target_model = available_models[0]['name']
             sys.stderr.write(colorize(f"[INFO] Auto-selected hosted model: '{target_model}'\n", 'success'))
         else:
-            target_model = "llama3" # Fallback
+            # No models available - fetch for display
+            all_models = fetch_models_llamacpp(base_url)
+            if all_models:
+                target_model = ""  # Signal: no model pre-loaded, user must pick
+                print(colorize("\n[No model loaded in memory. Available models:]", 'info'), file=sys.stderr)
+                list_models_llamacpp(base_url, filter_arg=None)
+            else:
+                sys.stderr.write(colorize("[ERROR] No models available on Llama.cpp server.\n", 'error'))
+                sys.exit(1)
 
     # Handle listing operations
     if args.list or args.list_all:
