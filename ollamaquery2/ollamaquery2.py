@@ -13,8 +13,10 @@ import base64
 import argparse
 import subprocess
 import shutil
+import shlex
 import threading
 import time
+import traceback
 from datetime import datetime
 
 from html.parser import HTMLParser
@@ -50,22 +52,76 @@ import atexit
 
 BUILTIN_PROMPTS = {
     "default": (
-        "You are an accurate chatbot."
-        "Reply accurately to the question which is ask."
-        "If you are unsure say it."
+        "You are an accurate chatbot replying to a user in their terminal."
+        " The user may switch between languages mid-conversation. Mirror their language"
+        " — if they write in French, reply in French. Only translate if explicitly asked"
+        " (e.g. 'translate this to French')."
+        " Format responses with markdown (code blocks, lists, headings) for readability"
+        " in a terminal. Only use plain text if the user explicitly requests it."
+        " Answer the question accurately. If unsure, say so rather than guessing."
     ),
     "coder": (
-        "You are an AI chatbot specialist in Python and C++ coding, as well as system and "
-        "software engineering. You can use emoji to emphasize titles. If you are not fully sure, "
-        "ask for more information to guide me properly."
+        "You are a coding specialist focused on Python and C++, with broad system and"
+        " software engineering knowledge."
+        " The user may switch between languages mid-conversation. Mirror their language"
+        " — if they write in French, reply in French. Only translate if explicitly asked."
+        " Format responses with markdown (code blocks, lists, headings) for readability"
+        " in a terminal."
+        " Use emoji to emphasize section titles — this helps visually organize technical"
+        " explanations. If the request is ambiguous, ask clarifying questions rather than"
+        " guessing the intent."
     ),
     "sysadmin": (
-        "You are a Linux system administrator. Reply briefly to my questions. And don't "
-        "think too much. If I give you an image, summarize it briefly."
+        "You are a Linux system administrator helping a user manage their system."
+        " The user may switch between languages mid-conversation. Mirror their language"
+        " — if they write in French, reply in French. Only translate if explicitly asked."
+        " Format responses with markdown (code blocks, lists, headings) for readability"
+        " in a terminal."
+        " Keep answers short and to the point — the user is in a terminal and needs quick"
+        " information. If given an image, summarize its contents briefly."
     ),
     "concise": (
-        "You are a highly efficient AI assistant. Provide direct, factual answers without "
-        "filler, pleasantries, or unnecessary explanations."
+        "You are a highly efficient assistant providing factual answers."
+        " The user may switch between languages mid-conversation. Mirror their language"
+        " — if they write in French, reply in French. Only translate if explicitly asked."
+        " Format responses with markdown (code blocks, lists, headings) for readability"
+        " in a terminal."
+        " Skip pleasantries, filler, and unnecessary explanations. The user wants direct,"
+        " factual answers with no extra verbosity."
+    ),
+    "doctor": (
+        "You are a helpful medical information assistant. You provide general health"
+        " information but must always clarify that you are NOT a licensed medical professional"
+        " and cannot diagnose conditions or prescribe treatments. The user should consult a"
+        " real doctor for medical advice."
+        " The user may switch between languages mid-conversation. Mirror their language"
+        " — if they write in French, reply in French. Only translate if explicitly asked."
+        " Format responses with markdown (code blocks, lists, headings) for readability"
+        " in a terminal."
+        " When discussing symptoms or conditions, explain the reasoning clearly and note"
+        " when something requires urgent professional attention."
+    ),
+    "teacher": (
+        "You are a patient and knowledgeable teacher explaining concepts to a learner."
+        " Adapt your explanation depth to the user's apparent level — if they ask a basic"
+        " question, start simple; if they use technical terms, go deeper."
+        " The user may switch between languages mid-conversation. Mirror their language"
+        " — if they write in French, reply in French. Only translate if explicitly asked."
+        " Format responses with markdown (code blocks, lists, headings) for readability"
+        " in a terminal."
+        " Use analogies and examples to clarify difficult ideas. If the user seems confused,"
+        " offer to rephrase or break it down further."
+    ),
+    "politic": (
+        "You are a neutral political analyst providing factual, balanced information."
+        " Present multiple perspectives on political issues fairly, citing sources where"
+        " possible. Distinguish clearly between established facts and opinions or theories."
+        " The user may switch between languages mid-conversation. Mirror their language"
+        " — if they write in French, reply in French. Only translate if explicitly asked."
+        " Format responses with markdown (code blocks, lists, headings) for readability"
+        " in a terminal."
+        " Avoid endorsing any party, candidate, or ideology. If asked for analysis, explain"
+        " the reasoning behind different positions rather than advocating for one."
     )
 }
 
@@ -379,7 +435,7 @@ def get_theme(theme_name: str = "default"):
 def colorize(text, role, theme=None, force_color=False, is_prompt=False):
     """Apply color to text using active theme."""
     if theme is None:
-        theme = ACTIVE_THEME
+        theme = get_theme()
     
     if not colors_enabled() and not force_color:
         return text
@@ -395,16 +451,47 @@ def colorize(text, role, theme=None, force_color=False, is_prompt=False):
     return f"{start_code}{text}{reset_code}"
 
 
-def c(role, theme=None):
-    """Get color code from active theme."""
-    if theme is None:
-        theme = ACTIVE_THEME
-    if not colors_enabled():
-        return ''
-    return theme.get(role, '')
+# ============================================================================
+# ============= RETRY UTILITY ================================================
+# ============================================================================
 
+def _request_with_retry(req, max_retries=3, delay=1, **kwargs):
+    """Open URL with retry on transient network errors.
 
-ACTIVE_THEME = get_theme()
+    Retries on URLError, HTTPError (5xx only), ConnectionError, TimeoutError,
+    and OSError. Does NOT retry HTTP 4xx client errors.
+
+    Args:
+        req: URL string or Request object to pass to urlopen
+        max_retries: Maximum number of attempts (default 3)
+        delay: Seconds to wait between retries (default 1)
+        **kwargs: Additional arguments passed to urlopen (e.g. timeout)
+
+    Returns:
+        Same as urlopen(req, **kwargs)
+
+    Raises:
+        HTTPError: For 4xx errors or if all retries exhausted
+        URLError: If all retries exhausted
+    """
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            return urlopen(req, **kwargs)
+        except (URLError, HTTPError, ConnectionResetError, ConnectionError, TimeoutError, OSError) as e:
+            last_exception = e
+            if isinstance(e, HTTPError) and e.code < 500:
+                raise  # Don't retry 4xx client errors
+            if attempt < max_retries - 1:
+                sys.stderr.write(
+                    colorize(f"\n[RETRY] Request failed ({e}), "
+                             f"retrying in {delay}s (attempt {attempt+1}/{max_retries})\n",
+                             'warning')
+                )
+                time.sleep(delay)
+                continue
+            raise
+    raise last_exception  # Shouldn't reach here
 
 
 # ============================================================================
@@ -414,9 +501,8 @@ ACTIVE_THEME = get_theme()
 def get_ollama_context_size(base_url: str, model_name: str) -> int:
     """Get the actual context window size from Ollama's running model."""
     try:
-        # Try /api/ps first (running models)
         url = f"{base_url}/api/ps"
-        with urlopen(Request(url)) as response:
+        with _request_with_retry(Request(url)) as response:
             data = json.loads(response.read().decode('utf-8'))
             models = data.get("models", [])
             for model in models:
@@ -425,23 +511,21 @@ def get_ollama_context_size(base_url: str, model_name: str) -> int:
                     if size > 0:
                         return size
         
-        # Fallback: try /api/show
         url = f"{base_url}/api/show"
         payload = json.dumps({"name": model_name}).encode('utf-8')
         req = Request(url, data=payload, 
                      headers={'Content-Type': 'application/json'}, method='POST')
-        with urlopen(req) as response:
+        with _request_with_retry(req) as response:
             data = json.loads(response.read().decode('utf-8'))
-            # Some models include context_size in their info
             return data.get("context_size", 0)
-    except:
-        pass
+    except Exception:
+        sys.stderr.write(colorize(f"[WARNING] Failed to get Ollama context size for '{model_name}'\n", 'warning'))
     return 0
 
 
 # update the ctx.context_window_size by querying the LLM server
 # ctx is an object which contain ctx.context_window_size
-def update_context_window_size(ctx):
+def refresh_context_window_size(ctx):
     """Fetch and update context window size from the backend."""
     if ctx.backend == "ollama":
         size = get_ollama_context_size(ctx.base_url, ctx.model)
@@ -490,7 +574,7 @@ def sanitize_shell_command(command):
         return None
 
     # Remove dangerous characters that enable command chaining
-    dangerous_patterns = [';', '|', '&&', '||', '`']
+    dangerous_patterns = [';', '|', '&&', '||', '`', '$(']
     for pattern in dangerous_patterns:
         if pattern in command:
             return None
@@ -520,12 +604,16 @@ def validate_shell_command_safety(command, max_length=500):
     if len(command) > max_length:
         return False
 
-    # Block dangerous utilities
+    # Block dangerous utilities and substitution patterns
     dangerous = ['rm -rf', 'mkfs', 'dd if=', 'wget ', 'curl ',
                  'nc -e', 'python -c', 'perl -e', 'bash -c']
     for pattern in dangerous:
         if pattern.lower() in command.lower():
             return False
+
+    # Block command substitution $() (modern shell syntax)
+    if '$(' in command:
+        return False
 
     # Check for shell escape sequences
     if re.search(r'\\[\"\'\$\`]', command):
@@ -557,7 +645,7 @@ def fetch_models_ollama(base_url):
     """Fetch available models from Ollama API."""
     try:
         url = f"{base_url}/api/tags"
-        with urlopen(Request(url, headers={'User-Agent': 'Mozilla/5.0'})) as response:
+        with _request_with_retry(Request(url, headers={'User-Agent': 'Mozilla/5.0'})) as response:
             data = json.loads(response.read().decode('utf-8'))
             return data.get('models', [])
     except Exception:
@@ -568,27 +656,27 @@ def fetch_models_llamacpp(base_url):
     """Fetch available models from Llama.cpp API."""
     try:
         url = f"{base_url}/v1/models"
-        with urlopen(Request(url, headers={'User-Agent': 'Mozilla/5.0'})) as response:
+        with _request_with_retry(Request(url, headers={'User-Agent': 'Mozilla/5.0'})) as response:
             data = json.loads(response.read().decode('utf-8'))
             models = data.get('data', [])
             if not models:
                 models = data.get('models', [])
             return [{'name': m.get('id', m.get('name', 'unknown'))} for m in models]
-    except:
+    except Exception:
         return []
 
 def get_llamacpp_context_size(base_url: str) -> int:
     """Get context size from Llama.cpp /slots endpoint."""
     try:
         url = f"{base_url}/slots"
-        with urlopen(Request(url)) as response:
+        with _request_with_retry(Request(url)) as response:
             data = json.loads(response.read().decode('utf-8'))
             if data and isinstance(data, list):
                 # Return the context size from the first slot
-                return data[0].get('n_ctx', 32768)
-    except:
-        pass
-    return 32768  # Default fallback
+                return data[0].get('n_ctx', -1)
+    except Exception:
+        sys.stderr.write(colorize(f"[WARNING] Failed to get Llama.cpp context size\n", 'warning'))
+    return -1
 
 def get_message_token_count_llamacpp(base_url: str, text: str) -> int:
     """Get exact token count using the /tokenize endpoint (no GPU overhead)."""
@@ -596,10 +684,10 @@ def get_message_token_count_llamacpp(base_url: str, text: str) -> int:
         url = f"{base_url}/tokenize"
         payload = json.dumps({"content": text}).encode('utf-8')
         req = Request(url, data=payload, headers={'Content-Type': 'application/json'})
-        with urlopen(req, timeout=5) as response:
+        with _request_with_retry(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
             return len(data.get('tokens', []))
-    except:
+    except Exception:
         return 0
 
 
@@ -611,10 +699,10 @@ def get_message_token_count_ollama(base_url: str, text: str, model: str) -> int:
         url = f"{base_url}/api/tokenize"
         payload = json.dumps({"model": model, "content": text}).encode('utf-8')
         req = Request(url, data=payload, headers={'Content-Type': 'application/json'})
-        with urlopen(req, timeout=5) as response:
+        with _request_with_retry(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
             return len(data.get('tokens', []))
-    except:
+    except Exception:
         return 0
 
 
@@ -682,7 +770,7 @@ def fetch_model_info_ollama(base_url, model_name):
         url = f"{base_url}/api/show"
         payload = json.dumps({"name": model_name}).encode('utf-8')
         req = Request(url, data=payload, headers={'Content-Type': 'application/json'}, method='POST')
-        with urlopen(req) as response:
+        with _request_with_retry(req) as response:
             return json.loads(response.read().decode('utf-8'))
     except Exception:
         return {}
@@ -706,6 +794,7 @@ class CommandContext:
         if CommandContext._initialized:
             return
         CommandContext._initialized = True
+        self.shell_timeout: int = 5
         self.debug_manager = DebugManager() 
         # Connection info
         self._base_url: str = ""
@@ -762,21 +851,14 @@ class CommandContext:
 
     # === Helper Methods ===
     def reset(self):
-        """Reset session state without changing connection info."""
-        self.system_prompt = DEFAULT_SYSTEM_PROMPT
-        self.context_size = None
+        """Reset session state without changing connection info or user preferences."""
         self.current_images = []
-        self.force_no_thinking = False
-        self.models = []
-        self.debug_mode = False
-        self.stream_enabled = True
         self.total_queries = 0
         self.total_tokens_generated = 0
         self.total_prompt_tokens = 0
         self.total_time_spent = 0.0
         self.total_chars_generated = 0
         self.query_history = []
-        self.debug_manager = DebugManager()
         self.context_window_size = 0
         self.current_context_tokens = 0
 
@@ -835,14 +917,6 @@ class CommandContext:
             total += self.estimate_tokens(content)
             total += 2
         return total
-
-    def colorize(self, text: str, role: str, force_color: bool = False, is_prompt: bool = False):
-        """Delegate colorize to ACTIVE_THEME and colors_enabled."""
-        return colorize(text, role, force_color=force_color, is_prompt=is_prompt)
-
-    def c(self, role: str):
-        """Get color code for a role."""
-        return c(role)
 
 # ============================================================================
 # ============= DEBUGGING CLASS    ===========================================
@@ -973,37 +1047,37 @@ class ModelQuery:
             self.ctx = CommandContext()
 
     def _debug_request(self, url: str, payload: dict, headers: dict = None):
-     """Log outgoing request to LLM server."""
-     debug_mgr = self.ctx.debug_manager
-     
-     if not debug_mgr or not payload:
-         return
-     
-     if headers is None:
-         headers = {'Content-Type': 'application/json'}
-     
-     if debug_mgr.should_log('network', 1):
-         try:
-             payload_size = len(json.dumps(payload))
-             debug_log(debug_mgr, 'network', 1,
-                      f"POST {url} ({payload_size} bytes)",
-                      prefix="HTTP→")
-         except Exception:
-             pass  # Silently fail debug logging
-     
-     if debug_mgr.should_log('payload', 1):
-         try:
-             # Create a safe copy for logging (mask large base64 data)
-             safe_payload = self._mask_payload(payload)
-             model_name = payload.get('model', '?') if isinstance(payload, dict) else '?'
-             msg_count = len(payload.get('messages', [])) if isinstance(payload, dict) else 0
-             
-             debug_log(debug_mgr, 'payload', 1,
-                      f"Sending to model '{model_name}' | {msg_count} messages",
-                      safe_payload,
-                      prefix="PAYLOAD")
-         except Exception:
-             pass  # Silently fail debug logging
+        """Log outgoing request to LLM server."""
+        debug_mgr = self.ctx.debug_manager
+        
+        if not debug_mgr or not payload:
+            return
+        
+        if headers is None:
+            headers = {'Content-Type': 'application/json'}
+        
+        if debug_mgr.should_log('network', 1):
+            try:
+                payload_size = len(json.dumps(payload))
+                debug_log(debug_mgr, 'network', 1,
+                         f"POST {url} ({payload_size} bytes)",
+                         prefix="HTTP→")
+            except Exception:
+                pass  # Silently fail debug logging
+        
+        if debug_mgr.should_log('payload', 1):
+            try:
+                # Create a safe copy for logging (mask large base64 data)
+                safe_payload = self._mask_payload(payload)
+                model_name = payload.get('model', '?') if isinstance(payload, dict) else '?'
+                msg_count = len(payload.get('messages', [])) if isinstance(payload, dict) else 0
+                
+                debug_log(debug_mgr, 'payload', 1,
+                         f"Sending to model '{model_name}' | {msg_count} messages",
+                         safe_payload,
+                         prefix="PAYLOAD")
+            except Exception:
+                pass  # Silently fail debug logging
  
     def _debug_response_chunk(self, chunk: dict, is_first: bool = False, is_final: bool = False, *args, **kwargs):
         """Log incoming streaming chunk."""
@@ -1081,14 +1155,6 @@ class ModelQuery:
     
     
    
-    def _mask_payload_for_logging(self, payload: dict) -> dict:
-        """Replace image data with size indicator for logging."""
-        masked = json.loads(json.dumps(payload))
-        for msg in masked.get('messages', []):
-            if 'images' in msg:
-                msg['images'] = [f"<{len(img)} bytes base64>" for img in msg['images']]
-        return masked
-    
 
     @property
     def base_url(self):
@@ -1099,20 +1165,12 @@ class ModelQuery:
         return self.ctx.backend
 
     def estimate_tokens(self, text):
-        """Estimate token count from text. Uses CommandContext for consistency."""
-        if not text:
-            return 0
-        tokens = len(re.findall(r'\b\w+\b|[^\w\s]', text))
-        return max(1, int(tokens * 1.1))
+        """Estimate token count. Delegates to CommandContext."""
+        return self.ctx.estimate_tokens(text)
 
     def calculate_context_tokens(self, messages):
-        """Calculate estimated total tokens in conversation context."""
-        total = 0
-        for msg in messages:
-            content = msg.get("content", "")
-            total += self.estimate_tokens(content)
-            total += 2
-        return total
+        """Calculate estimated total tokens in conversation context. Delegates to CommandContext."""
+        return self.ctx.calculate_context_tokens(messages)
 
     def calculate_stats(self, total_time, content, usage=None, messages=None):
         """Calculate stats for current query AND update cumulative totals in context."""
@@ -1139,89 +1197,32 @@ class ModelQuery:
             "total_context_tokens": total_context_tokens,
             "total_time": total_time,
             "tps": tps,
-            "content_length": len(content),
-            "cumulative_queries": self.ctx.total_queries,
-            "cumulative_tokens": self.ctx.total_tokens_generated,
-            "cumulative_avg_tps": self.ctx.total_tokens_generated / self.ctx.total_time_spent if self.ctx.total_time_spent > 0 else 0.0
+            "content_length": len(content)
         }
-    
-        # Update context cumulative stats instead of instance variables
-        self.ctx.total_queries += 1
-        self.ctx.total_tokens_generated += eval_count
-        self.ctx.total_prompt_tokens += prompt_tokens
-        self.ctx.total_time_spent += total_time
-        self.ctx.total_chars_generated += len(content)
-        
-        # Update context rolling history instead of instance variable
-        entry = {
-            "timestamp": time.time(),
-            "tokens": eval_count,
-            "prompt_tokens": prompt_tokens,
-            "time": total_time,
-            "tps": tps
-        }
-        self.ctx.query_history.append(entry)
-        if len(self.ctx.query_history) > self.ctx.max_history:
-            self.ctx.query_history.pop(0)
-        
-        # Add cumulative stats from context to return value
-        current_stats["cumulative_queries"] = self.ctx.total_queries
-        current_stats["cumulative_tokens"] = self.ctx.total_tokens_generated
-        current_stats["cumulative_avg_tps"] = (
-            self.ctx.total_tokens_generated / self.ctx.total_time_spent 
-            if self.ctx.total_time_spent > 0 else 0.0
-        )
-        
+
         return current_stats
     
 
-    def print_stats_display(self, stats, show_cumulative=False):
+    def print_stats_display(self, stats):
         """Print formatted stats to stderr."""
         if not stats:
             return
             
-        # Current query stats
         parts = [f"{stats['total_time']:.2f}s total"]
         
         if stats.get("eval_count", 0) > 0:
             parts.append(f"{stats['tps']:.2f} t/s")
-            # Show real context size from backend, with fallback
-            ctx = stats.get("total_context_tokens", 0)
-            if not ctx:  # Fallback if backend didn't provide total_tokens
+            ctx = self.ctx.current_context_tokens
+            if not ctx:
+                ctx = stats.get("total_context_tokens", 0)
+            if not ctx:
                 ctx = stats.get("prompt_eval_count", 0) + stats['eval_count']
             parts.append(f"Context: {ctx} tokens")
         else:
             parts.append(f"Content: {stats.get('content_length', 0)} chars")
         
-        # Append cumulative stats if requested
-        if show_cumulative and stats.get("cumulative_queries", 0) > 1:
-            parts.append(f"Cum: {stats['cumulative_queries']}q | "
-                        f"{stats['cumulative_tokens']} tok | "
-                        f"{stats['cumulative_avg_tps']:.2f} avg t/s")
         sys.stderr.write(colorize(f"\n--- Stats: {' | '.join(parts)} ---\n", 'muted'))
-
-
-    def get_cumulative_stats(self):
-        """Return a summary of all tracked usage from the context."""
-        return {
-            "total_queries": self.ctx.total_queries,
-            "total_completion_tokens": self.ctx.total_tokens_generated,
-            "total_prompt_tokens": self.ctx.total_prompt_tokens,
-            "total_tokens": self.ctx.total_tokens_generated + self.ctx.total_prompt_tokens,
-            "total_time_seconds": self.ctx.total_time_spent,
-            "avg_tps": self.ctx.total_tokens_generated / self.ctx.total_time_spent if self.ctx.total_time_spent > 0 else 0.0,
-            "avg_tokens_per_query": self.ctx.total_tokens_generated / self.ctx.total_queries if self.ctx.total_queries > 0 else 0.0
-        }
-    
-    def reset_stats(self):
-        """Reset all cumulative tracking via the context."""
-        self.ctx.total_queries = 0
-        self.ctx.total_tokens_generated = 0
-        self.ctx.total_prompt_tokens = 0
-        self.ctx.total_time_spent = 0.0
-        self.ctx.total_chars_generated = 0
-        self.ctx.query_history = []   
-       
+ 
 
     def build_request_payload(self, messages, model, stream_enabled=False, **kwargs):
         """Build request payload for the backend."""
@@ -1253,180 +1254,18 @@ class ModelQuery:
 
             data = json.dumps(payload).encode('utf-8')
             req = Request(url, data=data, headers={'Content-Type': 'application/json'})
-            if self.ctx.debug_manager.is_enabled('network') or self.ctx.debug_manager.is_enabled('payload'):
-                debug_log(self.ctx.debug_manager, 'network', 1,f"message: {messages} model: {model}")
+            self._debug_request(url, payload)
 
 
-            with urlopen(req) as response:
+            with _request_with_retry(req) as response:
                 return json.loads(response.read().decode('utf-8'))
         except Exception as e:
             sys.stderr.write(colorize(f"[ERROR] Sync query failed: {e}\n", 'error'))
-            return ""
+            return {}
 
 
-    # ==========================================
-    # === OLLAMA STREAMING FUNCTION ===
-    # ==========================================
-
-    def query_stream_ollama(
-        self,
-        messages, model, stream_enabled=True, debug=False,
-        show_thinking=True, context_size=None, images=None
-    ):
-        """Stream response from Ollama API with thinking support."""
-        full_content = ""
-        start_time = time.time()
-
-        # Always confirm debug mode at start
-        debug_log(self.ctx.debug_manager, 'stream', 2, 
-             f"Stream started | model={model} | messages={len(messages)}",
-             prefix="OLLAMA")
-
-        try:
-            # === Build payload for Ollama ===
-            #if images: messages[1]["images"] = images
-            if images and messages and messages[-1].get("role") == "user":
-                messages[-1]["images"] = images
-            payload = {
-                "model": model,
-                "messages": messages,
-                "stream": stream_enabled
-            }
-            if context_size is not None:
-                payload["options"] = {"num_ctx": context_size}
-
-            # === Send request and handle streaming chunks ===
-            api_url = f"{self.base_url}/api/chat"
-            data = json.dumps(payload).encode('utf-8')
-            req = Request(api_url, data=data, headers={'Content-Type': 'application/json'})
-
-            start_thinking = False
-            thinking_buffer = ""
-            started_content = False
-            first_chunk=True
-            usage_stats = {}
-
-            #self._debug_request(api_url, payload, {'Content-Type': 'application/json'})
-            self._debug_request(api_url, payload)
-
-            with urlopen(req) as response:
-                for line in response:
-                    decoded_line = line.decode('utf-8').strip()
-                    if not decoded_line or decoded_line == '[DONE]':
-                        continue
-
-                    try:
-                        chunk = json.loads(decoded_line)
-                        
-
-                        if chunk:
-                        # --- ADD: Debug response chunk ---
-                            is_final = chunk.get('done', False)
-                            self._debug_response_chunk(chunk, first_chunk, is_final)
-                            first_chunk = False
-                
-                        if is_final and 'usage' in chunk:
-                            self._debug_final_stats(chunk['usage'])
-                        # ----------------------------------
-
-                        # === DEBUG: Log final chunk to see usage structure ===
-                        if debug and chunk.get("done", False):
-                            #sys.stderr.write(colorize(f"\n[DEBUG] Final chunk keys: {list(chunk.keys())}\n", 'muted'))
-                            formatted_json = json.dumps(chunk, indent=4)
-                            sys.stderr.write(colorize(f"\n[DEBUG] Final JSON chunk from server:\n{formatted_json}\n", 'muted'))
-                            if "usage" in chunk:
-                                sys.stderr.write(colorize(f"[DEBUG] usage: {chunk['usage']}\n", 'muted'))
-                                # Ollama sometimes puts usage fields at root level
-                            #if "prompt_eval_count" in chunk or "eval_count" in chunk:
-                            #    sys.stderr.write(colorize(f"[DEBUG] root usage fields: prompt_eval_count={chunk.get('prompt_eval_count')}, eval_count={chunk.get('eval_count')}\n", 'muted'))
-                        # =====================================================
 
 
-                        # Extract thinking/reasoning content in query_stream_ollama
-                        thought = (chunk.get("message", {}).get("thought") or
-                                   chunk.get("message", {}).get("thinking")) or ""
-                        content = chunk.get("message", {}).get("content", "")
-
-                        # Track usage stats from Ollama response (only in final chunk with done=True)
-                        if chunk.get("done", False):
-                            if "usage" in chunk:
-                                usage_stats = chunk["usage"]
-                                    # === ADD THIS: Update context tracking with real server data ===
-                                total_tokens = usage_stats.get("total_tokens", 0)
-                                if total_tokens > 0:
-                                    self.ctx.current_context_tokens = total_tokens
-                            # ============================================================
-                            # Fallback to root level keys if no usage block exists
-                            else:
-                                # Ollama streaming often puts stats at the root level
-                                usage_stats = {
-                                    "prompt_eval_count": chunk.get("prompt_eval_count", 0),
-                                    "eval_count": chunk.get("eval_count", 0),
-                                    "total_tokens": chunk.get("prompt_eval_count", 0) + chunk.get("eval_count", 0)
-                                }
-                            # === FIXED: Update context tracking with proper field names ===
-                            # Ollama uses different field names than what we were checking
-                            total_tokens = (usage_stats.get("total_tokens", 0) or 
-                                           usage_stats.get("prompt_eval_count", 0) + usage_stats.get("eval_count", 0))
-                            
-                            if total_tokens > 0:
-                                self.ctx.current_context_tokens = total_tokens
-                                # Debug output to verify it's working
-                                if self.ctx.debug_manager.is_enabled('context'):
-                                    debug_log(self.ctx.debug_manager, 'context', 1,
-                                             f"Updated context tokens: {total_tokens}", prefix="CTX")
-                            # ============================================================
-                        
-                            if debug:  # ← Only print if --debug flag is used
-                                sys.stderr.write(colorize(f"\n[DEBUG] Usage: {usage_stats}\n", 'muted'))
-
-                        # Handle thinking with buffered display
-                        if thought and show_thinking:
-                            if start_thinking == False:
-                                start_thinking = True
-                                sys.stderr.write("\n<thinking>>\n")
-                            sys.stdout.write(thought)
-                            sys.stdout.flush()
-
-                        # Flush accumulated thinking when content arrives
-                        if content:
-                            if thinking_buffer.strip() and started_content:
-                                sys.stderr.write("\n<thinking>>\n")
-                                thinking_buffer = ""
-
-                            # Strip only leading/trailing whitespace, preserve internal spaces
-                            #clean_content = content.strip(' \t\n\r\x0c')
-                            clean_content = content
-
-                            if not started_content:
-                                print("\n[--- Response ---]", file=sys.stdout)
-                                started_content = True
-
-                            sys.stdout.write(clean_content)
-                            sys.stdout.flush()
-                            full_content += clean_content
-
-                    except json.JSONDecodeError:
-                        continue
-
-            # === Calculate and print final stats ===
-            total_time = time.time() - start_time
-            #usage = self.calculate_stats(total_time, full_content, usage_stats)
-            usage = self.calculate_stats(total_time, full_content, usage_stats, messages )
-            self.print_stats_display(usage)
-
-            return full_content
-
-        except Exception as e:
-            sys.stderr.write(colorize(f"\n[ERROR] Ollama streaming failed: {e}\n", 'error'))
-            return full_content
-
-
-    # ==========================================
-    # === LLAMA.CPP STREAMING FUNCTION ===
-    # ==========================================
-
-   
     def _normalize_llamacpp_usage(self, chunk: dict) -> dict:
         """
         Extract token counts from any Llama.cpp chunk format.
@@ -1457,179 +1296,160 @@ class ModelQuery:
             usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
         
         return usage if usage else None
-    
 
-    def query_stream_llamacpp(
-        self,
-        messages, model, stream_enabled=True, debug=False,
-        show_thinking=True, context_size=None, images=None
-    ):
-        """Stream response from Llama.cpp /v1/chat/completions API with thinking support."""
-        full_content = ""
-        start_time = time.time()
-
-        # 1. ADD DEBUG START LOG
-        if debug:
-            sys.stderr.write(colorize(f"\n[DEBUG] Llama.cpp Stream started | model={model} | messages={len(messages)}\n", 'muted'))
-
-        try:
-            # === Build payload for Llama.cpp ===
-            #if images: messages[1]["images"] = images
-            if images and messages and messages[-1].get("role") == "user":
-                messages[-1]["images"] = images
-            payload = {
-                "model": model,
-                "messages": messages,
-                "stream": stream_enabled
-            }
+    def _build_stream_request(self, backend, messages, model, stream_enabled, context_size):
+        """Build URL, payload and headers for the backend."""
+        if backend == "ollama":
+            payload = {"model": model, "messages": messages, "stream": stream_enabled}
+            if context_size is not None:
+                payload["options"] = {"num_ctx": context_size}
+            return f"{self.base_url}/api/chat", payload, {'Content-Type': 'application/json'}
+        elif backend == "llamacpp":
+            payload = {"model": model, "messages": messages, "stream": stream_enabled}
             if context_size is not None:
                 payload["max_tokens"] = context_size
+            return f"{self.base_url}/v1/chat/completions", payload, {'Content-Type': 'application/json'}
+        else:
+            raise ValueError(f"Unknown backend: {backend}")
 
-            # === Send request and handle streaming chunks ===
-            api_url = f"{self.base_url}/v1/chat/completions"
-            data = json.dumps(payload).encode('utf-8')
-            headers={'Content-Type': 'application/json'}
-            #req = Request(api_url, data=data, headers={'Content-Type': 'application/json'})
-            req = Request(api_url, data=data, headers=headers)
+    def _parse_chunk(self, chunk, backend):
+        """Extract (thought, content, is_final, usage) from a chunk for any backend."""
+        if backend == "ollama":
+            thought = (chunk.get("message", {}).get("thought") or
+                       chunk.get("message", {}).get("thinking")) or ""
+            content = chunk.get("message", {}).get("content", "")
+            is_final = chunk.get("done", False)
+            usage = None
+            if is_final:
+                if "usage" in chunk:
+                    usage = chunk["usage"]
+                else:
+                    usage = {
+                        "prompt_eval_count": chunk.get("prompt_eval_count", 0),
+                        "eval_count": chunk.get("eval_count", 0),
+                    }
+            return thought, content, is_final, usage
+        elif backend == "llamacpp":
+            choices = chunk.get("choices", [])
+            is_final = bool(choices and choices[0].get("finish_reason") is not None)
+            delta = choices[0].get("delta", {}) if choices else {}
+            thought = delta.get("reasoning_content") or ""
+            content = delta.get("content") or ""
+            usage = self._normalize_llamacpp_usage(chunk) if is_final else None
+            return thought, content, is_final, usage
+        else:
+            raise ValueError(f"Unknown backend: {backend}")
 
-            start_thinking = False
-            started_content = False
-            completion_data = {}
-            is_final_chunk = False
-            first_chunk = True
+    def _iter_stream_lines(self, response, backend):
+        """Yield decoded JSON lines from streaming response, stripping SSE prefixes."""
+        for line in response:
+            decoded = line.decode('utf-8').strip()
+            if not decoded:
+                continue
+            if backend == "llamacpp":
+                if decoded.startswith('data: '):
+                    decoded = decoded[6:].strip()
+            if decoded == '[DONE]':
+                continue
+            yield decoded
 
-            self._debug_request(api_url, payload,headers=headers)
-
-            with urlopen(req) as response:
-                for line in response:
-                    decoded_line = line.decode('utf-8').strip()
-
-                    if not decoded_line:
-                        continue
-
-                    # Strip SSE 'data: ' prefix
-                    if decoded_line.startswith('data: '):
-                        decoded_line = decoded_line[6:].strip()
-
-                    if decoded_line == '[DONE]':
-                        continue
-
-                    try:
-                        chunk = json.loads(decoded_line)
-                        #print(chunk)
-
-                        # --- ADD: Debug chunk ---
-                        choices = chunk.get("choices", [])
-                        is_final = choices and choices[0].get("finish_reason") is not None
-
-                        self._debug_response_chunk(chunk, first_chunk, is_final)
-
-                        if is_final and chunk.get("usage"):
-                            self._debug_final_stats(chunk["usage"])
-                        usage = self._normalize_llamacpp_usage(chunk)
-                        if usage:
-                            completion_data.update(usage)
-
-                        first_chunk = False
-               
-                            # =========================================
-                        # Native Llama.cpp style timings
-                        if "timings" in chunk:
-                            is_final_chunk = True
-                            
-                        if debug and is_final_chunk:
-                            formatted_json = json.dumps(chunk, indent=4)
-                            sys.stderr.write(colorize(f"\n[DEBUG] Final JSON chunk from server:\n{formatted_json}\n", 'muted'))
-
-                        # Detect the end of the stream
-                        choices = chunk.get("choices", [])
-                        if choices and choices[0].get("finish_reason") is not None:
-                            is_final_chunk = True
-
-                        if choices:
-                            delta = choices[0].get("delta", {})
-
-                            # Extract content
-                            thought = delta.get("reasoning_content") or ""
-                            content = delta.get("content") or ""
-
-                            # 1. Print thinking in real-time as it arrives
-                            if thought and show_thinking:
-                                if not start_thinking:
-                                    sys.stderr.write(colorize("\n<thinking>\n", 'muted'))
-                                    start_thinking = True
-                                sys.stderr.write(colorize(thought, 'muted'))
-                                sys.stderr.flush()
-
-                            # 2. Print content in real-time
-                            if content:
-                                # Close the thinking block if it was open
-                                if start_thinking and not started_content:
-                                    sys.stderr.write(colorize("\n</thinking>\n", 'muted'))
-
-                                # Print response header once
-                                if not started_content:
-                                    print(colorize("\n[--- Response ---]", 'success'), file=sys.stdout)
-                                    started_content = True
-
-                                # DO NOT strip spaces here, or words will mash together!
-                                sys.stdout.write(content)
-                                sys.stdout.flush()
-                                full_content += content
-
-                    except json.JSONDecodeError:
-                        continue
-
-            # Failsafe: close thinking block if the model thought but generated no content
-            if start_thinking and not started_content:
-                sys.stderr.write(colorize("\n</thinking>\n", 'muted'))
-
-            # === Calculate and print final stats ===
-            total_time = time.time() - start_time
-            #usage = self.calculate_stats(total_time, full_content, completion_data)
-            
-                       
-                        # === UPDATE CONTEXT TOKENS (after loop has collected all data) ===
-            if completion_data:
-                #print("completion")
-                total_tokens = (
-                    completion_data.get("total_tokens", 0) or
-                    completion_data.get("prompt_tokens", 0) + completion_data.get("completion_tokens", 0)
-                )
-                if total_tokens > 0:
-                    self.ctx.current_context_tokens = total_tokens
-            # ================================================================
-            usage = self.calculate_stats(total_time, full_content, completion_data, messages)
-            self.print_stats_display(usage)
-
-            return full_content
-
-        except Exception as e:
-            sys.stderr.write(colorize(f"\n[ERROR] Llama.cpp streaming failed: {e}\n", 'error'))
-            return full_content
-
-
-
-    # ==========================================
-    # === GENERIC STREAMING WRAPPER FUNCTION ===
-    # ==========================================
+    def _update_context_tokens(self, backend, aggregated_usage, messages):
+        """Update context token tracking after stream completes."""
+        if backend == "ollama":
+            total_tokens = (aggregated_usage.get("total_tokens", 0) or
+                           aggregated_usage.get("prompt_eval_count", 0) + aggregated_usage.get("eval_count", 0))
+            if total_tokens > 0:
+                self.ctx.current_context_tokens = total_tokens
+                if self.ctx.debug_manager.is_enabled('context'):
+                    debug_log(self.ctx.debug_manager, 'context', 1,
+                             f"Updated context tokens: {total_tokens}", prefix="CTX")
+        elif backend == "llamacpp":
+            if messages:
+                self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(messages)
 
     def query_stream(
         self,
         messages, model, stream_enabled=True, debug=False,
         show_thinking=True, context_size=None, images=None
     ):
-        """Generic streaming wrapper that dispatches to correct backend-specific handler."""
-        if self.backend == "ollama":
-            return self.query_stream_ollama(
-                messages, model, stream_enabled, debug,
-                show_thinking, context_size, images
-            )
-        else:  # llamacpp
-            return self.query_stream_llamacpp(
-                messages, model, stream_enabled, debug,
-                show_thinking, context_size, images
-            )
+        """Stream response from any backend. Dispatches to backend-specific chunk parsing."""
+        full_content = ""
+        start_time = time.time()
+        backend = self.backend
+
+        if images and messages and messages[-1].get("role") == "user":
+            messages[-1]["images"] = images
+
+        api_url, payload, headers = self._build_stream_request(
+            backend, messages, model, stream_enabled, context_size)
+
+        data = json.dumps(payload).encode('utf-8')
+        req = Request(api_url, data=data, headers=headers)
+        self._debug_request(api_url, payload)
+
+        start_thinking = False
+        started_content = False
+        first_chunk = True
+        aggregated_usage = {}
+
+        try:
+            with _request_with_retry(req) as response:
+                for raw_line in self._iter_stream_lines(response, backend):
+                    try:
+                        chunk = json.loads(raw_line)
+                        thought, content, is_final, usage = self._parse_chunk(chunk, backend)
+
+                        self._debug_response_chunk(chunk, first_chunk, is_final)
+                        first_chunk = False
+
+                        if is_final and usage:
+                            self._debug_final_stats(usage)
+
+                        if usage:
+                            aggregated_usage.update(usage)
+
+                        if debug and is_final:
+                            formatted_json = json.dumps(chunk, indent=4)
+                            sys.stderr.write(colorize(f"\n[DEBUG] Final JSON chunk from server:\n{formatted_json}\n", 'muted'))
+
+                        # Thinking display
+                        if thought and show_thinking:
+                            if not start_thinking:
+                                start_thinking = True
+                                sys.stderr.write("\n<thinking>\n")
+                            sys.stderr.write(thought)
+                            sys.stderr.flush()
+
+                        # Content display
+                        if content:
+                            if start_thinking and not started_content:
+                                sys.stderr.write("\n</thinking>\n")
+
+                            if not started_content:
+                                print("\n[--- Response ---]", file=sys.stdout)
+                                started_content = True
+
+                            sys.stdout.write(content)
+                            sys.stdout.flush()
+                            full_content += content
+
+                    except json.JSONDecodeError:
+                        continue
+
+            if start_thinking and not started_content:
+                sys.stderr.write("\n</thinking>\n")
+
+            total_time = time.time() - start_time
+            self._update_context_tokens(backend, aggregated_usage, messages)
+            usage = self.calculate_stats(total_time, full_content, aggregated_usage, messages)
+            self.ctx.update_stats(usage["eval_count"], usage["prompt_eval_count"], total_time, usage["content_length"])
+            self.print_stats_display(usage)
+
+            return full_content
+
+        except Exception as e:
+            sys.stderr.write(colorize(f"\n[ERROR] {backend} streaming failed: {e}\n", 'error'))
+            return full_content
 
 
 # ============================================================================
@@ -1676,7 +1496,7 @@ class ChatCompleter:
 
         # 2. File Path Autocompletion (/cwd, /ls, /image and inline @)
         # buffer is the full line, text could be in the middle of the line
-        elif buffer.startswith('/cwd ') or buffer.startswith('/ls ') or text.startswith('/image ') or text.startswith('@'):
+        elif buffer.startswith('/cwd ') or buffer.startswith('/ls ') or buffer.startswith('/image ') or text.startswith('@'):
             # Determine how much of the text is the actual path
             if text.startswith('@'):
                 path_input = text[1:]
@@ -1794,32 +1614,23 @@ def gather_user_input(prompt_prefix, show_multiline=True):
                 print(f"\n[Exiting]", file=sys.stderr)
                 sys.exit(1)
 
-def process_inline_commands(full_input):
-    """
-    Process inline commands (!, /curl, @) within user input.
-    """
-    processed_lines = []
-    file_inclusions = []
-    
-    # 1. Scan for inline @filepath mentions anywhere in the text
-    # We split by whitespace to extract words starting with '@'
-    for word in full_input.split():
+def _process_file_inclusions(text):
+    """Scan text for @filepath mentions and load referenced files."""
+    inclusions = []
+    for word in text.split():
         if word.startswith('@') and len(word) > 1:
             filepath = word[1:]
             expanded_path = os.path.expanduser(filepath)
-            
-            # Only attempt to load if it actually exists as a file
             if os.path.isfile(expanded_path):
                 print(colorize(f"[--- Loading file: {filepath} ---]", 'muted'), file=sys.stderr)
                 try:
                     with open(expanded_path, 'r', encoding='utf-8') as f:
                         file_content = f.read()
-                    
+
                     lines_count = len(file_content.splitlines())
                     char_count = len(file_content)
                     word_count = len(file_content.split())
-                    
-                    # Count tokens using backend's tokenizer API, or fallback to estimation
+
                     token_count = 0
                     token_method = "api"
                     if CommandContext._initialized:
@@ -1829,46 +1640,46 @@ def process_inline_commands(full_input):
                                 token_count = get_message_token_count_ollama(ctx.base_url, file_content, ctx.model)
                             elif ctx.backend == "llamacpp":
                                 token_count = get_message_token_count_llamacpp(ctx.base_url, file_content)
-                    
-                    # Fallback to estimation if API failed
+
                     if token_count == 0:
                         token_count = estimate_token_count(file_content)
                         token_method = "est"
-                    
+
                     if token_method == "api":
                         print(colorize(f"Successfully loaded {lines_count} lines ({char_count} chars, {word_count} words, ~{token_count} tokens).", 'info'), file=sys.stderr)
                     else:
                         print(colorize(f"Successfully loaded {lines_count} lines ({char_count} chars, {word_count} words, ~{token_count} tokens est).", 'warning'), file=sys.stderr)
-                    
-                    file_inclusions.append(f"\n[Content of local file `{filepath}`]:\n```text\n{file_content}\n```\n")
+
+                    inclusions.append(f"\n[Content of local file `{filepath}`]:\n```text\n{file_content}\n```\n")
                 except UnicodeDecodeError:
                     err_msg = f"[Failed to load `{filepath}`: Appears to be a binary or non-UTF-8 file]"
                     print(colorize(err_msg, 'error'), file=sys.stderr)
-                    file_inclusions.append(err_msg + "\n")
+                    inclusions.append(err_msg + "\n")
                 except Exception as e:
                     err_msg = f"[Failed to load `{filepath}`: {e}]"
                     print(colorize(err_msg, 'error'), file=sys.stderr)
-                    file_inclusions.append(err_msg + "\n")
+                    inclusions.append(err_msg + "\n")
+    return inclusions
 
-    # 2. Process line-by-line commands (! and /curl)
-    for line in full_input.split('\n'):
-        stripped_line = line.lstrip()
 
-        if stripped_line.startswith("!"):
-            # Execute shell command
-            command = stripped_line[1:].strip()
+def _process_command_lines(text):
+    """Process lines starting with ! (shell) or /curl (URL fetch)."""
+    processed = []
+    for line in text.split('\n'):
+        stripped = line.lstrip()
+
+        if stripped.startswith("!"):
+            command = stripped[1:].strip()
             if command and validate_shell_command_safety(command):
                 output_str = execute_os_command(sanitize_shell_command(command))
             else:
-                output_str = f"[Command rejected: Invalid characters]"
-            processed_lines.append(output_str)
+                output_str = "[Command rejected: Invalid characters]"
+            processed.append(output_str)
 
-
-        elif stripped_line.startswith("/curl "):
-            # Fetch URL content
-            url = stripped_line[6:].strip()
+        elif stripped.startswith("/curl "):
+            url = stripped[6:].strip()
             if not url:
-                processed_lines.append(line)
+                processed.append(line)
                 continue
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
@@ -1877,65 +1688,65 @@ def process_inline_commands(full_input):
                 print(colorize(f"[--- Fetching URL: {url} ---]", 'muted'), file=sys.stderr)
                 text_content, used_tool = fetch_and_convert_url(url)
                 word_count = len(text_content.split()) if text_content else 0
-                tool_suffix = ""
-                if word_count>0 and used_tool and used_tool != "None":
-                    tool_suffix = f" (via {used_tool})"
-                if word_count>0:
-                    print(colorize(f"[Successfully fetched {word_count} words from {url}{tool_suffix}]", 'muted'), file=sys.stderr)
-                    processed_lines.append(text_content)
-                    preview_length = 500
-                    preview_text=""
-                    header_text=""
-                    if len(text_content) > preview_length:
-                        header_text += "[Output truncated for terminal display. LLM received full text.]"
-                    preview_text += text_content[:preview_length].strip()
-                    print(colorize(f"{header_text}\n```", 'muted'), file=sys.stderr)
-                    print(colorize(f"```text\n{preview_text}\n```", 'info'), file=sys.stderr)
+                if word_count > 0:
+                    print(colorize(f"[Successfully fetched {word_count} words from {url}]" + (f" (via {used_tool})" if used_tool and used_tool != "None" else ""), 'muted'), file=sys.stderr)
+                    processed.append(text_content)
+                    preview = text_content[:500].strip()
+                    header = "[Output truncated for terminal display. LLM received full text.]" if len(text_content) > 500 else ""
+                    print(colorize(f"{header}\n```", 'muted'), file=sys.stderr)
+                    print(colorize(f"```text\n{preview}\n```", 'info'), file=sys.stderr)
                 else:
                     print(colorize(f"[Warning: No text content could be extracted from {url}]", 'warning'), file=sys.stderr)
             except Exception as e:
                 print(colorize(f"[Failed to fetch URL: {e}]", 'error'), file=sys.stderr)
         else:
-            # Append normal text (including the text containing the @ tag itself)
-            processed_lines.append(line)
+            processed.append(line)
+    return processed
 
-    # 3. Combine the user's original prompt with the loaded file contents at the bottom
+
+def process_inline_commands(full_input):
+    """Process inline commands (!, /curl, @) within user input."""
+    file_inclusions = _process_file_inclusions(full_input)
+    processed_lines = _process_command_lines(full_input)
     final_output = "\n".join(processed_lines)
     if file_inclusions:
         final_output += "\n" + "".join(file_inclusions)
-        
     return final_output
 
 
 
-def execute_os_command(command):
+def execute_os_command(command, timeout=None):
     """
     Execute OS command with safety checks and timeout.
 
     Args:
         command (str): Command to execute
+        timeout (int): Maximum execution time in seconds (None = use default)
 
     Returns:
         str: Command output or error message
     """
-    # Validate command safety
+    if timeout is None and CommandContext._initialized:
+        timeout = CommandContext().shell_timeout
+    if timeout is None:
+        timeout = 5
     if not validate_shell_command_safety(command, max_length=500):
         msg = "[Command rejected: Invalid characters]"
         print(colorize(msg, 'error'), file=sys.stderr)
         return "[Command rejected: Invalid characters]"
 
-    print(f"[--- Executing (max 5s): {command} ---]", file=sys.stderr)
+    print(f"[--- Executing (max {timeout}s): {command} ---]", file=sys.stderr)
     output_lines = []
 
     try:
-        # Use timeout wrapper for safety
+        args_list = shlex.split(command)
         process = subprocess.run(
-            command, shell=True,
+            args_list, shell=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            timeout=5
+            timeout=timeout
         )
 
         raw_output = process.stdout if process.stdout else ""
@@ -1951,8 +1762,8 @@ def execute_os_command(command):
         output = raw_output or "[Command executed successfully with no output]"
 
     except subprocess.TimeoutExpired:
-        print("[Command timed out after 5 seconds!]", file=sys.stderr)
-        output = "[Command execution interrupted: Time limit exceeded (5s)]"
+        print(f"[Command timed out after {timeout} seconds!]", file=sys.stderr)
+        output = f"[Command execution interrupted: Time limit exceeded ({timeout}s)]"
 
     except Exception as e:
         print(f"[Failed to execute command: {e}]", file=sys.stderr)
@@ -1990,12 +1801,14 @@ def fetch_and_convert_url(url):
                 if proc.returncode == 0 and proc.stdout.strip():
                     return proc.stdout.decode('utf-8', errors='replace'), f"{tool_map[converter]}"
             except Exception:
-                print(colorize("Exception catch in fetch_and_convert_url going back to FallbackHTMLStripper\n", 'muted'), file=sys.stderr)
+                print(colorize("Exception in converter, falling back to HTMLStripper\n", 'muted'), file=sys.stderr)
                 continue
 
         # Fallback: Simple HTML strip
         html_str = html_bytes.decode('utf-8', errors='ignore')
-        return FallbackHTMLStripper().get_data(html_str), "FallbackHTMLStripper"
+        stripper = HTMLStripper()
+        stripper.feed(html_str)
+        return stripper.get_text(), "htmlstrip"
 
     except Exception as e:
         return f"[Failed to fetch URL: {e}]", "None"
@@ -2017,115 +1830,41 @@ def get_html_bytes(url, depth=0):
             )
             return proc.stdout
 
-    # Fallback to urllib
+    # Fallback to urllib with retry
     try:
         req = Request(url, headers=headers)
-        with urlopen(req, timeout=15) as response:
+        with _request_with_retry(req, timeout=15) as response:
             return response.read()
     except Exception:
         return b""
 
 
-class FallbackHTMLStripper:
-    """Simple HTML content stripper that removes tags."""
+class HTMLStripper(HTMLParser):
+    """Simple HTML parser that extracts text content, skipping specified tags."""
+    skip_tags = {'script', 'style', 'head', 'meta', 'title', 'link', 'noscript'}
 
     def __init__(self):
-        self.reset()
-        self.strict = False
-        self.convert_charrefs = True
-        self.text = []
-        self.skip_tags = {'script', 'style', 'head', 'meta',
-                          'title', 'link', 'noscript'}
-        self.current_tag = ""
-
-    def reset(self):
-        """Reset stripper state."""
-        super(FallbackHTMLStripper, self).reset()
-        self.strict = False
-        self.convert_charrefs = True
-        self.text = []
-        self.skip_tags = {'script', 'style', 'head', 'meta',
-                          'title', 'link', 'noscript'}
-        self.current_tag = ""
+        super().__init__()
+        self.text_parts = []
+        self._current_tag = ""
 
     def handle_starttag(self, tag, attrs):
-        """Handle opening HTML tags."""
-        self.current_tag = tag
+        self._current_tag = tag
+        if tag not in self.skip_tags:
+            super().handle_starttag(tag, attrs)
 
     def handle_endtag(self, tag):
-        """Handle closing HTML tags."""
-        self.current_tag = ""
+        if tag not in self.skip_tags:
+            super().handle_endtag(tag)
 
     def handle_data(self, data):
-        """Handle text data between tags."""
-        if self.current_tag not in self.skip_tags:
+        if self._current_tag not in self.skip_tags:
             cleaned = data.strip()
             if cleaned:
-                self.text.append(cleaned)
+                self.text_parts.append(cleaned)
 
-    def feed(self, html_text):
-        """Parse HTML text."""
-        from html.parser import HTMLParser
-        parser = HTMLParser()
-        parser.reset()
-        parser.strict = False
-        parser.convert_charrefs = True
-        parser.skip_tags = self.skip_tags
-        parser.current_tag = ""
-
-        class LocalParser(html.parser.HTMLParser):
-            def __init__(self, *args, **kwargs):
-                html.parser.HTMLParser.__init__(self, *args, **kwargs)
-                self.outer_text = []
-                self.inner_text = ''
-
-            def handle_starttag(self, tag, attrs):
-                html.parser.HTMLParser.handle_starttag(self, tag, attrs)
-
-            def handle_endtag(self, tag):
-                html.parser.HTMLParser.handle_endtag(self, tag)
-
-            def handle_data(self, data):
-                html.parser.HTMLParser.handle_data(self, data)
-
-        parser = LocalParser()
-        parser.feed(html_text)
-
-    def get_data(self, text=None):
-        """Get stripped text content."""
-        if not text and self.text:
-            return '\n'.join(self.text)
-        elif text:
-            self.text.clear()
-
-            class DataGatherer(HTMLParser):
-                def __init__(self, *args, **kwargs):
-                    HTMLParser.__init__(self, *args, **kwargs)
-                    self.outer_text = []
-                    self.inner_text = ''
-
-                def handle_starttag(self, tag, attrs):
-                    if tag not in self.skip_tags:
-                        html.parser.HTMLParser.handle_starttag(self, tag, attrs)
-
-                def handle_endtag(self, tag):
-                    if tag not in self.skip_tags:
-                        html.parser.HTMLParser.handle_endtag(self, tag)
-
-                def handle_data(self, data):
-                                                if self.current_tag not in self.skip_tags:
-                                                    cleaned = data.strip()
-                                                    if cleaned:
-                                                        self.outer_text.append(cleaned)
-
-                def get_outer(self):
-                    return ''.join(self.outer_text)
-
-            parser = DataGatherer(skip_tags=self.skip_tags, current_tag=self.current_tag)
-            parser.feed(text)
-
-            return parser.get_outer() if parser.outer_text else ""
-        return ''
+    def get_text(self):
+        return ' '.join(self.text_parts)
 
 
 # ============================================================================
@@ -2141,12 +1880,13 @@ class ChatLoop:
     """
 
     def __init__(self, context: CommandContext):
+        """Initialize chat loop with shared context, completer, and query handler."""
         self.ctx = context
         self.completer = context.create_completer()
         self.query_handler = context.create_query_handler()
         self.commands = get_command_aliases()
 
-    def handle_debug_command(self, args: str):
+    def handle_debug_command(self, args: str) -> None:
         """Process /debug commands."""
         parts = args.strip().split()
     
@@ -2177,26 +1917,24 @@ class ChatLoop:
 
     def dump_context_to_file(self, filepath: str) -> None:
         """Dump current conversation history to a JSON file for browsing."""
-        import json
+        if not hasattr(self, 'messages') or not self.messages:
+            raise ValueError("No conversation history to dump")
 
-        # Safely copy the live history
         history = []
         for msg in self.messages:
             msg_copy = dict(msg)
 
-            # Sanitize large base64 image payloads to avoid massive file sizes
             if 'images' in msg_copy:
                 msg_copy['images'] = [
                     f"[image: {len(img)} bytes]" for img in msg_copy['images']
                 ]
             history.append(msg_copy)
 
-        # Write formatted JSON
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(history, f, indent=2, ensure_ascii=False)
  
 
-    def fetch_models(self):
+    def fetch_models(self) -> None:
         """Fetch available models from the backend."""
         if self.ctx.backend == "llamacpp":
             self.ctx.models = [m['name'] for m in fetch_models_llamacpp(self.ctx.base_url)]
@@ -2210,24 +1948,182 @@ class ChatLoop:
             self.ctx.model = self.ctx.models[0]
             print(colorize(f"[INFO] Model '{old_model}' not found on server. Auto-selecting '{self.ctx.model}'", 'warning'), file=sys.stderr)
 
-    def run(self, stream_enabled=True, debug=False, images=None):
+    def run(self, stream_enabled: bool = True, debug: bool = False, images: Optional[List[str]] = None) -> None:
         """Main chat loop - handles interactive session."""
+        host_clean = urlparse(self.ctx.base_url).netloc
 
-        # Initialize state from args
+        self.run_init_session(stream_enabled, debug, images)
+
+        while True:
+            try:
+                self.run_update_ollama_context(host_clean)
+                self.run_display_context_bar()
+
+                prompt_prefix = self.run_build_prompt(host_clean)
+                full_input = gather_user_input(prompt_prefix)
+                if full_input is None or not full_input.strip():
+                    continue
+
+                if not self.ctx.model and not (full_input.startswith('/') or full_input.lower() in ('exit', 'quit')):
+                    print(colorize("\n[ERROR] No model selected. Use /listmodel to see available models, then /switchmodel <name> to select one.", 'error'), file=sys.stderr)
+                    continue
+
+                result = self.run_handle_exit(full_input)
+                if result is True:
+                    break
+                if result is False:
+                    continue
+
+                result = self.run_handle_help(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_stats(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_listmodel(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_context_size(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_clear(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_image(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_dumpcontext(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_debug(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_thinking(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_cwd(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_ls(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_switchmodel(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_spawnshell(full_input)
+                if result is False:
+                    continue
+
+                self.run_process_query(full_input)
+
+            except KeyboardInterrupt:
+                print(f"\n[Interrupted]", file=sys.stderr)
+                continue
+
+            except Exception as e:
+                if isinstance(e, EOFError):
+                    print(f"[EOF - Goodbye!]", file=sys.stderr)
+                    break
+                else:
+                    print(colorize(f"[ERROR] ChatLoop->run {e}", 'error'), file=sys.stderr)
+                    if self.ctx.debug_mode or self.ctx.debug_manager.get_level('all') > 0:
+                        traceback.print_exc(file=sys.stderr)
+
+        return
+
+    def list_models(self, filter_arg: Optional[str] = None) -> None:
+        """List available models from the backend, with optional name filter."""
+        if self.ctx.backend == "ollama":
+            list_models_ollama(self.ctx.base_url, filter_arg, file=sys.stdout)
+        else:
+            models = fetch_models_llamacpp(self.ctx.base_url)
+            if not models:
+                print(colorize(f"\n[No models found via {self.ctx.backend} API]", 'warning'), file=sys.stderr)
+                return
+            models.sort(key=lambda x: x.get('name', ''))
+            header = f"{'NAME':<50} | {'OWNED BY'}"
+            print(colorize(header, 'muted'))
+            print(colorize("-" * len(header), 'muted'))
+            for m in models:
+                owned_by = m.get('owned_by', 'N/A')
+                print(f"{m['name']:<50} | {owned_by}")
+            print()
+
+    def set_context_size(self, full_input: str) -> None:
+        """Parse and apply /contextsizeset command argument."""
+        parts = full_input.split()
+        if len(parts) > 1 and parts[1].isdigit():
+            val = int(parts[1])
+            if val == 0:
+                self.ctx.context_size = None
+                print("[Context size reset to default]", file=sys.stderr)
+            else:
+                if val > MAX_CONTEXT_SIZE:
+                    print(colorize(f"[ERROR] Context size {val} exceeds maximum {MAX_CONTEXT_SIZE}", 'error'), file=sys.stderr)
+                    return
+                self.ctx.context_size = val
+                print(f"[Context size set to {val}]", file=sys.stderr)
+        else:
+            print("[Usage: /contextsizeset <integer> (use 0 for default)]", file=sys.stderr)
+
+    def handle_spawnshell(self) -> Optional[str]:
+        """Spawn an interactive shell session."""
+        if not PTY_AVAILABLE:
+            print("[spawnshell requires Unix-like system with pty]", file=sys.stderr)
+            return None
+
+        print("[Spawning interactive shell. Type 'exit' to return.]", file=sys.stderr)
+
+        try:
+            shell_cmd = os.environ.get('SHELL', '/bin/bash')
+            output_lines = []
+
+            def read_output(fd):
+                try:
+                    while True:
+                        data = os.read(fd, 4096)
+                        if not data:
+                            break
+                        output_lines.append(data.decode('utf-8', errors='replace'))
+                except OSError:
+                    pass
+
+            pty.spawn(shell_cmd, read_output)
+
+        except Exception as e:
+            print(f"[ERROR] Shell exited: {e}", file=sys.stderr)
+
+        return "".join(output_lines).strip()
+
+    # ============================================================================
+    # ============= REFACTORED RUN HANDLERS ====================================
+    # ============================================================================
+
+    def run_init_session(self, stream_enabled: bool = True, debug: bool = False, images: Optional[List[str]] = None) -> None:
+        """Initialize session state from args."""
         self.fetch_models()
         self.ctx.debug_mode = debug
         self.ctx.stream_enabled = stream_enabled
 
-        # Print welcome message using command registry
         print(colorize(f"\n[{self.ctx.backend.upper()} Chat Mode]", 'info'), file=sys.stderr)
         print(format_help_text(compact=True), file=sys.stderr)
         print(colorize("Type /help for details\n", 'muted'), file=sys.stderr)
 
-        # Load startup image if provided via --image
         if images:
             self.ctx.current_images = images
 
-        # Setup readline completer if available
         if READLINE_AVAILABLE:
             try:
                 readline.set_completer_delims(' \t\n')
@@ -2247,7 +2143,6 @@ class ChatLoop:
 
                 readline.set_history_length(1000)
 
-                # Register history save on any exit (normal, Ctrl+C, EOF, exceptions)
                 def save_history():
                     if READLINE_AVAILABLE:
                         try:
@@ -2262,431 +2157,358 @@ class ChatLoop:
         if images:
             print(colorize("[Image loaded for session]", 'success'), file=sys.stderr)
 
-        from urllib.parse import urlparse
-        host_clean = urlparse(self.ctx.base_url).netloc
-        
-        # === ADD THIS: Show context bar and auto-update window size ===
-        # Update context window size on first run or model switch
         if self.ctx.context_window_size == 0:
-            update_context_window_size(self.ctx)
-        
-       
+            refresh_context_window_size(self.ctx)
 
-        while True:
-            try:
-                if self.ctx.backend == "ollama" and self.ctx.context_window_size == 0:
-                    # After printing the model context info from /api/ps:
-                    model_ctx_list = fetch_loaded_models_context_ollama(self.ctx.base_url)
-                    for m, c in model_ctx_list:
-                        #print(f"    model : {m} context : {c}", file=sys.stderr)
-                        # === ADD THIS: Update our context window size ===
-                        if m.startswith(self.ctx.model.split(':')[0]):
-                            if c > 0:
-                                self.ctx.context_window_size = c
-                        # =============================================
-                               
-                # Display context bar
-                #print(f"self.ctx.context_window_size : {self.ctx.context_window_size} self.ctx.current_context_tokens {self.ctx.current_context_tokens}")
-                if self.ctx.context_window_size > 0:
-                    bar = context_bar(self.ctx.current_context_tokens, self.ctx.context_window_size)
-                    print(bar, file=sys.stderr)
-                    
-                    # Warning at high usage
-                    pct = self.ctx.current_context_tokens / self.ctx.context_window_size
-                    if pct >= 0.80:
-                        print(colorize("⚠️  Context almost full! /clear recommended", 'error'), file=sys.stderr)
-                    elif pct >= 0.60:
-                        print(colorize("⚠️  Context getting full", 'warning'), file=sys.stderr)
-                #print(f"self.ctx.context_window_size : {self.ctx.context_window_size} self.ctx.current_context_tokens: {self.ctx.current_context_tokens}")         
-        
-                # Build the dynamic prompt: backend@IPv4/model
-                if self.ctx.model:
-                    prompt_prefix = f"{self.ctx.backend}@{host_clean}/{self.ctx.model}"
-                else:
-                    prompt_prefix = f"{self.ctx.backend}@{host_clean}/(no model selected)"
-                if self.ctx.current_images:
-                    prompt_prefix += colorize("[🖼️]", 'info', is_prompt=True)
+    def run_update_ollama_context(self, host_clean: str) -> None:
+        """Update context window size for Ollama backend."""
+        if self.ctx.backend == "ollama" and self.ctx.context_window_size == 0:
+            model_ctx_list = fetch_loaded_models_context_ollama(self.ctx.base_url)
+            for m, c in model_ctx_list:
+                if m.startswith(self.ctx.model.split(':')[0]):
+                    if c > 0:
+                        self.ctx.context_window_size = c
 
-                full_input = gather_user_input(prompt_prefix)
-                if full_input is None or not full_input.strip():
-                    continue
+    def run_display_context_bar(self) -> None:
+        """Display context bar and warnings."""
+        if self.ctx.context_window_size > 0:
+            bar = context_bar(self.ctx.current_context_tokens, self.ctx.context_window_size)
+            print(bar, file=sys.stderr)
 
-                # If no model selected, only allow /switchmodel command
-                if not self.ctx.model:
-                    if not full_input.startswith('/switchmodel'):
-                        print(colorize("\n[ERROR] No model selected. Use /switchmodel <name> to select a model first.]", 'error'), file=sys.stderr)
-                        continue
+            pct = self.ctx.current_context_tokens / self.ctx.context_window_size
+            if pct >= 0.80:
+                print(colorize("Context almost full! /clear recommended", 'error'), file=sys.stderr)
+            elif pct >= 0.60:
+                print(colorize("Context getting full", 'warning'), file=sys.stderr)
 
-                # Handle exit commands
-                if full_input.lower() in ['exit', 'quit', '/exit', '/quit']:
-                    print(colorize("\n[Goodbye!]", 'info'), file=sys.stderr)
-                    break
-
-                # Handle help command
-                if full_input in ['/?', '/help']:
-                    print(format_help_text(compact=False), file=sys.stderr)
-                    continue
-
-                # Handle stats command
-                if full_input.lower() in ['/stats', '/usage']:
-                    cum = self.ctx.get_cumulative_stats()
-                    print(colorize(f"\n[Usage Summary]", 'info'), file=sys.stderr)
-                    print(f"  Queries: {cum['total_queries']}", file=sys.stderr)
-                    print(f"  Tokens (completion): {cum['total_completion_tokens']:,}", file=sys.stderr)
-                    print(f"  Tokens (prompt): {cum['total_prompt_tokens']:,}", file=sys.stderr)
-                    print(f"  Total tokens: {cum['total_tokens']:,}", file=sys.stderr)
-                    print(f"  Avg throughput: {cum['avg_tps']:.2f} t/s", file=sys.stderr)
-                    print(f"  Avg tokens/query: {cum['avg_tokens_per_query']:.1f}", file=sys.stderr)
-                    print()
-                    if self.ctx.backend == "ollama":
-                        model_ctx_list=fetch_loaded_models_context_ollama(self.ctx.base_url)
-                        for m,c in model_ctx_list:
-                            print(f"    model : {m} context : {c}", file=sys.stderr)
-                    continue
-
-
-                # Handle model listing
-                if full_input.startswith('/listmodel'):
-                    parts = full_input.split(maxsplit=1)
-                    if full_input.strip() == '/listmodelall':
-                        if self.ctx.backend == "ollama":
-                            list_models_ollama(self.ctx.base_url, include_capabilities=True, file=sys.stderr)
-                        else:
-                            # Llama.cpp doesn't have capabilities endpoint, fall back to basic list
-                            self.list_models()
-                    else:
-                        self.list_models(parts[1] if len(parts) > 1 else None)
-                    continue
-
-                # Handle context size
-                if full_input.startswith('/contextsizeset'):
-                    self.set_context_size(full_input)
-                    continue
-
-                # Handle clear command
-                if full_input == '/clear':
-                    print(colorize("[Context memory wiped clean]", 'success'), file=sys.stderr)
-                    self.ctx.reset()
-                    self.ctx.current_context_tokens = 0  # Reset token count
-                    update_context_window_size(self.ctx)
-                    continue
-
-                # Handle image attach/clear command
-                if full_input.startswith('/image'):
-                    parts = full_input.split(maxsplit=1)
-                    if len(parts) < 2 or parts[1].strip() in ('', 'clear', 'none'):
-                        self.ctx.current_images = []
-                        print(colorize("[Image cleared]", 'info'), file=sys.stderr)
-                    else:
-                        img_path = os.path.expanduser(parts[1].strip())
-                        if os.path.isfile(img_path):
-                            img_data = prepare_image_data(img_path)
-                            if img_data:
-                                self.ctx.current_images = [img_data]
-                                print(colorize(f"[Image attached: {os.path.basename(img_path)}]", 'success'), file=sys.stderr)
-                            else:
-                                print(colorize("[Error: Could not encode image]", 'error'), file=sys.stderr)
-                        else:
-                            print(colorize(f"[Error: File not found: {img_path}]", 'error'), file=sys.stderr)
-                    continue
-
-                # Handle dumpcontext command
-                if full_input.startswith('/dumpcontext'):
-                    parts = full_input.split(maxsplit=1)
-                    if len(parts) < 2 or not parts[1].strip():
-                        print(colorize("[Usage: /dumpcontext <filepath>]", 'warning'), file=sys.stderr)
-                        continue
-
-                    dump_path = os.path.expanduser(parts[1].strip())
-                    try:
-                        self.dump_context_to_file(dump_path)
-                        print(colorize(f"[Context dumped to {dump_path}]", 'success'), file=sys.stderr)
-                    except Exception as e:
-                        print(colorize(f"[ERROR] Failed to dump context: {e}", 'error'), file=sys.stderr)
-                    continue
-
-                # Handle debug mode
-                # Handle debug command
-                if full_input.startswith('/debug'):
-                    parts = full_input.split(maxsplit=2)
-                    
-                    if len(parts) == 1 or (len(parts) == 2 and not parts[1].strip()):
-                        # Just '/debug' or '/debug ' - show available categories
-                        print(colorize("\n[Debug Categories - Use /debug <category> <level>]", 'info'), file=sys.stderr)
-                        print("  Levels: off (0), basic (1), verbose (2), trace (3)", file=sys.stderr)
-                        print()
-                        for cat, desc in DebugManager.CATEGORIES.items():
-                            current_level = self.ctx.debug_manager.get_level(cat)
-                            level_name = {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(current_level, str(current_level))
-                            marker = '▶' if current_level > 0 else ' '
-                            print(f"  {marker} {cat:<12} [{level_name:<7}] {desc}", file=sys.stderr)
-                        print()
-                        
-                    elif len(parts) == 2:
-                        arg = parts[1].lower()
-                        
-                        if arg == 'list':
-                            # Same as above but more compact
-                            print(colorize("\n[Debug Categories]", 'info'), file=sys.stderr)
-                            for cat, desc in DebugManager.CATEGORIES.items():
-                                current_level = self.ctx.debug_manager.get_level(cat)
-                                level_name = {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(current_level, str(current_level))
-                                marker = '▶' if current_level > 0 else ' '
-                                print(f"  {marker} {cat:<12} [{level_name}]", file=sys.stderr)
-                            print()
-                        
-                        elif arg == 'status':
-                            # Show only active debug categories
-                            status = self.ctx.debug_manager.get_status()
-                            if any(level > 0 for level in status.values() if isinstance(level, int)):
-                                print(colorize("\n[Active Debug Categories]", 'info'), file=sys.stderr)
-                                for cat, level in status.items():
-                                    if isinstance(level, int) and level > 0:
-                                        level_name = {1: 'basic', 2: 'verbose', 3: 'trace'}.get(level, str(level))
-                                        print(f"  ▶ {cat}: {level_name}", file=sys.stderr)
-                                print()
-                            else:
-                                print(colorize("\n[Debug: No categories active]\n", 'muted'), file=sys.stderr)
-                        
-                        elif arg in ('on', 'off', '0', '1', '2', '3'):
-                            # Legacy support and numeric levels
-                            if arg == 'on':
-                                level = 'verbose'
-                            elif arg == 'off':
-                                level = 'off'
-                            elif arg in ('0', '1', '2', '3'):
-                                level_map = {'0': 'off', '1': 'basic', '2': 'verbose', '3': 'trace'}
-                                level = level_map[arg]
-                            else:
-                                level = arg
-                            
-                            self.ctx.debug_manager.set_level('all', level)
-                            print(colorize(f"\n[Debug: ALL categories → {level}]\n", 'success'), file=sys.stderr)
-                        
-                        else:
-                            # Just a category name with no level - show current level
-                            if arg in DebugManager.CATEGORIES:
-                                current = self.ctx.debug_manager.get_level(arg)
-                                level_name = {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(current, str(current))
-                                desc = DebugManager.CATEGORIES[arg]
-                                print(colorize(f"\n[Debug: {arg} = {level_name}] - {desc}", 'info'), file=sys.stderr)
-                                print("Usage: /debug {} [off|basic|verbose|trace]\n".format(arg), file=sys.stderr)
-                            else:
-                                print(colorize(f"\n[Unknown category: '{arg}']", 'error'), file=sys.stderr)
-                                print(colorize("Use '/debug' to see available categories\n", 'muted'), file=sys.stderr)
-                    
-                    elif len(parts) == 3:
-                        category, level = parts[1].lower(), parts[2].lower()
-                        
-                        if not self.ctx.debug_manager.set_level(category, level):
-                            print(colorize(f"\n[Invalid category '{category}' or level '{level}']", 'error'), file=sys.stderr)
-                            print(colorize("Use '/debug' to see available categories\n", 'muted'), file=sys.stderr)
-                        else:
-                            print(colorize(f"\n[Debug: {category} → {level}]\n", 'success'), file=sys.stderr)
-                    
-                    continue  # Move to next loop iteration
-                
-
-                # Handle thinking control
-                if full_input == '/thinkingoff':
-                    self.ctx.force_no_thinking = True
-                    print(colorize("[Model will skip reasoning phase]", 'warning'), file=sys.stderr)
-                    continue
-                elif full_input == '/thinkingon':
-                    self.ctx.force_no_thinking = False
-                    print(colorize("[Reasoning phase enabled]", 'success'), file=sys.stderr)
-                    continue
-
-                # Handle directory change
-                if full_input.startswith('/cwd'):
-                    parts = full_input.split(maxsplit=1)
-                    if len(parts) > 1:
-                        try:
-                            os.chdir(os.path.expanduser(parts[1]))
-                        except Exception as e:
-                            print(colorize(f"[ERROR] {e}", 'error'), file=sys.stderr)
-                    print(colorize(f"[Current directory: {os.getcwd()}]", 'info'), file=sys.stderr)
-                    continue
-
-                # Handle ls command
-                if full_input.startswith('/ls'):
-                    try:
-                        subprocess.run("ls" + full_input[3:], shell=True, check=False)
-                    except Exception as e:
-                        print(colorize(f"[ERROR] {e}", 'error'), file=sys.stderr)
-                    continue
-
-                # Handle model switch
-                # with ollama this will result in sending the prompt token to preload the model
-                if full_input.startswith('/switchmodel'):
-                    parts = full_input.split()
-                    if len(parts) > 1 and parts[1].strip():
-                        new_model = parts[1].strip()
-                        if self.ctx.backend == "ollama":
-                            model_exists = is_available_ollama_model(self.ctx.base_url, new_model)
-                        else:
-                            model_exists = is_available_llamacpp_model(self.ctx.base_url, new_model)
-                        
-                        if model_exists:
-                            self.ctx.model = new_model
-                            self.ctx.context_window_size = 0
-                            self.ctx.current_context_tokens = 0
-
-                            # Display model size before loading
-                            if self.ctx.backend == "ollama":
-                                # Get model size from /api/tags (it's available there, not in /api/show)
-                                all_models = fetch_models_ollama(self.ctx.base_url)
-                                model_size = 0
-                                for m in all_models:
-                                    if m.get('name') == new_model:
-                                        model_size = m.get('size', 0)
-                                        break
-                                
-                                if model_size:
-                                    size_str = parse_size(model_size)
-                                    print(colorize(f"[Loading   '{new_model}' ({size_str})]", 'muted'), file=sys.stderr)
-                                else:
-                                    print(colorize(f"[Loading   '{new_model}']", 'muted'), file=sys.stderr)
-                                
-                                # force model preload with ollama to reduce the wait later
-                                # only the prompt will be loaded
-                                ping_messages = [{"role": "system", "content": self.ctx.system_prompt}]
-                                res_ping=self.query_handler.query_sync(ping_messages, new_model, stream_enabled=False)
-
-                                #print(res_ping)
-                                # update the number of token with the new prompt token which has been submitted to the model
-                                # full chat history will be sent when user type a message
-                                ptokens = res_ping.get("prompt_eval_count", 0)
-                                if ptokens > 0:
-                                    self.ctx.current_context_tokens = ptokens
-
-                                    
-
-
-                            print(colorize(f"[Switched to '{new_model}']", 'success'), file=sys.stderr)
-                            continue
-                        else:
-                            print(colorize(f"[ERROR] Model '{new_model}' not found on server", 'error'), file=sys.stderr)
-                            print(colorize("Use /listmodel to see available models", 'muted'), file=sys.stderr)
-                    else:
-                        print(colorize("[ERROR] Usage: /switchmodel <model_name>", 'error'), file=sys.stderr)
-
-                # Handle spawnshell command
-                if full_input == '/spawnshell':
-                    self.handle_spawnshell()
-                    continue
-
-                # Process inline commands and build message
-                final_content = process_inline_commands(full_input)
-                if not final_content.strip():
-                    continue
-
-                # Track conversation history within ChatLoop (not in shared context)
-                if not hasattr(self, 'messages'):
-                    self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
-                self.messages.append({'role': 'user', 'content': final_content})
-
-                payload_messages = list(self.messages)
-
-                if self.ctx.force_no_thinking:
-                    payload_messages.append({
-                        'role': 'system',
-                        'content': 'Do NOT output reasoning or thoughts'
-                    })
-
-                if payload_messages[-1]['role'] == 'user':
-                    # Guard: ensure model is selected before querying
-                    if not self.ctx.model:
-                        print(colorize("\n[ERROR] No model selected. Use /switchmodel <name> to select a model first.]", 'error'), file=sys.stderr)
-                        continue
-                    response = self.query_handler.query_stream(
-                        payload_messages,
-                        self.ctx.model,
-                        stream_enabled=self.ctx.stream_enabled,
-                        debug=self.ctx.debug_mode,
-                        show_thinking=(not self.ctx.force_no_thinking),
-                        context_size=self.ctx.context_size,
-                        images=self.ctx.current_images
-                    )
-
-                    if response:
-                        self.messages.append({'role': 'assistant', 'content': response})
-                        print()
-
-            except KeyboardInterrupt:
-                print(f"\n[Interrupted]", file=sys.stderr)
-                continue
-
-            except Exception as e:
-                if isinstance(e, EOFError):
-                    print(f"[EOF - Goodbye!]", file=sys.stderr)
-                    break
-                else:
-                    print(colorize(f"[ERROR] ChatLoop->run {e}", 'error'), file=sys.stderr)
-
-        return
-
-    def list_models(self, filter_arg=None):
-        if self.ctx.backend == "ollama":
-            list_models_ollama(self.ctx.base_url, filter_arg, file=sys.stdout)
+    def run_build_prompt(self, host_clean: str) -> str:
+        """Build the dynamic prompt prefix."""
+        if self.ctx.model:
+            prompt_prefix = f"{self.ctx.backend}@{host_clean}/{self.ctx.model}"
         else:
-            models = fetch_models_llamacpp(self.ctx.base_url)
-            if not models:
-                print(colorize(f"\n[No models found via {self.ctx.backend} API]", 'warning'), file=sys.stderr)
-                return
-            models.sort(key=lambda x: x.get('name', ''))
-            header = f"{'NAME':<50} | {'OWNED BY'}"
-            print(colorize(header, 'muted'))
-            print(colorize("-" * len(header), 'muted'))
-            for m in models:
-                owned_by = m.get('owned_by', 'N/A')
-                print(f"{m['name']:<50} | {owned_by}")
+            prompt_prefix = f"{self.ctx.backend}@{host_clean}/(no model selected)"
+        if self.ctx.current_images:
+            prompt_prefix += colorize("[img]", 'info')
+        return prompt_prefix
+
+    def run_handle_exit(self, full_input: str) -> Optional[bool]:
+        """Handle exit/quit commands. Returns True to break loop."""
+        if full_input.lower() in ['exit', 'quit', '/exit', '/quit']:
+            print(colorize("\n[Goodbye!]", 'info'), file=sys.stderr)
+            return True
+        return None
+
+    def run_handle_help(self, full_input: str) -> Optional[bool]:
+        """Handle /help command. Returns False to continue loop."""
+        if full_input in ['/?', '/help']:
+            print(format_help_text(compact=False), file=sys.stderr)
+            return False
+        return None
+
+    def run_handle_stats(self, full_input: str) -> Optional[bool]:
+        """Handle /stats and /usage commands."""
+        if full_input.lower() in ['/stats', '/usage']:
+            cum = self.ctx.get_cumulative_stats()
+            print(colorize(f"\n[Usage Summary]", 'info'), file=sys.stderr)
+            print(f"  Queries: {cum['total_queries']}", file=sys.stderr)
+            print(f"  Tokens (completion): {cum['total_completion_tokens']:,}", file=sys.stderr)
+            print(f"  Tokens (prompt): {cum['total_prompt_tokens']:,}", file=sys.stderr)
+            print(f"  Total tokens: {cum['total_tokens']:,}", file=sys.stderr)
+            print(f"  Avg throughput: {cum['avg_tps']:.2f} t/s", file=sys.stderr)
+            print(f"  Avg tokens/query: {cum['avg_tokens_per_query']:.1f}", file=sys.stderr)
             print()
+            if self.ctx.backend == "ollama":
+                model_ctx_list = fetch_loaded_models_context_ollama(self.ctx.base_url)
+                for m, c in model_ctx_list:
+                    print(f"    model : {m} context : {c}", file=sys.stderr)
+            return False
+        return None
 
-    def set_context_size(self, full_input):
-        parts = full_input.split()
-        if len(parts) > 1 and parts[1].isdigit():
-            val = int(parts[1])
-            if val == 0:
-                self.ctx.context_size = None
-                print("[Context size reset to default]", file=sys.stderr)
+    def run_handle_listmodel(self, full_input: str) -> Optional[bool]:
+        """Handle /listmodel and /listmodelall commands."""
+        if full_input.startswith('/listmodel'):
+            parts = full_input.split(maxsplit=1)
+            if full_input.strip() == '/listmodelall':
+                if self.ctx.backend == "ollama":
+                    list_models_ollama(self.ctx.base_url, include_capabilities=True, file=sys.stderr)
+                else:
+                    self.list_models()
             else:
-                if val > MAX_CONTEXT_SIZE:
-                    print(colorize(f"[ERROR] Context size {val} exceeds maximum {MAX_CONTEXT_SIZE}", 'error'), file=sys.stderr)
-                    return
-                self.ctx.context_size = val
-                print(f"[Context size set to {val}]", file=sys.stderr)
-        else:
-            print("[Usage: /contextsizeset <integer> (use 0 for default)]", file=sys.stderr)
+                self.list_models(parts[1] if len(parts) > 1 else None)
+            return False
+        return None
 
-    def handle_spawnshell(self):
-        """Spawn an interactive shell session."""
-        if not PTY_AVAILABLE:
-            print("[spawnshell requires Unix-like system with pty]", file=sys.stderr)
-            return None
+    def run_handle_context_size(self, full_input: str) -> Optional[bool]:
+        """Handle /contextsizeset command."""
+        if full_input.startswith('/contextsizeset'):
+            self.set_context_size(full_input)
+            return False
+        return None
 
-        print("[Spawning interactive shell. Type 'exit' to return.]", file=sys.stderr)
+    def run_handle_clear(self, full_input: str) -> Optional[bool]:
+        """Handle /clear command."""
+        if full_input == '/clear':
+            print(colorize("[Context memory wiped clean]", 'success'), file=sys.stderr)
+            self.ctx.reset()
+            refresh_context_window_size(self.ctx)
+            return False
+        return None
 
-        try:
-            shell_cmd = os.environ.get('SHELL', '/bin/bash')
-            output_lines = []
+    def run_handle_image(self, full_input: str) -> Optional[bool]:
+        """Handle /image command for attaching or clearing images."""
+        if full_input.startswith('/image'):
+            parts = full_input.split(maxsplit=1)
+            if len(parts) < 2 or parts[1].strip() in ('', 'clear', 'none'):
+                self.ctx.current_images = []
+                print(colorize("[Image cleared]", 'info'), file=sys.stderr)
+            else:
+                img_path = os.path.expanduser(parts[1].strip())
+                if os.path.isfile(img_path):
+                    img_data = prepare_image_data(img_path)
+                    if img_data:
+                        self.ctx.current_images = [img_data]
+                        print(colorize(f"[Image attached: {os.path.basename(img_path)}]", 'success'), file=sys.stderr)
+                    else:
+                        print(colorize("[Error: Could not encode image]", 'error'), file=sys.stderr)
+                else:
+                    print(colorize(f"[Error: File not found: {img_path}]", 'error'), file=sys.stderr)
+            return False
+        return None
 
-            def read_output(fd):
+    def run_handle_dumpcontext(self, full_input: str) -> Optional[bool]:
+        """Handle /dumpcontext command."""
+        if full_input.startswith('/dumpcontext'):
+            parts = full_input.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                print(colorize("[Usage: /dumpcontext <filepath>]", 'warning'), file=sys.stderr)
+                return False
+
+            dump_path = os.path.expanduser(parts[1].strip())
+            try:
+                self.dump_context_to_file(dump_path)
+                print(colorize(f"[Context dumped to {dump_path}]", 'success'), file=sys.stderr)
+            except ValueError as e:
+                print(colorize(f"[ERROR] {e}", 'error'), file=sys.stderr)
+            except Exception as e:
+                print(colorize(f"[ERROR] Failed to dump context: {e}", 'error'), file=sys.stderr)
+            return False
+        return None
+
+    def run_handle_debug(self, full_input: str) -> Optional[bool]:
+        """Handle /debug command."""
+        if full_input.startswith('/debug'):
+            parts = full_input.split(maxsplit=2)
+
+            if len(parts) == 1 or (len(parts) == 2 and not parts[1].strip()):
+                print(colorize("\n[Debug Categories - Use /debug <category> <level>]", 'info'), file=sys.stderr)
+                print("  Levels: off (0), basic (1), verbose (2), trace (3)", file=sys.stderr)
+                print()
+                for cat, desc in DebugManager.CATEGORIES.items():
+                    current_level = self.ctx.debug_manager.get_level(cat)
+                    level_name = {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(current_level, str(current_level))
+                    marker = '>' if current_level > 0 else ' '
+                    print(f"  {marker} {cat:<12} [{level_name:<7}] {desc}", file=sys.stderr)
+                print()
+
+            elif len(parts) == 2:
+                arg = parts[1].lower()
+
+                if arg == 'list':
+                    print(colorize("\n[Debug Categories]", 'info'), file=sys.stderr)
+                    for cat, desc in DebugManager.CATEGORIES.items():
+                        current_level = self.ctx.debug_manager.get_level(cat)
+                        level_name = {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(current_level, str(current_level))
+                        marker = '>' if current_level > 0 else ' '
+                        print(f"  {marker} {cat:<12} [{level_name}]", file=sys.stderr)
+                    print()
+
+                elif arg == 'status':
+                    status = self.ctx.debug_manager.get_status()
+                    if any(level > 0 for level in status.values() if isinstance(level, int)):
+                        print(colorize("\n[Active Debug Categories]", 'info'), file=sys.stderr)
+                        for cat, level in status.items():
+                            if isinstance(level, int) and level > 0:
+                                level_name = {1: 'basic', 2: 'verbose', 3: 'trace'}.get(level, str(level))
+                                print(f"  > {cat}: {level_name}", file=sys.stderr)
+                        print()
+                    else:
+                        print(colorize("\n[Debug: No categories active]\n", 'muted'), file=sys.stderr)
+
+                elif arg in ('on', 'off', '0', '1', '2', '3'):
+                    if arg == 'on':
+                        level = 'verbose'
+                    elif arg == 'off':
+                        level = 'off'
+                    elif arg in ('0', '1', '2', '3'):
+                        level_map = {'0': 'off', '1': 'basic', '2': 'verbose', '3': 'trace'}
+                        level = level_map[arg]
+                    else:
+                        level = arg
+
+                    self.ctx.debug_manager.set_level('all', level)
+                    print(colorize(f"\n[Debug: ALL categories -> {level}]\n", 'success'), file=sys.stderr)
+
+                else:
+                    if arg in DebugManager.CATEGORIES:
+                        current = self.ctx.debug_manager.get_level(arg)
+                        level_name = {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(current, str(current))
+                        desc = DebugManager.CATEGORIES[arg]
+                        print(colorize(f"\n[Debug: {arg} = {level_name}] - {desc}", 'info'), file=sys.stderr)
+                        print("Usage: /debug {} [off|basic|verbose|trace]\n".format(arg), file=sys.stderr)
+                    else:
+                        print(colorize(f"\n[Unknown category: '{arg}']", 'error'), file=sys.stderr)
+                        print(colorize("Use '/debug' to see available categories\n", 'muted'), file=sys.stderr)
+
+            elif len(parts) == 3:
+                category, level = parts[1].lower(), parts[2].lower()
+
+                if not self.ctx.debug_manager.set_level(category, level):
+                    print(colorize(f"\n[Invalid category '{category}' or level '{level}']", 'error'), file=sys.stderr)
+                    print(colorize("Use '/debug' to see available categories\n", 'muted'), file=sys.stderr)
+                else:
+                    print(colorize(f"\n[Debug: {category} -> {level}]\n", 'success'), file=sys.stderr)
+
+            return False
+        return None
+
+    def run_handle_thinking(self, full_input: str) -> Optional[bool]:
+        """Handle /thinkingon and /thinkingoff commands."""
+        if full_input == '/thinkingoff':
+            self.ctx.force_no_thinking = True
+            print(colorize("[Model will skip reasoning phase]", 'warning'), file=sys.stderr)
+            return False
+        elif full_input == '/thinkingon':
+            self.ctx.force_no_thinking = False
+            print(colorize("[Reasoning phase enabled]", 'success'), file=sys.stderr)
+            return False
+        return None
+
+    def run_handle_cwd(self, full_input: str) -> Optional[bool]:
+        """Handle /cwd command."""
+        if full_input.startswith('/cwd'):
+            parts = full_input.split(maxsplit=1)
+            if len(parts) > 1:
                 try:
-                    while True:
-                        data = os.read(fd, 4096)
-                        if not data:
-                            break
-                        output_lines.extend(data.decode('utf-8', errors='replace'))
-                except OSError:
-                    pass
+                    os.chdir(os.path.expanduser(parts[1]))
+                except Exception as e:
+                    print(colorize(f"[ERROR] {e}", 'error'), file=sys.stderr)
+            print(colorize(f"[Current directory: {os.getcwd()}]", 'info'), file=sys.stderr)
+            return False
+        return None
 
-            pty.spawn(shell_cmd, read_output)
+    def run_handle_ls(self, full_input: str) -> Optional[bool]:
+        """Handle /ls command."""
+        if full_input.startswith('/ls'):
+            try:
+                args_part = full_input[3:].strip()
+                if args_part:
+                    ls_args = shlex.split(args_part)
+                    subprocess.run(['ls'] + ls_args, check=False)
+                else:
+                    subprocess.run(['ls'], check=False)
+            except Exception as e:
+                print(colorize(f"[ERROR] {e}", 'error'), file=sys.stderr)
+            return False
+        return None
 
-        except Exception as e:
-            print(f"[ERROR] Shell exited: {e}", file=sys.stderr)
+    def run_handle_switchmodel(self, full_input: str) -> Optional[bool]:
+        """Handle /switchmodel command."""
+        if full_input.startswith('/switchmodel'):
+            parts = full_input.split()
+            if len(parts) > 1 and parts[1].strip():
+                new_model = parts[1].strip()
+                if self.ctx.backend == "ollama":
+                    model_exists = is_available_ollama_model(self.ctx.base_url, new_model)
+                else:
+                    model_exists = is_available_llamacpp_model(self.ctx.base_url, new_model)
 
-        return "".join(output_lines).strip()
+                if model_exists:
+                    self.ctx.model = new_model
+                    self.ctx.context_window_size = 0
+
+                    if hasattr(self, 'messages') and self.messages:
+                        self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
+                    else:
+                        self.ctx.current_context_tokens = 0
+
+                    if self.ctx.backend == "ollama":
+                        all_models = fetch_models_ollama(self.ctx.base_url)
+                        model_size = 0
+                        for m in all_models:
+                            if m.get('name') == new_model:
+                                model_size = m.get('size', 0)
+                                break
+
+                        if model_size:
+                            size_str = parse_size(model_size)
+                            print(colorize(f"[Loading   '{new_model}' ({size_str})]", 'muted'), file=sys.stderr)
+                        else:
+                            print(colorize(f"[Loading   '{new_model}']", 'muted'), file=sys.stderr)
+
+                    if hasattr(self, 'messages') and self.messages:
+                        ping_messages = list(self.messages)
+                    else:
+                        ping_messages = [{"role": "system", "content": self.ctx.system_prompt}]
+                    res_ping = self.query_handler.query_sync(ping_messages, new_model, stream_enabled=False)
+
+                    ptokens = res_ping.get("prompt_eval_count", 0)
+                    if ptokens > 0:
+                        self.ctx.current_context_tokens = ptokens
+
+                    print(colorize(f"[Switched to '{new_model}']", 'success'), file=sys.stderr)
+                    return False
+                else:
+                    print(colorize(f"[ERROR] Model '{new_model}' not found on server", 'error'), file=sys.stderr)
+                    print(colorize("Use /listmodel to see available models", 'muted'), file=sys.stderr)
+                    return False
+            else:
+                print(colorize("[ERROR] Usage: /switchmodel <model_name>", 'error'), file=sys.stderr)
+                return False
+        return None
+
+    def run_handle_spawnshell(self, full_input: str) -> Optional[bool]:
+        """Handle /spawnshell command."""
+        if full_input == '/spawnshell':
+            self.handle_spawnshell()
+            return False
+        return None
+
+    def run_process_query(self, full_input: str) -> None:
+        """Process regular user query (non-command input)."""
+        final_content = process_inline_commands(full_input)
+        if not final_content.strip():
+            return
+
+        if not hasattr(self, 'messages'):
+            self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
+        self.messages.append({'role': 'user', 'content': final_content})
+
+        payload_messages = list(self.messages)
+
+        if self.ctx.force_no_thinking:
+            payload_messages.append({
+                'role': 'system',
+                'content': 'Do NOT output reasoning or thoughts'
+            })
+
+        if payload_messages[-1]['role'] == 'user':
+            if not self.ctx.model:
+                print(colorize("\n[ERROR] No model selected. Use /switchmodel <name> to select a model first.", 'error'), file=sys.stderr)
+                return
+
+            response = self.query_handler.query_stream(
+                payload_messages,
+                self.ctx.model,
+                stream_enabled=self.ctx.stream_enabled,
+                debug=self.ctx.debug_mode,
+                show_thinking=(not self.ctx.force_no_thinking),
+                context_size=self.ctx.context_size,
+                images=self.ctx.current_images
+            )
+
+            if response:
+                self.messages.append({'role': 'assistant', 'content': response})
+                print()
 
 
 # ============================================================================
@@ -2885,7 +2707,7 @@ def fetch_loaded_models_ollama(base_url):
     """Fetch models currently loaded in memory via Ollama /api/ps."""
     try:
         url = f"{base_url}/api/ps"
-        with urlopen(Request(url, headers={'User-Agent': 'Mozilla/5.0'})) as response:
+        with _request_with_retry(Request(url, headers={'User-Agent': 'Mozilla/5.0'})) as response:
             data = json.loads(response.read().decode('utf-8'))
             return data.get('models', [])
     except Exception:
@@ -2893,7 +2715,7 @@ def fetch_loaded_models_ollama(base_url):
 
 def fetch_loaded_models_context_ollama(base_url: str) -> list[tuple[str, int]]:
     """
-    Query Ollama `/api/ps` and return a list of (model_name, context_length).
+    Query Ollama /api/ps and return a list of (model_name, context_length).
 
     Example output:
         [ ("nemotron-cascade-2:30b", 131072),
@@ -2901,7 +2723,7 @@ def fetch_loaded_models_context_ollama(base_url: str) -> list[tuple[str, int]]:
     """
     try:
         url = f"{base_url}/api/ps"
-        with urlopen(
+        with _request_with_retry(
             Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         ) as response:
             data = json.loads(response.read().decode('utf-8'))
@@ -2919,7 +2741,7 @@ def check_backend_with_head(url, server_marker):
     """Attempt HEAD request to URL and check for server header."""
     try:
         request = Request(url, method='HEAD')
-        with urlopen(request, timeout=1.0) as response:
+        with _request_with_retry(request, timeout=1.0) as response:
             server_header = response.headers.get('Server', '').lower()
             return server_marker.lower() in server_header
     except (HTTPError, URLError, OSError, TimeoutError, Exception):
@@ -2928,14 +2750,13 @@ def check_backend_with_head(url, server_marker):
 
 
 def check_backend_with_get(url, server_marker):
-    """Attempt HEAD request to URL and check for server header."""
+    """Attempt GET request to URL and check for server marker."""
     try:
         request = Request(url, method='GET')
-        with urlopen(request, timeout=1.0) as response:
+        with _request_with_retry(request, timeout=1.0) as response:
             my_response = str(response.read())
             my_response = my_response.lower()
-            #print(my_response)
-            if "ollama" in my_response:
+            if server_marker.lower() in my_response:
                 return True
     except (HTTPError, URLError, OSError, TimeoutError, Exception):
         return False
@@ -3010,7 +2831,7 @@ def load_saved_backends():
                 if isinstance(data, list):
                     return data
         except Exception:
-            pass
+            sys.stderr.write(colorize("[WARNING] Failed to load saved backend config\n", 'warning'))
     return []
 
 def save_backend_config(backend, host):
@@ -3160,25 +2981,17 @@ def main():
                        help='Color theme for output')
     parser.add_argument('--no-color', action="store_true",
                        help='Disable colored output')
+    parser.add_argument('--shell-timeout', type=int, default=5,
+                       help='Timeout in seconds for shell commands (default: 5)')
 
     # Parse arguments
     args = parser.parse_args()
 
     # Initialize theme system
-    global ACTIVE_THEME
-    theme_to_use = "default"
     if args.no_color:
         os.environ['NO_COLOR'] = '1'
-        theme_to_use = "minimal"
     elif args.theme is not None:
-        theme_to_use = args.theme
-    elif os.environ.get('OLLAMAQUERY_THEME'):
-        theme_to_use = os.environ.get('OLLAMAQUERY_THEME')
-        # Ensure we have a string value
-        if theme_to_use is None:
-            theme_to_use = "default"
-    
-    ACTIVE_THEME = get_theme(theme_to_use)
+        os.environ['OLLAMAQUERY_THEME'] = args.theme
     if args.prompt:
         active_prompt = args.prompt
     elif args.profile:
@@ -3212,12 +3025,11 @@ def main():
             target_model = loaded_models[0]['name']
             sys.stderr.write(colorize(f"[INFO] Auto-selected active model in memory: '{target_model}'\n", 'success'))
         else:
-            # No models loaded - fetch all available models for display
+            # No models loaded - tell user to use /listmodel
             all_models = fetch_models_ollama(base_url)
             if all_models:
                 target_model = ""  # Signal: no model pre-loaded, user must pick
-                print(colorize("\n[No model loaded in memory. Available models:]", 'info'), file=sys.stderr)
-                list_models_ollama(base_url, filter_arg=None, include_capabilities=False, file=sys.stderr)
+                print(colorize("\n[No model loaded. Use /listmodel to see available models.]", 'info'), file=sys.stderr)
             else:
                 sys.stderr.write(colorize("[ERROR] No models available on Ollama server.\n", 'error'))
                 sys.exit(1)
@@ -3228,12 +3040,11 @@ def main():
             target_model = available_models[0]['name']
             sys.stderr.write(colorize(f"[INFO] Auto-selected hosted model: '{target_model}'\n", 'success'))
         else:
-            # No models available - fetch for display
+            # No models available - tell user to use /listmodel
             all_models = fetch_models_llamacpp(base_url)
             if all_models:
                 target_model = ""  # Signal: no model pre-loaded, user must pick
-                print(colorize("\n[No model loaded in memory. Available models:]", 'info'), file=sys.stderr)
-                list_models_llamacpp(base_url, filter_arg=None)
+                print(colorize("\n[No model loaded. Use /listmodel to see available models.]", 'info'), file=sys.stderr)
             else:
                 sys.stderr.write(colorize("[ERROR] No models available on Llama.cpp server.\n", 'error'))
                 sys.exit(1)
@@ -3257,7 +3068,7 @@ def main():
         sys.exit(0)
 
     # Handle model info operations
-    if args.show or args.show_details:
+    if args.show:
         show_model_info(base_url, target_model, args)
     elif args.show_details:
         show_model_details(base_url, target_model, args)
@@ -3269,6 +3080,7 @@ def main():
         ctx.backend = backend
         ctx.model = target_model
         ctx.system_prompt = args.prompt
+        ctx.shell_timeout = args.shell_timeout
 
         image_data = prepare_image_data(args.image) if args.image else None
         images_list = [image_data] if image_data else None
@@ -3311,16 +3123,16 @@ def main():
                     {'role': 'user', 'content': content}
                 ]
 
+                images_list = None
                 if args.image:
                     image_data = prepare_image_data(args.image)
                     if image_data:
                         images_list = [image_data]
-                else:
-                    images_list = None
 
                 query_handler = ModelQuery(context=CommandContext())
                 query_handler.ctx.base_url = base_url
                 query_handler.ctx.backend = backend
+                query_handler.ctx.shell_timeout = args.shell_timeout
 
                 response = query_handler.query_sync(
                     messages,
@@ -3331,9 +3143,10 @@ def main():
                     images=images_list
                 )
 
+                output_text = response.get('message', {}).get('content', '') if isinstance(response, dict) else str(response)
                 output_path = os.path.join(args.output_dir, filename + '.output')
                 with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write(response)
+                    f.write(output_text)
 
             sys.exit(0)
 
@@ -3360,6 +3173,7 @@ def main():
             query_handler = ModelQuery(context=CommandContext())
             query_handler.ctx.base_url = base_url
             query_handler.ctx.backend = backend
+            query_handler.ctx.shell_timeout = args.shell_timeout
             should_stream = not args.no_stream and sys.stdout.isatty()
 
             response = query_handler.query_sync(
@@ -3368,15 +3182,17 @@ def main():
                 context_size=None,
                 show_thinking=True,
                 debug=args.debug,
-                images=image_data
+                images=[image_data] if image_data else None
             )
 
             if args.output:
+                content = response.get('message', {}).get('content', '') if isinstance(response, dict) else str(response)
                 with open(args.output, 'w', encoding='utf-8') as f:
-                    f.write(response)
+                    f.write(content)
                 print(f"[Success: Output saved to {args.output}]", file=sys.stderr)
             elif not should_stream and response:
-                print(response)
+                content = response.get('message', {}).get('content', '') if isinstance(response, dict) else str(response)
+                print(content)
 
         # Error handling for missing input
         if not (args.chat or args.input_text or args.input_file or
