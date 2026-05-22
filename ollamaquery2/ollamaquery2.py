@@ -17,6 +17,8 @@ import shlex
 import threading
 import time
 import traceback
+import glob
+import difflib
 from datetime import datetime
 
 from html.parser import HTMLParser
@@ -279,6 +281,20 @@ COMMANDS = {
         'description': 'Configure per-category debug levels',
         'usage': '/debug <category> <level> | /debug list | /debug status',
         'handler': 'handle_debug_command'
+    },
+    'agentic': {
+        'aliases': ['/agentic'],
+        'category': 'Settings',
+        'description': 'Configure agentic mode and sub-options',
+        'usage': '/agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|iterations|timeout|status]',
+        'handler': None
+    },
+    'listtool': {
+        'aliases': ['/listtool'],
+        'category': 'Model',
+        'description': 'List available agentic tools',
+        'usage': '/listtool',
+        'handler': None
     },
     # === I/O Operations ===
     'image': {
@@ -820,6 +836,17 @@ class CommandContext:
         self.total_chars_generated: int = 0
         self.query_history: list = []
         self.max_history: int = 50
+        # Agentic mode
+        self.agentic_mode: bool = False
+        self.auto_confirm: bool = False
+        self.agentic_verbose: bool = False
+        self.agentic_show_thinking: bool = False
+        self.agentic_trace: bool = False
+        self.agentic_logging: bool = True
+        self.agentic_max_iterations: int = 10
+        self.agentic_step_timeout: int = 120
+        self.lazy_tool: bool = False
+        
         # Context window tracking
         self.context_window_size: int = 0  # Will be fetched from server
         self.current_context_tokens: int = 0  # Updated after each query
@@ -870,6 +897,15 @@ class CommandContext:
         """Create a ModelQuery using this context's connection info."""
         return ModelQuery(self.base_url, self.backend)
 
+    def create_executor(self):
+        """Create an Executor for agentic tool execution."""
+        return Executor()
+
+    def create_tool_registry(self):
+        """Create a ToolRegistry for agentic mode."""
+        executor = self.create_executor()
+        return ToolRegistry(ctx=self, executor=executor)
+
     def update_stats(self, tokens: int, prompt_tokens: int, time_spent: float, chars: int):
         """Update cumulative statistics."""
         self.total_queries += 1
@@ -917,6 +953,420 @@ class CommandContext:
             total += self.estimate_tokens(content)
             total += 2
         return total
+
+
+# ============================================================================
+# ============= AGENTIC SYSTEM PROMPT          ================================
+# ============================================================================
+
+AGENTIC_SYSTEM_PROMPT = """You are a capable AI agent with access to tools. You operate in a terminal environment.
+
+## Your capabilities
+You have tools that let you read/write files, execute Python code, fetch URLs, search files, and apply diffs. Use them whenever you need information from the outside world.
+
+## How to use tools
+When you need to perform an action, respond with a JSON object:
+
+{"tool": "tool_name", "arguments": {"arg1": "value1", ...}}
+
+After the tool runs, you will receive the result as an observation. Use it to decide the next step.
+
+## ReAct protocol (Think → Act → Observe → Answer)
+1. **Think** about what the user needs and which tool can help
+2. **Act** by outputting a JSON tool call
+3. **Observe** the tool result (it will be shown to you)
+4. **Repeat** if more actions are needed
+5. When you have the answer, respond in plain text (no JSON) — that is your final answer
+
+## CRITICAL rules
+- When you need to use a tool, output ONLY the JSON tool call — no surrounding text, no explanations, no markdown fences. If you add text before the JSON, the system will treat it as a final answer and ignore the tool call.
+- Do NOT chain multiple commands with `&&`, `|`, `;` etc. Each tool call runs in isolation. Break multi-step tasks into separate sequential tool calls.
+- Be precise with file paths. If `write_file` creates a file in a subdirectory, use the same path when compiling or reading it later.
+- Each tool call must be valid JSON with exactly the required arguments.
+- You may make multiple tool calls sequentially — each result feeds back in.
+- When you have the final answer, respond in plain text (no JSON). Do NOT include tool call JSON in your plain text answer — it will be mistaken for a real tool call.
+- Format your final answer with markdown for terminal readability (code blocks, lists, headings).
+- Mirror the user's language — if they write in French, reply in French."""
+
+
+# ============================================================================
+# ============= EXECUTOR (CONTAINER/HOST)  ===================================
+# ============================================================================
+# ============= EXECUTOR (CONTAINER/HOST)  ===================================
+# ============================================================================
+
+class Executor:
+    """Runs shell commands on host or inside a container sandbox."""
+
+    def __init__(self, mode="host", container_runtime=None, container_image=None):
+        self.mode = mode
+        self.runtime = container_runtime or os.environ.get("OLLAMAQUERY_CONTAINER_RT", "podman")
+        self.image = container_image or os.environ.get("OLLAMAQUERY_CONTAINER_IMAGE",
+                                                       "docker.io/library/python:3.12-alpine")
+
+    def run(self, command: str, timeout: int = 15) -> dict:
+        if self.mode == "container":
+            cwd_bind = os.getcwd()
+            wrapped = (
+                f"{self.runtime} run --rm "
+                f"-v {shlex.quote(cwd_bind)}:/workspace:Z "
+                f"-w /workspace "
+                f"{shlex.quote(self.image)} "
+                f"sh -c {shlex.quote(command)}"
+            )
+            return self._run_shell(wrapped, timeout)
+        return self._run_shell(command, timeout)
+
+    def _run_shell(self, command: str, timeout: int) -> dict:
+        if not validate_shell_command_safety(command, max_length=1000):
+            return {"stdout": "", "stderr": "Command rejected by safety validator", "returncode": -1}
+        try:
+            args_list = shlex.split(command)
+            proc = subprocess.run(
+                args_list, shell=False,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=timeout
+            )
+            return {"stdout": proc.stdout, "stderr": proc.stderr, "returncode": proc.returncode}
+        except subprocess.TimeoutExpired:
+            return {"stdout": "", "stderr": f"Timed out after {timeout}s", "returncode": -1}
+        except Exception as e:
+            return {"stdout": "", "stderr": str(e), "returncode": -1}
+
+
+# ============================================================================
+# ============= AGENTIC TOOL DEFINITIONS      ================================
+# ============================================================================
+
+AGENTIC_TOOL_DEFS = {
+    "fetch_url": {
+        "description": "Fetch a URL and return its content as plain text.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Full URL (http/https only)"}
+            },
+            "required": ["url"]
+        }
+    },
+    "read_file": {
+        "description": "Read a file from disk (text, max 100KB). Path relative to CWD.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file": {"type": "string", "description": "File path relative to CWD"}
+            },
+            "required": ["file"]
+        }
+    },
+    "write_file": {
+        "description": "Write text content to a file. Creates subdirectories if needed. Overwrites existing files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file": {"type": "string", "description": "File path relative to CWD"},
+                "content": {"type": "string", "description": "Text content to write"}
+            },
+            "required": ["file", "content"]
+        }
+    },
+    "list_directory": {
+        "description": "List files and directories. Directories have a trailing '/'.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Directory to list (default: '.')"}
+            },
+            "required": ["path"]
+        }
+    },
+    "glob": {
+        "description": "Find files matching a glob pattern (e.g. '**/*.py').",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob pattern to match"}
+            },
+            "required": ["pattern"]
+        }
+    },
+    "run_python": {
+        "description": "Execute Python 3 code (inline or from a file). Returns stdout/stderr. Timeout: 120s.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Inline Python code to run"},
+                "file": {"type": "string", "description": "Path to .py file to run"}
+            }
+        }
+    },
+    "run_command": {
+        "description": "Execute a shell command (compiler, build tool, etc.). Returns stdout/stderr. Timeout: 120s.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command to execute"}
+            },
+            "required": ["command"]
+        }
+    },
+    "diff": {
+        "description": "Generate a unified diff between two files. Pure Python.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file1": {"type": "string", "description": "Original file"},
+                "file2": {"type": "string", "description": "Modified file"},
+                "label1": {"type": "string", "description": "Optional label for file1"},
+                "label2": {"type": "string", "description": "Optional label for file2"}
+            },
+            "required": ["file1", "file2"]
+        }
+    },
+    "patch": {
+        "description": "Apply a unified diff to a file in-place using the `patch` command. Destructive — user confirmation required.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "diff": {"type": "string", "description": "Unified diff text to apply"},
+                "target": {"type": "string", "description": "File to patch"}
+            },
+            "required": ["diff", "target"]
+        }
+    }
+}
+
+DESTRUCTIVE_TOOLS = {"write_file", "run_python", "run_command", "patch"}
+
+
+# ============================================================================
+# ============= AGENTIC TOOL HANDLERS         ================================
+# ============================================================================
+
+def _tool_handle_fetch_url(self, args):
+    url = args["url"]
+    text, _tool = fetch_and_convert_url(url)
+    return {"success": True, "output": text, "error": None}
+
+
+def _tool_handle_read_file(self, args):
+    filepath = os.path.normpath(os.path.join(os.getcwd(), args["file"]))
+    if not filepath.startswith(os.getcwd()):
+        return {"success": False, "output": "", "error": "Path traversal denied"}
+    if not os.path.isfile(filepath):
+        return {"success": False, "output": "", "error": "File not found"}
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(102400)
+        return {"success": True, "output": content, "error": None}
+    except Exception as e:
+        return {"success": False, "output": "", "error": str(e)}
+
+
+def _tool_handle_write_file(self, args):
+    filepath = os.path.normpath(os.path.join(os.getcwd(), args["file"]))
+    if not filepath.startswith(os.getcwd()):
+        return {"success": False, "output": "", "error": "Path traversal denied"}
+    content = args["content"]
+    if len(content) > 1048576:
+        return {"success": False, "output": "", "error": "Content too large (max 1MB)"}
+    try:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        return {"success": True, "output": f"Written {len(content)} bytes to {args['file']}", "error": None}
+    except Exception as e:
+        return {"success": False, "output": "", "error": str(e)}
+
+
+def _tool_handle_list_directory(self, args):
+    path = os.path.normpath(os.path.join(os.getcwd(), args.get("path", ".")))
+    if not path.startswith(os.getcwd()):
+        return {"success": False, "output": "", "error": "Path traversal denied"}
+    if not os.path.isdir(path):
+        return {"success": False, "output": "", "error": "Not a directory"}
+    try:
+        entries = []
+        for name in sorted(os.listdir(path)):
+            suffix = "/" if os.path.isdir(os.path.join(path, name)) else ""
+            entries.append(f"{name}{suffix}")
+        return {"success": True, "output": "\n".join(entries), "error": None}
+    except Exception as e:
+        return {"success": False, "output": "", "error": str(e)}
+
+
+def _tool_handle_glob(self, args):
+    try:
+        matches = sorted(glob.glob(args["pattern"], recursive=True))
+        return {"success": True, "output": "\n".join(matches), "error": None}
+    except Exception as e:
+        return {"success": False, "output": "", "error": str(e)}
+
+
+def _tool_handle_run_python(self, args):
+    if "code" in args:
+        command = f"python3 -c {shlex.quote(args['code'])}"
+    elif "file" in args:
+        command = f"python3 {shlex.quote(os.path.join(os.getcwd(), args['file']))}"
+    else:
+        return {"success": False, "output": "", "error": "Provide either 'code' or 'file'"}
+    result = self.executor.run(command, timeout=120)
+    output = result["stdout"]
+    if result["stderr"]:
+        output += f"\n[stderr]\n{result['stderr']}"
+    return {"success": result["returncode"] == 0, "output": output, "error": result["stderr"] or None}
+
+
+def _tool_handle_run_command(self, args):
+    command = args["command"]
+    result = self.executor.run(command, timeout=120)
+    output = result["stdout"]
+    if result["stderr"]:
+        output += f"\n[stderr]\n{result['stderr']}"
+    return {"success": result["returncode"] == 0, "output": output, "error": result["stderr"] or None}
+
+
+def _tool_handle_diff(self, args):
+    filepath1 = os.path.normpath(os.path.join(os.getcwd(), args["file1"]))
+    filepath2 = os.path.normpath(os.path.join(os.getcwd(), args["file2"]))
+    label1 = args.get("label1", args["file1"])
+    label2 = args.get("label2", args["file2"])
+    try:
+        with open(filepath1, "r") as f:
+            lines1 = f.readlines()
+        with open(filepath2, "r") as f:
+            lines2 = f.readlines()
+        diff = list(difflib.unified_diff(lines1, lines2, fromfile=label1, tofile=label2))
+        output = "".join(diff) if diff else "Files are identical"
+        return {"success": True, "output": output, "error": None}
+    except Exception as e:
+        return {"success": False, "output": "", "error": str(e)}
+
+
+def _tool_handle_patch(self, args):
+    import tempfile
+    diff_text = args["diff"]
+    target = shlex.quote(os.path.normpath(os.path.join(os.getcwd(), args.get("target", ""))))
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".diff", delete=False) as f:
+            f.write(diff_text)
+            diff_path = f.name
+        command = f"patch {target} {shlex.quote(diff_path)}" if target else f"patch < {shlex.quote(diff_path)}"
+        result = self.executor.run(command, timeout=15)
+        os.unlink(diff_path)
+        if result["returncode"] == 0:
+            return {"success": True, "output": result["stdout"], "error": None}
+        return {"success": False, "output": result["stdout"], "error": result["stderr"]}
+    except Exception as e:
+        return {"success": False, "output": "", "error": str(e)}
+
+
+# ============================================================================
+# ============= TOOL REGISTRY                  ================================
+# ============================================================================
+
+TOOL_ARG_ALIASES = {
+    "read_file": {"file": ["path", "filename", "filepath", "file_path"]},
+    "write_file": {"file": ["path", "filename", "filepath", "file_path"], "content": ["file_content"]},
+    "run_python": {"file": ["path", "filename", "filepath", "file_path"]},
+    "run_command": {"command": ["cmd", "shell"]},
+    "list_directory": {"path": ["directory", "dir"]},
+}
+
+class ToolRegistry:
+    """Registers and executes agentic tools with confirmation support."""
+
+    def __init__(self, ctx=None, executor=None):
+        self._ctx = ctx
+        self.executor = executor or Executor()
+        self._handlers = {
+            "fetch_url": _tool_handle_fetch_url,
+            "read_file": _tool_handle_read_file,
+            "write_file": _tool_handle_write_file,
+            "list_directory": _tool_handle_list_directory,
+            "glob": _tool_handle_glob,
+            "run_python": _tool_handle_run_python,
+            "run_command": _tool_handle_run_command,
+            "diff": _tool_handle_diff,
+            "patch": _tool_handle_patch,
+        }
+
+    def get_system_prompt_block(self) -> str:
+        """Append tool definitions and JSON format reminder to the agentic prompt."""
+        lines = ["", "## Available tools"]
+        for name, defn in AGENTIC_TOOL_DEFS.items():
+            params = defn["parameters"]["properties"]
+            args_str = ", ".join(f"{n}: {d['description']}" for n, d in params.items())
+            reqs = defn["parameters"].get("required", [])
+            required_str = f" (required: {', '.join(reqs)})" if reqs else ""
+            lines.append(f"- {name}: {defn['description']} Arguments: {args_str}{required_str}")
+        lines.append("""
+Respond with a JSON tool call when you need to act. Respond in plain text when you have the final answer.""")
+        return "\n".join(lines)
+
+    def list_tools_str(self) -> str:
+        lines = []
+        for name, defn in AGENTIC_TOOL_DEFS.items():
+            destructive = "! " if name in DESTRUCTIVE_TOOLS else "  "
+            lines.append(f"{destructive}{name:<16} {defn['description']}")
+        return "\n".join(lines)
+
+    def _confirm(self, tool_name: str, args: dict) -> bool:
+        if tool_name not in DESTRUCTIVE_TOOLS:
+            return True
+        if self._ctx and self._ctx.auto_confirm:
+            return True
+        args_display = ", ".join(f"{k}={v!r}" for k, v in args.items())
+        prompt = f"\n[Agentic] Run {tool_name}({args_display})? [y/N] "
+        try:
+            reply = input(prompt).strip().lower()
+            return reply in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+    def execute(self, tool_name: str, args: dict) -> dict:
+        if tool_name not in self._handlers:
+            return {"success": False, "output": "", "error": f"Unknown tool '{tool_name}'"}
+        # Normalize argument name aliases (e.g. "path" -> "file")
+        if tool_name in TOOL_ARG_ALIASES:
+            for canonical, aliases in TOOL_ARG_ALIASES[tool_name].items():
+                if canonical not in args:
+                    for alias in aliases:
+                        if alias in args:
+                            args[canonical] = args.pop(alias)
+                            break
+        if not self._confirm(tool_name, args):
+            return {"success": False, "output": "", "error": "Cancelled by user"}
+        try:
+            return self._handlers[tool_name](self, args)
+        except KeyError as e:
+            return {"success": False, "output": "", "error": f"Missing required argument: {e}"}
+        except Exception as e:
+            return {"success": False, "output": "", "error": str(e)}
+
+
+# ============================================================================
+# ============= AGENTIC SESSION LOGGER          ================================
+# ============================================================================
+
+class AgenticLogger:
+    """Logs agentic session turns to a structured JSONL file."""
+
+    def __init__(self):
+        log_dir = os.path.expanduser("~/.ollamaquery.d/agentic")
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = os.path.join(log_dir, f"{timestamp}.jsonl")
+        self.file = open(self.path, "w", encoding="utf-8")
+
+    def write(self, **data):
+        data["timestamp"] = datetime.now().isoformat()
+        self.file.write(json.dumps(data, default=str) + "\n")
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
 
 # ============================================================================
 # ============= DEBUGGING CLASS    ===========================================
@@ -1884,6 +2334,8 @@ class ChatLoop:
         self.ctx = context
         self.completer = context.create_completer()
         self.query_handler = context.create_query_handler()
+        self.executor = context.create_executor()
+        self.tool_registry = context.create_tool_registry()
         self.commands = get_command_aliases()
 
     def handle_debug_command(self, args: str) -> None:
@@ -2026,6 +2478,14 @@ class ChatLoop:
                 if result is False:
                     continue
 
+                result = self.run_handle_agentic(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_listtool(full_input)
+                if result is False:
+                    continue
+
                 self.run_process_query(full_input)
 
             except KeyboardInterrupt:
@@ -2092,13 +2552,12 @@ class ChatLoop:
 
             def read_output(fd):
                 try:
-                    while True:
-                        data = os.read(fd, 4096)
-                        if not data:
-                            break
+                    data = os.read(fd, 4096)
+                    if data:
                         output_lines.append(data.decode('utf-8', errors='replace'))
+                    return data
                 except OSError:
-                    pass
+                    return b''
 
             pty.spawn(shell_cmd, read_output)
 
@@ -2466,6 +2925,619 @@ class ChatLoop:
                 return False
         return None
 
+    def run_handle_agentic(self, full_input: str) -> Optional[bool]:
+        """Handle /agentic command and subcommands (like /debug)."""
+        if not full_input.startswith('/agentic'):
+            return None
+        parts = full_input.split()
+
+        # Bare /agentic or /agentic status -> show status
+        if len(parts) == 1 or (len(parts) >= 2 and parts[1] == 'status'):
+            self._print_agentic_status()
+            return False
+
+        subcmd = parts[1]
+
+        # on/off -> explicit toggle
+        if subcmd in ("on", "off"):
+            target = subcmd == "on"
+            if self.ctx.agentic_mode == target:
+                print(colorize(f"[Agentic mode already {'ON' if target else 'OFF'}]", 'muted'), file=sys.stderr)
+                return False
+            self.ctx.agentic_mode = target
+            state = "ON" if self.ctx.agentic_mode else "OFF"
+            if self.ctx.agentic_mode:
+                self.ctx._saved_system_prompt = self.ctx.system_prompt
+                self.ctx.system_prompt = AGENTIC_SYSTEM_PROMPT
+            else:
+                if hasattr(self.ctx, '_saved_system_prompt'):
+                    self.ctx.system_prompt = self.ctx._saved_system_prompt
+            print(colorize(f"[Agentic mode: {state}]", 'success' if self.ctx.agentic_mode else 'warning'), file=sys.stderr)
+            return False
+
+        # full -> enable everything
+        if subcmd == "full":
+            self.ctx._saved_system_prompt = self.ctx.system_prompt
+            self.ctx.system_prompt = AGENTIC_SYSTEM_PROMPT
+            self.ctx.agentic_mode = True
+            self.ctx.agentic_verbose = True
+            self.ctx.agentic_show_thinking = True
+            self.ctx.agentic_trace = True
+            self.ctx.auto_confirm = True
+            self.ctx.lazy_tool = True
+            print(colorize("[Agentic mode: ON]", 'success'), file=sys.stderr)
+            print(colorize("[System prompt switched to agentic mode]", 'muted'), file=sys.stderr)
+            print(colorize("[Verbose: ON]", 'info'), file=sys.stderr)
+            print(colorize("[Show thinking: ON]", 'info'), file=sys.stderr)
+            print(colorize("[Trace: ON]", 'info'), file=sys.stderr)
+            print(colorize("[Auto-confirm: ON]", 'info'), file=sys.stderr)
+            print(colorize("[Lazy tool extraction: ON]", 'info'), file=sys.stderr)
+            return False
+
+        # Named toggles (always toggle between on/off)
+        toggle_map = {
+            "auto":     ("auto_confirm",        "Auto-confirm"),
+            "verbose":  ("agentic_verbose",     "Verbose"),
+            "thinking": ("agentic_show_thinking", "Show thinking"),
+            "trace":    ("agentic_trace",        "Trace"),
+            "log":      ("agentic_logging",      "Logging"),
+            "lazytool": ("lazy_tool",            "Lazy tool extraction"),
+        }
+
+        if subcmd == "sandbox":
+            new_mode = "container" if self.executor.mode != "container" else "host"
+            self.executor.mode = new_mode
+            self.tool_registry.executor.mode = new_mode
+            print(colorize(f"[Executor mode: {self.executor.mode}]", 'info'), file=sys.stderr)
+
+        elif subcmd in ("iterations", "timeout"):
+            if len(parts) < 3 or not parts[2].isdigit():
+                print(colorize(f"[Usage: /agentic {subcmd} <number>]", 'warning'), file=sys.stderr)
+                return False
+            val = int(parts[2])
+            attr = "agentic_max_iterations" if subcmd == "iterations" else "agentic_step_timeout"
+            setattr(self.ctx, attr, val)
+            label = "Max iterations" if subcmd == "iterations" else "Step timeout"
+            print(colorize(f"[{label}: {val}]", 'info'), file=sys.stderr)
+
+        elif subcmd in toggle_map:
+            attr, label = toggle_map[subcmd]
+            new_val = not getattr(self.ctx, attr)
+            setattr(self.ctx, attr, new_val)
+            state = "ON" if new_val else "OFF"
+            print(colorize(f"[{label}: {state}]", 'info'), file=sys.stderr)
+
+        else:
+            print(colorize("[Usage: /agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|lazytool|iterations <N>|timeout <N>|status]]", 'warning'), file=sys.stderr)
+        return False
+
+    def _print_agentic_status(self):
+        """Display current agentic settings like /debug output."""
+        c = self.ctx
+        print(colorize("\n[Agentic Settings - Use /agentic <option> [value]]", 'info'), file=sys.stderr)
+        print("  Subcommands: on, off, full, auto, sandbox, verbose, thinking, trace, log, lazytool,", file=sys.stderr)
+        print("               iterations <N>, timeout <N>, status", file=sys.stderr)
+        print(file=sys.stderr)
+
+        settings = [
+            ("agentic",    "Master toggle",             str(c.agentic_mode).lower()),
+            ("auto",       "Skip destructive tool confirmation", str(c.auto_confirm).lower()),
+            ("sandbox",    "Run tool subprocesses in container", self.executor.mode),
+            ("verbose",    "Show raw model responses during ReAct", str(c.agentic_verbose).lower()),
+            ("thinking",   "Show model reasoning during ReAct", str(c.agentic_show_thinking).lower()),
+            ("trace",      "Show full tool args and results", str(c.agentic_trace).lower()),
+            ("log",        "Write structured JSONL logs", str(c.agentic_logging).lower()),
+            ("lazytool",   "Extract tool calls from anywhere in reply", str(c.lazy_tool).lower()),
+            ("iterations", "Max ReAct loop iterations", str(c.agentic_max_iterations)),
+            ("timeout",    "Per-step timeout (seconds)", f"{c.agentic_step_timeout}s"),
+        ]
+        for name, desc, value in settings:
+            marker = ">" if (value not in ("off", "false", "host", "0") and "off" not in value) else " "
+            print(f"  {marker} {name:<12} [{value:<8}] {desc}", file=sys.stderr)
+        print()
+        subcmd = parts[1]
+        if subcmd == "sandbox":
+            new_mode = "container" if self.executor.mode != "container" else "host"
+            self.executor.mode = new_mode
+            self.tool_registry.executor.mode = new_mode
+            print(colorize(f"[Executor mode: {self.executor.mode}]", 'info'), file=sys.stderr)
+        elif subcmd == "auto":
+            self.ctx.auto_confirm = not self.ctx.auto_confirm
+            state = "ON" if self.ctx.auto_confirm else "OFF"
+            print(colorize(f"[Auto-confirm: {state}]", 'info'), file=sys.stderr)
+        else:
+            print(colorize("[Usage: /agentic [sandbox|auto]]", 'warning'), file=sys.stderr)
+        return False
+
+    def run_handle_listtool(self, full_input: str) -> Optional[bool]:
+        """Handle /listtool command."""
+        if full_input.strip() != '/listtool':
+            return None
+        header = f"Available Tools (agentic: {'ON' if self.ctx.agentic_mode else 'OFF'})"
+        print(colorize(f"\n{header}", 'info'), file=sys.stderr)
+        print(colorize("\u2500" * 70, 'muted'), file=sys.stderr)
+        print(self.tool_registry.list_tools_str(), file=sys.stderr)
+        print(file=sys.stderr)
+        return False
+
+    @staticmethod
+    def _normalize_tool_json(json_text: str) -> Optional[dict]:
+        """Parse JSON and normalize any tool call format to {"tool": ..., "arguments": ...}.
+        
+        Supports:
+        - Internal:  {"tool": "name", "arguments": {...}}
+        - OpenAI:    {"type": "function", "function": {"name": "name", "arguments": {...}}}
+        - Compact:   {"function": {"name": "name", "arguments": {...}}}
+        Arguments can be a dict or a JSON string.
+        """
+        try:
+            obj = json.loads(json_text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        if "tool" in obj:
+            return obj
+        tool_name = None
+        tool_args = {}
+        if "function" in obj and isinstance(obj["function"], dict):
+            fn = obj["function"]
+            if "name" in fn:
+                tool_name = fn["name"]
+                raw_args = fn.get("arguments", {})
+                if isinstance(raw_args, str):
+                    try:
+                        tool_args = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        tool_args = {"raw": raw_args}
+                elif isinstance(raw_args, dict):
+                    tool_args = raw_args
+        # OpenAI format without function wrapper: {"type": "function", "name": "...", "arguments": {...}}
+        if not tool_name and obj.get("type") == "function" and isinstance(obj.get("name"), str):
+            tool_name = obj["name"]
+            raw_args = obj.get("arguments", {})
+            if isinstance(raw_args, str):
+                try:
+                    tool_args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    tool_args = {"raw": raw_args}
+            elif isinstance(raw_args, dict):
+                tool_args = raw_args
+        if tool_name:
+            return {"tool": tool_name, "arguments": tool_args}
+        return None
+
+    def parse_tool_call(self, text: str) -> Optional[dict]:
+        """Extract tool call JSON from LLM response. Returns {"tool": ..., "arguments": ...} or None."""
+        lazy = getattr(self.ctx, 'lazy_tool', False)
+        text = text.strip()
+        # Pass 1: full JSON parse
+        result = self._normalize_tool_json(text)
+        if result:
+            return result
+        # Pass 2: fenced JSON code block
+        m = re.search(r'```(?:json)?\s*\n?(\{.*?\})\s*\n?```', text, re.DOTALL)
+        if m:
+            accept = lazy
+            if not accept:
+                prefix = text[:m.start()].strip()
+                suffix = text[m.end():].strip()
+                accept = ((not prefix or len(prefix) <= 100) and not suffix)
+            if accept:
+                result = self._normalize_tool_json(m.group(1))
+                if result:
+                    args_str = json.dumps(result.get("arguments", {}))
+                    if not ('<' in args_str and '>' in args_str):
+                        return result
+        # Pass 3: bare JSON object with "tool" key
+        if lazy:
+            # Lazy mode: accept first bare JSON anywhere in the text
+            m = re.search(r'\{"tool"\s*:\s*"[^"]+"', text)
+            if m:
+                start = m.start()
+                depth, end = 0, start
+                for i, ch in enumerate(text[start:], start):
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+                result = self._normalize_tool_json(text[start:end])
+                if result:
+                    args_str = json.dumps(result.get("arguments", {}))
+                    if not ('<' in args_str and '>' in args_str):
+                        return result
+        else:
+            # Strict mode: only at START of the text
+            stripped = text.lstrip()
+            if stripped.startswith('{"tool"') or stripped.startswith('{"function"') or stripped.startswith('{"type"'):
+                start = text.index('{')
+                depth, end = 0, start
+                for i, ch in enumerate(text[start:], start):
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+                result = self._normalize_tool_json(text[start:end])
+                if result:
+                    return result
+            # Pass 4: bare JSON tool call at the END of the text (strict mode only)
+            for search_key in ('{"tool"', '{"function"', '{"type"'):
+                idx = text.rfind(search_key)
+                if idx >= 0:
+                    start = idx
+                    depth, end = 0, start
+                    for i, ch in enumerate(text[start:], start):
+                        if ch == '{':
+                            depth += 1
+                        elif ch == '}':
+                            depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                    if not text[end:].strip():
+                        prefix = text[:start].strip()
+                        if not prefix:
+                            result = self._normalize_tool_json(text[start:end])
+                            if result:
+                                args_str = json.dumps(result.get("arguments", {}))
+                                if not ('<' in args_str and '>' in args_str):
+                                    return result
+        return None
+
+    def parse_tool_calls(self, text: str) -> list[dict]:
+        """Extract ALL tool call JSONs from the response.
+        
+        In strict mode (default): only matches consecutive tool calls starting
+        from the beginning of the response (no preamble).
+        In lazy mode (/agentic lazytool): finds tool calls anywhere in the text.
+        Returns list of {"tool": ..., "arguments": ...} dicts.
+        """
+        lazy = getattr(self.ctx, 'lazy_tool', False)
+        text = text.strip()
+        results = []
+        
+        if lazy:
+            # Lazy mode: find ALL tool call JSONs anywhere in the text
+            seen_keys = set()
+            pos = 0
+            while pos < len(text):
+                idx = text.find('{"tool"', pos)
+                if idx == -1:
+                    idx = text.find('{"function"', pos)
+                if idx == -1:
+                    idx = text.find('{"type"', pos)
+                if idx == -1:
+                    break
+                depth, end = 0, idx
+                for i, ch in enumerate(text[idx:], idx):
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+                result = self._normalize_tool_json(text[idx:end])
+                if result:
+                    key = (result["tool"], json.dumps(result.get("arguments", {}), sort_keys=True))
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        results.append(result)
+                pos = end
+        else:
+            # Strict mode: only consecutive tool calls from the start
+            if not (text.startswith('{"tool"') or text.startswith('{"function"') or text.startswith('{"type"')):
+                return []
+            pos = 0
+            while pos < len(text):
+                # Skip whitespace between consecutive tool calls
+                while pos < len(text) and text[pos] in (' ', '\t', '\n', '\r'):
+                    pos += 1
+                if pos >= len(text):
+                    break
+                idx = -1
+                for search_key in ('{"tool"', '{"function"', '{"type"'):
+                    idx = text.find(search_key, pos)
+                    if idx == pos:
+                        break
+                else:
+                    break
+                depth, end = 0, idx
+                for i, ch in enumerate(text[idx:], idx):
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+                result = self._normalize_tool_json(text[idx:end])
+                if result:
+                    results.append(result)
+                else:
+                    break
+                pos = end
+        return results
+
+    @staticmethod
+    def _is_stuck(text: str, threshold: float = 0.8) -> bool:
+        """Detect if the model is repeating itself (stuck in a loop).
+        
+        Checks if the last ~500 chars show strong self-similarity.
+        Returns True if the response appears stuck.
+        """
+        if len(text) < 200:
+            return False
+        tail = text[-500:]
+        chunk_size = 50
+        chunks = [tail[i:i + chunk_size] for i in range(0, len(tail) - chunk_size + 1, chunk_size)]
+        if len(chunks) < 4:
+            return False
+        similar = 0
+        for i in range(len(chunks) - 1):
+            common = sum(1 for a, b in zip(chunks[i], chunks[i + 1]) if a == b)
+            ratio = common / max(len(chunks[i]), len(chunks[i + 1]))
+            if ratio > 0.85:
+                similar += 1
+        return similar / (len(chunks) - 1) > threshold
+
+    @staticmethod
+    def _call_with_timeout(func, timeout_sec: int, *args, **kwargs):
+        """Call a function with a wall-clock timeout using a daemon thread."""
+        result = [None]
+        exception = [None]
+
+        def worker():
+            try:
+                result[0] = func(*args, **kwargs)
+            except Exception as e:
+                exception[0] = e
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(timeout_sec)
+        if thread.is_alive():
+            return None  # timed out
+        if exception[0]:
+            raise exception[0]
+        return result[0]
+
+    def run_agentic_query(self, full_input: str) -> None:
+        """ReAct loop: query model, parse tool calls, execute tools, stream final answer."""
+        try:
+            final_content = process_inline_commands(full_input)
+            if not final_content.strip():
+                return
+
+            # Always ensure self.messages exists
+            if not getattr(self, 'messages', None):
+                self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
+
+            # Build augmented messages for the ReAct loop (append tool definitions)
+            agentic_prompt = self.ctx.system_prompt + self.tool_registry.get_system_prompt_block()
+            messages = [{'role': 'system', 'content': agentic_prompt}]
+            if len(self.messages) > 1:
+                messages.extend(self.messages[1:])  # conversation history
+            messages.append({'role': 'user', 'content': final_content})
+
+            if self.ctx.agentic_logging:
+                logger = AgenticLogger()
+                logger.write(type="start", user_input=final_content)
+            else:
+                logger = None
+
+            iteration = 0
+            max_iterations = self.ctx.agentic_max_iterations
+            final_answer = ""
+            last_tool_call = None
+            step_timeout = self.ctx.agentic_step_timeout
+
+            while iteration < max_iterations:
+                iteration += 1
+                if logger:
+                    logger.write(type="iteration", iteration=iteration)
+                print(colorize(f"\r[Agentic] Step {iteration}/{max_iterations}…", 'muted'), file=sys.stderr, end="")
+                sys.stderr.flush()
+
+                response = self._call_with_timeout(
+                    self.query_handler.query_sync, step_timeout,
+                    messages, self.ctx.model,
+                    context_size=self.ctx.context_size,
+                    images=self.ctx.current_images
+                )
+
+                if response is None:
+                    print(colorize(f"\n[Agentic] Step timed out after {step_timeout}s.", 'error'), file=sys.stderr)
+                    break
+
+                response_text = ""
+                if isinstance(response, dict):
+                    if self.ctx.backend == "ollama":
+                        response_text = response.get('message', {}).get('content', '')
+                    else:
+                        choices = response.get('choices', [])
+                        if choices:
+                            response_text = choices[0].get('message', {}).get('content', '')
+                elif isinstance(response, str):
+                    response_text = response
+
+                if self.ctx.agentic_verbose and response_text:
+                    truncated = len(response_text) > 500
+                    display = response_text[:500] + ("..." if truncated else "")
+                    print(colorize(f"\n[Verbose] {display}", 'muted'), file=sys.stderr)
+                    if truncated:
+                        print(colorize(f"[Verbose] ({len(response_text)} total chars, showing first 500)", 'muted'), file=sys.stderr)
+
+                if self.ctx.agentic_show_thinking and isinstance(response, dict):
+                    thinking = ""
+                    if self.ctx.backend == "ollama":
+                        thinking = response.get('message', {}).get('reasoning_content', '')
+                    else:
+                        choices = response.get('choices', [])
+                        if choices:
+                            msg = choices[0].get('message', {})
+                            thinking = msg.get('reasoning_content', '') or msg.get('reasoning', '')
+                    if thinking:
+                        print(colorize(f"\n<thinking>\n{thinking}\n</thinking>", 'muted'), file=sys.stderr)
+
+                if not response_text:
+                    print(colorize("\n[Agentic] Empty response, aborting.", 'error'), file=sys.stderr)
+                    break
+
+                if self._is_stuck(response_text):
+                    print(colorize("\n[Agentic] Model appears stuck (repetitive output), aborting.", 'warning'), file=sys.stderr)
+                    break
+
+                tool_calls = self.parse_tool_calls(response_text)
+                if not tool_calls:
+                    single = self.parse_tool_call(response_text)
+                    if single:
+                        tool_calls = [single]
+
+                if logger:
+                    first_call = tool_calls[0] if tool_calls else None
+                    logger.write(type="turn", iteration=iteration, model_response=response_text,
+                                 tool_call=first_call)
+
+                if not tool_calls:
+                    final_answer = response_text
+                    break
+
+                observations = []
+                abort_loop = False
+                for i, tool_call in enumerate(tool_calls):
+                    tool_name = tool_call["tool"]
+                    tool_args = tool_call.get("arguments", {})
+                    args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+                    print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr)
+
+                    if self.ctx.agentic_trace:
+                        print(colorize(f"[Trace] Full args: {json.dumps(tool_args, default=str)[:2000]}", 'muted'), file=sys.stderr)
+
+                    # Detect same-tool loop: same name + same args twice in a row
+                    current_call = (tool_name, json.dumps(tool_args, sort_keys=True))
+                    if i == 0 and current_call == last_tool_call:
+                        print(colorize("[Agentic] Same tool call repeated, breaking loop.", 'warning'), file=sys.stderr)
+                        final_answer = "[Agentic: model stuck in tool loop]"
+                        abort_loop = True
+                        break
+                    if i == 0:
+                        last_tool_call = current_call
+
+                    result = self.tool_registry.execute(tool_name, tool_args)
+                    observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
+                    if not observation:
+                        observation = "[Tool returned no output]"
+                    if len(observation) > 4000:
+                        observation = observation[:4000] + "\n... [truncated]"
+
+                    if self.ctx.agentic_trace:
+                        trace_out = result["output"] if len(result["output"]) < 2000 else result["output"][:2000] + "..."
+                        print(colorize(f"[Trace] Result: {json.dumps({'success': result['success'], 'output': trace_out, 'error': result['error']}, default=str)}", 'muted'), file=sys.stderr)
+
+                    if self.ctx.agentic_logging:
+                        logger.write(type="result", iteration=iteration, tool_name=tool_name,
+                                     tool_args=tool_args, result=result)
+
+                    if not result["success"] and "Cancelled" in (result.get("error") or ""):
+                        print(colorize("[Agentic] Tool cancelled by user, aborting.", 'warning'), file=sys.stderr)
+                        final_answer = "[Agentic query cancelled]"
+                        abort_loop = True
+                        break
+
+                    observations.append(f"[{tool_name}] {observation}")
+
+                if abort_loop:
+                    break
+
+                combined = "\n---\n".join(observations) if observations else "[No tool output]"
+                messages.append({'role': 'assistant', 'content': response_text})
+                messages.append({'role': 'user', 'content': f"Tool result:\n{combined}"})
+
+            if iteration >= max_iterations and not final_answer:
+                final_answer = response_text if 'response_text' in locals() else "[Agentic: max iterations reached]"
+
+            if not final_answer:
+                final_answer = response_text if 'response_text' in locals() else "[Agentic: no answer produced]"
+
+            if logger:
+                logger.write(type="final", final_answer=final_answer)
+
+            if final_answer:
+                pending_tool = self.parse_tool_call(final_answer)
+                if pending_tool:
+                    tool_name = pending_tool["tool"]
+                    tool_args = pending_tool.get("arguments", {})
+                    args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+                    print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr)
+                    result = self.tool_registry.execute(tool_name, tool_args)
+                    observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
+                    if not observation:
+                        observation = "[Tool returned no output]"
+                    if len(observation) > 4000:
+                        observation = observation[:4000] + "\n... [truncated]"
+                    print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
+                    self.messages.append({'role': 'assistant', 'content': final_answer})
+                    print()
+                else:
+                    if not getattr(self, 'messages', None):
+                        self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
+                    final_messages = list(messages)
+                    if final_messages:
+                        final_messages[0] = {'role': 'system', 'content': self.ctx.system_prompt}
+                    if final_messages and final_messages[-1]['role'] != 'user':
+                        final_messages.append({'role': 'user', 'content': final_content})
+
+                    response = self.query_handler.query_stream(
+                        final_messages, self.ctx.model,
+                        stream_enabled=self.ctx.stream_enabled,
+                        debug=self.ctx.debug_mode,
+                        show_thinking=(not self.ctx.force_no_thinking),
+                        context_size=self.ctx.context_size,
+                        images=self.ctx.current_images
+                    )
+                    if response:
+                        stream_tool_calls = self.parse_tool_calls(response)
+                        if not stream_tool_calls:
+                            single = self.parse_tool_call(response)
+                            if single:
+                                stream_tool_calls = [single]
+                        if stream_tool_calls:
+                            for stream_tc in stream_tool_calls:
+                                tool_name = stream_tc["tool"]
+                                tool_args = stream_tc.get("arguments", {})
+                                args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+                                print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr)
+                                result = self.tool_registry.execute(tool_name, tool_args)
+                                observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
+                                if not observation:
+                                    observation = "[Tool returned no output]"
+                                if len(observation) > 4000:
+                                    observation = observation[:4000] + "\n... [truncated]"
+                                print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
+                            self.messages.append({'role': 'assistant', 'content': response})
+                            print()
+                        else:
+                            self.messages.append({'role': 'assistant', 'content': response})
+                            print()
+                    else:
+                        print(colorize(f"\n{final_answer}", 'success'), file=sys.stdout)
+            else:
+                print(colorize("\n[Agentic] No final answer produced.", 'error'), file=sys.stderr)
+
+            if logger:
+                logger.write(type="end", total_iterations=iteration)
+                logger.close()
+        except Exception as e:
+            print(colorize(f"\n[Agentic] Internal error: {e}", 'error'), file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
     def run_handle_spawnshell(self, full_input: str) -> Optional[bool]:
         """Handle /spawnshell command."""
         if full_input == '/spawnshell':
@@ -2475,6 +3547,9 @@ class ChatLoop:
 
     def run_process_query(self, full_input: str) -> None:
         """Process regular user query (non-command input)."""
+        if self.ctx.agentic_mode:
+            return self.run_agentic_query(full_input)
+
         final_content = process_inline_commands(full_input)
         if not final_content.strip():
             return
