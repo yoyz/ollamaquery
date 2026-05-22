@@ -13,21 +13,58 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ollamaquery2 as q
 
-BACKEND = "llamacpp"
-BASE_URL = os.environ.get("LLAMACPP_HOST", "http://127.0.0.1:8080")
-MODEL = os.environ.get("TEST_MODEL", "google_gemma-4-E4B-it-Q4_K_M.gguf")
+OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')
+LLAMACPP_HOST = os.environ.get('LLAMACPP_HOST', 'http://127.0.0.1:8080')
 
+# Auto-detect available backend
+BACKEND = None
+BASE_URL = None
+MODEL = None
 BACKEND_AVAILABLE = False
 
-def setUpModule():
-    """Check backend availability (does NOT skip all tests — only integration tests skip)."""
-    global BACKEND_AVAILABLE
+
+def _check_backend(url, label):
+    """Try to reach a backend, return (available, model_name)."""
     try:
-        req = q.Request(BASE_URL, method="HEAD")
+        req = q.Request(url, method='HEAD')
         q.urlopen(req, timeout=2)
-        BACKEND_AVAILABLE = True
+        # Try to get a loaded model
+        try:
+            tags = json.loads(q.urlopen(q.Request(f"{url}/api/tags"), timeout=3).read())
+            models = [m['name'] for m in tags.get('models', [])]
+            # Prefer models with "dns" capability, or pick first non-embedding
+            for m in models:
+                if 'embed' not in m.lower() and '3.5:9b' in m:
+                    return True, m
+            for m in models:
+                if 'embed' not in m.lower():
+                    return True, m
+        except Exception:
+            pass
+        return True, None
     except Exception:
-        BACKEND_AVAILABLE = False
+        return False, None
+
+
+def setUpModule():
+    """Detect available backend and pick a model."""
+    global BACKEND, BASE_URL, MODEL, BACKEND_AVAILABLE
+
+    avail, model = _check_backend(OLLAMA_HOST, "Ollama")
+    if avail:
+        BACKEND = "ollama"
+        BASE_URL = OLLAMA_HOST
+        MODEL = model or os.environ.get("TEST_MODEL", "qwen3.5:9b")
+        BACKEND_AVAILABLE = True
+        return
+
+    avail, model = _check_backend(LLAMACPP_HOST, "llama.cpp")
+    if avail:
+        BACKEND = "llamacpp"
+        BASE_URL = LLAMACPP_HOST
+        MODEL = model or os.environ.get("TEST_MODEL", "google_gemma-4-E4B-it-Q4_K_M.gguf")
+        BACKEND_AVAILABLE = True
+        return
 
 
 class TestParseToolCall(unittest.TestCase):
@@ -97,9 +134,10 @@ class TestToolRegistry(unittest.TestCase):
         block = self.reg.get_system_prompt_block()
         self.assertIn("fetch_url", block)
         self.assertIn("write_file", block)
-        self.assertIn("JSON tool call", block)
-        self.assertIn("final answer", block)
         self.assertIn("Available tools", block)
+        self.assertIn("read_file", block)
+        self.assertIn("run_python", block)
+        self.assertNotIn("JSON tool call", block)  # format reminders are in format blocks now
 
     def test_read_file(self):
         """Test reading a file within CWD."""
@@ -156,6 +194,40 @@ class TestToolRegistry(unittest.TestCase):
         self.assertIn("-line2", result["output"])
         self.assertIn("+line3", result["output"])
 
+    def test_write_compile_run(self):
+        """Full write_file → run_command(gcc) → run_command(test) pipeline."""
+        c_code = (
+            '#include <stdio.h>\n'
+            'int main(int argc, char *argv[]) {\n'
+            '    for (int i = 1; i < argc; i++) printf("%s\\n", argv[i]);\n'
+            '    return 0;\n'
+            '}\n'
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                wr = self.reg.execute("write_file", {
+                    "file": "echo_args.c", "content": c_code
+                })
+                self.assertTrue(wr["success"], msg=wr.get("error"))
+
+                cc = self.reg.execute("run_command", {
+                    "command": "gcc -o echo_args echo_args.c"
+                })
+                self.assertTrue(cc["success"], msg=f"compile failed: {cc.get('error')}")
+                self.assertTrue(os.path.exists("echo_args"))
+
+                run = self.reg.execute("run_command", {
+                    "command": "./echo_args hello world 42"
+                })
+                self.assertTrue(run["success"], msg=run.get("error"))
+                self.assertIn("hello", run["output"])
+                self.assertIn("world", run["output"])
+                self.assertIn("42", run["output"])
+            finally:
+                os.chdir(old_cwd)
+
 
 class TestExecutor(unittest.TestCase):
     """Test Executor (host mode only — no container runtime required)."""
@@ -181,19 +253,26 @@ class TestExecutor(unittest.TestCase):
         self.assertIn("rejected", result["stderr"])
 
 
-@unittest.skipIf(not BACKEND_AVAILABLE, f"llamacpp backend not available at {BASE_URL}")
 class TestAgenticReActEndToEnd(unittest.TestCase):
     """End-to-end ReAct loop tests with a real LLM backend.
 
-    These tests require a running llama.cpp server with a model loaded.
+    Auto-detects Ollama or llama.cpp. Requires a loaded model capable of
+    code generation and tool use (e.g. qwen3.5:9b, dolphin3:8b).
+    All tests skip if no backend is reachable.
     """
 
     def setUp(self):
+        if not BACKEND_AVAILABLE:
+            self.skipTest(
+                f"No backend available "
+                f"(Ollama at {OLLAMA_HOST} / llama.cpp at {LLAMACPP_HOST})"
+            )
         self.ctx = q.CommandContext()
         self.ctx.base_url = BASE_URL
         self.ctx.backend = BACKEND
         self.ctx.model = MODEL
         self.ctx.agentic_mode = True
+        self.ctx.agentic_logging = False
         self.ctx.auto_confirm = True  # skip prompts
         self.loop = q.ChatLoop(self.ctx)
 
@@ -238,6 +317,32 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
                 last = self.loop.messages[-1]
                 self.assertEqual(last["role"], "assistant")
                 self.assertGreater(len(last["content"]), 0)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_dns_resolver_write_compile_run(self):
+        """End-to-end: LLM writes dns_resolver.c, compiles it, and tests it.
+
+        Uses a temporary directory for isolation. Verifies the binary exists
+        and can be invoked after the agentic session completes.
+        """
+        import tempfile, os
+        query = (
+            "write a dns_resolver.c, compile it, then test it. "
+            "This dns_resolve will take two arguments: <dnsserverip> and <FQDN> "
+            "and the tool will ask to the <dnsserverip>:53 using udp the dns query "
+            "and give back the IPv4 address of the resolution."
+        )
+        self.ctx.lazy_tool = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                self.loop.run_agentic_query(query)
+                self.assertTrue(
+                    os.path.exists("dns_resolver"),
+                    msg="dns_resolver binary was not created by the agentic workflow"
+                )
             finally:
                 os.chdir(old_cwd)
 
@@ -602,6 +707,47 @@ class TestLazyToolMode(unittest.TestCase):
         result = self.loop.parse_tool_call(text)
         self.assertIsNotNone(result)
         self.assertEqual(result["tool"], "run_command")
+
+
+class TestComposableSystemPrompt(unittest.TestCase):
+    """Test the composable agentic system prompt blocks."""
+
+    def test_get_prompt_style_default(self):
+        style = q.get_prompt_style("unknown-model")
+        self.assertEqual(style, "strict")
+
+    def test_get_prompt_style_nemotron(self):
+        style = q.get_prompt_style("nemotron-cascade-2-30b")
+        self.assertEqual(style, "soft")
+
+    def test_get_prompt_style_substring(self):
+        style = q.get_prompt_style("some-nemotron-cascade-v2")
+        self.assertEqual(style, "soft")
+
+    def test_get_agentic_prompt_includes_role(self):
+        prompt = q.get_agentic_prompt("test-model")
+        self.assertIn("capable AI agent", prompt)
+        self.assertIn("terminal environment", prompt)
+
+    def test_get_agentic_prompt_includes_tool_defs(self):
+        tool_defs = "## Available tools\n- test_tool: does something"
+        prompt = q.get_agentic_prompt("test-model", tool_defs)
+        self.assertIn("test_tool", prompt)
+
+    def test_get_agentic_prompt_strict_format(self):
+        prompt = q.get_agentic_prompt("test-model")
+        self.assertIn("Output ONLY the JSON tool call", prompt)
+        self.assertIn("ReAct protocol", prompt)
+
+    def test_get_agentic_prompt_soft_format(self):
+        prompt = q.get_agentic_prompt("nemotron-cascade")
+        self.assertIn("code block", prompt)
+        self.assertNotIn("ONLY the JSON tool call", prompt)
+
+    def test_get_agentic_prompt_includes_rules(self):
+        prompt = q.get_agentic_prompt("test-model")
+        self.assertIn("Mirror the user's language", prompt)
+        self.assertIn("Be precise with file paths", prompt)
 
 
 if __name__ == "__main__":

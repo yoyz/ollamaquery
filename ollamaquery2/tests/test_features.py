@@ -38,6 +38,7 @@ import ollamaquery2 as q
 
 OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')
 LLAMACPP_HOST = os.environ.get('LLAMACPP_HOST', 'http://127.0.0.1:8080')
+LMSTUDIO_HOST = os.environ.get('LMSTUDIO_HOST', 'http://127.0.0.1:1234')
 SMALL_MODEL = os.environ.get('TEST_MODEL', 'granite4:350m')
 
 
@@ -66,10 +67,11 @@ def _tokenize_available(base_url, model):
 
 HAS_OLLAMA = _backend_available(OLLAMA_HOST)
 HAS_LLAMACPP = _backend_available(LLAMACPP_HOST)
+HAS_LMSTUDIO = _backend_available(LMSTUDIO_HOST)
 
 ollama_only = unittest.skipUnless(HAS_OLLAMA, 'Ollama backend not available')
 llamacpp_only = unittest.skipUnless(HAS_LLAMACPP, 'Llama.cpp backend not available')
-any_backend = unittest.skipUnless(HAS_OLLAMA or HAS_LLAMACPP,
+any_backend = unittest.skipUnless(HAS_OLLAMA or HAS_LLAMACPP or HAS_LMSTUDIO,
                                   'No backend available')
 
 
@@ -126,6 +128,28 @@ def _ensure_model_loaded(base_url, model_name):
 if HAS_OLLAMA:
     SMALL_MODEL = _pick_small_model(OLLAMA_HOST)
     _ensure_model_loaded(OLLAMA_HOST, SMALL_MODEL)
+
+# Detect which backend is actually available for any_backend tests
+ANY_BACKEND = None
+ANY_BASE_URL = None
+ANY_MODEL = None
+
+if HAS_LMSTUDIO:
+    models = q.fetch_models_llamacpp(LMSTUDIO_HOST)
+    if models:
+        ANY_BACKEND = 'lmstudio'
+        ANY_BASE_URL = LMSTUDIO_HOST
+        ANY_MODEL = models[0]['name']
+elif HAS_LLAMACPP:
+    models = q.fetch_models_llamacpp(LLAMACPP_HOST)
+    if models:
+        ANY_BACKEND = 'llamacpp'
+        ANY_BASE_URL = LLAMACPP_HOST
+        ANY_MODEL = models[0]['name']
+elif HAS_OLLAMA:
+    ANY_BACKEND = 'ollama'
+    ANY_BASE_URL = OLLAMA_HOST
+    ANY_MODEL = SMALL_MODEL
 
 
 def _fresh_ctx(base_url=OLLAMA_HOST, backend='ollama', model=SMALL_MODEL,
@@ -203,7 +227,7 @@ class TestBackendDetection(unittest.TestCase):
         args.backend = None
         args.host = None
         backend, url = q.resolve_connection(args)
-        self.assertIn(backend, ('ollama', 'llamacpp'))
+        self.assertIn(backend, ('ollama', 'llamacpp', 'lmstudio'))
 
 
 @ollama_only
@@ -398,6 +422,60 @@ class TestBasicQueries(unittest.TestCase):
         loop = _chat_loop(self.ctx)
         result = loop.run_process_query('   ')
         self.assertIsNone(result)
+
+
+@any_backend
+class TestAnyBackend(unittest.TestCase):
+    """Generic query tests that work with any available backend."""
+
+    def setUp(self):
+        self.ctx = _fresh_ctx(base_url=ANY_BASE_URL, backend=ANY_BACKEND, model=ANY_MODEL)
+
+    def test_modelquery_creation(self):
+        mq = q.ModelQuery(ANY_BASE_URL, ANY_BACKEND)
+        self.assertEqual(mq.base_url, ANY_BASE_URL)
+        self.assertEqual(mq.backend, ANY_BACKEND)
+
+    def test_query_sync_returns_dict(self):
+        mq = q.ModelQuery(ANY_BASE_URL, ANY_BACKEND, context=self.ctx)
+        result = mq.query_sync(
+            [{'role': 'user', 'content': 'Say hello in 1 word'}],
+            ANY_MODEL)
+        self.assertIsInstance(result, dict)
+        content = ""
+        if isinstance(result, dict):
+            content = result.get('message', {}).get('content', '')
+            if not content:
+                choices = result.get('choices', [])
+                if choices:
+                    content = choices[0].get('message', {}).get('content', '')
+        self.assertGreater(len(content), 0, "Response should contain content")
+
+    def test_chat_loop_processes_query(self):
+        loop = _chat_loop(self.ctx)
+        loop.run_process_query('Say hello')
+        self.assertTrue(hasattr(loop, 'messages'))
+        self.assertGreaterEqual(len(loop.messages), 2)
+        self.assertEqual(loop.messages[-1]['role'], 'assistant')
+        self.assertGreater(len(loop.messages[-1]['content']), 0)
+
+    def test_stats_accumulate(self):
+        loop = _chat_loop(self.ctx)
+        loop.run_process_query('Say hi')
+        loop.run_process_query('Say bye')
+        cum = self.ctx.get_cumulative_stats()
+        self.assertEqual(cum['total_queries'], 2)
+        self.assertGreater(cum['total_tokens'], 0)
+
+    def test_context_tokens_updated(self):
+        loop = _chat_loop(self.ctx)
+        loop.run_process_query('Say hello')
+        self.assertGreater(self.ctx.current_context_tokens, 0)
+
+    def test_switchmodel_changes_model(self):
+        loop = _chat_loop(self.ctx)
+        loop.run_handle_switchmodel(f'/switchmodel {ANY_MODEL}')
+        self.assertEqual(self.ctx.model, ANY_MODEL)
 
 
 @ollama_only
@@ -933,14 +1011,17 @@ class TestSpawnShell(unittest.TestCase):
         self.ctx = _fresh_ctx()
         self.loop = _chat_loop(self.ctx)
 
+    @unittest.skipIf(not sys.stdin.isatty(), "spawnshell tests require a real terminal")
     def test_handle_spawnshell_no_command(self):
         result = self.loop.run_handle_spawnshell('/spawnshell')
         self.assertFalse(result)
 
+    @unittest.skipIf(not sys.stdin.isatty(), "spawnshell tests require a real terminal")
     def test_handle_spawnshell_with_command(self):
         result = self.loop.run_handle_spawnshell('/spawnshell echo hi')
         self.assertFalse(result)
 
+    @unittest.skipIf(not sys.stdin.isatty(), "spawnshell tests require a real terminal")
     def test_spawnshell_output_not_characters(self):
         """handle_spawnshell must NOT split output into individual characters."""
         output = self.loop.handle_spawnshell()

@@ -48,6 +48,9 @@ except ImportError:
 import atexit
 
 
+__version__ = "0.1.0"
+
+
 # ============================================================================
 # ============= DEFAULT CONFIGURATION =======================================
 # ============================================================================
@@ -131,10 +134,15 @@ DEFAULT_SYSTEM_PROMPT = BUILTIN_PROMPTS["default"]
 
 
 MAX_CONTEXT_SIZE = 4192000  # 4M tokens maximum limit (prevent OOM)
+MAX_READ_FILE_SIZE = 102400    # 100KB max for agentic read_file tool
+MAX_WRITE_FILE_SIZE = 1048576  # 1MB max for agentic write_file tool
+MAX_FILE_INCLUSION_SIZE = 5 * 1024 * 1024  # 5MB max for @file inclusions
 DEFAULT_OLLAMA_HOST    = 'http://127.0.0.1:11434'
 DEFAULT_LLAMACPP_HOST  = 'http://127.0.0.1:8080'
+DEFAULT_LMSTUDIO_HOST  = 'http://127.0.0.1:1234'
 DEFAULT_OLLAMA_PORT    =  11434
 DEFAULT_LLAMACPP_PORT  =  8080
+DEFAULT_LMSTUDIO_PORT  =  1234
 
 
 
@@ -545,6 +553,8 @@ def refresh_context_window_size(ctx):
     """Fetch and update context window size from the backend."""
     if ctx.backend == "ollama":
         size = get_ollama_context_size(ctx.base_url, ctx.model)
+    elif ctx.backend == "lmstudio":
+        size = 0
     else:
         size = get_llamacpp_context_size(ctx.base_url)
     
@@ -655,6 +665,19 @@ def prepare_image_data(image_path):
     except Exception as e:
         print(colorize(f"[ERROR] Loading image {image_path}: {e}", 'error'), file=sys.stderr)
         return None
+
+
+def guess_image_mime(b64_data):
+    """Guess image MIME type from base64-encoded data prefix."""
+    if b64_data.startswith('/9j/'):
+        return "jpeg"
+    if b64_data.startswith('iVBOR'):
+        return "png"
+    if b64_data.startswith('R0lGOD'):
+        return "gif"
+    if b64_data.startswith('UklGR'):
+        return "webp"
+    return "jpeg"
 
 
 def fetch_models_ollama(base_url):
@@ -843,7 +866,7 @@ class CommandContext:
         self.agentic_show_thinking: bool = False
         self.agentic_trace: bool = False
         self.agentic_logging: bool = True
-        self.agentic_max_iterations: int = 10
+        self.agentic_max_iterations: int = 50
         self.agentic_step_timeout: int = 120
         self.lazy_tool: bool = False
         
@@ -956,37 +979,172 @@ class CommandContext:
 
 
 # ============================================================================
-# ============= AGENTIC SYSTEM PROMPT          ================================
+# ============= COMPOSABLE AGENTIC SYSTEM PROMPT  ============================
 # ============================================================================
+# System prompt is assembled from blocks: role + tool defs + format + examples + rules.
+# This avoids monolithic prompt strings and allows per-model format/style selection.
 
-AGENTIC_SYSTEM_PROMPT = """You are a capable AI agent with access to tools. You operate in a terminal environment.
+AGENTIC_ROLE_BLOCK = """You are a capable AI agent with access to tools. You operate in a terminal environment.
 
 ## Your capabilities
-You have tools that let you read/write files, execute Python code, fetch URLs, search files, and apply diffs. Use them whenever you need information from the outside world.
+You have tools that let you read/write files, execute Python code, fetch URLs, search files, and apply diffs. Use them whenever you need information from the outside world."""
 
-## How to use tools
+# Strict format: bare JSON only, no surrounding text, no code blocks.
+# For models that reliably follow strict JSON-only instructions (Qwen3.5, GPT-OSS).
+AGENTIC_FORMAT_STRICT = """## Output format
 When you need to perform an action, respond with a JSON object:
-
 {"tool": "tool_name", "arguments": {"arg1": "value1", ...}}
 
 After the tool runs, you will receive the result as an observation. Use it to decide the next step.
 
-## ReAct protocol (Think → Act → Observe → Answer)
+## CRITICAL rules
+- Output ONLY the JSON tool call — no surrounding text, no explanations, no markdown fences. If you add text before the JSON, the system will treat it as a final answer and ignore the tool call.
+- Do NOT chain multiple commands with `&&`, `|`, `;` etc. Each tool call runs in isolation.
+- You may make multiple tool calls sequentially — each result feeds back in.
+- Format your final answer with markdown for terminal readability (code blocks, lists, headings)."""
+
+# Soft format: allows code blocks, preamble, multi-tool-per-response.
+# For models like Nemotron-Cascade that refuse bare JSON output.
+AGENTIC_FORMAT_SOFT = """## Output format
+When you need to perform an action, output a JSON tool call in a code block. Use one code block per tool call.
+
+After the tool runs, you will receive the result as an observation. Use it to decide the next step.
+
+## Rules
+- You may output multiple tool calls in a single response (each in its own code block).
+- Each tool call runs in isolation. Break multi-step tasks into separate calls.
+- When you have the final answer, respond in plain text with markdown formatting."""
+
+# ReAct protocol description matching each format style.
+AGENTIC_EXAMPLE_STRICT = """## ReAct protocol (Think → Act → Observe → Answer)
 1. **Think** about what the user needs and which tool can help
 2. **Act** by outputting a JSON tool call
 3. **Observe** the tool result (it will be shown to you)
 4. **Repeat** if more actions are needed
-5. When you have the answer, respond in plain text (no JSON) — that is your final answer
+5. When you have the answer, respond in plain text (no JSON) — that is your final answer"""
 
-## CRITICAL rules
-- When you need to use a tool, output ONLY the JSON tool call — no surrounding text, no explanations, no markdown fences. If you add text before the JSON, the system will treat it as a final answer and ignore the tool call.
-- Do NOT chain multiple commands with `&&`, `|`, `;` etc. Each tool call runs in isolation. Break multi-step tasks into separate sequential tool calls.
-- Be precise with file paths. If `write_file` creates a file in a subdirectory, use the same path when compiling or reading it later.
-- Each tool call must be valid JSON with exactly the required arguments.
-- You may make multiple tool calls sequentially — each result feeds back in.
-- When you have the final answer, respond in plain text (no JSON). Do NOT include tool call JSON in your plain text answer — it will be mistaken for a real tool call.
-- Format your final answer with markdown for terminal readability (code blocks, lists, headings).
+AGENTIC_EXAMPLE_SOFT = """## Protocol
+1. **Think** about what steps are needed
+2. **Act** by outputting the JSON tool call in a code block
+3. **Observe** the tool result
+4. **Repeat** if more actions are needed
+5. When you have the final answer, respond in plain text with markdown formatting"""
+
+# Shared rules block — common to all models.
+AGENTIC_RULES_BLOCK = """## General rules
+- Be precise with file paths. If you create a file in a subdirectory, use the same path when compiling or reading it later.
 - Mirror the user's language — if they write in French, reply in French."""
+
+# Registry mapping format style names to their blocks.
+AGENTIC_FORMAT_REGISTRY = {
+    "strict": AGENTIC_FORMAT_STRICT,
+    "soft": AGENTIC_FORMAT_SOFT,
+}
+
+AGENTIC_EXAMPLE_REGISTRY = {
+    "strict": AGENTIC_EXAMPLE_STRICT,
+    "soft": AGENTIC_EXAMPLE_SOFT,
+}
+
+# Registry mapping model name substrings to format style.
+AGENTIC_PROMPT_STYLE_REGISTRY = {
+    "nemotron-cascade": "soft",
+}
+
+AGENTIC_PROMPT_STYLE_DEFAULT = "strict"
+
+
+def get_prompt_style(model_name: str) -> str:
+    """Determine which format style a model should use."""
+    lower = model_name.lower()
+    for key, style in AGENTIC_PROMPT_STYLE_REGISTRY.items():
+        if key in lower:
+            return style
+    return AGENTIC_PROMPT_STYLE_DEFAULT
+
+
+def get_agentic_prompt(model_name: str, tool_defs_block: str = "") -> str:
+    """Assemble the agentic system prompt from composable blocks.
+    
+    Args:
+        model_name: Used to select format style from registry.
+        tool_defs_block: Tool definitions block (from ToolRegistry.get_system_prompt_block()).
+            Inserted after the role block so models see available tools before format instructions.
+    """
+    style = get_prompt_style(model_name)
+    blocks = [AGENTIC_ROLE_BLOCK]
+    if tool_defs_block:
+        blocks.append(tool_defs_block)
+    blocks.append(AGENTIC_FORMAT_REGISTRY[style])
+    blocks.append(AGENTIC_EXAMPLE_REGISTRY[style])
+    blocks.append(AGENTIC_RULES_BLOCK)
+    return "\n\n".join(blocks)
+
+
+# Model-specific inference parameters for agentic/tool-calling mode.
+# Keys are substrings matched against the lowercased model name.
+# Values are passed as top-level fields to the llama.cpp OpenAI-compatible API.
+# Sources: HuggingFace model card "Best Practices" sections.
+MODEL_INFERENCE_PARAMS_REGISTRY = {
+    "nemotron-cascade": {
+        # https://huggingface.co/nvidia/Nemotron-Cascade-2-30B-A3B
+        # HF recommends temperature=1.0 for general use, but we use 0.6 for
+        # more deterministic tool-calling (inspired by Qwen coding best practices).
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+    "qwen3.5": {
+        # https://huggingface.co/Qwen/Qwen3.5-9B#best-practices
+        # "Thinking mode for precise coding tasks":
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+    "nemotron": {
+        # https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+        # "temperature=0.6 and top_p=0.95 are recommended for tool calling"
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+    "gpt-oss": {
+        # Conservative defaults for general GPT-style open-source models
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": 40,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+}
+
+DEFAULT_INFERENCE_PARAMS = {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 40,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repeat_penalty": 1.0,
+}
+
+
+def get_inference_params(model_name: str) -> dict:
+    """Look up inference params for a model by matching its name against the registry."""
+    lower = model_name.lower()
+    for key, params in MODEL_INFERENCE_PARAMS_REGISTRY.items():
+        if key in lower:
+            return dict(params)
+    return dict(DEFAULT_INFERENCE_PARAMS)
 
 
 # ============================================================================
@@ -1054,9 +1212,9 @@ AGENTIC_TOOL_DEFS = {
         "parameters": {
             "type": "object",
             "properties": {
-                "file": {"type": "string", "description": "File path relative to CWD"}
+                "file_path": {"type": "string", "description": "File path relative to CWD"}
             },
-            "required": ["file"]
+            "required": ["file_path"]
         }
     },
     "write_file": {
@@ -1064,10 +1222,10 @@ AGENTIC_TOOL_DEFS = {
         "parameters": {
             "type": "object",
             "properties": {
-                "file": {"type": "string", "description": "File path relative to CWD"},
+                "file_path": {"type": "string", "description": "File path relative to CWD"},
                 "content": {"type": "string", "description": "Text content to write"}
             },
-            "required": ["file", "content"]
+            "required": ["file_path", "content"]
         }
     },
     "list_directory": {
@@ -1133,10 +1291,32 @@ AGENTIC_TOOL_DEFS = {
             },
             "required": ["diff", "target"]
         }
+    },
+    "edit_file": {
+        "description": "Make a precise text replacement in an existing file. Finds exact old_string and replaces with new_string. Requires exactly one match.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "File path relative to CWD"},
+                "old_string": {"type": "string", "description": "Exact text to find (must match exactly once)"},
+                "new_string": {"type": "string", "description": "Replacement text"}
+            },
+            "required": ["file_path", "old_string", "new_string"]
+        }
+    },
+    "apply_patch": {
+        "description": "Apply a unified diff to the filesystem. Accepts standard unified diff format (---/+++ headers, @@ hunks) or OpenCode-style markers (*** Add File: path, *** Update File: path, *** Delete File: path, *** Move to: path). Creates/modifies/deletes files automatically based on diff content. Pure Python, no external dependencies.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "patch_text": {"type": "string", "description": "Unified diff text to apply. File paths are parsed from diff headers or OpenCode markers."}
+            },
+            "required": ["patch_text"]
+        }
     }
 }
 
-DESTRUCTIVE_TOOLS = {"write_file", "run_python", "run_command", "patch"}
+DESTRUCTIVE_TOOLS = {"write_file", "run_python", "run_command", "patch", "edit_file", "apply_patch"}
 
 
 # ============================================================================
@@ -1150,38 +1330,41 @@ def _tool_handle_fetch_url(self, args):
 
 
 def _tool_handle_read_file(self, args):
-    filepath = os.path.normpath(os.path.join(os.getcwd(), args["file"]))
-    if not filepath.startswith(os.getcwd()):
+    base_dir = os.path.abspath(os.getcwd())
+    filepath = os.path.abspath(os.path.join(os.getcwd(), args["file_path"]))
+    if os.path.commonpath([base_dir, filepath]) != base_dir:
         return {"success": False, "output": "", "error": "Path traversal denied"}
     if not os.path.isfile(filepath):
         return {"success": False, "output": "", "error": "File not found"}
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read(102400)
+            content = f.read(MAX_READ_FILE_SIZE)
         return {"success": True, "output": content, "error": None}
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
 
 
 def _tool_handle_write_file(self, args):
-    filepath = os.path.normpath(os.path.join(os.getcwd(), args["file"]))
-    if not filepath.startswith(os.getcwd()):
+    base_dir = os.path.abspath(os.getcwd())
+    filepath = os.path.abspath(os.path.join(os.getcwd(), args["file_path"]))
+    if os.path.commonpath([base_dir, filepath]) != base_dir:
         return {"success": False, "output": "", "error": "Path traversal denied"}
     content = args["content"]
-    if len(content) > 1048576:
+    if len(content) > MAX_WRITE_FILE_SIZE:
         return {"success": False, "output": "", "error": "Content too large (max 1MB)"}
     try:
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
-        return {"success": True, "output": f"Written {len(content)} bytes to {args['file']}", "error": None}
+        return {"success": True, "output": f"Written {len(content)} bytes to {args['file_path']}", "error": None}
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
 
 
 def _tool_handle_list_directory(self, args):
-    path = os.path.normpath(os.path.join(os.getcwd(), args.get("path", ".")))
-    if not path.startswith(os.getcwd()):
+    base_dir = os.path.abspath(os.getcwd())
+    path = os.path.abspath(os.path.join(os.getcwd(), args.get("path", ".")))
+    if os.path.commonpath([base_dir, path]) != base_dir:
         return {"success": False, "output": "", "error": "Path traversal denied"}
     if not os.path.isdir(path):
         return {"success": False, "output": "", "error": "Not a directory"}
@@ -1206,6 +1389,8 @@ def _tool_handle_glob(self, args):
 def _tool_handle_run_python(self, args):
     if "code" in args:
         command = f"python3 -c {shlex.quote(args['code'])}"
+    elif "file_path" in args:
+        command = f"python3 {shlex.quote(os.path.join(os.getcwd(), args['file_path']))}"
     elif "file" in args:
         command = f"python3 {shlex.quote(os.path.join(os.getcwd(), args['file']))}"
     else:
@@ -1261,16 +1446,286 @@ def _tool_handle_patch(self, args):
         return {"success": False, "output": "", "error": str(e)}
 
 
+def _tool_handle_edit_file(self, args):
+    filepath = os.path.normpath(os.path.join(os.getcwd(), args["file_path"]))
+    if not filepath.startswith(os.getcwd()):
+        return {"success": False, "output": "", "error": "Path traversal denied"}
+    if not os.path.isfile(filepath):
+        return {"success": False, "output": "", "error": f"File not found: {args['file_path']}"}
+    old = args["old_string"]
+    new_string = args["new_string"]
+    if not old:
+        return {"success": False, "output": "", "error": "old_string must not be empty"}
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+        count = content.count(old)
+        if count == 0:
+            return {"success": False, "output": "", "error": "old_string not found in file"}
+        if count > 1:
+            return {"success": False, "output": "", "error": f"Found {count} matches. Provide more surrounding context in old_string to make the match unique."}
+        content = content.replace(old, new_string, 1)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        return {"success": True, "output": f"Replaced 1 occurrence in {args['file_path']}", "error": None}
+    except Exception as e:
+        return {"success": False, "output": "", "error": str(e)}
+
+
+def _parse_patch_sections(patch_text):
+    """Parse patch text into sections for each file.
+    
+    Returns list of dicts:
+      {"path": str, "operation": "add"|"modify"|"delete"|"move",
+       "destination": str (for move), "hunks": [{"start": int, "old_count": int, "new_lines": [str]}]}
+    """
+    lines = patch_text.splitlines(keepends=True)
+    sections = []
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i]
+
+        # OpenCode-style marker: *** Add/Update/Delete/Move to: path
+        if line.startswith("*** "):
+            marker = line[4:].strip()
+            if marker.startswith("Add File:"):
+                path = marker[len("Add File:"):].strip()
+                op = "add"
+            elif marker.startswith("Update File:"):
+                path = marker[len("Update File:"):].strip()
+                op = "modify"
+            elif marker.startswith("Delete File:"):
+                path = marker[len("Delete File:"):].strip()
+                sections.append({"path": path, "operation": "delete", "hunks": []})
+                i += 1
+                continue
+            elif marker.startswith("Move to:"):
+                dest = marker[len("Move to:"):].strip()
+                # The marker line tells us the destination; the source comes from ---/+++ headers or a path before this
+                path = dest  # We'll override if ---/+++ follow
+                op = "move"
+            else:
+                i += 1
+                continue
+
+            i += 1
+            # Collect the diff body (---/+++ lines + hunks) that follows the marker
+            body_start = i
+            while i < n and not lines[i].startswith("*** ") and not (i > 0 and lines[i].startswith("--- ") and lines[i-1].startswith("*** ")):
+                i += 1
+            body = "".join(lines[body_start:i])
+            hunks, detected_path, is_delete = _parse_unified_hunks(body)
+            if detected_path and not marker.startswith("Move to:"):
+                path = detected_path
+            if is_delete:
+                sections.append({"path": path, "operation": "delete", "hunks": []})
+            elif op == "move":
+                source_path = detected_path or path
+                sections.append({"path": source_path, "operation": "move", "destination": dest, "hunks": hunks})
+            else:
+                sections.append({"path": path, "operation": op, "hunks": hunks})
+            continue
+
+        # Standard unified diff section: starts with "--- "
+        if line.startswith("--- "):
+            old_path = line[4:].strip()
+            if i + 1 < n and lines[i + 1].startswith("+++ "):
+                new_path = lines[i + 1][4:].strip()
+                i += 2
+                # Strip "a/" and "b/" prefixes commonly used by git
+                src = old_path[2:] if old_path.startswith(("a/", "b/")) else old_path
+                dst = new_path[2:] if new_path.startswith(("a/", "b/")) else new_path
+                path = dst if dst != "/dev/null" else src
+                is_new = old_path == "/dev/null" or old_path.endswith("/dev/null")
+                is_delete = new_path == "/dev/null" or new_path.endswith("/dev/null")
+
+                # Collect hunks
+                body_start = i
+                while i < n and not lines[i].startswith("--- "):
+                    i += 1
+                body = "".join(lines[body_start:i])
+                hunks, _, _ = _parse_unified_hunks(body)
+
+                if is_delete:
+                    sections.append({"path": path, "operation": "delete", "hunks": []})
+                elif is_new:
+                    sections.append({"path": path, "operation": "add", "hunks": hunks})
+                else:
+                    sections.append({"path": path, "operation": "modify", "hunks": hunks})
+                continue
+        i += 1
+
+    return sections
+
+
+def _parse_unified_hunks(body):
+    """Parse @@ hunks from a unified diff body.
+    
+    Returns (hunks, detected_path, is_delete).
+    Each hunk: {"start": int, "old_count": int, "new_lines": [str]}
+    """
+    import re
+    hunks = []
+    lines = body.splitlines(keepends=True)
+    i = 0
+    n = len(lines)
+    detected_path = None
+    is_delete = False
+
+    while i < n:
+        line = lines[i]
+
+        # Check for new file marker
+        if line.startswith("new file mode"):
+            is_delete = False
+            i += 1
+            continue
+
+        # Extract file path from /dev/null detection
+        if line.startswith("--- "):
+            p = line[4:].strip()
+            if p != "/dev/null":
+                detected_path = p[2:] if p.startswith(("a/", "b/")) else p
+            else:
+                is_delete = False
+            i += 1
+            continue
+        if line.startswith("+++ "):
+            p = line[4:].strip()
+            if p != "/dev/null":
+                detected_path = p[2:] if p.startswith(("a/", "b/")) else p
+            else:
+                is_delete = True
+            i += 1
+            continue
+
+        # Parse hunk header: @@ -start,count +start,count @@
+        m = re.match(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', line)
+        if m:
+            start = int(m.group(3))
+            old_count = int(m.group(2) or 1)
+            new_count = int(m.group(4) or 1)
+            i += 1
+
+            new_lines = []
+            collected = 0
+            while i < n and collected < new_count:
+                cl = lines[i]
+                if cl.startswith(("+", " ")):
+                    new_lines.append(cl[1:] if cl.startswith("+") else cl[1:])
+                    collected += 1
+                elif cl.startswith("-"):
+                    # Skip removed lines
+                    pass
+                elif cl.startswith("\\ "):
+                    # No newline at end of file marker
+                    pass
+                else:
+                    break
+                i += 1
+
+            hunks.append({"start": start, "old_count": old_count, "new_lines": new_lines})
+            continue
+
+        i += 1
+
+    return hunks, detected_path, is_delete
+
+
+def _apply_unified_diff(patch_text):
+    """Apply a unified diff patch to the filesystem. Pure Python.
+    
+    Supports standard unified diff (---/+++ headers, @@ hunks)
+    and OpenCode-style markers (*** Add/Update/Delete/Move to: path).
+    """
+    sections = _parse_patch_sections(patch_text)
+    if not sections:
+        return {"success": False, "output": "", "error": "No valid patch sections found in patch_text"}
+
+    applied = []
+    for sec in sections:
+        path = sec["path"]
+        abspath = os.path.normpath(os.path.join(os.getcwd(), path))
+        if not abspath.startswith(os.getcwd()):
+            return {"success": False, "output": "", "error": f"Path traversal denied: {path}"}
+
+        op = sec.get("operation", "modify")
+
+        if op == "delete":
+            if os.path.isfile(abspath):
+                os.unlink(abspath)
+            applied.append(f"Deleted {path}")
+            continue
+
+        if op == "move":
+            dest = sec["destination"]
+            absdest = os.path.normpath(os.path.join(os.getcwd(), dest))
+            if not absdest.startswith(os.getcwd()):
+                return {"success": False, "output": "", "error": f"Path traversal denied: {dest}"}
+            if os.path.isfile(abspath):
+                os.makedirs(os.path.dirname(absdest), exist_ok=True)
+                os.rename(abspath, absdest)
+            applied.append(f"Moved {path} -> {dest}")
+            continue
+
+        # Read existing content or start empty for new files
+        if os.path.isfile(abspath):
+            with open(abspath, "r") as f:
+                content = f.readlines()
+        elif op == "add":
+            content = []
+        else:
+            return {"success": False, "output": "", "error": f"File not found: {path}"}
+
+        # Apply hunks in reverse order to preserve line numbers
+        for hunk in sorted(sec["hunks"], key=lambda h: h["start"], reverse=True):
+            start_idx = hunk["start"] - 1
+            old_count = hunk["old_count"]
+            new_lines = hunk["new_lines"]
+
+            if start_idx < 0:
+                start_idx = 0
+            if start_idx + old_count > len(content):
+                old_count = len(content) - start_idx
+            if old_count < 0:
+                old_count = 0
+
+            content[start_idx:start_idx + old_count] = new_lines
+
+        os.makedirs(os.path.dirname(abspath), exist_ok=True)
+        with open(abspath, "w") as f:
+            f.writelines(content)
+
+        action = "Added" if op == "add" else "Patched"
+        applied.append(f"{action} {path}")
+
+    return {"success": True, "output": "\n".join(applied), "error": None}
+
+
+def _tool_handle_apply_patch(self, args):
+    patch_text = args["patch_text"]
+    if not patch_text.strip():
+        return {"success": False, "output": "", "error": "patch_text must not be empty"}
+    try:
+        return _apply_unified_diff(patch_text)
+    except Exception as e:
+        return {"success": False, "output": "", "error": str(e)}
+
+
 # ============================================================================
 # ============= TOOL REGISTRY                  ================================
 # ============================================================================
 
 TOOL_ARG_ALIASES = {
-    "read_file": {"file": ["path", "filename", "filepath", "file_path"]},
-    "write_file": {"file": ["path", "filename", "filepath", "file_path"], "content": ["file_content"]},
-    "run_python": {"file": ["path", "filename", "filepath", "file_path"]},
+    "read_file": {"file_path": ["file", "path", "filename", "filepath"]},
+    "write_file": {"file_path": ["file", "path", "filename", "filepath"], "content": ["file_content"]},
+    "run_python": {"file_path": ["file", "path", "filename", "filepath"]},
     "run_command": {"command": ["cmd", "shell"]},
     "list_directory": {"path": ["directory", "dir"]},
+    "edit_file": {"file_path": ["file", "path", "filename", "filepath"]},
+    "apply_patch": {},
 }
 
 class ToolRegistry:
@@ -1289,19 +1744,19 @@ class ToolRegistry:
             "run_command": _tool_handle_run_command,
             "diff": _tool_handle_diff,
             "patch": _tool_handle_patch,
+            "edit_file": _tool_handle_edit_file,
+            "apply_patch": _tool_handle_apply_patch,
         }
 
     def get_system_prompt_block(self) -> str:
-        """Append tool definitions and JSON format reminder to the agentic prompt."""
-        lines = ["", "## Available tools"]
+        """Build tool definitions section for embedding in the agentic system prompt."""
+        lines = ["## Available tools"]
         for name, defn in AGENTIC_TOOL_DEFS.items():
             params = defn["parameters"]["properties"]
             args_str = ", ".join(f"{n}: {d['description']}" for n, d in params.items())
             reqs = defn["parameters"].get("required", [])
             required_str = f" (required: {', '.join(reqs)})" if reqs else ""
             lines.append(f"- {name}: {defn['description']} Arguments: {args_str}{required_str}")
-        lines.append("""
-Respond with a JSON tool call when you need to act. Respond in plain text when you have the final answer.""")
         return "\n".join(lines)
 
     def list_tools_str(self) -> str:
@@ -1350,14 +1805,33 @@ Respond with a JSON tool call when you need to act. Respond in plain text when y
 # ============================================================================
 
 class AgenticLogger:
-    """Logs agentic session turns to a structured JSONL file."""
+    """Logs agentic session turns to a structured JSONL file.
+    
+    Automatically cleans up log files older than AGENTIC_LOG_RETENTION_DAYS
+    (default 1) on initialization to prevent unbounded disk growth.
+    """
+
+    AGENTIC_LOG_RETENTION_DAYS = 1
 
     def __init__(self):
         log_dir = os.path.expanduser("~/.ollamaquery.d/agentic")
         os.makedirs(log_dir, exist_ok=True)
+        self._cleanup_old_logs(log_dir)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.path = os.path.join(log_dir, f"{timestamp}.jsonl")
         self.file = open(self.path, "w", encoding="utf-8")
+
+    def _cleanup_old_logs(self, log_dir: str) -> None:
+        """Remove log files older than AGENTIC_LOG_RETENTION_DAYS."""
+        cutoff = time.time() - (self.AGENTIC_LOG_RETENTION_DAYS * 86400)
+        try:
+            for fname in os.listdir(log_dir):
+                fpath = os.path.join(log_dir, fname)
+                if fname.endswith(".jsonl") and os.path.isfile(fpath):
+                    if os.path.getmtime(fpath) < cutoff:
+                        os.unlink(fpath)
+        except OSError:
+            pass
 
     def write(self, **data):
         data["timestamp"] = datetime.now().isoformat()
@@ -1678,7 +2152,15 @@ class ModelQuery:
         """Build request payload for the backend."""
         if images := kwargs.get('images'):
             if messages and messages[-1].get("role") == "user":
-                messages[-1]["images"] = images
+                if self.backend == "ollama":
+                    messages[-1]["images"] = images
+                else:
+                    text = messages[-1].get("content", "")
+                    content_parts = [{"type": "text", "text": text or "Describe this image"}]
+                    for img in images:
+                        mime = guess_image_mime(img)
+                        content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img}"}})
+                    messages[-1]["content"] = content_parts
         
         payload = {
             "model": model,
@@ -1689,8 +2171,21 @@ class ModelQuery:
         if context_size := kwargs.get('context_size'):
             if self.backend == "ollama":
                 payload["options"] = {"num_ctx": context_size}
-            else:  # llamacpp
+            elif self.backend in ("llamacpp", "lmstudio"):
                 payload["max_tokens"] = context_size
+        
+        if tools := kwargs.get('tools'):
+            payload["tools"] = tools
+        
+        # Pass inference params for backend
+        if self.backend == "llamacpp":
+            for param in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]:
+                if param in kwargs:
+                    payload[param] = kwargs[param]
+        elif self.backend == "lmstudio":
+            for param in ["temperature", "top_p", "presence_penalty", "repeat_penalty"]:
+                if param in kwargs:
+                    payload[param] = kwargs[param]
         
         return payload
 
@@ -1747,7 +2242,7 @@ class ModelQuery:
         
         return usage if usage else None
 
-    def _build_stream_request(self, backend, messages, model, stream_enabled, context_size):
+    def _build_stream_request(self, backend, messages, model, stream_enabled, context_size, **kwargs):
         """Build URL, payload and headers for the backend."""
         if backend == "ollama":
             payload = {"model": model, "messages": messages, "stream": stream_enabled}
@@ -1758,6 +2253,17 @@ class ModelQuery:
             payload = {"model": model, "messages": messages, "stream": stream_enabled}
             if context_size is not None:
                 payload["max_tokens"] = context_size
+            for param in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]:
+                if param in kwargs:
+                    payload[param] = kwargs[param]
+            return f"{self.base_url}/v1/chat/completions", payload, {'Content-Type': 'application/json'}
+        elif backend == "lmstudio":
+            payload = {"model": model, "messages": messages, "stream": stream_enabled}
+            if context_size is not None:
+                payload["max_tokens"] = context_size
+            for param in ["temperature", "top_p", "presence_penalty", "repeat_penalty"]:
+                if param in kwargs:
+                    payload[param] = kwargs[param]
             return f"{self.base_url}/v1/chat/completions", payload, {'Content-Type': 'application/json'}
         else:
             raise ValueError(f"Unknown backend: {backend}")
@@ -1787,6 +2293,14 @@ class ModelQuery:
             content = delta.get("content") or ""
             usage = self._normalize_llamacpp_usage(chunk) if is_final else None
             return thought, content, is_final, usage
+        elif backend == "lmstudio":
+            choices = chunk.get("choices", [])
+            is_final = bool(choices and choices[0].get("finish_reason") is not None)
+            delta = choices[0].get("delta", {}) if choices else {}
+            thought = delta.get("reasoning") or ""
+            content = delta.get("content") or ""
+            usage = self._normalize_llamacpp_usage(chunk) if is_final else None
+            return thought, content, is_final, usage
         else:
             raise ValueError(f"Unknown backend: {backend}")
 
@@ -1796,7 +2310,7 @@ class ModelQuery:
             decoded = line.decode('utf-8').strip()
             if not decoded:
                 continue
-            if backend == "llamacpp":
+            if backend in ("llamacpp", "lmstudio"):
                 if decoded.startswith('data: '):
                     decoded = decoded[6:].strip()
             if decoded == '[DONE]':
@@ -1813,14 +2327,14 @@ class ModelQuery:
                 if self.ctx.debug_manager.is_enabled('context'):
                     debug_log(self.ctx.debug_manager, 'context', 1,
                              f"Updated context tokens: {total_tokens}", prefix="CTX")
-        elif backend == "llamacpp":
+        elif backend in ("llamacpp", "lmstudio"):
             if messages:
                 self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(messages)
 
     def query_stream(
         self,
         messages, model, stream_enabled=True, debug=False,
-        show_thinking=True, context_size=None, images=None
+        show_thinking=True, context_size=None, images=None, **kwargs
     ):
         """Stream response from any backend. Dispatches to backend-specific chunk parsing."""
         full_content = ""
@@ -1828,10 +2342,25 @@ class ModelQuery:
         backend = self.backend
 
         if images and messages and messages[-1].get("role") == "user":
-            messages[-1]["images"] = images
+            if self.backend == "ollama":
+                messages[-1]["images"] = images
+            elif self.backend == "lmstudio":
+                text = messages[-1].get("content", "")
+                content_parts = [{"type": "text", "text": text or "Describe this image"}]
+                for img in images:
+                    mime = guess_image_mime(img)
+                    content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img}"}})
+                messages[-1]["content"] = content_parts
+            else:
+                text = messages[-1].get("content", "")
+                content_parts = [{"type": "text", "text": text or "Describe this image"}]
+                for img in images:
+                    mime = guess_image_mime(img)
+                    content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img}"}})
+                messages[-1]["content"] = content_parts
 
         api_url, payload, headers = self._build_stream_request(
-            backend, messages, model, stream_enabled, context_size)
+            backend, messages, model, stream_enabled, context_size, **kwargs)
 
         data = json.dumps(payload).encode('utf-8')
         req = Request(api_url, data=data, headers=headers)
@@ -2072,6 +2601,11 @@ def _process_file_inclusions(text):
             filepath = word[1:]
             expanded_path = os.path.expanduser(filepath)
             if os.path.isfile(expanded_path):
+                file_size = os.path.getsize(expanded_path)
+                if file_size > MAX_FILE_INCLUSION_SIZE:
+                    err_msg = f"[Failed to load `{filepath}`: File too large ({file_size / 1024 / 1024:.1f} MB, max 5 MB)]"
+                    print(colorize(err_msg, 'error'), file=sys.stderr)
+                    continue
                 print(colorize(f"[--- Loading file: {filepath} ---]", 'muted'), file=sys.stderr)
                 try:
                     with open(expanded_path, 'r', encoding='utf-8') as f:
@@ -2388,7 +2922,7 @@ class ChatLoop:
 
     def fetch_models(self) -> None:
         """Fetch available models from the backend."""
-        if self.ctx.backend == "llamacpp":
+        if self.ctx.backend in ("llamacpp", "lmstudio"):
             self.ctx.models = [m['name'] for m in fetch_models_llamacpp(self.ctx.base_url)]
         else:
             self.ctx.models = [m['name'] for m in fetch_models_ollama(self.ctx.base_url)]
@@ -2566,6 +3100,121 @@ class ChatLoop:
 
         return "".join(output_lines).strip()
 
+    def _parse_shell_into_blocks(self, text):
+        """Split shell session into command blocks by detecting prompt lines."""
+        text = strip_ansi(text)
+        import re
+        parts = re.split(r'(?m)^.*[\$#] ', text)
+        return [p.strip() for p in parts if p.strip()]
+
+    def _filter_smart_blocks(self, blocks):
+        """Filter out trivial commands (cd, ls, pwd, clear, echo, exit)."""
+        boring = re.compile(r'^\s*(cd|ls|pwd|clear|exit|echo)\b')
+        return [b for b in blocks if not boring.match(b.split('\n')[0].strip()) and len(b.strip()) > 20]
+
+    def _edit_session(self, content):
+        """Open content in editor (VISUAL > EDITOR > vim) and return the edited result."""
+        import tempfile
+        editor = os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vim'
+        tmpfile = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write(content)
+                tmpfile = f.name
+            subprocess.run([editor, tmpfile], check=True)
+            with open(tmpfile, 'r') as f:
+                return f.read()
+        except (subprocess.CalledProcessError, Exception) as e:
+            print(colorize(f"[Edit cancelled: {e}]", 'error'), file=sys.stderr)
+            return None
+        finally:
+            if tmpfile:
+                try:
+                    os.unlink(tmpfile)
+                except OSError:
+                    pass
+
+    def _handle_shell_session(self, session_output):
+        """Parse captured shell session and let user choose what to send."""
+        clean = strip_ansi(session_output)
+        if len(clean) > MAX_WRITE_FILE_SIZE:
+            print(colorize(f"\n[Shell session output too large ({len(clean)} bytes), discarding — will not be sent to LLM]", 'error'), file=sys.stderr)
+            return
+        token_count = estimate_token_count(clean)
+        blocks = self._parse_shell_into_blocks(clean)
+
+        print(colorize(f"\n[Shell session: {len(blocks)} command(s), ~{token_count} tokens]", 'info'), file=sys.stderr)
+        for i, block in enumerate(blocks, 1):
+            block_tokens = estimate_token_count(block)
+            first = block.split('\n')[0].strip()[:80]
+            print(colorize(f"  {i}. ~{block_tokens:>5}  {first}", 'muted'), file=sys.stderr)
+
+        try:
+            choice = input(colorize("\n[S]end all / Sma[r]t / [E]dit / S[k]ip / [1,3-5] by #? ", 'warning')).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            choice = 'k'
+
+        if choice in ('s', 'send'):
+            self.run_process_query(f"Shell session transcript:\n{clean}")
+        elif choice in ('r', 'smart'):
+            filtered = self._filter_smart_blocks(blocks)
+            if filtered:
+                content = "\n---\n".join(f"$ {b.split(chr(10))[0].strip()}\n{chr(10).join(b.split(chr(10))[1:]).strip()}" for b in filtered)
+                print(colorize(f"[Smart filter: {len(filtered)}/{len(blocks)} commands]", 'info'), file=sys.stderr)
+                self.run_process_query(f"Shell session transcript (filtered):\n{content}")
+            else:
+                print(colorize("[No interesting commands found, sending all]", 'warning'), file=sys.stderr)
+                self.run_process_query(f"Shell session transcript:\n{clean}")
+        elif choice in ('e', 'edit'):
+            edited = self._edit_session(clean)
+            if edited and edited.strip():
+                edited_clean = strip_ansi(edited)
+                print(colorize(f"[Editing accepted: ~{estimate_token_count(edited_clean)} tokens]", 'info'), file=sys.stderr)
+                self.run_process_query(f"Shell session transcript:\n{edited_clean}")
+            else:
+                print(colorize("[Edit cancelled or empty, discarding]", 'muted'), file=sys.stderr)
+        else:
+            # Try numeric selection (e.g. "1", "1,3,7", "1-5", "1,3-5,7")
+            indices = self._parse_number_ranges(choice, len(blocks))
+            if indices:
+                content = "\n---\n".join(f"$ {blocks[i].split(chr(10))[0].strip()}\n{chr(10).join(blocks[i].split(chr(10))[1:]).strip()}" for i in indices)
+                print(colorize(f"[Selected {len(indices)}/{len(blocks)} commands]", 'info'), file=sys.stderr)
+                self.run_process_query(f"Shell session transcript (selected commands):\n{content}")
+            else:
+                print(colorize("[Shell session discarded]", 'muted'), file=sys.stderr)
+
+    @staticmethod
+    def _parse_number_ranges(text, max_val):
+        """Parse '1,3-5,7' into [1, 3, 4, 5, 7]. Returns None on invalid input."""
+        import re
+        if not text or not re.match(r'^[\d,\- ]+$', text):
+            return None
+        result = set()
+        for part in re.split(r'[,\s]+', text):
+            part = part.strip()
+            if not part:
+                continue
+            if '-' in part:
+                bounds = part.split('-')
+                if len(bounds) != 2:
+                    return None
+                try:
+                    start, end = int(bounds[0]), int(bounds[1])
+                    if start < 1 or end > max_val or start > end:
+                        return None
+                    result.update(range(start, end + 1))
+                except ValueError:
+                    return None
+            else:
+                try:
+                    n = int(part)
+                    if n < 1 or n > max_val:
+                        return None
+                    result.add(n)
+                except ValueError:
+                    return None
+        return sorted(result)
+
     # ============================================================================
     # ============= REFACTORED RUN HANDLERS ====================================
     # ============================================================================
@@ -2576,7 +3225,7 @@ class ChatLoop:
         self.ctx.debug_mode = debug
         self.ctx.stream_enabled = stream_enabled
 
-        print(colorize(f"\n[{self.ctx.backend.upper()} Chat Mode]", 'info'), file=sys.stderr)
+        print(colorize(f"\n[ollamaquery2 v{__version__} - {self.ctx.backend.upper()} Chat Mode]", 'info'), file=sys.stderr)
         print(format_help_text(compact=True), file=sys.stderr)
         print(colorize("Type /help for details\n", 'muted'), file=sys.stderr)
 
@@ -2721,16 +3370,24 @@ class ChatLoop:
                 self.ctx.current_images = []
                 print(colorize("[Image cleared]", 'info'), file=sys.stderr)
             else:
-                img_path = os.path.expanduser(parts[1].strip())
-                if os.path.isfile(img_path):
-                    img_data = prepare_image_data(img_path)
-                    if img_data:
-                        self.ctx.current_images = [img_data]
-                        print(colorize(f"[Image attached: {os.path.basename(img_path)}]", 'success'), file=sys.stderr)
+                paths = parts[1].strip().split()
+                new_images = []
+                loaded = 0
+                for p in paths:
+                    img_path = os.path.expanduser(p)
+                    if os.path.isfile(img_path):
+                        img_data = prepare_image_data(img_path)
+                        if img_data:
+                            new_images.append(img_data)
+                            loaded += 1
+                        else:
+                            print(colorize(f"[Error: Could not encode {os.path.basename(img_path)}]", 'error'), file=sys.stderr)
                     else:
-                        print(colorize("[Error: Could not encode image]", 'error'), file=sys.stderr)
-                else:
-                    print(colorize(f"[Error: File not found: {img_path}]", 'error'), file=sys.stderr)
+                        print(colorize(f"[Error: File not found: {img_path}]", 'error'), file=sys.stderr)
+                if loaded:
+                    self.ctx.current_images = new_images
+                    names = ", ".join(os.path.basename(p) for p in paths if os.path.isfile(os.path.expanduser(p)))
+                    print(colorize(f"[{loaded} image(s) attached: {names}]", 'success'), file=sys.stderr)
             return False
         return None
 
@@ -2948,7 +3605,7 @@ class ChatLoop:
             state = "ON" if self.ctx.agentic_mode else "OFF"
             if self.ctx.agentic_mode:
                 self.ctx._saved_system_prompt = self.ctx.system_prompt
-                self.ctx.system_prompt = AGENTIC_SYSTEM_PROMPT
+                self.ctx.system_prompt = get_agentic_prompt(self.ctx.model)
             else:
                 if hasattr(self.ctx, '_saved_system_prompt'):
                     self.ctx.system_prompt = self.ctx._saved_system_prompt
@@ -2958,7 +3615,7 @@ class ChatLoop:
         # full -> enable everything
         if subcmd == "full":
             self.ctx._saved_system_prompt = self.ctx.system_prompt
-            self.ctx.system_prompt = AGENTIC_SYSTEM_PROMPT
+            self.ctx.system_prompt = get_agentic_prompt(self.ctx.model)
             self.ctx.agentic_mode = True
             self.ctx.agentic_verbose = True
             self.ctx.agentic_show_thinking = True
@@ -3107,6 +3764,34 @@ class ChatLoop:
             return {"tool": tool_name, "arguments": tool_args}
         return None
 
+    _TOOL_CALL_OPEN_RE = re.compile(r'\{\s*"(tool|function|type)"')
+
+    def _find_tool_call_json(self, text, pos=0):
+        """Find the next JSON tool call opening brace, handling multi-line whitespace."""
+        m = self._TOOL_CALL_OPEN_RE.search(text, pos)
+        if m:
+            return m.start()
+        return -1
+
+    def _rfind_tool_call_json(self, text):
+        """Find the last JSON tool call opening brace, handling multi-line whitespace."""
+        matches = list(self._TOOL_CALL_OPEN_RE.finditer(text))
+        if matches:
+            return matches[-1].start()
+        return -1
+
+    def _extract_json_balanced(self, text, start):
+        """Extract balanced JSON from text starting at an opening brace."""
+        depth, end = 0, start
+        for i, ch in enumerate(text[start:], start):
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+        return None
+
     def parse_tool_call(self, text: str) -> Optional[dict]:
         """Extract tool call JSON from LLM response. Returns {"tool": ..., "arguments": ...} or None."""
         lazy = getattr(self.ctx, 'lazy_tool', False)
@@ -3131,59 +3816,36 @@ class ChatLoop:
                         return result
         # Pass 3: bare JSON object with "tool" key
         if lazy:
-            # Lazy mode: accept first bare JSON anywhere in the text
-            m = re.search(r'\{"tool"\s*:\s*"[^"]+"', text)
+            m = self._TOOL_CALL_OPEN_RE.search(text)
             if m:
                 start = m.start()
-                depth, end = 0, start
-                for i, ch in enumerate(text[start:], start):
-                    if ch == '{':
-                        depth += 1
-                    elif ch == '}':
-                        depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
-                result = self._normalize_tool_json(text[start:end])
-                if result:
-                    args_str = json.dumps(result.get("arguments", {}))
-                    if not ('<' in args_str and '>' in args_str):
-                        return result
+                json_str = self._extract_json_balanced(text, start)
+                if json_str:
+                    result = self._normalize_tool_json(json_str)
+                    if result:
+                        args_str = json.dumps(result.get("arguments", {}))
+                        if not ('<' in args_str and '>' in args_str):
+                            return result
         else:
             # Strict mode: only at START of the text
-            stripped = text.lstrip()
-            if stripped.startswith('{"tool"') or stripped.startswith('{"function"') or stripped.startswith('{"type"'):
+            m = re.match(r'\s*\{\s*"(?:tool|function|type)"', text)
+            if m:
                 start = text.index('{')
-                depth, end = 0, start
-                for i, ch in enumerate(text[start:], start):
-                    if ch == '{':
-                        depth += 1
-                    elif ch == '}':
-                        depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
-                result = self._normalize_tool_json(text[start:end])
-                if result:
-                    return result
+                json_str = self._extract_json_balanced(text, start)
+                if json_str:
+                    result = self._normalize_tool_json(json_str)
+                    if result:
+                        return result
             # Pass 4: bare JSON tool call at the END of the text (strict mode only)
-            for search_key in ('{"tool"', '{"function"', '{"type"'):
-                idx = text.rfind(search_key)
-                if idx >= 0:
-                    start = idx
-                    depth, end = 0, start
-                    for i, ch in enumerate(text[start:], start):
-                        if ch == '{':
-                            depth += 1
-                        elif ch == '}':
-                            depth -= 1
-                        if depth == 0:
-                            end = i + 1
-                            break
+            idx = self._rfind_tool_call_json(text)
+            if idx >= 0:
+                json_str = self._extract_json_balanced(text, idx)
+                if json_str:
+                    end = idx + len(json_str)
                     if not text[end:].strip():
-                        prefix = text[:start].strip()
+                        prefix = text[:idx].strip()
                         if not prefix:
-                            result = self._normalize_tool_json(text[start:end])
+                            result = self._normalize_tool_json(json_str)
                             if result:
                                 args_str = json.dumps(result.get("arguments", {}))
                                 if not ('<' in args_str and '>' in args_str):
@@ -3207,32 +3869,23 @@ class ChatLoop:
             seen_keys = set()
             pos = 0
             while pos < len(text):
-                idx = text.find('{"tool"', pos)
-                if idx == -1:
-                    idx = text.find('{"function"', pos)
-                if idx == -1:
-                    idx = text.find('{"type"', pos)
+                idx = self._find_tool_call_json(text, pos)
                 if idx == -1:
                     break
-                depth, end = 0, idx
-                for i, ch in enumerate(text[idx:], idx):
-                    if ch == '{':
-                        depth += 1
-                    elif ch == '}':
-                        depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
-                result = self._normalize_tool_json(text[idx:end])
+                json_str = self._extract_json_balanced(text, idx)
+                if not json_str:
+                    break
+                result = self._normalize_tool_json(json_str)
                 if result:
                     key = (result["tool"], json.dumps(result.get("arguments", {}), sort_keys=True))
                     if key not in seen_keys:
                         seen_keys.add(key)
                         results.append(result)
-                pos = end
+                pos = idx + len(json_str) if json_str else idx + 1
         else:
             # Strict mode: only consecutive tool calls from the start
-            if not (text.startswith('{"tool"') or text.startswith('{"function"') or text.startswith('{"type"')):
+            m = re.match(r'\s*\{\s*"(?:tool|function|type)"', text)
+            if not m:
                 return []
             pos = 0
             while pos < len(text):
@@ -3241,28 +3894,19 @@ class ChatLoop:
                     pos += 1
                 if pos >= len(text):
                     break
-                idx = -1
-                for search_key in ('{"tool"', '{"function"', '{"type"'):
-                    idx = text.find(search_key, pos)
-                    if idx == pos:
-                        break
-                else:
+                # Check if next non-whitespace is a tool call
+                m2 = re.match(r'\{\s*"(?:tool|function|type)"', text[pos:])
+                if not m2:
                     break
-                depth, end = 0, idx
-                for i, ch in enumerate(text[idx:], idx):
-                    if ch == '{':
-                        depth += 1
-                    elif ch == '}':
-                        depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
-                result = self._normalize_tool_json(text[idx:end])
+                json_str = self._extract_json_balanced(text, pos)
+                if not json_str:
+                    break
+                result = self._normalize_tool_json(json_str)
                 if result:
                     results.append(result)
                 else:
                     break
-                pos = end
+                pos += len(json_str)
         return results
 
     @staticmethod
@@ -3319,9 +3963,9 @@ class ChatLoop:
             if not getattr(self, 'messages', None):
                 self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
 
-            # Build augmented messages for the ReAct loop (append tool definitions)
-            agentic_prompt = self.ctx.system_prompt + self.tool_registry.get_system_prompt_block()
-            messages = [{'role': 'system', 'content': agentic_prompt}]
+            # Use model-specific system prompt with tool definitions for agentic ReAct loop
+            tool_defs = self.tool_registry.get_system_prompt_block()
+            messages = [{'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs)}]
             if len(self.messages) > 1:
                 messages.extend(self.messages[1:])  # conversation history
             messages.append({'role': 'user', 'content': final_content})
@@ -3338,6 +3982,18 @@ class ChatLoop:
             last_tool_call = None
             step_timeout = self.ctx.agentic_step_timeout
 
+            # Convert tool definitions to OpenAI function-calling format
+            openai_tools = []
+            for name, defn in AGENTIC_TOOL_DEFS.items():
+                openai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": defn["description"],
+                        "parameters": defn["parameters"]
+                    }
+                })
+
             while iteration < max_iterations:
                 iteration += 1
                 if logger:
@@ -3349,7 +4005,9 @@ class ChatLoop:
                     self.query_handler.query_sync, step_timeout,
                     messages, self.ctx.model,
                     context_size=self.ctx.context_size,
-                    images=self.ctx.current_images
+                    images=self.ctx.current_images,
+                    tools=openai_tools,
+                    **get_inference_params(self.ctx.model)
                 )
 
                 if response is None:
@@ -3357,13 +4015,18 @@ class ChatLoop:
                     break
 
                 response_text = ""
+                api_tool_calls = []
                 if isinstance(response, dict):
                     if self.ctx.backend == "ollama":
-                        response_text = response.get('message', {}).get('content', '')
+                        msg = response.get('message', {})
+                        response_text = msg.get('content', '')
+                        api_tool_calls = msg.get('tool_calls', [])
                     else:
                         choices = response.get('choices', [])
                         if choices:
-                            response_text = choices[0].get('message', {}).get('content', '')
+                            msg = choices[0].get('message', {})
+                            response_text = msg.get('content', '') or ''
+                            api_tool_calls = msg.get('tool_calls', [])
                 elif isinstance(response, str):
                     response_text = response
 
@@ -3386,19 +4049,35 @@ class ChatLoop:
                     if thinking:
                         print(colorize(f"\n<thinking>\n{thinking}\n</thinking>", 'muted'), file=sys.stderr)
 
-                if not response_text:
+                if not response_text and not api_tool_calls:
                     print(colorize("\n[Agentic] Empty response, aborting.", 'error'), file=sys.stderr)
                     break
 
-                if self._is_stuck(response_text):
+                if response_text and self._is_stuck(response_text):
                     print(colorize("\n[Agentic] Model appears stuck (repetitive output), aborting.", 'warning'), file=sys.stderr)
                     break
 
-                tool_calls = self.parse_tool_calls(response_text)
-                if not tool_calls:
-                    single = self.parse_tool_call(response_text)
-                    if single:
-                        tool_calls = [single]
+                # Convert API-level tool_calls to internal format
+                tool_calls = []
+                if api_tool_calls:
+                    for tc in api_tool_calls:
+                        func = tc.get('function', {})
+                        name = func.get('name', '')
+                        args_raw = func.get('arguments', {})
+                        if isinstance(args_raw, str):
+                            try:
+                                args = json.loads(args_raw)
+                            except json.JSONDecodeError:
+                                args = {}
+                        else:
+                            args = args_raw
+                        tool_calls.append({"tool": name, "arguments": args})
+                elif response_text:
+                    tool_calls = self.parse_tool_calls(response_text)
+                    if not tool_calls:
+                        single = self.parse_tool_call(response_text)
+                        if single:
+                            tool_calls = [single]
 
                 if logger:
                     first_call = tool_calls[0] if tool_calls else None
@@ -3457,7 +4136,10 @@ class ChatLoop:
                     break
 
                 combined = "\n---\n".join(observations) if observations else "[No tool output]"
-                messages.append({'role': 'assistant', 'content': response_text})
+                assistant_msg = {'role': 'assistant', 'content': response_text}
+                if api_tool_calls:
+                    assistant_msg['tool_calls'] = api_tool_calls
+                messages.append(assistant_msg)
                 messages.append({'role': 'user', 'content': f"Tool result:\n{combined}"})
 
             if iteration >= max_iterations and not final_answer:
@@ -3500,7 +4182,8 @@ class ChatLoop:
                         debug=self.ctx.debug_mode,
                         show_thinking=(not self.ctx.force_no_thinking),
                         context_size=self.ctx.context_size,
-                        images=self.ctx.current_images
+                        images=self.ctx.current_images,
+                        **get_inference_params(self.ctx.model)
                     )
                     if response:
                         stream_tool_calls = self.parse_tool_calls(response)
@@ -3539,9 +4222,11 @@ class ChatLoop:
             traceback.print_exc(file=sys.stderr)
 
     def run_handle_spawnshell(self, full_input: str) -> Optional[bool]:
-        """Handle /spawnshell command."""
+        """Handle /spawnshell command. Captures shell session and lets user choose what to send."""
         if full_input == '/spawnshell':
-            self.handle_spawnshell()
+            session_output = self.handle_spawnshell()
+            if session_output:
+                self._handle_shell_session(session_output)
             return False
         return None
 
@@ -3595,7 +4280,7 @@ def get_base_url(args, backend):
     if args.host:
         base_url = args.host
     else:
-        default = DEFAULT_LLAMACPP_HOST if backend == "llamacpp" else DEFAULT_OLLAMA_HOST
+        default = DEFAULT_LLAMACPP_HOST if backend in ("llamacpp", "lmstudio") else DEFAULT_OLLAMA_HOST
         env_var = f'{backend.upper()}_HOST'
         base_url = os.environ.get(env_var, default)
 
@@ -3627,6 +4312,8 @@ def build_messages(args, input_data, image_path):
 def list_models(base_url, backend):
     """List all available models and exit."""
     if backend == "llamacpp":
+        list_models_llamacpp(base_url)
+    elif backend == "lmstudio":
         list_models_llamacpp(base_url)
     else:
         list_models_ollama(base_url)
@@ -3816,45 +4503,55 @@ def check_backend_with_head(url, server_marker):
     """Attempt HEAD request to URL and check for server header."""
     try:
         request = Request(url, method='HEAD')
-        with _request_with_retry(request, timeout=1.0) as response:
+        with urlopen(request, timeout=1) as response:
             server_header = response.headers.get('Server', '').lower()
             return server_marker.lower() in server_header
-    except (HTTPError, URLError, OSError, TimeoutError, Exception):
+    except Exception:
         return False
-
 
 
 def check_backend_with_get(url, server_marker):
     """Attempt GET request to URL and check for server marker."""
     try:
         request = Request(url, method='GET')
-        with _request_with_retry(request, timeout=1.0) as response:
+        with urlopen(request, timeout=1) as response:
             my_response = str(response.read())
             my_response = my_response.lower()
             if server_marker.lower() in my_response:
                 return True
-    except (HTTPError, URLError, OSError, TimeoutError, Exception):
+    except Exception:
         return False
- 
+
+
+
+def check_lmstudio(url):
+    """Check if LM Studio is running by querying /v1/models."""
+    try:
+        request = Request(f"{url}/v1/models", method='GET')
+        with urlopen(request, timeout=2) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            models = data.get('data', [])
+            return bool(models)
+    except Exception:
+        return False
 
 def auto_detect_backend():
     """Auto-detect backend based on default ports using HEAD request.
     
-    Checks if both backends are running at their default ports:
+    Checks sequentiall for:
     - 127.0.0.1:8080 for llama.cpp
     - 127.0.0.1:11434 for ollama
-    
-    Uses HTTP HEAD request with timeout of 1 second and checks for
-    'Server: llama.cpp' or 'Server: ollama' headers.
+    - 127.0.0.1:1234 for lm studio
     
     Returns:
-        str: 'llamacpp', 'ollama', or None if neither detected
+        tuple: (found, backend_name, url) or (None, '', '')
     """
    
     # Default URLs
     llama_cpp_url = DEFAULT_LLAMACPP_HOST
     ollama_url =    DEFAULT_OLLAMA_HOST
-    
+    lmstudio_url =  DEFAULT_LMSTUDIO_HOST
+
     # Check which backend is running
 
     sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + llama_cpp_url + " ", 'info'))
@@ -3871,10 +4568,15 @@ def auto_detect_backend():
     else:
         sys.stderr.write(colorize(f"Fail\n", 'info'))
 
+    sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + lmstudio_url + " ", 'info'))
+    if check_lmstudio(lmstudio_url):
+        sys.stderr.write(colorize(f"Success\n", 'info'))
+        return True,'lmstudio',lmstudio_url
+    else:
+        sys.stderr.write(colorize(f"Fail\n", 'info'))
+
 
     # grab the ip of the host 
-    #  socket.gethostbyname_ex(socket.gethostname())[-1] 
-    # ('myhost.home', [], ['192.168.1.19', '192.168.1.20'])
     list_of_ip = socket.gethostbyname_ex(socket.gethostname())[-1]
     for ip in list_of_ip:
         
@@ -3891,6 +4593,14 @@ def auto_detect_backend():
         if check_backend_with_get("http://"+ip + ":" +  str(DEFAULT_OLLAMA_PORT),   'ollama'):
             sys.stderr.write(colorize(f"Success\n", 'info'))
             return True,'ollama',url
+        else:
+            sys.stderr.write(colorize(f"Fail\n", 'info'))
+
+        url="http://"+ip + ":" + str(DEFAULT_LMSTUDIO_PORT)
+        sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + url    + " ", 'info'))
+        if check_lmstudio(url):
+            sys.stderr.write(colorize(f"Success\n", 'info'))
+            return True,'lmstudio',url
         else:
             sys.stderr.write(colorize(f"Fail\n", 'info'))
 
@@ -3941,7 +4651,20 @@ def resolve_connection(args):
     # 1. Explicit user override (-H)
     if args.host:
         base_url = args.host if args.host.startswith(('http://', 'https://')) else f"http://{args.host}"
-        selected_backend = args.backend or "ollama"  # Default to ollama if only host is provided
+        selected_backend = args.backend
+        if not selected_backend:
+            # Infer backend from known ports
+            port_match = re.search(r':(\d+)(/|$)', base_url)
+            if port_match:
+                port = int(port_match.group(1))
+                if port == DEFAULT_OLLAMA_PORT:
+                    selected_backend = "ollama"
+                elif port == DEFAULT_LLAMACPP_PORT:
+                    selected_backend = "llamacpp"
+                elif port == DEFAULT_LMSTUDIO_PORT:
+                    selected_backend = "lmstudio"
+            if not selected_backend:
+                selected_backend = "ollama"
         save_backend_config(selected_backend, base_url)
         return selected_backend, base_url
 
@@ -3963,6 +4686,8 @@ def resolve_connection(args):
             is_valid = check_backend_with_head(s_host, 'llama.cpp')
         elif s_backend == 'ollama':
             is_valid = check_backend_with_get(s_host, 'ollama')
+        elif s_backend == 'lmstudio':
+            is_valid = check_lmstudio(s_host)
 
         if is_valid:
             sys.stderr.write(colorize("Success\n", 'success'))
@@ -3985,6 +4710,8 @@ def resolve_connection(args):
     fallback_backend = args.backend or "ollama"
     if fallback_backend == "llamacpp":
         fallback_host = os.environ.get('LLAMACPP_HOST', DEFAULT_LLAMACPP_HOST)
+    elif fallback_backend == "lmstudio":
+        fallback_host = os.environ.get('LMSTUDIO_HOST', DEFAULT_LMSTUDIO_HOST)
     else:
         fallback_host = os.environ.get('OLLAMA_HOST', DEFAULT_OLLAMA_HOST)
 
@@ -3998,13 +4725,14 @@ def resolve_connection(args):
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Unified LLM Query Interface for Ollama & Llama.cpp"
+        description="Unified LLM Query Interface for Ollama, Llama.cpp & LM Studio"
     )
 
     # Backend selection
     group = parser.add_argument_group('Backend')
-    parser.add_argument("-b", "--backend", choices=["ollama", "llamacpp"], default=None, help="API backend to use (auto-detected if omitted).")
+    parser.add_argument("-b", "--backend", choices=["ollama", "llamacpp", "lmstudio"], default=None, help="API backend to use (auto-detected if omitted).")
     group.add_argument('-H', '--host', help='Custom API URL')
+    parser.add_argument('--version', action='store_true', help='Show version and exit')
 
     # Listing operations
     list_group = parser.add_mutually_exclusive_group()
@@ -4042,7 +4770,7 @@ def main():
     prompt_group.add_argument('--prompt', help='Custom system prompt text')
 
     # Image support
-    parser.add_argument('--image', help='Image file for multimodal models')
+    parser.add_argument('--image', nargs='*', help='Image file(s) for multimodal models (space-separated)')
 
     # Display options
     parser.add_argument('-p', '--no-stream', action="store_true",
@@ -4062,6 +4790,10 @@ def main():
     # Parse arguments
     args = parser.parse_args()
 
+    if args.version:
+        print(f"ollamaquery2 v{__version__}")
+        sys.exit(0)
+
     # Initialize theme system
     if args.no_color:
         os.environ['NO_COLOR'] = '1'
@@ -4074,7 +4806,18 @@ def main():
     else:
         active_prompt = DEFAULT_SYSTEM_PROMPT
     args.prompt = active_prompt
-    # ---------------------------------
+
+    # Early exit if no actionable argument was provided (avoid connecting for help display)
+    if not (args.chat or args.input_text or args.input_file or
+             args.input_dir or args.list or args.show or args.show_details):
+        print(colorize(f"ollamaquery2 v{__version__} - LLM Query Interface", 'info'))
+        if args.backend or args.host:
+            print(f"  Backend configured ({args.backend or 'auto'} @ {args.host or 'auto'}), but no action specified.")
+        print(f"  Start chat:  -c")
+        print(f"  Single query: -I \"your prompt\"")
+        print(f"  List models: -l")
+        print(f"  Help:        --help")
+        sys.exit(0)
 
     # determine backend first so we know where to check for loaded models
     backend, base_url = resolve_connection(args)
@@ -4083,11 +4826,58 @@ def main():
     server_reachable = False
     if backend == "ollama":
         server_reachable = check_backend_with_get(base_url, 'ollama')
-    else:
+    elif backend == "llamacpp":
         server_reachable = check_backend_with_head(base_url, 'llama.cpp')
+    elif backend == "lmstudio":
+        server_reachable = check_lmstudio(base_url)
+
+    if not server_reachable and not re.search(r':\d{2,5}(/|$)', base_url):
+        # No port in URL — try default ports
+        if args.backend:
+            # User specified a backend — try its default port first
+            port_map = {"ollama": DEFAULT_OLLAMA_PORT, "llamacpp": DEFAULT_LLAMACPP_PORT, "lmstudio": DEFAULT_LMSTUDIO_PORT}
+            fallback = f"{base_url}:{port_map.get(backend, DEFAULT_OLLAMA_PORT)}"
+            sys.stderr.write(colorize(f"[INFO] Checking {fallback}... ", 'muted'))
+            ok = check_lmstudio(fallback) if backend == "lmstudio" else \
+                 check_backend_with_head(fallback, 'llama.cpp') if backend == "llamacpp" else \
+                 check_backend_with_get(fallback, 'ollama')
+            if ok:
+                sys.stderr.write(colorize(f"found {backend}\n", 'success'))
+                base_url = fallback
+                server_reachable = True
+            else:
+                sys.stderr.write(colorize("no\n", 'warning'))
+        else:
+            # No explicit backend — try all default ports
+            probes = [
+                ("ollama", f"{base_url}:{DEFAULT_OLLAMA_PORT}", check_backend_with_get, 'ollama'),
+                ("llamacpp", f"{base_url}:{DEFAULT_LLAMACPP_PORT}", check_backend_with_head, 'llama.cpp'),
+                ("lmstudio", f"{base_url}:{DEFAULT_LMSTUDIO_PORT}", check_lmstudio, None),
+            ]
+            for probe_backend, probe_url, probe_fn, probe_marker in probes:
+                sys.stderr.write(colorize(f"[INFO] Checking {probe_url}... ", 'muted'))
+                try:
+                    ok = probe_fn(probe_url) if probe_marker is None else probe_fn(probe_url, probe_marker)
+                    if ok:
+                        sys.stderr.write(colorize(f"found {probe_backend}\n", 'success'))
+                        backend, base_url = probe_backend, probe_url
+                        server_reachable = True
+                        break
+                    sys.stderr.write(colorize("no\n", 'warning'))
+                except Exception:
+                    sys.stderr.write(colorize("no\n", 'warning'))
+                    continue
 
     if not server_reachable:
-        sys.stderr.write(colorize(f"[ERROR] Cannot reach {backend} at {base_url}. Server may be offline.\n", 'error'))
+        hint = ""
+        has_port = re.search(r':\d{2,5}(/|$)', base_url)
+        if backend == "llamacpp" and not has_port:
+            hint = f" (try {base_url}:{DEFAULT_LLAMACPP_PORT})"
+        elif backend == "lmstudio" and not has_port:
+            hint = f" (try {base_url}:{DEFAULT_LMSTUDIO_PORT})"
+        elif backend == "ollama" and not has_port:
+            hint = f" (try {base_url}:{DEFAULT_OLLAMA_PORT})"
+        sys.stderr.write(colorize(f"[ERROR] Cannot reach {backend} at {base_url}. Server may be offline.{hint}\n", 'error'))
         sys.exit(1)
 
     # 1. Use explicitly requested model if provided via -m
@@ -4123,11 +4913,29 @@ def main():
             else:
                 sys.stderr.write(colorize("[ERROR] No models available on Llama.cpp server.\n", 'error'))
                 sys.exit(1)
+    # 4. LM Studio
+    elif backend == "lmstudio":
+        available_models = fetch_models_llamacpp(base_url)
+        if available_models:
+            target_model = available_models[0]['name']
+            sys.stderr.write(colorize(f"[INFO] Auto-selected hosted model: '{target_model}'\n", 'success'))
+        else:
+            all_models = fetch_models_llamacpp(base_url)
+            if all_models:
+                target_model = ""
+                print(colorize("\n[No model loaded. Use /listmodel to see available models.]", 'info'), file=sys.stderr)
+            else:
+                sys.stderr.write(colorize("[ERROR] No models available on LM Studio server.\n", 'error'))
+                sys.exit(1)
 
     # Handle listing operations
     if args.list or args.list_all:
         if backend == "llamacpp":
             list_models_llamacpp(base_url, filter_arg=args.model)
+            sys.exit(0)
+        elif backend == "lmstudio":
+            list_models_llamacpp(base_url, filter_arg=args.model)
+            sys.exit(0)
         if backend == "ollama":
             if args.list_all:
               list_models_ollama(
@@ -4139,6 +4947,7 @@ def main():
                   base_url,
                   filter_arg=args.model,
                   include_capabilities=False)
+            sys.exit(0)
             
         sys.exit(0)
 
@@ -4157,10 +4966,11 @@ def main():
         ctx.system_prompt = args.prompt
         ctx.shell_timeout = args.shell_timeout
 
-        image_data = prepare_image_data(args.image) if args.image else None
-        images_list = [image_data] if image_data else None
-        if images_list:
-            ctx.current_images = images_list
+        images_list = None
+        if args.image:
+            images_list = [prepare_image_data(p) for p in args.image if p and prepare_image_data(p)]
+            if images_list:
+                ctx.current_images = images_list
 
         should_stream = not args.no_stream and sys.stdout.isatty()
         loop = ChatLoop(ctx)
@@ -4200,9 +5010,7 @@ def main():
 
                 images_list = None
                 if args.image:
-                    image_data = prepare_image_data(args.image)
-                    if image_data:
-                        images_list = [image_data]
+                    images_list = [prepare_image_data(p) for p in args.image if p and prepare_image_data(p)]
 
                 query_handler = ModelQuery(context=CommandContext())
                 query_handler.ctx.base_url = base_url
@@ -4218,7 +5026,15 @@ def main():
                     images=images_list
                 )
 
-                output_text = response.get('message', {}).get('content', '') if isinstance(response, dict) else str(response)
+                output_text = ""
+                if isinstance(response, dict):
+                    output_text = response.get('message', {}).get('content', '')
+                    if not output_text:
+                        choices = response.get('choices', [])
+                        if choices:
+                            output_text = choices[0].get('message', {}).get('content', '')
+                else:
+                    output_text = str(response)
                 output_path = os.path.join(args.output_dir, filename + '.output')
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(output_text)
@@ -4227,7 +5043,9 @@ def main():
 
         # Single query with input text/file
         if args.input_text or args.input_file:
-            image_data = prepare_image_data(args.image) if args.image else None
+            images_list = None
+            if args.image:
+                images_list = [prepare_image_data(p) for p in args.image if p and prepare_image_data(p)]
 
             messages = [
                 {'role': 'system', 'content': args.prompt}
@@ -4241,10 +5059,6 @@ def main():
 
                 messages.append({'role': 'user', 'content': content})
 
-            # Add image if provided
-            if image_data and messages[-1]['role'] == 'user':
-                messages[-1]['images'] = [image_data]
-
             query_handler = ModelQuery(context=CommandContext())
             query_handler.ctx.base_url = base_url
             query_handler.ctx.backend = backend
@@ -4257,25 +5071,33 @@ def main():
                 context_size=None,
                 show_thinking=True,
                 debug=args.debug,
-                images=[image_data] if image_data else None
+                images=images_list
             )
 
             if args.output:
-                content = response.get('message', {}).get('content', '') if isinstance(response, dict) else str(response)
+                content = ""
+                if isinstance(response, dict):
+                    content = response.get('message', {}).get('content', '')
+                    if not content:
+                        choices = response.get('choices', [])
+                        if choices:
+                            content = choices[0].get('message', {}).get('content', '')
+                else:
+                    content = str(response)
                 with open(args.output, 'w', encoding='utf-8') as f:
                     f.write(content)
                 print(f"[Success: Output saved to {args.output}]", file=sys.stderr)
             elif not should_stream and response:
-                content = response.get('message', {}).get('content', '') if isinstance(response, dict) else str(response)
+                content = ""
+                if isinstance(response, dict):
+                    content = response.get('message', {}).get('content', '')
+                    if not content:
+                        choices = response.get('choices', [])
+                        if choices:
+                            content = choices[0].get('message', {}).get('content', '')
+                else:
+                    content = str(response)
                 print(content)
-
-        # Error handling for missing input
-        if not (args.chat or args.input_text or args.input_file or
-                 args.input_dir or args.list or args.show or args.show_details):
-            parser.error(
-                "You must provide an input (-I, -i, --input-dir), start chat (-c), "
-                "or list models/info (-l/--show/--list)"
-            )
 
 
 if __name__ == "__main__":

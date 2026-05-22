@@ -2,7 +2,7 @@
 
 ## Overview
 
-`ollamaquery2.py` (~3212 lines) is a single-file CLI tool for interacting with local LLM servers (Ollama and Llama.cpp). It supports interactive chat, batch processing, inline shell/URL/file commands, context tracking, and color themes.
+`ollamaquery2.py` (~4306 lines) is a single-file CLI tool for interacting with local LLM servers (Ollama and Llama.cpp). It supports interactive chat, batch processing, inline shell/URL/file commands, context tracking, agentic mode, and color themes.
 
 ## Architecture Diagram
 
@@ -16,7 +16,14 @@ main()
       │    ├── _process_file_inclusions()   # @filepath
       │    ├── _process_command_lines()     # !shell, /curl
       │    └── execute_os_command() / fetch_and_convert_url()
-      └── query_stream()                    # Unified streaming loop
+      ├── run_agentic_query()               # ReAct loop (if agentic mode)
+      │    ├── parse_tool_calls()           # Multi-tool extraction (strict/lazy)
+      │    ├── parse_tool_call()            # Single tool with format normalization
+      │    │    └── _normalize_tool_json()  # OpenAI function-calling → internal
+      │    ├── ToolRegistry.execute()       # Dispatch + alias mapping
+      │    │    └── TOOL_ARG_ALIASES        # path→file, cmd→command, etc.
+      │    └── query_stream()               # Final answer streaming
+      └── query_stream()                    # Unified streaming loop (non-agentic)
            ├── _build_stream_request()      # Backend-specific URL + payload
            ├── _iter_stream_lines()         # SSE-aware line iteration
            ├── _parse_chunk()               # Backend-specific chunk parsing
