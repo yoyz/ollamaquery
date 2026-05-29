@@ -48,7 +48,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 
 # ============================================================================
@@ -732,14 +732,18 @@ def get_message_token_count_llamacpp(base_url: str, text: str) -> int:
         with _request_with_retry(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
             return len(data.get('tokens', []))
-    except Exception:
-        return 0
+    except Exception as e:
+        global _TOKEN_COUNT_WARNED
+        if not _TOKEN_COUNT_WARNED:
+            sys.stderr.write(colorize(f"[WARNING] Token counting failed (llama.cpp): {e}\n", 'warning'))
+            _TOKEN_COUNT_WARNED = True
+        return estimate_token_count(text)
 
 
 def get_message_token_count_ollama(base_url: str, text: str, model: str) -> int:
     """Get exact token count using the /api/tokenize endpoint (no GPU overhead)."""
     if not model:
-        return 0
+        return estimate_token_count(text)
     try:
         url = f"{base_url}/api/tokenize"
         payload = json.dumps({"model": model, "content": text}).encode('utf-8')
@@ -747,8 +751,12 @@ def get_message_token_count_ollama(base_url: str, text: str, model: str) -> int:
         with _request_with_retry(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
             return len(data.get('tokens', []))
-    except Exception:
-        return 0
+    except Exception as e:
+        global _TOKEN_COUNT_WARNED
+        if not _TOKEN_COUNT_WARNED:
+            sys.stderr.write(colorize(f"[WARNING] Token counting failed (ollama): {e}\n", 'warning'))
+            _TOKEN_COUNT_WARNED = True
+        return estimate_token_count(text)
 
 
 def is_available_ollama_model(base_url: str, model_name: str) -> bool:
@@ -795,18 +803,33 @@ def parse_size(size_bytes):
     try:
         size_bytes = int(size_bytes)
         if size_bytes > 0:
-            return f"{size_bytes / (1024**3):.1f} GB"
+            if size_bytes >= 1024**3:
+                return f"{size_bytes / (1024**3):.1f} GB"
+            if size_bytes >= 1024**2:
+                return f"{size_bytes / (1024**2):.1f} MB"
+            if size_bytes >= 1024:
+                return f"{size_bytes / 1024:.1f} KB"
+            return f"{size_bytes} B"
     except (TypeError, ValueError):
         pass
     return "N/A"
 
 
+_TOKEN_COUNT_WARNED = False
+
+
 def estimate_token_count(text: str) -> int:
-    """Estimate token count from text using regex-based heuristic."""
+    """Estimate token count from text using regex-based heuristic.
+    
+    Falls back to a safe overestimate when API tokenization is unavailable.
+    Detects code content and uses a higher multiplier for safety.
+    """
     if not text:
         return 0
     tokens = len(re.findall(r'\b\w+\b|[^\w\s]', text))
-    return max(1, int(tokens * 1.1))
+    if re.search(r'\b(def|class|import|from|if|else|elif|return|for|while|try|except|with|as|pass|raise|lambda|yield|async|await)\b', text):
+        return max(1, int(tokens * 2.0))
+    return max(1, int(tokens * 1.5))
 
 
 def fetch_model_info_ollama(base_url, model_name):
@@ -970,11 +993,8 @@ class CommandContext:
         }
 
     def estimate_tokens(self, text: str) -> int:
-        """Estimate token count from text."""
-        if not text:
-            return 0
-        tokens = len(re.findall(r'\b\w+\b|[^\w\s]', text))
-        return max(1, int(tokens * 1.1))
+        """Estimate token count from text. Delegates to standalone estimator."""
+        return estimate_token_count(text)
 
     def calculate_context_tokens(self, messages: list) -> int:
         """Calculate estimated total tokens in conversation context."""
@@ -1264,6 +1284,23 @@ _VISION_ERROR_KEYWORDS = [
 ]
 
 
+def _extract_error_text(obj, depth=0):
+    """Recursively extract error text from nested structures."""
+    if depth > 5:
+        return ""
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, dict):
+        parts = []
+        for key in ["message", "error", "text", "type", "detail", "details"]:
+            if key in obj:
+                parts.append(_extract_error_text(obj[key], depth + 1))
+        return " ".join(parts)
+    if isinstance(obj, list):
+        return " ".join(_extract_error_text(item, depth + 1) for item in obj)
+    return str(obj)
+
+
 def check_vision_error(response) -> bool:
     """Check if an API response dict indicates the model doesn't support vision.
     
@@ -1272,13 +1309,7 @@ def check_vision_error(response) -> bool:
     """
     if not isinstance(response, dict):
         return False
-    error_text = ""
-    raw = response.get("error")
-    if raw:
-        if isinstance(raw, dict):
-            error_text = raw.get("message", "") or raw.get("type", "")
-        elif isinstance(raw, str):
-            error_text = raw
+    error_text = _extract_error_text(response.get("error", ""))
     return any(kw in error_text.lower() for kw in _VISION_ERROR_KEYWORDS)
 
 
@@ -1297,13 +1328,7 @@ def check_tools_error(response) -> bool:
     """
     if not isinstance(response, dict):
         return False
-    error_text = ""
-    raw = response.get("error")
-    if raw:
-        if isinstance(raw, dict):
-            error_text = raw.get("message", "") or raw.get("type", "")
-        elif isinstance(raw, str):
-            error_text = raw
+    error_text = _extract_error_text(response.get("error", ""))
     return any(kw in error_text.lower() for kw in _TOOLS_ERROR_KEYWORDS)
 
 
@@ -1322,8 +1347,19 @@ class Executor:
         self.image = container_image or os.environ.get("OLLAMAQUERY_CONTAINER_IMAGE",
                                                        "docker.io/library/python:3.12-alpine")
 
+    def _pre_pull_image(self):
+        """Pull the container image with a separate timeout so pulls don't consume command timeout."""
+        try:
+            subprocess.run(
+                [self.runtime, "pull", self.image],
+                capture_output=True, timeout=120, check=False
+            )
+        except Exception:
+            pass
+
     def run(self, command: str, timeout: int = 120) -> dict:
         if self.mode == "container":
+            self._pre_pull_image()
             cwd_bind = os.getcwd()
             wrapped = (
                 f"{self.runtime} run --rm "
@@ -1341,7 +1377,7 @@ class Executor:
         try:
             args_list = shlex.split(command)
             proc = subprocess.run(
-                args_list, shell=False,
+                args_list, shell=False,  # Intentional: shell=True would enable pipes/redirects but risks injection. Single commands only.
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, timeout=timeout
             )
@@ -1414,7 +1450,7 @@ AGENTIC_TOOL_DEFS = {
             "type": "object",
             "properties": {
                 "code": {"type": "string", "description": "Inline Python code to run"},
-                "file": {"type": "string", "description": "Path to .py file to run"},
+                "file_path": {"type": "string", "description": "Path to .py file to run"},
                 "timeout": {"type": "integer", "description": "Timeout in seconds (default 10, max 300). Increase for long-running scripts."}
             }
         }
@@ -1541,9 +1577,15 @@ def _tool_handle_list_directory(self, args):
 
 
 def _tool_handle_glob(self, args):
+    base_dir = os.path.abspath(os.getcwd())
     try:
         matches = sorted(glob.glob(args["pattern"], recursive=True))
-        return {"success": True, "output": "\n".join(matches), "error": None}
+        safe_matches = []
+        for m in matches:
+            abs_m = os.path.abspath(m)
+            if os.path.commonpath([base_dir, abs_m]) == base_dir:
+                safe_matches.append(m)
+        return {"success": True, "output": "\n".join(safe_matches), "error": None}
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
 
@@ -1583,8 +1625,13 @@ def _tool_handle_run_command(self, args):
 
 
 def _tool_handle_diff(self, args):
-    filepath1 = os.path.normpath(os.path.join(os.getcwd(), args["file1"]))
-    filepath2 = os.path.normpath(os.path.join(os.getcwd(), args["file2"]))
+    base_dir = os.path.abspath(os.getcwd())
+    filepath1 = os.path.abspath(os.path.join(os.getcwd(), args["file1"]))
+    filepath2 = os.path.abspath(os.path.join(os.getcwd(), args["file2"]))
+    if os.path.commonpath([base_dir, filepath1]) != base_dir:
+        return {"success": False, "output": "", "error": "Path traversal denied"}
+    if os.path.commonpath([base_dir, filepath2]) != base_dir:
+        return {"success": False, "output": "", "error": "Path traversal denied"}
     label1 = args.get("label1", args["file1"])
     label2 = args.get("label2", args["file2"])
     try:
@@ -1602,12 +1649,16 @@ def _tool_handle_diff(self, args):
 def _tool_handle_patch(self, args):
     import tempfile
     diff_text = args["diff"]
-    target = shlex.quote(os.path.normpath(os.path.join(os.getcwd(), args.get("target", ""))))
+    base_dir = os.path.abspath(os.getcwd())
+    target_raw = os.path.abspath(os.path.join(os.getcwd(), args.get("target", "")))
+    if os.path.commonpath([base_dir, target_raw]) != base_dir:
+        return {"success": False, "output": "", "error": "Path traversal denied"}
+    target = shlex.quote(target_raw)
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".diff", delete=False) as f:
             f.write(diff_text)
             diff_path = f.name
-        command = f"patch {target} {shlex.quote(diff_path)}" if target else f"patch < {shlex.quote(diff_path)}"
+        command = f"patch {target} {shlex.quote(diff_path)}" if target else f"patch -i {shlex.quote(diff_path)}"
         result = self.executor.run(command, timeout=120)
         os.unlink(diff_path)
         if result["returncode"] == 0:
@@ -1618,8 +1669,9 @@ def _tool_handle_patch(self, args):
 
 
 def _tool_handle_edit_file(self, args):
-    filepath = os.path.normpath(os.path.join(os.getcwd(), args["file_path"]))
-    if not filepath.startswith(os.getcwd()):
+    base_dir = os.path.abspath(os.getcwd())
+    filepath = os.path.abspath(os.path.join(os.getcwd(), args["file_path"]))
+    if os.path.commonpath([base_dir, filepath]) != base_dir:
         return {"success": False, "output": "", "error": "Path traversal denied"}
     if not os.path.isfile(filepath):
         return {"success": False, "output": "", "error": f"File not found: {args['file_path']}"}
@@ -1735,7 +1787,7 @@ def _parse_unified_hunks(body):
     """Parse @@ hunks from a unified diff body.
     
     Returns (hunks, detected_path, is_delete).
-    Each hunk: {"start": int, "old_count": int, "new_lines": [str]}
+    Each hunk: {"start": int, "old_count": int, "old_lines": [str], "new_lines": [str]}
     """
     import re
     hunks = []
@@ -1780,24 +1832,23 @@ def _parse_unified_hunks(body):
             new_count = int(m.group(4) or 1)
             i += 1
 
+            old_lines = []
             new_lines = []
-            collected = 0
-            while i < n and collected < new_count:
+            old_collected = 0
+            new_collected = 0
+            while i < n and (old_collected < old_count or new_collected < new_count):
                 cl = lines[i]
-                if cl.startswith(("+", " ")):
+                if cl.startswith("+") or cl.startswith(" "):
                     new_lines.append(cl[1:] if cl.startswith("+") else cl[1:])
-                    collected += 1
-                elif cl.startswith("-"):
-                    # Skip removed lines
-                    pass
-                elif cl.startswith("\\ "):
-                    # No newline at end of file marker
-                    pass
-                else:
+                    new_collected += 1
+                if cl.startswith("-") or cl.startswith(" "):
+                    old_lines.append(cl[1:] if cl.startswith("-") else cl[1:])
+                    old_collected += 1
+                if not (cl.startswith(("+", "-", " ")) or cl.startswith("\\ ")):
                     break
                 i += 1
 
-            hunks.append({"start": start, "old_count": old_count, "new_lines": new_lines})
+            hunks.append({"start": start, "old_count": old_count, "old_lines": old_lines, "new_lines": new_lines})
             continue
 
         i += 1
@@ -1816,10 +1867,11 @@ def _apply_unified_diff(patch_text):
         return {"success": False, "output": "", "error": "No valid patch sections found in patch_text"}
 
     applied = []
+    base_dir = os.path.abspath(os.getcwd())
     for sec in sections:
         path = sec["path"]
-        abspath = os.path.normpath(os.path.join(os.getcwd(), path))
-        if not abspath.startswith(os.getcwd()):
+        abspath = os.path.abspath(os.path.join(os.getcwd(), path))
+        if os.path.commonpath([base_dir, abspath]) != base_dir:
             return {"success": False, "output": "", "error": f"Path traversal denied: {path}"}
 
         op = sec.get("operation", "modify")
@@ -1832,8 +1884,8 @@ def _apply_unified_diff(patch_text):
 
         if op == "move":
             dest = sec["destination"]
-            absdest = os.path.normpath(os.path.join(os.getcwd(), dest))
-            if not absdest.startswith(os.getcwd()):
+            absdest = os.path.abspath(os.path.join(os.getcwd(), dest))
+            if os.path.commonpath([base_dir, absdest]) != base_dir:
                 return {"success": False, "output": "", "error": f"Path traversal denied: {dest}"}
             if os.path.isfile(abspath):
                 os.makedirs(os.path.dirname(absdest), exist_ok=True)
@@ -1862,6 +1914,12 @@ def _apply_unified_diff(patch_text):
                 old_count = len(content) - start_idx
             if old_count < 0:
                 old_count = 0
+
+            existing = content[start_idx:start_idx + old_count]
+            expected = hunk.get("old_lines", [])
+            if expected and existing != expected:
+                applied.append(f"SKIPPED {path} hunk at line {hunk['start']} (context mismatch)")
+                continue
 
             content[start_idx:start_idx + old_count] = new_lines
 
@@ -2319,19 +2377,29 @@ class ModelQuery:
         sys.stderr.write(colorize(f"\n--- Stats: {' | '.join(parts)} ---\n", 'muted'))
  
 
+    @staticmethod
+    def _inject_images_into_messages(messages, images, backend):
+        """Inject image data into the last user message, mutating in-place.
+
+        Ollama backend: sets messages[-1]["images"] = images list.
+        OpenAI-compatible backends (llamacpp, lmstudio): embeds images as
+        content parts with data:image URIs.
+        """
+        if not images or not messages or messages[-1].get("role") != "user":
+            return
+        if backend == "ollama":
+            messages[-1]["images"] = images
+        else:
+            text = messages[-1].get("content", "")
+            content_parts = [{"type": "text", "text": text or "Describe this image"}]
+            for img in images:
+                mime = guess_image_mime(img)
+                content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img}"}})
+            messages[-1]["content"] = content_parts
+
     def build_request_payload(self, messages, model, stream_enabled=False, **kwargs):
         """Build request payload for the backend."""
-        if images := kwargs.get('images'):
-            if messages and messages[-1].get("role") == "user":
-                if self.backend == "ollama":
-                    messages[-1]["images"] = images
-                else:
-                    text = messages[-1].get("content", "")
-                    content_parts = [{"type": "text", "text": text or "Describe this image"}]
-                    for img in images:
-                        mime = guess_image_mime(img)
-                        content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img}"}})
-                    messages[-1]["content"] = content_parts
+        self._inject_images_into_messages(messages, kwargs.get('images'), self.backend)
         
         payload = {
             "model": model,
@@ -2376,7 +2444,10 @@ class ModelQuery:
             with _request_with_retry(req) as response:
                 return json.loads(response.read().decode('utf-8'))
         except Exception as e:
-            sys.stderr.write(colorize(f"[ERROR] Sync query failed: {e}\n", 'error'))
+            msg = f"[ERROR] Sync query failed: {e}"
+            if isinstance(e, HTTPError) and e.code == 403 and ":cloud" in model:
+                msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
+            sys.stderr.write(colorize(msg, 'error'))
             return {}
 
 
@@ -2528,22 +2599,7 @@ class ModelQuery:
         backend = self.backend
 
         if images and messages and messages[-1].get("role") == "user":
-            if self.backend == "ollama":
-                messages[-1]["images"] = images
-            elif self.backend == "lmstudio":
-                text = messages[-1].get("content", "")
-                content_parts = [{"type": "text", "text": text or "Describe this image"}]
-                for img in images:
-                    mime = guess_image_mime(img)
-                    content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img}"}})
-                messages[-1]["content"] = content_parts
-            else:
-                text = messages[-1].get("content", "")
-                content_parts = [{"type": "text", "text": text or "Describe this image"}]
-                for img in images:
-                    mime = guess_image_mime(img)
-                    content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img}"}})
-                messages[-1]["content"] = content_parts
+            self._inject_images_into_messages(messages, images, self.backend)
 
         api_url, payload, headers = self._build_stream_request(
             backend, messages, model, stream_enabled, context_size, **kwargs)
@@ -2652,7 +2708,10 @@ class ModelQuery:
             return full_content
 
         except Exception as e:
-            sys.stderr.write(colorize(f"\n[ERROR] {backend} streaming failed: {e}\n", 'error'))
+            msg = f"\n[ERROR] {backend} streaming failed: {e}"
+            if isinstance(e, HTTPError) and e.code == 403 and ":cloud" in model:
+                msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
+            sys.stderr.write(colorize(f"{msg}\n", 'error'))
             return full_content
 
 
@@ -2902,7 +2961,7 @@ def _process_command_lines(text):
                     processed.append(text_content)
                     preview = text_content[:500].strip()
                     header = "[Output truncated for terminal display. LLM received full text.]" if len(text_content) > 500 else ""
-                    print(colorize(f"{header}\n```", 'muted'), file=sys.stderr)
+                    print(colorize(f"{header}", 'muted'), file=sys.stderr)
                     print(colorize(f"```text\n{preview}\n```", 'info'), file=sys.stderr)
                 else:
                     print(colorize(f"[Warning: No text content could be extracted from {url}]", 'warning'), file=sys.stderr)
@@ -2950,7 +3009,7 @@ def execute_os_command(command, timeout=None):
     try:
         args_list = shlex.split(command)
         process = subprocess.run(
-            args_list, shell=False,
+            args_list, shell=False,  # Intentional: shell=False prevents pipes/redirects but blocks injection. Single commands only.
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -2996,9 +3055,9 @@ def fetch_and_convert_url(url):
         for converter in ['html2text', 'pandoc', 'lynx']:
             if converter == 'lynx':
                 cmd = [converter, '-stdin']             
-            if converter == 'pandoc':
+            elif converter == 'pandoc':
                 cmd = [converter, '--from', 'html', '--to', 'markdown_strict']
-            if converter == 'html2text':
+            elif converter == 'html2text':
                 cmd = [converter]
             try:
                 if not shutil.which(converter):
@@ -3033,11 +3092,17 @@ def get_html_bytes(url, depth=0):
     # Try curl/wget first, fallback to urllib
     for tool in ['curl', 'wget']:
         if shutil.which(tool):
+            if tool == 'curl':
+                cmd = [tool, '-L', '-s', '-A', headers['User-Agent'], url]
+            else:
+                cmd = [tool, '-q', '-O', '-', '--user-agent', headers['User-Agent'], url]
             proc = subprocess.run(
-                [tool, '-L', '-s', '-A', headers['User-Agent'], url],
+                cmd,
                 capture_output=True, timeout=15, check=False
             )
-            return proc.stdout
+            if proc.returncode == 0 and proc.stdout:
+                return proc.stdout
+            # Non-zero exit or empty output: try next tool instead
 
     # Fallback to urllib with retry
     try:
@@ -4194,58 +4259,234 @@ class ChatLoop:
             raise exception[0]
         return result[0]
 
+    def _init_agentic_query(self, final_content):
+        """Initialize messages, logger, and tool format for an agentic query.
+
+        Returns (messages, logger, openai_tools, send_tools_api) or None on early exit.
+        """
+        if not getattr(self, 'messages', None):
+            self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
+
+        tool_format = get_tool_format(self.ctx.model)
+        if tool_format == "openai":
+            include_tool_defs = False
+            send_tools_api = True
+        else:
+            include_tool_defs = True
+            send_tools_api = False
+
+        tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
+        messages = [{'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs)}]
+        if len(self.messages) > 1:
+            messages.extend(self.messages[1:])
+        messages.append({'role': 'user', 'content': final_content})
+
+        logger = AgenticLogger() if self.ctx.agentic_logging else None
+        if logger:
+            logger.write(type="start", user_input=final_content)
+
+        openai_tools = []
+        for name, defn in AGENTIC_TOOL_DEFS.items():
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": defn["description"],
+                    "parameters": defn["parameters"]
+                }
+            })
+
+        return messages, logger, openai_tools, send_tools_api
+
+    def _execute_tool_calls(self, tool_calls, last_tool_call, iteration, logger, messages, response_text, api_tool_calls):
+        """Execute a list of tool calls, collecting observations.
+
+        Returns (observations, abort_loop, last_tool_call, final_answer).
+        """
+        observations = []
+        abort_loop = False
+        final_answer = ""
+        for i, tool_call in enumerate(tool_calls):
+            tool_name = tool_call["tool"]
+            tool_args = tool_call.get("arguments", {})
+            args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+            print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
+            sys.stderr.flush()
+
+            if self.ctx.agentic_trace:
+                print(colorize(f"\n[Trace] Full args: {json.dumps(tool_args, default=str)[:2000]}", 'muted'), file=sys.stderr)
+
+            current_call = (tool_name, json.dumps(tool_args, sort_keys=True))
+            if i == 0 and current_call == last_tool_call:
+                print(colorize("[Agentic] Same tool call repeated, breaking loop.", 'warning'), file=sys.stderr)
+                final_answer = "[Agentic: model stuck in tool loop]"
+                abort_loop = True
+                break
+            if i == 0:
+                last_tool_call = current_call
+
+            t_start = time.time()
+            result = self.tool_registry.execute(tool_name, tool_args)
+            elapsed = time.time() - t_start
+            status = "OK" if result["success"] else "ERROR"
+            print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
+
+            if result["success"]:
+                observation = result["output"]
+            else:
+                full = result["output"] or ""
+                lines = full.split("\n")[:4]
+                context = "\n".join(lines).strip()
+                error_msg = result.get("error", "") or ""
+                observation = f"{context}\nERROR: {error_msg}" if context else f"ERROR: {error_msg}"
+            if not observation:
+                observation = "[Tool returned no output]"
+            if len(observation) > 4000:
+                observation = observation[:4000] + "\n... [truncated]"
+
+            timed_observation = json.dumps({"tool": tool_name, "duration_s": round(elapsed, 1), "success": result["success"], "output": observation})
+            if self.ctx.agentic_trace:
+                trace_out = result["output"] if len(result["output"]) < 2000 else result["output"][:2000] + "..."
+                print(colorize(f"[Trace] Result: {json.dumps({'success': result['success'], 'output': trace_out, 'error': result['error']}, default=str)}", 'muted'), file=sys.stderr)
+
+            if self.ctx.agentic_logging and logger:
+                logger.write(type="result", iteration=iteration, tool_name=tool_name, tool_args=tool_args, result=result)
+
+            if not result["success"] and "Cancelled" in (result.get("error") or ""):
+                print(colorize("[Agentic] Tool cancelled by user, aborting.", 'warning'), file=sys.stderr)
+                final_answer = "[Agentic query cancelled]"
+                abort_loop = True
+                break
+
+            observations.append(f"[{tool_name}] {timed_observation}")
+
+        return observations, abort_loop, last_tool_call, final_answer
+
+    def _finalize_agentic_query(self, messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text):
+        """Stream final answer or execute pending tool call, then update self.messages."""
+        if not final_answer:
+            final_answer = response_text if response_text else "[Agentic: no answer produced]"
+
+        if logger:
+            logger.write(type="final", final_answer=final_answer)
+
+        pending_tool = self.parse_tool_call(final_answer)
+        if pending_tool:
+            tool_name = pending_tool["tool"]
+            tool_args = pending_tool.get("arguments", {})
+            args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+            print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr)
+            result = self.tool_registry.execute(tool_name, tool_args)
+            observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
+            if not observation:
+                observation = "[Tool returned no output]"
+            if len(observation) > 4000:
+                observation = observation[:4000] + "\n... [truncated]"
+            print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
+            self.messages.append({'role': 'assistant', 'content': final_answer})
+            print()
+        else:
+            if not getattr(self, 'messages', None):
+                self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
+            final_messages = list(messages)
+            if final_messages:
+                final_messages[0] = {'role': 'system', 'content': self.ctx.system_prompt}
+            if final_messages and final_messages[-1]['role'] != 'user':
+                final_messages.append({'role': 'user', 'content': final_content})
+
+            stream_kwargs = dict(get_inference_params(self.ctx.model))
+            stream_tool_calls_out = []
+            if send_tools_api:
+                stream_kwargs["tools"] = openai_tools
+
+            response = self.query_handler.query_stream(
+                final_messages, self.ctx.model,
+                stream_enabled=self.ctx.stream_enabled,
+                debug=self.ctx.debug_mode,
+                show_thinking=(not self.ctx.force_no_thinking),
+                context_size=self.ctx.context_size,
+                images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
+                tool_calls_out=stream_tool_calls_out,
+                **stream_kwargs
+            )
+            if response or stream_tool_calls_out:
+                stream_tool_calls = []
+                if stream_tool_calls_out:
+                    for tc in stream_tool_calls_out:
+                        func = tc.get("function", {})
+                        name = func.get("name", "")
+                        args_raw = func.get("arguments", "{}")
+                        try:
+                            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                        except json.JSONDecodeError:
+                            args = {"raw": args_raw}
+                        stream_tool_calls.append({"tool": name, "arguments": args})
+                if not stream_tool_calls and response:
+                    stream_tool_calls = self.parse_tool_calls(response)
+                    if not stream_tool_calls:
+                        single = self.parse_tool_call(response)
+                        if single:
+                            stream_tool_calls = [single]
+                if stream_tool_calls:
+                    for stream_tc in stream_tool_calls:
+                        tool_name = stream_tc["tool"]
+                        tool_args = stream_tc.get("arguments", {})
+                        args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+                        print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
+                        sys.stderr.flush()
+                        t_start = time.time()
+                        result = self.tool_registry.execute(tool_name, tool_args)
+                        elapsed = time.time() - t_start
+                        status = "OK" if result["success"] else "ERROR"
+                        print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
+                        observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
+                        if not observation:
+                            observation = "[Tool returned no output]"
+                        if len(observation) > 4000:
+                            observation = observation[:4000] + "\n... [truncated]"
+                        print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
+                    if stream_tool_calls_out:
+                        stream_content = response or ""
+                        if not stream_content:
+                            inline_parts = []
+                            for stc in stream_tool_calls_out:
+                                fn = stc.get("function", {})
+                                inline_parts.append(json.dumps({
+                                    "tool": fn.get("name", ""),
+                                    "arguments": fn.get("arguments", "{}")
+                                }))
+                            stream_content = "\n".join(inline_parts)
+                        assistant_msg = {'role': 'assistant', 'content': stream_content}
+                        assistant_msg['tool_calls'] = stream_tool_calls_out
+                        self.messages.append(assistant_msg)
+                    else:
+                        self.messages.append({'role': 'assistant', 'content': response})
+                    print()
+                else:
+                    self.messages.append({'role': 'assistant', 'content': response})
+                    print()
+            else:
+                print(colorize(f"\n{final_answer}", 'success'), file=sys.stdout)
+
     def run_agentic_query(self, full_input: str) -> None:
         """ReAct loop: query model, parse tool calls, execute tools, stream final answer."""
+        logger = None
         try:
             final_content = process_inline_commands(full_input)
             if not final_content.strip():
                 return
 
-            # Always ensure self.messages exists
-            if not getattr(self, 'messages', None):
-                self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
-
-            # Determine tool delivery strategy for this model
-            tool_format = get_tool_format(self.ctx.model)
-            if tool_format == "openai":
-                # Native tools API: strip inline tool defs from prompt, pass via API param
-                include_tool_defs = False
-                send_tools_api = True
-            else:
-                # Inline: embed tool defs in prompt, don't pass via API
-                include_tool_defs = True
-                send_tools_api = False
-
-            # Build system prompt with or without inline tool definitions
-            tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
-            messages = [{'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs)}]
-            if len(self.messages) > 1:
-                messages.extend(self.messages[1:])  # conversation history
-            messages.append({'role': 'user', 'content': final_content})
-
-            if self.ctx.agentic_logging:
-                logger = AgenticLogger()
-                logger.write(type="start", user_input=final_content)
-            else:
-                logger = None
+            inited = self._init_agentic_query(final_content)
+            if inited is None:
+                return
+            messages, logger, openai_tools, send_tools_api = inited
 
             iteration = 0
             max_iterations = self.ctx.agentic_max_iterations
             final_answer = ""
             last_tool_call = None
             step_timeout = self.ctx.agentic_step_timeout
-
-            # Convert tool definitions to OpenAI function-calling format
-            openai_tools = []
-            for name, defn in AGENTIC_TOOL_DEFS.items():
-                openai_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": defn["description"],
-                        "parameters": defn["parameters"]
-                    }
-                })
+            response_text = ""
 
             while iteration < max_iterations:
                 iteration += 1
@@ -4270,16 +4511,12 @@ class ChatLoop:
                     print(colorize(f"\n[Agentic] Step timed out after {step_timeout}s.", 'error'), file=sys.stderr)
                     break
 
-                # Reactive vision detection: if images were sent and the model rejected them,
-                # mark as non-vision and retry the iteration without images.
                 if images_to_send and self.ctx.supports_vision is not False:
                     if check_vision_error(response):
                         self.ctx.supports_vision = False
                         print(colorize("\n[WARNING] Model does not support vision. Stripping images for subsequent queries.", 'warning'), file=sys.stderr)
                         continue
 
-                # Reactive tools detection: if native tools API was used and the model rejected it,
-                # fall back to inline tool definitions for subsequent iterations.
                 if send_tools_api and check_tools_error(response):
                     send_tools_api = False
                     include_tool_defs = True
@@ -4331,7 +4568,6 @@ class ChatLoop:
                     print(colorize("\n[Agentic] Model appears stuck (repetitive output), aborting.", 'warning'), file=sys.stderr)
                     break
 
-                # Convert API-level tool_calls to internal format
                 tool_calls = []
                 if api_tool_calls:
                     for tc in api_tool_calls:
@@ -4355,76 +4591,21 @@ class ChatLoop:
 
                 if logger:
                     first_call = tool_calls[0] if tool_calls else None
-                    logger.write(type="turn", iteration=iteration, model_response=response_text,
-                                 tool_call=first_call)
+                    logger.write(type="turn", iteration=iteration, model_response=response_text, tool_call=first_call)
 
                 if not tool_calls:
                     final_answer = response_text
                     break
 
-                observations = []
-                abort_loop = False
-                for i, tool_call in enumerate(tool_calls):
-                    tool_name = tool_call["tool"]
-                    tool_args = tool_call.get("arguments", {})
-                    args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-                    print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
-                    sys.stderr.flush()
-
-                    if self.ctx.agentic_trace:
-                        print(colorize(f"\n[Trace] Full args: {json.dumps(tool_args, default=str)[:2000]}", 'muted'), file=sys.stderr)
-
-                    # Detect same-tool loop: same name + same args twice in a row
-                    current_call = (tool_name, json.dumps(tool_args, sort_keys=True))
-                    if i == 0 and current_call == last_tool_call:
-                        print(colorize("[Agentic] Same tool call repeated, breaking loop.", 'warning'), file=sys.stderr)
-                        final_answer = "[Agentic: model stuck in tool loop]"
-                        abort_loop = True
-                        break
-                    if i == 0:
-                        last_tool_call = current_call
-
-                    t_start = time.time()
-                    result = self.tool_registry.execute(tool_name, tool_args)
-                    elapsed = time.time() - t_start
-                    status = "OK" if result["success"] else "ERROR"
-                    print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
-                    if result["success"]:
-                        observation = result["output"]
-                    else:
-                        full = result["output"] or ""
-                        error_msg = result.get("error", "") or ""
-                        lines = full.split("\n")[:4]
-                        context = "\n".join(lines).strip()
-                        observation = f"{context}\nERROR: {error_msg}" if context else f"ERROR: {error_msg}"
-                    if not observation:
-                        observation = "[Tool returned no output]"
-                    if len(observation) > 4000:
-                        observation = observation[:4000] + "\n... [truncated]"
-                    timed_observation = json.dumps({"tool": tool_name, "duration_s": round(elapsed, 1), "success": result["success"], "output": observation})
-
-                    if self.ctx.agentic_trace:
-                        trace_out = result["output"] if len(result["output"]) < 2000 else result["output"][:2000] + "..."
-                        print(colorize(f"[Trace] Result: {json.dumps({'success': result['success'], 'output': trace_out, 'error': result['error']}, default=str)}", 'muted'), file=sys.stderr)
-
-                    if self.ctx.agentic_logging:
-                        logger.write(type="result", iteration=iteration, tool_name=tool_name,
-                                     tool_args=tool_args, result=result)
-
-                    if not result["success"] and "Cancelled" in (result.get("error") or ""):
-                        print(colorize("[Agentic] Tool cancelled by user, aborting.", 'warning'), file=sys.stderr)
-                        final_answer = "[Agentic query cancelled]"
-                        abort_loop = True
-                        break
-
-                    observations.append(f"[{tool_name}] {timed_observation}")
-
+                observations, abort_loop, last_tool_call, tool_final = self._execute_tool_calls(
+                    tool_calls, last_tool_call, iteration, logger, messages, response_text, api_tool_calls
+                )
+                if tool_final:
+                    final_answer = tool_final
                 if abort_loop:
                     break
 
                 combined = "\n---\n".join(observations) if observations else "[No tool output]"
-                # When using native API tool_calls, also populate content with inline JSON
-                # so the model can always see tool calls as text in the conversation history.
                 assistant_content = response_text
                 if api_tool_calls and not response_text and tool_calls:
                     tool_json = json.dumps(tool_calls[0])
@@ -4436,121 +4617,18 @@ class ChatLoop:
                 messages.append({'role': 'user', 'content': f"Tool result:\n{combined}"})
 
             if iteration >= max_iterations and not final_answer:
-                final_answer = response_text if 'response_text' in locals() else "[Agentic: max iterations reached]"
+                final_answer = response_text
 
-            if not final_answer:
-                final_answer = response_text if 'response_text' in locals() else "[Agentic: no answer produced]"
-
-            if logger:
-                logger.write(type="final", final_answer=final_answer)
-
-            if final_answer:
-                pending_tool = self.parse_tool_call(final_answer)
-                if pending_tool:
-                    tool_name = pending_tool["tool"]
-                    tool_args = pending_tool.get("arguments", {})
-                    args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-                    print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr)
-                    result = self.tool_registry.execute(tool_name, tool_args)
-                    observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
-                    if not observation:
-                        observation = "[Tool returned no output]"
-                    if len(observation) > 4000:
-                        observation = observation[:4000] + "\n... [truncated]"
-                    print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
-                    self.messages.append({'role': 'assistant', 'content': final_answer})
-                    print()
-                else:
-                    if not getattr(self, 'messages', None):
-                        self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
-                    final_messages = list(messages)
-                    if final_messages:
-                        final_messages[0] = {'role': 'system', 'content': self.ctx.system_prompt}
-                    if final_messages and final_messages[-1]['role'] != 'user':
-                        final_messages.append({'role': 'user', 'content': final_content})
-
-                    stream_kwargs = dict(get_inference_params(self.ctx.model))
-                    stream_tool_calls_out = []
-                    if send_tools_api:
-                        stream_kwargs["tools"] = openai_tools
-                    response = self.query_handler.query_stream(
-                        final_messages, self.ctx.model,
-                        stream_enabled=self.ctx.stream_enabled,
-                        debug=self.ctx.debug_mode,
-                        show_thinking=(not self.ctx.force_no_thinking),
-                        context_size=self.ctx.context_size,
-                        images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
-                        tool_calls_out=stream_tool_calls_out,
-                        **stream_kwargs
-                    )
-                    if response or stream_tool_calls_out:
-                        stream_tool_calls = []
-                        if stream_tool_calls_out:
-                            for tc in stream_tool_calls_out:
-                                func = tc.get("function", {})
-                                name = func.get("name", "")
-                                args_raw = func.get("arguments", "{}")
-                                try:
-                                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                                except json.JSONDecodeError:
-                                    args = {"raw": args_raw}
-                                stream_tool_calls.append({"tool": name, "arguments": args})
-                        if not stream_tool_calls and response:
-                            stream_tool_calls = self.parse_tool_calls(response)
-                            if not stream_tool_calls:
-                                single = self.parse_tool_call(response)
-                                if single:
-                                    stream_tool_calls = [single]
-                        if stream_tool_calls:
-                            for stream_tc in stream_tool_calls:
-                                tool_name = stream_tc["tool"]
-                                tool_args = stream_tc.get("arguments", {})
-                                args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-                                print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
-                                sys.stderr.flush()
-                                t_start = time.time()
-                                result = self.tool_registry.execute(tool_name, tool_args)
-                                elapsed = time.time() - t_start
-                                status = "OK" if result["success"] else "ERROR"
-                                print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
-                                observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
-                                if not observation:
-                                    observation = "[Tool returned no output]"
-                                if len(observation) > 4000:
-                                    observation = observation[:4000] + "\n... [truncated]"
-                                print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
-                            if stream_tool_calls_out:
-                                # Populate content with inline JSON for conversation history consistency
-                                stream_content = response or ""
-                                if not stream_content:
-                                    inline_parts = []
-                                    for stc in stream_tool_calls_out:
-                                        fn = stc.get("function", {})
-                                        inline_parts.append(json.dumps({
-                                            "tool": fn.get("name", ""),
-                                            "arguments": fn.get("arguments", "{}")
-                                        }))
-                                    stream_content = "\n".join(inline_parts)
-                                assistant_msg = {'role': 'assistant', 'content': stream_content}
-                                assistant_msg['tool_calls'] = stream_tool_calls_out
-                                self.messages.append(assistant_msg)
-                            else:
-                                self.messages.append({'role': 'assistant', 'content': response})
-                            print()
-                        else:
-                            self.messages.append({'role': 'assistant', 'content': response})
-                            print()
-                    else:
-                        print(colorize(f"\n{final_answer}", 'success'), file=sys.stdout)
-            else:
-                print(colorize("\n[Agentic] No final answer produced.", 'error'), file=sys.stderr)
+            self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text)
 
             if logger:
                 logger.write(type="end", total_iterations=iteration)
-                logger.close()
         except Exception as e:
             print(colorize(f"\n[Agentic] Internal error: {e}", 'error'), file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
+        finally:
+            if logger:
+                logger.close()
 
     def run_handle_spawnshell(self, full_input: str) -> Optional[bool]:
         """Handle /spawnshell command. Captures shell session and lets user choose what to send."""
@@ -4834,7 +4912,7 @@ def check_backend_with_head(url, server_marker):
     """Attempt HEAD request to URL and check for server header."""
     try:
         request = Request(url, method='HEAD')
-        with urlopen(request, timeout=1) as response:
+        with urlopen(request, timeout=1) as response:  # startup-probe
             server_header = response.headers.get('Server', '').lower()
             return server_marker.lower() in server_header
     except Exception:
@@ -4845,7 +4923,7 @@ def check_backend_with_get(url, server_marker):
     """Attempt GET request to URL and check for server marker."""
     try:
         request = Request(url, method='GET')
-        with urlopen(request, timeout=1) as response:
+        with urlopen(request, timeout=1) as response:  # startup-probe
             my_response = str(response.read())
             my_response = my_response.lower()
             if server_marker.lower() in my_response:
@@ -4859,7 +4937,7 @@ def check_lmstudio(url):
     """Check if LM Studio is running by querying /v1/models."""
     try:
         request = Request(f"{url}/v1/models", method='GET')
-        with urlopen(request, timeout=2) as response:
+        with urlopen(request, timeout=2) as response:  # startup-probe
             data = json.loads(response.read().decode('utf-8'))
             models = data.get('data', [])
             return bool(models)
@@ -4996,7 +5074,6 @@ def resolve_connection(args):
                     selected_backend = "lmstudio"
             if not selected_backend:
                 selected_backend = "ollama"
-        save_backend_config(selected_backend, base_url)
         return selected_backend, base_url
 
     saved_backends = load_saved_backends()
@@ -5053,107 +5130,58 @@ def resolve_connection(args):
 # ============= ARGUMENT PARSER ==============================================
 # ============================================================================
 
-def main():
-    """Main entry point."""
+def _build_parser():
+    """Build and return the argument parser with all options."""
     parser = argparse.ArgumentParser(
         description="Unified LLM Query Interface for Ollama, Llama.cpp & LM Studio"
     )
 
-    # Backend selection
-    group = parser.add_argument_group('Backend')
+    parser.add_argument_group('Backend')
     parser.add_argument("-b", "--backend", choices=["ollama", "llamacpp", "lmstudio"], default=None, help="API backend to use (auto-detected if omitted).")
-    group.add_argument('-H', '--host', help='Custom API URL')
+    parser.add_argument('-H', '--host', help='Custom API URL')
     parser.add_argument('--version', action='store_true', help='Show version and exit')
 
-    # Listing operations
     list_group = parser.add_mutually_exclusive_group()
-    list_group.add_argument('-l', '--list', action="store_true",
-                           help='List all models and exit')
-    list_group.add_argument('-la', '--list-all', action="store_true",
-                          help='List models with capabilities (Ollama only)')
+    list_group.add_argument('-l', '--list', action="store_true", help='List all models and exit')
+    list_group.add_argument('-la', '--list-all', action="store_true", help='List models with capabilities (Ollama only)')
 
-    # Model info operations
     info_group = parser.add_mutually_exclusive_group()
-    info_group.add_argument('--show', action="store_true",
-                          help='Show concise model details')
-    info_group.add_argument('--show-details', action="store_true",
-                          help='Show full model information')
+    info_group.add_argument('--show', action="store_true", help='Show concise model details')
+    info_group.add_argument('--show-details', action="store_true", help='Show full model information')
 
-    # Input options
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument('-I', '--input-text', help='Direct query text')
     input_group.add_argument('-i', '--input-file', help='Input file path')
     input_group.add_argument('--input-dir', help='Directory of input files')
 
-    # Batch processing options
     batch_group = parser.add_mutually_exclusive_group()
-    batch_group.add_argument('-c', '--chat', action="store_true",
-                            help='Start interactive chat session')
+    batch_group.add_argument('-c', '--chat', action="store_true", help='Start interactive chat session')
     batch_group.add_argument('-o', '--output', help='Output file path')
     batch_group.add_argument('--output-dir', help='Output directory for batches')
 
-    parser.add_argument('-m', '--model', default=None,
-                       help='Model name')  # NOT mutually exclusive
-    # System Prompt configuration
+    parser.add_argument('-m', '--model', default=None, help='Model name')
+
     prompt_group = parser.add_mutually_exclusive_group()
-    prompt_group.add_argument('-P', '--profile', choices=list(BUILTIN_PROMPTS.keys()),
-                            help='Use a built-in system prompt profile')
+    prompt_group.add_argument('-P', '--profile', choices=list(BUILTIN_PROMPTS.keys()), help='Use a built-in system prompt profile')
     prompt_group.add_argument('--prompt', help='Custom system prompt text')
 
-    # Image support
     parser.add_argument('--image', nargs='*', help='Image file(s) for multimodal models (space-separated)')
+    parser.add_argument('-p', '--no-stream', action="store_true", help='Disable streaming output')
+    parser.add_argument('--debug', action="store_true", help='Print raw JSON to stderr')
+    parser.add_argument('--format', choices=["json", "yaml"], default="json", help='Output format for model info (default: json)')
+    parser.add_argument('--theme', default=None, choices=["default", "minimal", "emacs_dark", "vim_dark", "high_contrast"], help='Color theme for output')
+    parser.add_argument('--no-color', action="store_true", help='Disable colored output')
+    parser.add_argument('--shell-timeout', type=int, default=5, help='Timeout in seconds for shell commands (default: 5)')
 
-    # Display options
-    parser.add_argument('-p', '--no-stream', action="store_true",
-                       help='Disable streaming output')
-    parser.add_argument('--debug', action="store_true",
-                       help='Print raw JSON to stderr')
-    parser.add_argument('--format', choices=["json", "yaml"], default="json",
-                       help='Output format for model info (default: json)')
-    parser.add_argument('--theme', default=None,
-                       choices=["default", "minimal", "emacs_dark", "vim_dark", "high_contrast"],
-                       help='Color theme for output')
-    parser.add_argument('--no-color', action="store_true",
-                       help='Disable colored output')
-    parser.add_argument('--shell-timeout', type=int, default=5,
-                       help='Timeout in seconds for shell commands (default: 5)')
+    return parser
 
-    # Parse arguments
-    args = parser.parse_args()
 
-    if args.version:
-        print(f"ollamaquery2 v{__version__}")
-        sys.exit(0)
+def _verify_server(backend, base_url, args):
+    """Probe the server to confirm it's reachable, trying default ports if needed.
 
-    # Initialize theme system
-    if args.no_color:
-        os.environ['NO_COLOR'] = '1'
-    elif args.theme is not None:
-        os.environ['OLLAMAQUERY_THEME'] = args.theme
-    if args.prompt:
-        active_prompt = args.prompt
-    elif args.profile:
-        active_prompt = BUILTIN_PROMPTS[args.profile]
-    else:
-        active_prompt = DEFAULT_SYSTEM_PROMPT
-    args.prompt = active_prompt
-
-    # Early exit if no actionable argument was provided (avoid connecting for help display)
-    if not (args.chat or args.input_text or args.input_file or
-             args.input_dir or args.list or args.show or args.show_details):
-        print(colorize(f"ollamaquery2 v{__version__} - LLM Query Interface", 'info'))
-        if args.backend or args.host:
-            print(f"  Backend configured ({args.backend or 'auto'} @ {args.host or 'auto'}), but no action specified.")
-        print(f"  Start chat:  -c")
-        print(f"  Single query: -I \"your prompt\"")
-        print(f"  List models: -l")
-        print(f"  Help:        --help")
-        sys.exit(0)
-
-    # determine backend first so we know where to check for loaded models
-    backend, base_url = resolve_connection(args)
-
-    # Verify server is actually reachable before proceeding
+    Returns (backend, base_url) — may fall back to a different backend/port
+    if the initial guess was wrong. Exits with code 1 if unreachable.
+    """
     server_reachable = False
     if backend == "ollama":
         server_reachable = check_backend_with_get(base_url, 'ollama')
@@ -5163,23 +5191,22 @@ def main():
         server_reachable = check_lmstudio(base_url)
 
     if not server_reachable and not re.search(r':\d{2,5}(/|$)', base_url):
-        # No port in URL — try default ports
+        port_map = {"ollama": DEFAULT_OLLAMA_PORT, "llamacpp": DEFAULT_LLAMACPP_PORT, "lmstudio": DEFAULT_LMSTUDIO_PORT}
+
         if args.backend:
-            # User specified a backend — try its default port first
-            port_map = {"ollama": DEFAULT_OLLAMA_PORT, "llamacpp": DEFAULT_LLAMACPP_PORT, "lmstudio": DEFAULT_LMSTUDIO_PORT}
-            fallback = f"{base_url}:{port_map.get(backend, DEFAULT_OLLAMA_PORT)}"
+            port = port_map.get(backend, DEFAULT_OLLAMA_PORT)
+            fallback = f"{base_url}:{port}"
             sys.stderr.write(colorize(f"[INFO] Checking {fallback}... ", 'muted'))
             ok = check_lmstudio(fallback) if backend == "lmstudio" else \
                  check_backend_with_head(fallback, 'llama.cpp') if backend == "llamacpp" else \
                  check_backend_with_get(fallback, 'ollama')
             if ok:
                 sys.stderr.write(colorize(f"found {backend}\n", 'success'))
-                base_url = fallback
+                backend, base_url = backend, fallback
                 server_reachable = True
             else:
                 sys.stderr.write(colorize("no\n", 'warning'))
         else:
-            # No explicit backend — try all default ports
             probes = [
                 ("ollama", f"{base_url}:{DEFAULT_OLLAMA_PORT}", check_backend_with_get, 'ollama'),
                 ("llamacpp", f"{base_url}:{DEFAULT_LLAMACPP_PORT}", check_backend_with_head, 'llama.cpp'),
@@ -5211,78 +5238,100 @@ def main():
         sys.stderr.write(colorize(f"[ERROR] Cannot reach {backend} at {base_url}. Server may be offline.{hint}\n", 'error'))
         sys.exit(1)
 
-    # 1. Use explicitly requested model if provided via -m
-    if args.model:
-        target_model = args.model
-    # 2. Check for an already loaded model in memory for Ollama only
-    elif backend == "ollama":
-        loaded_models = fetch_loaded_models_ollama(base_url)
-        if loaded_models:
-            target_model = loaded_models[0]['name']
-            sys.stderr.write(colorize(f"[INFO] Auto-selected active model in memory: '{target_model}'\n", 'success'))
-        else:
-            # No models loaded - tell user to use /listmodel
-            all_models = fetch_models_ollama(base_url)
-            if all_models:
-                target_model = ""  # Signal: no model pre-loaded, user must pick
-                print(colorize("\n[No model loaded. Use /listmodel to see available models.]", 'info'), file=sys.stderr)
-            else:
-                sys.stderr.write(colorize("[ERROR] No models available on Ollama server.\n", 'error'))
-                sys.exit(1)
-    # 3. Fetch the currently hosted model (Llama.cpp)
-    elif backend == "llamacpp":
-        available_models = fetch_models_llamacpp(base_url)
-        if available_models:
-            target_model = available_models[0]['name']
-            sys.stderr.write(colorize(f"[INFO] Auto-selected hosted model: '{target_model}'\n", 'success'))
-        else:
-            # No models available - tell user to use /listmodel
-            all_models = fetch_models_llamacpp(base_url)
-            if all_models:
-                target_model = ""  # Signal: no model pre-loaded, user must pick
-                print(colorize("\n[No model loaded. Use /listmodel to see available models.]", 'info'), file=sys.stderr)
-            else:
-                sys.stderr.write(colorize("[ERROR] No models available on Llama.cpp server.\n", 'error'))
-                sys.exit(1)
-    # 4. LM Studio
-    elif backend == "lmstudio":
-        available_models = fetch_models_llamacpp(base_url)
-        if available_models:
-            target_model = available_models[0]['name']
-            sys.stderr.write(colorize(f"[INFO] Auto-selected hosted model: '{target_model}'\n", 'success'))
-        else:
-            all_models = fetch_models_llamacpp(base_url)
-            if all_models:
-                target_model = ""
-                print(colorize("\n[No model loaded. Use /listmodel to see available models.]", 'info'), file=sys.stderr)
-            else:
-                sys.stderr.write(colorize("[ERROR] No models available on LM Studio server.\n", 'error'))
-                sys.exit(1)
+    return backend, base_url
 
-    # Handle listing operations
-    if args.list or args.list_all:
-        if backend == "llamacpp":
-            list_models_llamacpp(base_url, filter_arg=args.model)
-            sys.exit(0)
-        elif backend == "lmstudio":
-            list_models_llamacpp(base_url, filter_arg=args.model)
-            sys.exit(0)
-        if backend == "ollama":
-            if args.list_all:
-              list_models_ollama(
-                  base_url,
-                  filter_arg=args.model,
-                  include_capabilities=(args.list_all))
-            else:
-              list_models_ollama(
-                  base_url,
-                  filter_arg=args.model,
-                  include_capabilities=False)
-            sys.exit(0)
-            
+
+def _select_model(backend, base_url, args):
+    """Select the target model, auto-detecting from server if -m not given.
+
+    Returns model name or empty string if none available.
+    """
+    if args.model:
+        return args.model
+
+    if backend == "ollama":
+        loaded = fetch_loaded_models_ollama(base_url)
+        if loaded:
+            model = loaded[0]['name']
+            sys.stderr.write(colorize(f"[INFO] Auto-selected active model in memory: '{model}'\n", 'success'))
+            return model
+        all_models = fetch_models_ollama(base_url)
+        if all_models:
+            print(colorize("\n[No model loaded. Use /listmodel to see available models.]", 'info'), file=sys.stderr)
+            return ""
+        sys.stderr.write(colorize("[WARNING] No models available on Ollama server.\n", 'warning'))
+        return ""
+
+    available = fetch_models_llamacpp(base_url)
+    if available:
+        model = available[0]['name']
+        label = "LM Studio" if backend == "lmstudio" else "Llama.cpp"
+        sys.stderr.write(colorize(f"[INFO] Auto-selected hosted model: '{model}'\n", 'success'))
+        return model
+
+    label = "LM Studio" if backend == "lmstudio" else "Llama.cpp"
+    print(colorize(f"\n[No models available on {backend} server. Use /listmodel to see available models.]", 'warning'), file=sys.stderr)
+    return ""
+
+
+def main():
+    """Main entry point."""
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    if args.version:
+        print(f"ollamaquery2 v{__version__}")
         sys.exit(0)
 
-    # Handle model info operations
+    if args.no_color:
+        os.environ['NO_COLOR'] = '1'
+    elif args.theme is not None:
+        os.environ['OLLAMAQUERY_THEME'] = args.theme
+
+    if args.prompt:
+        active_prompt = args.prompt
+    elif args.profile:
+        active_prompt = BUILTIN_PROMPTS[args.profile]
+    else:
+        active_prompt = DEFAULT_SYSTEM_PROMPT
+    args.prompt = active_prompt
+
+    if not (args.chat or args.input_text or args.input_file or
+             args.input_dir or args.list or args.show or args.show_details):
+        print(colorize(f"ollamaquery2 v{__version__} - LLM Query Interface", 'info'))
+        if args.backend or args.host:
+            print(f"  Backend configured ({args.backend or 'auto'} @ {args.host or 'auto'}), but no action specified.")
+        print(f"  Start chat:  -c")
+        print(f"  Single query: -I \"your prompt\"")
+        print(f"  List models: -l")
+        print(f"  Help:        --help")
+        sys.exit(2)
+
+    backend, base_url = resolve_connection(args)
+    backend, base_url = _verify_server(backend, base_url, args)
+    save_backend_config(backend, base_url)
+    target_model = _select_model(backend, base_url, args)
+
+    if not target_model:
+        sys.stderr.write(colorize(f"[INFO] Connected to {backend} at {base_url}\n", 'success'))
+        if args.show or args.show_details:
+            sys.stderr.write(colorize("[ERROR] No model selected. Use -m or --list to browse models.\n", 'error'))
+            sys.exit(1)
+        if args.input_text or args.input_file or args.input_dir:
+            sys.stderr.write(colorize("[ERROR] No model selected. Use -m to specify a model.\n", 'error'))
+            sys.exit(1)
+
+    # Listing operations
+    if args.list or args.list_all:
+        if backend in ("llamacpp", "lmstudio"):
+            list_models_llamacpp(base_url, filter_arg=args.model)
+        elif args.list_all:
+            list_models_ollama(base_url, filter_arg=args.model, include_capabilities=True)
+        else:
+            list_models_ollama(base_url, filter_arg=args.model, include_capabilities=False)
+        sys.exit(0)
+
+    # Model info operations
     if args.show:
         show_model_info(base_url, target_model, args)
     elif args.show_details:
@@ -5308,127 +5357,82 @@ def main():
         loop.run(stream_enabled=should_stream, debug=args.debug, images=images_list)
         sys.exit(0)
 
-    # Batch processing with input text/file/directory
-    else:
-        if args.input_text:
-            input_data = args.input_text
-        elif args.input_file:
-            if not os.path.isfile(args.input_file):
-                print(f"[ERROR] File '{args.input_file}' not found", file=sys.stderr)
-                sys.exit(1)
-
-            with open(args.input_file, 'r', encoding='utf-8') as f:
-                input_data = f.read()
-        elif args.input_dir:
-            if not args.output_dir:
-                print("[ERROR] --output-dir required for --input-dir", file=sys.stderr)
-                sys.exit(1)
-
-            if not os.path.exists(args.output_dir):
-                os.makedirs(args.output_dir, exist_ok=True)
-
-            for filename in sorted(os.listdir(args.input_dir)):
-                input_path = os.path.join(args.input_dir, filename)
-                print(f"[Processing: {filename}...]")
-
-                with open(input_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-
-                messages = [
-                    {'role': 'system', 'content': args.prompt},
-                    {'role': 'user', 'content': content}
-                ]
-
-                images_list = None
-                if args.image:
-                    images_list = [prepare_image_data(p) for p in args.image if p and prepare_image_data(p)]
-
-                query_handler = ModelQuery(context=CommandContext())
-                query_handler.ctx.base_url = base_url
-                query_handler.ctx.backend = backend
-                query_handler.ctx.shell_timeout = args.shell_timeout
-
-                response = query_handler.query_sync(
-                    messages,
-                    target_model,
-                    context_size=None,
-                    show_thinking=True,
-                    debug=args.debug,
-                    images=images_list
-                )
-
-                output_text = ""
-                if isinstance(response, dict):
-                    output_text = response.get('message', {}).get('content', '')
-                    if not output_text:
-                        choices = response.get('choices', [])
-                        if choices:
-                            output_text = choices[0].get('message', {}).get('content', '')
-                else:
-                    output_text = str(response)
-                output_path = os.path.join(args.output_dir, filename + '.output')
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write(output_text)
-
-            sys.exit(0)
-
-        # Single query with input text/file
-        if args.input_text or args.input_file:
-            images_list = None
-            if args.image:
-                images_list = [prepare_image_data(p) for p in args.image if p and prepare_image_data(p)]
-
+    # Batch / single query processing
+    if args.input_dir:
+        if not args.output_dir:
+            print("[ERROR] --output-dir required for --input-dir", file=sys.stderr)
+            sys.exit(1)
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir, exist_ok=True)
+        for filename in sorted(os.listdir(args.input_dir)):
+            input_path = os.path.join(args.input_dir, filename)
+            print(f"[Processing: {filename}...]")
+            with open(input_path, 'r', encoding='utf-8') as f:
+                content = f.read()
             messages = [
-                {'role': 'system', 'content': args.prompt}
+                {'role': 'system', 'content': args.prompt},
+                {'role': 'user', 'content': content}
             ]
+            images_list = [prepare_image_data(p) for p in args.image if p and prepare_image_data(p)] if args.image else None
+            qh = ModelQuery(context=CommandContext())
+            qh.ctx.base_url = base_url
+            qh.ctx.backend = backend
+            qh.ctx.shell_timeout = args.shell_timeout
+            response = qh.query_sync(messages, target_model, context_size=None, show_thinking=True, debug=args.debug, images=images_list)
+            output_text = ""
+            if isinstance(response, dict):
+                output_text = response.get('message', {}).get('content', '')
+                if not output_text:
+                    choices = response.get('choices', [])
+                    if choices:
+                        output_text = choices[0].get('message', {}).get('content', '')
+            else:
+                output_text = str(response)
+            with open(os.path.join(args.output_dir, filename + '.output'), 'w', encoding='utf-8') as f:
+                f.write(output_text)
+        sys.exit(0)
 
-            if args.input_text:
-                messages.append({'role': 'user', 'content': args.input_text})
-            elif args.input_file and os.path.isfile(args.input_file):
-                with open(args.input_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
+    if args.input_text or args.input_file:
+        images_list = [prepare_image_data(p) for p in args.image if p and prepare_image_data(p)] if args.image else None
+        messages = [{'role': 'system', 'content': args.prompt}]
+        if args.input_text:
+            messages.append({'role': 'user', 'content': args.input_text})
+        elif args.input_file and os.path.isfile(args.input_file):
+            with open(args.input_file, 'r', encoding='utf-8') as f:
+                messages.append({'role': 'user', 'content': f.read()})
 
-                messages.append({'role': 'user', 'content': content})
+        qh = ModelQuery(context=CommandContext())
+        qh.ctx.base_url = base_url
+        qh.ctx.backend = backend
+        qh.ctx.shell_timeout = args.shell_timeout
+        should_stream = not args.no_stream and sys.stdout.isatty()
 
-            query_handler = ModelQuery(context=CommandContext())
-            query_handler.ctx.base_url = base_url
-            query_handler.ctx.backend = backend
-            query_handler.ctx.shell_timeout = args.shell_timeout
-            should_stream = not args.no_stream and sys.stdout.isatty()
+        response = qh.query_sync(messages, target_model, context_size=None, show_thinking=True, debug=args.debug, images=images_list)
 
-            response = query_handler.query_sync(
-                messages,
-                target_model,
-                context_size=None,
-                show_thinking=True,
-                debug=args.debug,
-                images=images_list
-            )
-
-            if args.output:
-                content = ""
-                if isinstance(response, dict):
-                    content = response.get('message', {}).get('content', '')
-                    if not content:
-                        choices = response.get('choices', [])
-                        if choices:
-                            content = choices[0].get('message', {}).get('content', '')
-                else:
-                    content = str(response)
-                with open(args.output, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                print(f"[Success: Output saved to {args.output}]", file=sys.stderr)
-            elif not should_stream and response:
-                content = ""
-                if isinstance(response, dict):
-                    content = response.get('message', {}).get('content', '')
-                    if not content:
-                        choices = response.get('choices', [])
-                        if choices:
-                            content = choices[0].get('message', {}).get('content', '')
-                else:
-                    content = str(response)
-                print(content)
+        if args.output:
+            content = ""
+            if isinstance(response, dict):
+                content = response.get('message', {}).get('content', '')
+                if not content:
+                    choices = response.get('choices', [])
+                    if choices:
+                        content = choices[0].get('message', {}).get('content', '')
+            else:
+                content = str(response)
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(content)
+            print(f"[Success: Output saved to {args.output}]", file=sys.stderr)
+        elif not should_stream and response:
+            content = ""
+            if isinstance(response, dict):
+                content = response.get('message', {}).get('content', '')
+                if not content:
+                    choices = response.get('choices', [])
+                    if choices:
+                        content = choices[0].get('message', {}).get('content', '')
+            else:
+                content = str(response)
+            print(content)
 
 
 if __name__ == "__main__":

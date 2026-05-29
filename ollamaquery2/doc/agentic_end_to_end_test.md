@@ -123,22 +123,23 @@ The following changes were made to improve agentic reliability across all models
 
 ### Model Comparison
 
-| Dimension | GPT-OSS 20B | Qwen3 8B | GLM-4.7-Flash | Nemotron-Cascade-2 30B | Gemma4 26B |
-|-----------|-------------|----------|---------------|------------------------|-------------|
-| **Parameter count** | 20B (mxFP4) | 8B | ~9B | 31.6B (MoE, 3B active) | 26B (MoE, 4B active) |
-| **Tool format** | `openai` (native API) | `openai` (native API) | `inline` (JSON-in-text) | `inline` (JSON-in-text) | `inline` (JSON-in-text) |
-| **Prompt style** | `strict` (bare JSON) | `strict` (bare JSON) | `strict` (bare JSON) | `soft` (code blocks OK) | `strict` (bare JSON) |
-| **Native `tools` API** | ✅ | ✅ | ❌ (uses inline) | ❌ (uses inline) | ❌ (uses inline) |
-| **`lazy_tool` needed?** | No | No | ✅ | ✅ | ✅ |
-| **Temperature** | 0.7 | 0.7 (default) | 0.6 | 0.6 | 0.7 (default) |
-| **DNS resolver** | ✅ 4 steps, 89s | ❌ (compile errors) | ✅ 4 steps, 259s | ❌ (C syntax bug) | ✅ 3 steps* |
-| **URL fetch** | ✅ Chained http→https | ✅ | ✅ | ✅ | ✅ |
-| **Multi-step write+read** | ✅ Clean | ✅ Clean | ✅ Clean | ✅ (recovered from typos) | ✅ Clean |
-| **Code quality** | Excellent (single-shot) | Mediocre (compile bugs) | Good | Mediocre (parsing bugs, typos) | Good |
-| **`edit_file`/`apply_patch` used?** | No | No | No | No | No |
-| **Multi-tool per response** | No | No | No | Yes (verbose preamble + code blocks) | No |
+| Dimension | GPT-OSS 20B | Qwen3 8B | GLM-4.7-Flash | Nemotron-Cascade-2 30B | Gemma4 26B | MiniMax-M2.5:cloud | GPT-OSS 120B:cloud |
+|-----------|-------------|----------|---------------|------------------------|-------------|---------------------|
+| **Parameter count** | 20B (mxFP4) | 8B | ~9B | 31.6B (MoE, 3B active) | 26B (MoE, 4B active) | cloud (proprietary) | cloud (120B, proprietary) |
+| **Tool format** | `openai` (native API) | `openai` (native API) | `inline` (JSON-in-text) | `inline` (JSON-in-text) | `inline` (JSON-in-text) | `inline` (JSON-in-text) | `inline` (JSON-in-text) |
+| **Prompt style** | `strict` (bare JSON) | `strict` (bare JSON) | `strict` (bare JSON) | `soft` (code blocks OK) | `strict` (bare JSON) | `strict` (bare JSON) | `strict` (bare JSON) |
+| **Native `tools` API** | ✅ | ✅ | ❌ (uses inline) | ❌ (uses inline) | ❌ (uses inline) | ❌ (uses inline) | ❌ (uses inline) |
+| **`lazy_tool` needed?** | No | No | ✅ | ✅ | ✅ | ✅ | No |
+| **Temperature** | 0.7 | 0.7 (default) | 0.6 | 0.6 | 0.7 (default) | 0.7 (default) | 0.7 (default) |
+| **DNS resolver** | ✅ 4 steps, 89s | ❌ (compile errors) | ✅ 4 steps, 259s | ❌ (C syntax bug) | ✅ 3 steps* | ❌ (struct packing bug) | ✅ 4 steps, 42s |
+| **URL fetch** | ✅ Chained http→https | ✅ | ✅ | ✅ | ✅ | — | — |
+| **Multi-step write+read** | ✅ Clean | ✅ Clean | ✅ Clean | ✅ (recovered from typos) | ✅ Clean | — | — |
+| **Code quality** | Excellent (single-shot) | Mediocre (compile bugs) | Good | Mediocre (parsing bugs, typos) | Good | Good (correct C, one struct bug) | Excellent (single-shot, packed-compatible) |
+| **`edit_file`/`apply_patch` used?** | No | No | No | No | No | No | No |
+| **Multi-tool per response** | No | No | No | Yes (verbose preamble + code blocks) | No | No | No |
 
 \* Gemma4 needed `agentic_step_timeout > 120s` due to slow thinking generation.
+\*\* MiniMax-M2.5:cloud used cloud inference — no local model loading on the Ollama server.
 
 ### Detailed Per-Model Results (May 2026)
 
@@ -223,6 +224,47 @@ The following changes were made to improve agentic reliability across all models
 - With 300s timeout, the write→compile→run pipeline completed in 3 steps
 - C code was good but had a simplified DNS parser (couldn't handle compressed names)
 - Step timeout requirement is hardware-dependent, not a code issue
+
+#### MiniMax-M2.5:cloud (inline format — JSON-in-text)
+
+**Run 1 (tool_format="inline", lazy_tool=True, Ollama @ 192.168.1.20, 2026-05-29):**
+
+| Step | Tool | Observation |
+|------|------|-------------|
+| 1–13 | `write_file` | Wrote `dns_resolver.c` (7942 bytes) — correct DNS packet construction, proper header/struct definitions |
+| 14 | `run_command` | `gcc -o dns_resolver dns_resolver.c -Wall -Wextra` — compiled cleanly (0 warnings) |
+| 15 | `run_command` | `./dns_resolver 8.8.8.8 google.com` — received DNS response (44 bytes) but parser failed |
+| 16–27 | `write_file` + compile + test | Debug loop: rewrote parser 4 times, each time same root cause — struct packing |
+| — | **Result** | **FAILED** (timed out at 28 steps / 10 min). Binary never fully worked. |
+
+**Root cause:** The `dns_rr_t` struct lacks `__attribute__((packed))`, so `sizeof(dns_rr_t)` = 12 instead of the DNS wire format's 10 bytes. The RR header read at offset 30 produces `type=0x0001` (correct), but `class`, `ttl`, and `rdlength` are shifted by 2 bytes. The parser sees `rdlength=0x0400` (1176) instead of `0x0004`, then reports "Truncated RDATA." The model chased the compression pointer logic instead of identifying the struct packing issue.
+
+**Key observations:**
+- Cloud model: no local CPU/GPU load on the Ollama server — inference happens remotely
+- Good single-shot C code (correct DNS header structures, proper `sendto`/`recvfrom` usage)
+- Debugging loop was focused but in wrong direction (compression pointer logic, not struct packing)
+- All tool calls were valid JSON — no syntax errors in tool call extraction
+- No preamble text before tool JSON — clean output format
+- `write_file` used for every file modification — never attempted `edit_file` or `apply_patch`
+
+#### GPT-OSS 120B:cloud (inline format — JSON-in-text)
+
+**Run 1 (tool_format="inline", lazy_tool=False, Ollama @ 192.168.1.20, 2026-05-29):**
+
+| Step | Tool | Observation |
+|------|------|-------------|
+| 1 | `write_file` | Wrote `dns_resolver.c` (4918 bytes) — correct single-shot code with proper compression pointer handling |
+| 2 | `run_command` | `gcc -Wall -Wextra -O2 dns_resolver.c -o dns_resolver` — first try used `timeout=100000` (ms) → rejected; corrected to `timeout=30` → compiled cleanly |
+| 3 | `run_command` | `./dns_resolver 8.8.8.8 example.com` — **ran successfully**: `23.154.192.12` |
+| 4 | (text answer) | Presented full summary with code and test output |
+| — | **Result** | Test **OK** (42.3s). Fastest DNS resolver completion of all tested models. |
+
+**Key observations:**
+- Correct single-shot C code — no `__attribute__((packed))` needed because struct fields are manually accessed (not cast from wire buffer). The parser correctly handles compression pointers via `*ptr & 0xC0` check.
+- `lazy_tool=False` sufficient — model outputs clean JSON tool calls at start of response, no preamble
+- Cloud model: inference happens remotely, no local GPU/CPU load
+- Misunderstood timeout units (used `100000` for seconds instead of `30`) — corrected automatically after error. See Key Finding #10.
+- Clean, readable C code with proper error handling and comments
 
 #### Qwen3 8B (openai format — native tools API)
 

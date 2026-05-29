@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Integration tests verifying all modifications to ollamaquery2.py.
 
-Requires a live Ollama backend at the configured base_url.
+Discovery order: environment variable -> localhost -> local network IPs.
 """
 
 import io
@@ -11,6 +11,7 @@ import sys
 import time
 import json
 import types
+import socket
 import unittest
 from unittest.mock import patch, MagicMock
 from urllib.request import Request
@@ -20,31 +21,79 @@ from urllib.error import URLError, HTTPError
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ollamaquery2 as m
 
-def _backend_available(url, timeout=2):
-    """Return True if the given URL responds."""
-    try:
-        req = Request(url, method='HEAD')
-        m.urlopen(req, timeout=timeout)
-        return True
-    except Exception:
-        return False
+# -- Backend Discovery ------------------------------------------------------
 
-BACKEND_URL = 'http://127.0.0.1:8080'
-SMALL_MODEL = 'granite4:350m'
 
-HAS_OLLAMA = _backend_available(os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434'))
-HAS_LLAMACPP = _backend_available(os.environ.get('LLAMACPP_HOST', 'http://127.0.0.1:8080'))
+def _discover_backends():
+    """Auto-discover LLM backends by probing common URLs.
 
-# Pick whichever backend is available, prefer llamacpp then ollama
+    Checks in order:
+    1. User-set environment variables (OLLAMA_HOST, LLAMACPP_HOST)
+    2. Default localhost URLs on standard ports
+    3. Local network IPs on standard ports (via gethostbyname_ex)
+
+    Returns:
+        dict: Backend name -> (discovered_url, available_bool)
+    """
+    probes = [
+        ('ollama',   'OLLAMA_HOST',   'http://127.0.0.1:11434', 11434,
+         lambda u: m.check_backend_with_get(u, 'ollama')),
+        ('llamacpp', 'LLAMACPP_HOST', 'http://127.0.0.1:8080',   8080,
+         lambda u: m.check_backend_with_head(u, 'llama.cpp')),
+    ]
+
+    discovered = {}
+    for name, env_var, default_url, port, check_fn in probes:
+        url = os.environ.get(env_var, default_url)
+        ok = False
+
+        try:
+            ok = check_fn(url)
+        except Exception:
+            pass
+
+        if not ok:
+            try:
+                ips = socket.gethostbyname_ex(socket.gethostname())[-1]
+                for ip in ips:
+                    trial = f"http://{ip}:{port}"
+                    try:
+                        if check_fn(trial):
+                            url, ok = trial, True
+                            break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        discovered[name] = (url, ok)
+
+    return discovered
+
+
+_discovered_backends = _discover_backends()
+for _name, (_url, _ok) in _discovered_backends.items():
+    if _ok:
+        sys.stderr.write(f"[INFO] Discovered {_name} at {_url}\n")
+if not any(v[1] for v in _discovered_backends.values()):
+    sys.stderr.write("[INFO] No LLM backend discovered. Backend-dependent tests will be skipped.\n")
+
+OLLAMA_HOST   = _discovered_backends['ollama'][0]
+LLAMACPP_HOST = _discovered_backends['llamacpp'][0]
+HAS_OLLAMA    = _discovered_backends['ollama'][1]
+HAS_LLAMACPP  = _discovered_backends['llamacpp'][1]
+
 if HAS_LLAMACPP:
-    BACKEND_URL = os.environ.get('LLAMACPP_HOST', 'http://127.0.0.1:8080')
+    BACKEND_URL = LLAMACPP_HOST
     BACKEND_TYPE = 'llamacpp'
 elif HAS_OLLAMA:
-    BACKEND_URL = os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')
+    BACKEND_URL = OLLAMA_HOST
     BACKEND_TYPE = 'ollama'
 else:
     BACKEND_URL = 'http://127.0.0.1:8080'
     BACKEND_TYPE = 'llamacpp'
+
+SMALL_MODEL = os.environ.get('TEST_MODEL', 'granite4:350m')
 
 ollama_only = unittest.skipUnless(HAS_OLLAMA, 'Ollama backend not available')
 llamacpp_only = unittest.skipUnless(HAS_LLAMACPP, 'Llama.cpp backend not available')
@@ -265,6 +314,133 @@ class TestResetPreservesPreferences(unittest.TestCase):
 
 
 # ============================================================================
+# 2b. Singleton testing fragility
+# ============================================================================
+
+class TestSingletonFragility(unittest.TestCase):
+    """CommandContext is a singleton — tests must reset _instance between runs.
+
+    This test class verifies the singleton behavior and documents the manual
+    reset pattern required by all test files. See AGENTS.md "Singleton testing
+    fragility" for the pending fix (dep-injection or context manager).
+    """
+
+    def setUp(self):
+        m.CommandContext._instance = None
+        m.CommandContext._initialized = False
+        self.ctx = m.CommandContext()
+
+    def tearDown(self):
+        m.CommandContext._instance = None
+        m.CommandContext._initialized = False
+
+    def test_singleton_returns_same_instance(self):
+        """Two CommandContext() calls return the exact same object."""
+        ctx2 = m.CommandContext()
+        self.assertIs(self.ctx, ctx2)
+
+    def test_state_leaks_without_reset(self):
+        """Without _instance reset, state leaks across 'new' contexts."""
+        self.ctx.system_prompt = "Leaked value"
+        ctx2 = m.CommandContext()
+        self.assertEqual(ctx2.system_prompt, "Leaked value")
+
+    def test_manual_reset_enables_new_instance(self):
+        """Setting _instance = None allows a fresh singleton."""
+        self.ctx.system_prompt = "Should be isolated"
+        m.CommandContext._instance = None
+        m.CommandContext._initialized = False
+        ctx2 = m.CommandContext()
+        self.assertIsNot(self.ctx, ctx2)
+        self.assertEqual(ctx2.system_prompt, m.DEFAULT_SYSTEM_PROMPT)
+
+    def test_teardown_resets_for_next_test(self):
+        """tearDown resets so next test starts clean."""
+        self.ctx.system_prompt = "From test_teardown_resets"
+        # tearDown will reset; the next test will confirm isolation
+
+    def test_next_test_starts_clean_after_teardown(self):
+        """Verifies tearDown reset isolates tests."""
+        self.assertEqual(self.ctx.system_prompt, m.DEFAULT_SYSTEM_PROMPT)
+
+
+# ============================================================================
+# 2c. Path traversal protection
+# ============================================================================
+
+class TestPathTraversal(unittest.TestCase):
+    """All tool handlers must reject paths that escape the CWD.
+
+    Each test passes a path that resolves outside the current working directory
+    (e.g. ../etc/passwd or /tmp/foo) and verifies the handler returns
+    a "Path traversal denied" error without touching the filesystem.
+    """
+
+    def setUp(self):
+        m.CommandContext._instance = None
+        m.CommandContext._initialized = False
+        self.ctx = m.CommandContext()
+        self.ctx.auto_confirm = True
+        self.reg = m.ToolRegistry(ctx=self.ctx)
+
+    def tearDown(self):
+        m.CommandContext._instance = None
+        m.CommandContext._initialized = False
+
+    # -- via ToolRegistry execute() --
+
+    def test_read_file_rejects_traversal(self):
+        result = self.reg.execute("read_file", {"file": "../etc/passwd"})
+        self.assertFalse(result["success"])
+        self.assertIn("Path traversal denied", result.get("error", ""))
+
+    def test_read_file_rejects_absolute_outside(self):
+        result = self.reg.execute("read_file", {"file": "/tmp/foo"})
+        self.assertFalse(result["success"])
+        self.assertIn("Path traversal denied", result.get("error", ""))
+
+    def test_write_file_rejects_traversal(self):
+        result = self.reg.execute("write_file", {"file": "../outside.txt", "content": "x"})
+        self.assertFalse(result["success"])
+        self.assertIn("Path traversal denied", result.get("error", ""))
+
+    def test_list_directory_rejects_traversal(self):
+        result = self.reg.execute("list_directory", {"path": "../"})
+        self.assertFalse(result["success"])
+        self.assertIn("Path traversal denied", result.get("error", ""))
+
+    def test_edit_file_rejects_traversal(self):
+        result = self.reg.execute("edit_file", {"file": "../etc/passwd", "old_string": "root", "new_string": "toor"})
+        self.assertFalse(result["success"])
+        self.assertIn("Path traversal denied", result.get("error", ""))
+
+    def test_apply_patch_rejects_traversal(self):
+        """apply_patch must reject patches targeting files outside CWD."""
+        patch = "*** Update File: ../outside.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        result = self.reg.execute("apply_patch", {"patch_text": patch})
+        self.assertFalse(result["success"])
+        self.assertIn("Path traversal denied", result.get("error", ""))
+
+    # -- direct call to _apply_unified_diff --
+
+    def test_apply_unified_diff_rejects_traversal_direct(self):
+        """Direct call to _apply_unified_diff with traversal path."""
+        patch = "*** Update File: ../etc/hosts\n@@ -1 +1 @@\n-old\n+new\n"
+        result = m._apply_unified_diff(patch)
+        self.assertFalse(result["success"])
+        self.assertIn("Path traversal denied", result.get("error", ""))
+
+    def test_apply_unified_diff_rejects_move_traversal(self):
+        """Move operation to outside CWD must be rejected."""
+        patch = "*** Move to: ../outside_dir/\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        result = m._apply_unified_diff(patch)
+        self.assertFalse(result["success"])
+        self.assertIn("Path traversal denied", result.get("error", ""))
+
+
+# ============================================================================
+# 3.  No bare `except:` remains
+# ============================================================================
 # 3.  No bare `except:` remains
 # ============================================================================
 
@@ -428,6 +604,9 @@ class TestUrlopenReplaced(unittest.TestCase):
             if 'urlopen(' in line and not in_retry:
                 # Skip import line
                 if 'from urllib.request import urlopen' in line:
+                    continue
+                # Skip startup probe lines (fast, non-retrying URL checks at launch)
+                if '# startup-probe' in line:
                     continue
                 bare_urlopen_lines.append((i, line.strip()))
         self.assertEqual(bare_urlopen_lines, [],

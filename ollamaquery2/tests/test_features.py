@@ -2,11 +2,12 @@
 """Comprehensive release test suite for ollamaquery2.
 
 Auto-detects available backends and tests all features one by one.
+Discovery order: environment variable → localhost → local network IPs.
 Uses a small model (granite4:350m) for speed and reliability.
 
 Environment variables:
-  OLLAMA_HOST   — Ollama server URL (default: http://127.0.0.1:11434)
-  LLAMACPP_HOST — Llama.cpp server URL (default: http://127.0.0.1:8080)
+  OLLAMA_HOST   — Ollama server URL (auto-discovered if not set)
+  LLAMACPP_HOST — Llama.cpp server URL (auto-discovered if not set)
   TEST_MODEL    — Model name for query tests (default: granite4:350m)
 
 Usage:
@@ -21,6 +22,7 @@ import sys
 import json
 import time
 import signal
+import socket
 import atexit
 import textwrap
 import tempfile
@@ -34,28 +36,82 @@ from urllib.error import URLError, HTTPError
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ollamaquery2 as q
 
-# ── Configuration ──────────────────────────────────────────────────────────
-
-OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')
-LLAMACPP_HOST = os.environ.get('LLAMACPP_HOST', 'http://127.0.0.1:8080')
-LMSTUDIO_HOST = os.environ.get('LMSTUDIO_HOST', 'http://127.0.0.1:1234')
-SMALL_MODEL = os.environ.get('TEST_MODEL', 'granite4:350m')
+# ── Backend Discovery ──────────────────────────────────────────────────────
 
 
-def _backend_available(url, timeout=2):
-    """Return True if the given URL responds to a HEAD request."""
-    try:
-        req = Request(url, method='HEAD')
-        q.urlopen(req, timeout=timeout)
-        return True
-    except Exception:
-        return False
+def _discover_backends():
+    """Auto-discover LLM backends by probing common URLs.
+
+    Checks in order:
+    1. User-set environment variables (OLLAMA_HOST, LLAMACPP_HOST, LMSTUDIO_HOST)
+    2. Default localhost URLs on standard ports
+    3. Local network IPs on standard ports (via gethostbyname_ex)
+
+    Returns:
+        dict: Backend name -> (discovered_url, available_bool)
+    """
+    probes = [
+        ('ollama',   'OLLAMA_HOST',   'http://127.0.0.1:11434', 11434,
+         lambda u: q.check_backend_with_get(u, 'ollama')),
+        ('llamacpp', 'LLAMACPP_HOST', 'http://127.0.0.1:8080',   8080,
+         lambda u: q.check_backend_with_head(u, 'llama.cpp')),
+        ('lmstudio', 'LMSTUDIO_HOST', 'http://127.0.0.1:1234',   1234,
+         lambda u: q.check_lmstudio(u)),
+    ]
+
+    discovered = {}
+    for name, env_var, default_url, port, check_fn in probes:
+        url = os.environ.get(env_var, default_url)
+        ok = False
+
+        try:
+            ok = check_fn(url)
+        except Exception:
+            pass
+
+        if not ok:
+            try:
+                ips = socket.gethostbyname_ex(socket.gethostname())[-1]
+                for ip in ips:
+                    trial = f"http://{ip}:{port}"
+                    try:
+                        if check_fn(trial):
+                            url, ok = trial, True
+                            break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        discovered[name] = (url, ok)
+
+    return discovered
+
+
+_discovered_backends = _discover_backends()
+for _name, (_url, _ok) in _discovered_backends.items():
+    if _ok:
+        sys.stderr.write(f"[INFO] Discovered {_name} at {_url}\n")
+if not any(v[1] for v in _discovered_backends.values()):
+    sys.stderr.write("[INFO] No LLM backend discovered. Backend-dependent tests will be skipped.\n")
+
+OLLAMA_HOST   = _discovered_backends['ollama'][0]
+LLAMACPP_HOST = _discovered_backends['llamacpp'][0]
+LMSTUDIO_HOST = _discovered_backends['lmstudio'][0]
+HAS_OLLAMA    = _discovered_backends['ollama'][1]
+HAS_LLAMACPP  = _discovered_backends['llamacpp'][1]
+HAS_LMSTUDIO  = _discovered_backends['lmstudio'][1]
+SMALL_MODEL   = os.environ.get('TEST_MODEL', 'granite4:350m')
+
+ollama_only   = unittest.skipUnless(HAS_OLLAMA,   'Ollama backend not available')
+llamacpp_only = unittest.skipUnless(HAS_LLAMACPP, 'Llama.cpp backend not available')
+any_backend   = unittest.skipUnless(HAS_OLLAMA or HAS_LLAMACPP or HAS_LMSTUDIO,
+                                    'No backend available')
 
 
 def _tokenize_available(base_url, model):
     """Check if the /api/tokenize endpoint works for a given model."""
     try:
-        import json
         payload = json.dumps({"model": model, "content": "test"}).encode('utf-8')
         req = Request(f"{base_url}/api/tokenize", data=payload,
                       headers={'Content-Type': 'application/json'})
@@ -63,16 +119,6 @@ def _tokenize_available(base_url, model):
             return resp.status == 200
     except Exception:
         return False
-
-
-HAS_OLLAMA = _backend_available(OLLAMA_HOST)
-HAS_LLAMACPP = _backend_available(LLAMACPP_HOST)
-HAS_LMSTUDIO = _backend_available(LMSTUDIO_HOST)
-
-ollama_only = unittest.skipUnless(HAS_OLLAMA, 'Ollama backend not available')
-llamacpp_only = unittest.skipUnless(HAS_LLAMACPP, 'Llama.cpp backend not available')
-any_backend = unittest.skipUnless(HAS_OLLAMA or HAS_LLAMACPP or HAS_LMSTUDIO,
-                                  'No backend available')
 
 
 def _pick_small_model(base_url, prefer_under_gb=9):
@@ -251,6 +297,10 @@ class TestModelListing(unittest.TestCase):
 
     def test_parse_size(self):
         self.assertEqual(q.parse_size(1073741824), '1.0 GB')
+        self.assertEqual(q.parse_size(52428800), '50.0 MB')
+        self.assertEqual(q.parse_size(5242880), '5.0 MB')
+        self.assertEqual(q.parse_size(512000), '500.0 KB')
+        self.assertEqual(q.parse_size(500), '500 B')
         self.assertEqual(q.parse_size(0), 'N/A')
         self.assertEqual(q.parse_size(None), 'N/A')
 
@@ -776,6 +826,10 @@ class TestTokenCounting(unittest.TestCase):
     def test_estimate_token_count_basic(self):
         count = q.estimate_token_count('hello world foo bar')
         self.assertGreaterEqual(count, 1)
+
+    def test_estimate_token_count_code(self):
+        count = q.estimate_token_count('def foo(x): return x + 1')
+        self.assertGreater(count, q.estimate_token_count('hello world foo bar'))
 
     def test_estimate_token_count_empty(self):
         self.assertEqual(q.estimate_token_count(''), 0)
@@ -1341,7 +1395,7 @@ class TestErrorHandling(unittest.TestCase):
 
     def test_get_message_token_count_ollama_no_model(self):
         count = q.get_message_token_count_ollama(OLLAMA_HOST, 'hello', '')
-        self.assertEqual(count, 0)
+        self.assertGreaterEqual(count, 1)
 
     def test_get_ollama_context_size_nonexistent(self):
         size = q.get_ollama_context_size('http://127.0.0.1:1', 'nonexistent')
