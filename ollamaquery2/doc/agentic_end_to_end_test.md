@@ -4,15 +4,14 @@
 
 Validate that a real LLM can use the agentic tool system to solve multi-step tasks end-to-end. Each test exercises the full pipeline: the model must plan, use tools, observe results, and produce a working outcome.
 
-## Test Plan (3–5 tests)
+## Test Plan
 
 | # | Test | Tools required | What it proves |
 |---|------|---------------|----------------|
 | 1 | **DNS resolver** — write `dns_resolver.c`, compile with `gcc`, test it | `write_file`, `run_command` | Code generation, compilation, execution |
-| 2 | *(planned)* **Python script** — write a Python script, run it, capture output | `write_file`, `run_python` | Cross-language code generation |
-| 3 | *(planned)* **File processing** — read a file, process it, write result | `read_file`, `write_file` | Data pipeline without compilation |
-| 4 | *(planned)* **Web fetch + extract** — fetch a URL, extract specific data | `fetch_url`, `write_file` | External data retrieval and parsing |
-| 5 | *(planned)* **Glob + diff** — find files matching a pattern, compare two | `glob`, `diff` | File search and comparison |
+| 2 | **Simple answer** — direct answer without tools | (none) | Non-tool queries work |
+| 3 | **URL fetch** — fetch a URL, extract page title | `fetch_url` | External data retrieval |
+| 4 | **Multi-step write+read** — write file, then read it back | `write_file`, `read_file` | Multi-step tool chaining |
 
 ## Test 1: DNS Resolver
 
@@ -30,16 +29,47 @@ Validate that a real LLM can use the agentic tool system to solve multi-step tas
 | 3 | `run_command` | LLM tests with `./dns_resolver <dns> <fqdn>` | Binary runs |
 | 4 | — | Session completes | `dns_resolver` binary exists on disk |
 
+**Tool parameters introduced:**
+- `run_command` and `run_python` now accept an optional `timeout` parameter (integer, default 10s, max 300s). The LLM can set per-call timeouts for long-running compilations or tests.
+- Chaining operators (`&&`, `||`, `;`, `|`, `` ` ``, `$(`) are blocked. The LLM receives a JSON error: `"Only one command at a time is supported."`
+- Tool results are now structured JSON: `{"tool": ..., "duration_s": ..., "success": ..., "output": ...}` instead of plain text.
+
 ## Requirements
 
 - A running Ollama or llama.cpp server with a loaded model capable of code generation and tool use
-- Recommended models: `qwen3.5:9b`, `dolphin3:8b`, `qwen3-coder:30b`
+- Recommended models: `qwen3.5:9b`, `GLM-4.7-Flash`, `gpt-oss-20b`, `nemotron-cascade-2_30b`
 - `gcc` must be installed on the host (for compilation tests)
+
+## Test Configuration
+
+The E2E tests enable these debug features by default (`setUp` in `TestAgenticReActEndToEnd`):
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| `agentic_mode` | `True` | Enables the ReAct loop |
+| `lazy_tool` | `True` | Extract tool calls from anywhere in model response |
+| `auto_confirm` | `True` | Skip destructive tool confirmation prompts |
+| `agentic_verbose` | `True` | Show raw model responses during ReAct |
+| `agentic_show_thinking` | `True` | Show model reasoning in `<thinking>` blocks |
+| `agentic_trace` | `True` | Show full tool args and results |
+| `agentic_logging` | `False` | Disabled (test isolation) |
+| `agentic_max_iterations` | `30` | Stop early on stuck models |
+
+## Tool Delivery Format
+
+Tool descriptions are delivered to the model via one of two strategies, selected per-model:
+
+| Format | Mechanism | Models |
+|--------|-----------|--------|
+| `openai` | Native OpenAI `tools` API parameter. System prompt stays clean (no inline tool defs). | GPT-OSS, Qwen3.x, Llama 3.x |
+| `inline` | Tool descriptions embedded in system prompt text. No `tools` API param. | GLM-4.x, Qwen3.5, Nemotron, unknown |
+
+Key rule: **tools are sent only once** — never both inline and via API. If a model rejects the native `tools` API, the system auto-falls back to `inline` mode (via `check_tools_error()`).
 
 ## How to Run
 
 ```bash
-# Run the DNS resolver test with default Ollama host
+# Run DNS resolver with default Ollama host
 python3 -m unittest tests.test_agentic.TestAgenticReActEndToEnd.test_dns_resolver_write_compile_run -v
 
 # With custom host and model
@@ -47,12 +77,11 @@ OLLAMA_HOST=http://my-server:11434 TEST_MODEL=qwen3.5:9b \\
   python3 -m unittest tests.test_agentic.TestAgenticReActEndToEnd.test_dns_resolver_write_compile_run -v
 
 # With llama.cpp backend
-LLAMACPP_HOST=http://127.0.0.1:8080 \\
+LLAMACPP_HOST=http://127.0.0.1:8080 TEST_MODEL=GLM-4.7-Flash-Q4_K_M.gguf \\
   python3 -m unittest tests.test_agentic.TestAgenticReActEndToEnd -v
 
-# Run all end-to-end tests
-OLLAMA_HOST=http://192.168.1.20:11434 \\
-  python3 -m unittest tests.test_agentic.TestAgenticReActEndToEnd -v
+# Run all end-to-end tests (auto-detects backend)
+python3 -m unittest tests.test_agentic.TestAgenticReActEndToEnd -v
 ```
 
 ## Backend Auto-Detection
@@ -85,79 +114,138 @@ The following changes were made to improve agentic reliability across all models
 | `parse_tool_call` multi-line JSON fix | Regex `\{"tool"` changed to `\{\s*"(tool\|function\|type)"` to match models (like Nemotron) that put `{` and `"tool"` on separate lines. Applies to lazy-mode bare JSON extraction, strict-mode start-of-text check, and end-of-text check. |
 | `parse_tool_calls` multi-line JSON fix | Same `\{\s*"..."` regex applied to both lazy mode (find-all) and strict mode (consecutive-from-start) extraction. |
 | `run_agentic_query` model-specific prompt | Previously used a hardcoded prompt string literal. Now calls `get_agentic_prompt(self.ctx.model)` so registered model prompts take effect. |
+| `run_agentic_query` model-specific prompt | Previously used a hardcoded prompt string literal. Now calls `get_agentic_prompt(self.ctx.model)` so registered model prompts take effect. |
 | Helper methods: `_find_tool_call_json`, `_rfind_tool_call_json`, `_extract_json_balanced` | Extracted from inline loop logic for reuse across `parse_tool_call` and `parse_tool_calls`. `_extract_json_balanced` does brace-depth tracking to extract a complete JSON object from any starting position. |
+| `timeout` parameter in tool defs | Added optional `timeout` (integer, default 10, max 300) to `run_command` and `run_python`. Tool returns JSON error if timeout exceeds 300s. |
+| Chaining operators blocked in `run_command` | `&&`, `||`, `|`, `;`, `` ` ``, `$(` are rejected with explicit error: `"Only one command at a time is supported."` |
+| Tool result is JSON | Observation is now `{"tool": ..., "duration_s": ..., "success": ..., "output": ...}` instead of plain text. On failure, first 4 lines of output are included for context. |
+| Default tool timeout lowered to 10s | Reduced from 120s to 10s. LLM can override via the `timeout` parameter. Teaches the model to set appropriate timeouts. |
 
 ### Model Comparison
 
-| Dimension | Qwen3.5-9B | GPT-OSS 20B | Nemotron-Cascade-2 30B |
-|-----------|-------------|-------------|------------------------|
-| **Parameter count** | 9B | 20B (mxFP4) | 31.6B (MoE, 3B active) |
-| **Native `tools` API** | ❌ | ✅ | ❌ |
-| **Tool call format** | JSON-in-text `{"tool": ...}` | OpenAI `tool_calls[]` + JSON-in-text fallback | JSON-in-text `{"tool": ...}` in ````json` code blocks |
-| **Best prompt** | `AGENTIC_SYSTEM_PROMPT` (strict) | `AGENTIC_SYSTEM_PROMPT` (strict) | `AGENTIC_SYSTEM_PROMPT_SOFT` (code blocks OK) |
-| **`lazy_tool` needed?** | ✅ | No | ✅ |
-| **Temperature** | 0.6 | 0.7 | 0.6 |
-| **DNS resolver steps** | 10–14 | 4 | ~2 (multi-tool) |
-| **DNS resolver time** | 242–432s | 166s | ~100s |
-| **Code quality** | Good (iterative fixes) | Excellent (single-shot) | Mediocre (parsing bugs) |
-| **`edit_file`/`apply_patch` used?** | No | No | No |
-| **Multi-tool per response** | No (single tool call) | No (single tool call) | Yes (all 3 steps at once) |
+| Dimension | GPT-OSS 20B | Qwen3 8B | GLM-4.7-Flash | Nemotron-Cascade-2 30B | Gemma4 26B |
+|-----------|-------------|----------|---------------|------------------------|-------------|
+| **Parameter count** | 20B (mxFP4) | 8B | ~9B | 31.6B (MoE, 3B active) | 26B (MoE, 4B active) |
+| **Tool format** | `openai` (native API) | `openai` (native API) | `inline` (JSON-in-text) | `inline` (JSON-in-text) | `inline` (JSON-in-text) |
+| **Prompt style** | `strict` (bare JSON) | `strict` (bare JSON) | `strict` (bare JSON) | `soft` (code blocks OK) | `strict` (bare JSON) |
+| **Native `tools` API** | ✅ | ✅ | ❌ (uses inline) | ❌ (uses inline) | ❌ (uses inline) |
+| **`lazy_tool` needed?** | No | No | ✅ | ✅ | ✅ |
+| **Temperature** | 0.7 | 0.7 (default) | 0.6 | 0.6 | 0.7 (default) |
+| **DNS resolver** | ✅ 4 steps, 89s | ❌ (compile errors) | ✅ 4 steps, 259s | ❌ (C syntax bug) | ✅ 3 steps* |
+| **URL fetch** | ✅ Chained http→https | ✅ | ✅ | ✅ | ✅ |
+| **Multi-step write+read** | ✅ Clean | ✅ Clean | ✅ Clean | ✅ (recovered from typos) | ✅ Clean |
+| **Code quality** | Excellent (single-shot) | Mediocre (compile bugs) | Good | Mediocre (parsing bugs, typos) | Good |
+| **`edit_file`/`apply_patch` used?** | No | No | No | No | No |
+| **Multi-tool per response** | No | No | No | Yes (verbose preamble + code blocks) | No |
 
-### Detailed Per-Model Results
+\* Gemma4 needed `agentic_step_timeout > 120s` due to slow thinking generation.
 
-#### Qwen3.5-9B-Q4_K_M.gguf
+### Detailed Per-Model Results (May 2026)
 
-**Run 1 (max_iterations=50, with inference params):**
+#### GPT-OSS 20B (openai format — native tools API)
 
-| Step | Tool | Observation |
-|------|------|-------------|
-| 1 | `write_file` | Wrote initial `dns_resolver.c` with basic DNS structures, encode/build/send/parse functions |
-| 2 | `write_file` | Rewrote with `#include <time.h>` fix, cast fixes, unsigned short cast |
-| 3 | `run_command` | `gcc -o dns_resolver dns_resolver.c -Wall` — compiled with warnings, binary created |
-| 4 | `write_file` | Rewrote with label length/Max fixes, more robust encoding |
-| 5 | `run_command` | `gcc -o dns_resolver dns_resolver.c -Wall` — recompiled |
-| 6 | `write_file` | Rewrote with malloc fix, correct question section size |
-| 7 | `run_command` | `gcc -o dns_resolver dns_resolver.c -Wall` — recompiled |
-| 8 | `run_command` | `./dns_resolver 8.8.8.8 google.com` — **ran successfully** |
-| 9 | loop guard | Same tool call detected, loop broken, answer streamed |
-| — | **Result** | Test **OK** (242s). Binary existed from step 3. |
-
-**Run 2 (with edit_file, apply_patch tools available):**
+**Run 1 (tool_format="openai", lazy_tool=False):**
 
 | Step | Tool | Observation |
 |------|------|-------------|
-| 1 | `write_file` | Wrote `dns_resolver.c` with different initial implementation (used `arpa/nameser.h`, `resolv.h`) |
-| 2 | `write_file` | Rewrote with different encode/build/send/parse logic |
-| 3-7 | `run_command` | Multiple compile attempts — `pkg-config`, various `gcc` flags |
-| 8 | `run_command` | `./dns_resolver 8.8.8.8 google.com` — **ran successfully** |
-| 9-13 | `write_file` (×4) | Keep rewriting despite working binary — added debug output, label validation |
-| 14 | loop guard | Same tool call detected (same file path), loop broken |
-| — | **Result** | Test **OK** (432s). Binary existed from early compile. |
+| 1 | `write_file` | Wrote `dns_resolver.c` (5532 bytes) — correct single-shot code |
+| 2 | `run_command` | `gcc dns_resolver.c -o dns_resolver` — compiled cleanly |
+| 3 | `run_command` | `./dns_resolver 8.8.8.8 example.com` — **ran successfully**: `172.66.147.243` |
+| 4 | (text answer) | Presented full summary with code and test output |
+| — | **Result** | Test **OK** (89s). All 4 E2E tests passed. |
 
-#### GPT-OSS 20B (ggml-org_gpt-oss-20b-GGUF_gpt-oss-20b-mxfp4.gguf)
+**Key observations:**
+- Used native `tools` API — system prompt was clean (no inline tool defs)
+- Model output native `tool_calls` via API, not inline JSON
+- Single-shot correct C code, no debugging iterations needed
+- Fastest DNS resolver completion of all tested models
 
-**Run (max_iterations=50, with inference params `temperature=0.7, top_p=0.9, top_k=40`):**
+#### GLM-4.7-Flash (inline format — JSON-in-text)
+
+**Run 1 (tool_format="inline", lazy_tool=True):**
 
 | Step | Tool | Observation |
 |------|------|-------------|
-| 1 | `write_file` | Wrote complete `dns_resolver.c` (~250 lines) with all DNS structures, encode/build/send/parse functions. **Single-shot correct.** |
-| 2 | `run_command` | `gcc -Wall -Wextra -O2 dns_resolver.c -o dns_resolver` — compiled cleanly |
-| 3 | `run_command` | `./dns_resolver 8.8.8.8 example.com` — ran successfully, returned `104.20.23.154` |
-| 4 | — | Final answer with explanation of code, compilation, and test results |
-| — | **Result** | **Test OK** (166s). 4 steps — fastest run yet. |
+| 1 | `write_file` | Wrote `dns_resolver.c` (6509 bytes) |
+| 2 | `run_command` | `gcc -o dns_resolver dns_resolver.c -Wall -Wextra` — compiled with warnings |
+| 3 | `run_command` | `./dns_resolver 8.8.8.8 www.google.com` — timeout (network sandbox) |
+| 4–27 | (various) | Debug loop: tried DNS servers, dig tests, fix code |
+| — | **Result** | Test **OK** (374s total for all 4 tests). Binary existed. |
 
-#### Nemotron-Cascade-2-30B-A3B (`nemotron-cascade-2_30b.gguf`)
+**Key observations:**
+- Inline format produced reliable multi-step chaining on llama.cpp
+- Conversation history includes inline JSON in assistant content (always visible to model)
+- Longer debugging loop due to network sandbox restrictions on UDP 53
+- `lazy_tool=True` required — model sometimes embeds JSON in preamble text
 
-**Setup:** `AGENTIC_SYSTEM_PROMPT_SOFT`, `temperature=0.6`, `lazy_tool=True`, multi-line JSON regex fix applied.
+**Ollama backend run (glm-4.7-flash:q4_K_m @ 192.168.1.20:11434):**
 
-| Attempt | Tools used? | Binary created? | Notes |
-|---------|-------------|-----------------|-------|
-| hello.c (simple) | ✅ write, compile, run | ✅ | Full 3-step tool chain in a single response. `parse_tool_calls` extracted all 3 calls. |
-| dns_resolver.c (complex) | ✅ All three tools called | ~✅ | Wrote, compiled, tested. C code had inadequate DNS response parser (heuristic `strstr` approach). |
+| Test | Result | Notes |
+|------|--------|-------|
+| `test_direct_answer_no_tool` | ✅ | |
+| `test_fetch_url_tool` | ✅ | |
+| `test_multi_step_write_file` | ✅ | |
+| `test_dns_resolver_write_compile_run` | ❌ | Output code as text, never used `write_file` tool |
+
+**Finding:** GLM-4.7 behavior is **consistent across backends** — on both llama.cpp and Ollama, it handles simple tools reliably but outputs code as text instead of using tools for complex code generation tasks. This is a model-inherent behavior, not backend-dependent.
+
+#### Nemotron-Cascade-2 30B (inline format, soft prompt)
+
+**Run 1 (tool_format="inline", prompt_style="soft"):**
+
+| Step | Tool | Observation |
+|------|------|-------------|
+| 1 | `write_file` | Wrote `dns_resolver.c` with syntax error — `definition int` vs `int` |
+| 2 | `read_file` (typo) | Attempted `dns_olver.c` (wrong name) — file not found |
+| 3 | (same loop) | Repeated same typo — loop guard triggered |
+| — | **Result** | Test **FAILED**. Binary not created. Other 3 E2E tests passed. |
+
+**Key observations:**
+- Soft prompt allows verbose preamble and code block tool calls
+- Model makes typos in tool names (`write_ file`) and file paths (spaces in names)
+- Multi-tool-per-response supported but error-prone
+- DNS resolver failed due to C syntax bug the model couldn't recover from
+
+#### Gemma4 26B (inline format — JSON-in-text)
+
+**Run 1 (tool_format="inline", lazy_tool=True, agentic_step_timeout=300):**
+
+| Step | Tool | Observation |
+|------|------|-------------|
+| 1 | `write_file` | Wrote `dns_resolver.c` (5017 bytes) with DNS structures |
+| 2 | `run_command` | `gcc dns_resolver.c -o dns_resolver` — compiled cleanly |
+| 3 | `run_command` | `./dns_resolver 8.8.8.8 google.com` — parser returned `No A records found` |
+| 4 | (timeout) | Next step timed out (300s) |
+| — | **Result** | Binary existed. C code had simplified parser (no compressed name handling). |
+
+**Key observations:**
+- Default 120s step timeout was too short for initial code generation (Gemma4 is slow to start generating)
+- With 300s timeout, the write→compile→run pipeline completed in 3 steps
+- C code was good but had a simplified DNS parser (couldn't handle compressed names)
+- Step timeout requirement is hardware-dependent, not a code issue
+
+#### Qwen3 8B (openai format — native tools API)
+
+**Run 1 (tool_format="openai", native tools API, Ollama backend):**
+
+| Step | Tool | Observation |
+|------|------|-------------|
+| 1 | `write_file` | Wrote `dns_resolver.c` (6484 bytes) — used `arpa/nameser.h` and `resolv.h` |
+| 2 | `write_file` | Rewrote with manual DNS packet building (dropped system headers) |
+| 3 | `run_command` | `gcc -o dns_resolver dns_resolver.c -lc -ldns -lnet -lresolv` — **compile error**: redeclared `anc` variable |
+| 4 | (streaming) | Output inline JSON tool call in streaming response → rewrote file |
+| — | **Result** | Test **FAILED**. Binary not created. |
+
+**Key observations:**
+- Native `tools` API worked for the first tool call; subsequent calls fell back to inline JSON in streaming
+- 8B model lacks the code quality to produce correct DNS resolver C code
+- Compilation bugs (variable redeclaration) and wrong linker flags (`-lc -ldns -lnet`)
+- Simple tools (fetch_url, write_file, read_file) worked reliably
+- Code generation task exceeded model capability
 
 ### Key Findings (All Models)
 
-1. **`edit_file` / `apply_patch` never adopted** — Across all three models, tool descriptions alone don't steer models away from `write_file`. Even for small changes (adding debug output, fixing a single line), models rewrite the entire file. This is consistent regardless of model size (9B–31.6B) or tool-calling approach (native API vs JSON-in-text).
+1. **`edit_file` / `apply_patch` never adopted** — Across all tested models, tool descriptions alone don't steer models away from `write_file`. Even for small changes (adding debug output, fixing a single line), models rewrite the entire file. This is consistent regardless of model size (9B–31.6B) or tool-calling approach (native API vs JSON-in-text).
 
 2. **Inference params improve focus** — With `temperature=0.6` and constrained `top_k` (20–40), models stay on task and make consistent progress toward compilation. Higher temperatures cause wandering (unnecessary rewrites, unrelated changes).
 
@@ -172,6 +260,14 @@ The following changes were made to improve agentic reliability across all models
 7. **Multi-tool-per-response (Nemotron only)** — Nemotron outputs all three steps (write, compile, run) in a single response inside separate ````json` code blocks. Qwen3.5 and GPT-OSS output one tool call per response.
 
 8. **`run_agentic_query` had a hardcoded system prompt bug** — The prompt was embedded as a string literal in `run_agentic_query()` (line 3751), bypassing both `self.ctx.system_prompt` and `get_agentic_prompt()`. This meant model-specific prompts (set by `/agentic on` or `/agentic full` via `run_handle_agentic`) were silently ignored inside the ReAct loop. Fixed to use `get_agentic_prompt(self.ctx.model)`.
+
+9. **Tool descriptions must be short** — GLM-4.7 stopped using tools entirely when the `run_command` description grew to include chaining restrictions and timeout limits (~300 chars). After trimming it back to focus on what the tool **does** (not what it can't do), the model resumed tool use.
+
+10. **Models misinterpret timeout units** — GLM-4.7 used `timeout=30000` in tool calls, treating it as milliseconds. Explicit validation (max 300s + clear JSON error) is essential. Models learn from the error after one try.
+
+11. **JSON tool results help debugging** — Structuring tool observations as `{"tool", "duration_s", "success", "output"}` gives the model machine-readable context. On failure, including the first 4 lines of output helps the model understand why something failed instead of blindly retrying.
+
+12. **`gcc -o <name> <name>.c` conflicts confuse models** — When the binary name matches the source basename (`gcc -o dns_resolver dns_resolver.c`), subsequent compilation fails because the existing binary blocks the output. Models struggle with this, often retrying with `rm -f` (which hits shell chaining blocks) or creating increasingly strange binary names (`_new`, `_v2`, `_v3`).
 
 ### Architecture: Model-Specific Agentic Prompts
 

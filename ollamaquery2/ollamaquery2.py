@@ -48,7 +48,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 # ============================================================================
@@ -600,7 +600,7 @@ def sanitize_shell_command(command):
         return None
 
     # Remove dangerous characters that enable command chaining
-    dangerous_patterns = [';', '|', '&&', '||', '`', '$(']
+    dangerous_patterns = [';', '|', '&&', '||', '`', '$(', '>', '<']
     for pattern in dangerous_patterns:
         if pattern in command:
             return None
@@ -631,7 +631,7 @@ def validate_shell_command_safety(command, max_length=500):
         return False
 
     # Block dangerous utilities and substitution patterns
-    dangerous = ['rm -rf', 'mkfs', 'dd if=', 'wget ', 'curl ',
+    dangerous = ['rm -rf', 'rm -r -f', 'rm -r /', 'mv / ', 'mkfs', 'dd if=', 'wget ', 'curl ',
                  'nc -e', 'python -c', 'perl -e', 'bash -c']
     for pattern in dangerous:
         if pattern.lower() in command.lower():
@@ -644,6 +644,12 @@ def validate_shell_command_safety(command, max_length=500):
     # Check for shell escape sequences
     if re.search(r'\\[\"\'\$\`]', command):
         return False
+
+    # Block command chaining operators — only one command at a time
+    chain_ops = ['&&', '||', ';', '|']
+    for op in chain_ops:
+        if op in command:
+            return False
 
     return True
 
@@ -868,7 +874,8 @@ class CommandContext:
         self.agentic_logging: bool = True
         self.agentic_max_iterations: int = 50
         self.agentic_step_timeout: int = 120
-        self.lazy_tool: bool = False
+        self.lazy_tool: bool = True  # Enabled by default: many models embed tool calls after thinking/preamble
+        self.supports_vision: Optional[bool] = None  # None = unknown (treated as capable)
         
         # Context window tracking
         self.context_window_size: int = 0  # Will be fetched from server
@@ -911,6 +918,7 @@ class CommandContext:
         self.query_history = []
         self.context_window_size = 0
         self.current_context_tokens = 0
+        self.supports_vision = None
 
     def create_completer(self):
         """Create a ChatCompleter using this context's connection info."""
@@ -1053,6 +1061,32 @@ AGENTIC_PROMPT_STYLE_REGISTRY = {
 
 AGENTIC_PROMPT_STYLE_DEFAULT = "strict"
 
+# Registry mapping model name substrings to tool delivery strategy.
+# "openai": Pass tools via native OpenAI tools API parameter, strip inline tool defs from system prompt.
+# "inline": Embed tool descriptions in system prompt, don't use native tools API.
+# IMPORTANT: Longer/more-specific substrings must come before shorter ones
+# to avoid false matches (e.g. "qwen3.5" before "qwen3").
+TOOL_FORMAT_REGISTRY = [
+    ("qwen3.5", "inline"),
+    ("qwen3", "openai"),
+    ("glm-4", "inline"),
+    ("glm4", "inline"),
+    ("llama", "openai"),
+    ("gpt-oss", "openai"),
+    ("nemotron", "inline"),
+]
+
+TOOL_FORMAT_DEFAULT = "inline"
+
+
+def get_tool_format(model_name: str) -> str:
+    """Determine tool delivery strategy for a model."""
+    lower = model_name.lower()
+    for key, fmt in TOOL_FORMAT_REGISTRY:
+        if key in lower:
+            return fmt
+    return TOOL_FORMAT_DEFAULT
+
 
 def get_prompt_style(model_name: str) -> str:
     """Determine which format style a model should use."""
@@ -1063,17 +1097,19 @@ def get_prompt_style(model_name: str) -> str:
     return AGENTIC_PROMPT_STYLE_DEFAULT
 
 
-def get_agentic_prompt(model_name: str, tool_defs_block: str = "") -> str:
+def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
+                       include_tool_defs: bool = True) -> str:
     """Assemble the agentic system prompt from composable blocks.
     
     Args:
         model_name: Used to select format style from registry.
         tool_defs_block: Tool definitions block (from ToolRegistry.get_system_prompt_block()).
             Inserted after the role block so models see available tools before format instructions.
+        include_tool_defs: If False, skip tool_defs_block (for models using native tools API).
     """
     style = get_prompt_style(model_name)
     blocks = [AGENTIC_ROLE_BLOCK]
-    if tool_defs_block:
+    if include_tool_defs and tool_defs_block:
         blocks.append(tool_defs_block)
     blocks.append(AGENTIC_FORMAT_REGISTRY[style])
     blocks.append(AGENTIC_EXAMPLE_REGISTRY[style])
@@ -1097,10 +1133,84 @@ MODEL_INFERENCE_PARAMS_REGISTRY = {
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
     },
+    "glm-4.7": {
+        # https://medium.com/@zh.milo/glm-4-7-flash-the-ultimate-2026-guide-to-local-ai-coding-assistant
+        # Fetched via: curl https://r.jina.ai/<URL>
+        # EMPIRICAL VALIDATION (May 2026): Tested with 6-agentic-test suite
+        # on glm-4.7-flash:q4_K_m at OLLAMA_HOST=http://192.168.1.20:11434.
+        # Key findings:
+        #   - temp=0.7 is optimal (validated): fast thinking (~5-13s vs qwen3's
+        #     67-111s for simple queries), reliable tool calling
+        #   - Lower temps (0.1, 0.5) cause overthinking/meta-reasoning loops
+        #     similar to qwen3
+        #   - min_p=0.01 is correct: prevents llama.cpp default 0.05 from
+        #     over-pruning vocabulary during tool call JSON generation
+        #   - top_p=1.0 works well: model's RL alignment handles token filtering
+        #   - Intelligent debugging: model used netstat to discover correct
+        #     listening IP instead of trying to start listeners
+        #   - 5/6 E2E tests passed (port scanner overcame 127.0.0.1 vs
+        #     192.168.1.20 mismatch automatically)
+        #   - Web server test failed due to NULL pointer in accept() C code
+        # See doc/model-parameters.md for full test results.
+        "temperature": 0.7,
+        "top_p": 1.0,
+        "min_p": 0.01,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
     "qwen3.5": {
         # https://huggingface.co/Qwen/Qwen3.5-9B#best-practices
-        # "Thinking mode for precise coding tasks":
-        "temperature": 0.6,
+        # HF: temp=0.6, top_p=0.95, top_k=20 (thinking mode for precise coding tasks)
+        # CAUTION: Gemini 3.5 community advice says temp=0.0-0.5, top_p=0.8-0.9
+        # to reduce overthinking. Not official — evaluate before adopting.
+        "temperature": 0.5,
+        "top_p": 0.9,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+    "qwen3": {
+        # https://huggingface.co/Qwen/Qwen3-8B/blob/main/README.md
+        # HF thinking mode: Temperature=0.6, TopP=0.95, TopK=20, MinP=0
+        # EMPIRICAL VALIDATION (May 2026): Tested with 6-agentic-test suite
+        # on qwen3:8b at OLLAMA_HOST=http://192.168.1.20:11434.
+        # Key findings:
+        #   - temp=0.5 is best compromise: reliable tool calls for complex
+        #     multi-step (write→compile→run) without overthinking loops
+        #   - temp=0.1 is 7x faster for simple queries but causes
+        #     meta-reasoning loops on networking code generation
+        #   - Penalties (repeat=1.2, presence=0.3) backfire — increase
+        #     verbose think blocks by 2-5x without improving output
+        #   - top_k=20 prevents token sampling from wandering into
+        #     low-probability tokens during JSON tool call generation
+        # See doc/model-parameters.md for full test results.
+        "temperature": 0.5,
+        "top_p": 0.9,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+    "deepseek": {
+        # https://ollama.com/library/deepseek-r1
+        # DeepSeek-R1-Distill-Qwen-8B is a reasoning model based on Qwen3-8B.
+        # Ollama modelfile: temperature=0.6, top_p=0.95
+        # EMPIRICAL VALIDATION (May 2026): Tested on deepseek-r1:8b
+        # with 6-agentic-test suite.
+        # Key findings:
+        #   - temp=0.6 (Ollama default) works but verbose thinking
+        #     (238s for simple query)
+        #   - temp=0.7 is faster (57.5s) with same accuracy
+        #   - Automatically outputs JSON tool calls without
+        #     instruction following issues
+        #   - Tool calls bypass the verbose reasoning, making
+        #     fetch_url/write_file much faster than text responses
+        #   - 5/6 E2E tests passed (web server fails like all models)
+        #   - Compared to qwen3:8b: similar thinking verbosity but
+        #     better structured reasoning output
+        # See doc/model-parameters.md for full test results.
+        "temperature": 0.7,
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
@@ -1118,10 +1228,10 @@ MODEL_INFERENCE_PARAMS_REGISTRY = {
         "repeat_penalty": 1.0,
     },
     "gpt-oss": {
-        # Conservative defaults for general GPT-style open-source models
+        # CAUTION: Gemini 3.5 community advice (not official HF source):
+        # temp=0.0 (strict JSON) or 0.7 (CoT), top_p=1.0.
         "temperature": 0.7,
-        "top_p": 0.9,
-        "top_k": 40,
+        "top_p": 1.0,
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
@@ -1147,6 +1257,56 @@ def get_inference_params(model_name: str) -> dict:
     return dict(DEFAULT_INFERENCE_PARAMS)
 
 
+_VISION_ERROR_KEYWORDS = [
+    "does not support images", "does not support vision",
+    "image processing", "multimodal", "image input",
+    "vision is not supported", "this model does not support image",
+]
+
+
+def check_vision_error(response) -> bool:
+    """Check if an API response dict indicates the model doesn't support vision.
+    
+    Works for Ollama (/api/chat returns {"error": "..."}),
+    and OpenAI-compatible APIs (/v1/chat/completions returns {"error": {"message": "..."}}).
+    """
+    if not isinstance(response, dict):
+        return False
+    error_text = ""
+    raw = response.get("error")
+    if raw:
+        if isinstance(raw, dict):
+            error_text = raw.get("message", "") or raw.get("type", "")
+        elif isinstance(raw, str):
+            error_text = raw
+    return any(kw in error_text.lower() for kw in _VISION_ERROR_KEYWORDS)
+
+
+_TOOLS_ERROR_KEYWORDS = [
+    "does not support tools", "tool calls are not supported",
+    "tool_use", "tools is not supported", "tools not supported",
+    "this model does not support tools",
+]
+
+
+def check_tools_error(response) -> bool:
+    """Check if an API response dict indicates the model doesn't support native tools.
+    
+    Works for Ollama (/api/chat returns {"error": "..."}),
+    and OpenAI-compatible APIs (/v1/chat/completions returns {"error": {"message": "..."}}).
+    """
+    if not isinstance(response, dict):
+        return False
+    error_text = ""
+    raw = response.get("error")
+    if raw:
+        if isinstance(raw, dict):
+            error_text = raw.get("message", "") or raw.get("type", "")
+        elif isinstance(raw, str):
+            error_text = raw
+    return any(kw in error_text.lower() for kw in _TOOLS_ERROR_KEYWORDS)
+
+
 # ============================================================================
 # ============= EXECUTOR (CONTAINER/HOST)  ===================================
 # ============================================================================
@@ -1162,7 +1322,7 @@ class Executor:
         self.image = container_image or os.environ.get("OLLAMAQUERY_CONTAINER_IMAGE",
                                                        "docker.io/library/python:3.12-alpine")
 
-    def run(self, command: str, timeout: int = 15) -> dict:
+    def run(self, command: str, timeout: int = 120) -> dict:
         if self.mode == "container":
             cwd_bind = os.getcwd()
             wrapped = (
@@ -1249,21 +1409,23 @@ AGENTIC_TOOL_DEFS = {
         }
     },
     "run_python": {
-        "description": "Execute Python 3 code (inline or from a file). Returns stdout/stderr. Timeout: 120s.",
+        "description": "Execute Python 3 code (inline or from a file). Returns stdout/stderr. Default timeout: 10s, max: 300s.",
         "parameters": {
             "type": "object",
             "properties": {
                 "code": {"type": "string", "description": "Inline Python code to run"},
-                "file": {"type": "string", "description": "Path to .py file to run"}
+                "file": {"type": "string", "description": "Path to .py file to run"},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default 10, max 300). Increase for long-running scripts."}
             }
         }
     },
     "run_command": {
-        "description": "Execute a shell command (compiler, build tool, etc.). Returns stdout/stderr. Timeout: 120s.",
+        "description": "Execute a single shell command (compiler, build tool, etc.). Returns stdout/stderr. Default timeout: 10s, max: 300s.",
         "parameters": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "Shell command to execute"}
+                "command": {"type": "string", "description": "Shell command to execute"},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default 10, max 300). Increase for long-running compilations or tests."}
             },
             "required": ["command"]
         }
@@ -1395,7 +1557,10 @@ def _tool_handle_run_python(self, args):
         command = f"python3 {shlex.quote(os.path.join(os.getcwd(), args['file']))}"
     else:
         return {"success": False, "output": "", "error": "Provide either 'code' or 'file'"}
-    result = self.executor.run(command, timeout=120)
+    cmd_timeout = int(args.get("timeout", 10))
+    if cmd_timeout > 300:
+        return {"success": False, "output": "", "error": f"Invalid timeout: {cmd_timeout}. Timeout is in seconds (max 300). Use a lower value."}
+    result = self.executor.run(command, timeout=cmd_timeout)
     output = result["stdout"]
     if result["stderr"]:
         output += f"\n[stderr]\n{result['stderr']}"
@@ -1404,7 +1569,13 @@ def _tool_handle_run_python(self, args):
 
 def _tool_handle_run_command(self, args):
     command = args["command"]
-    result = self.executor.run(command, timeout=120)
+    for op in ("&&", "||", "|", ";", "`", "$("):
+        if op in command:
+            return {"success": False, "output": "", "error": f"Only one command at a time is supported. Remove shell operators like '{op}' and run commands separately."}
+    cmd_timeout = int(args.get("timeout", 10))
+    if cmd_timeout > 300:
+        return {"success": False, "output": "", "error": f"Invalid timeout: {cmd_timeout}. Timeout is in seconds (max 300). Use a lower value."}
+    result = self.executor.run(command, timeout=cmd_timeout)
     output = result["stdout"]
     if result["stderr"]:
         output += f"\n[stderr]\n{result['stderr']}"
@@ -1437,7 +1608,7 @@ def _tool_handle_patch(self, args):
             f.write(diff_text)
             diff_path = f.name
         command = f"patch {target} {shlex.quote(diff_path)}" if target else f"patch < {shlex.quote(diff_path)}"
-        result = self.executor.run(command, timeout=15)
+        result = self.executor.run(command, timeout=120)
         os.unlink(diff_path)
         if result["returncode"] == 0:
             return {"success": True, "output": result["stdout"], "error": None}
@@ -2248,11 +2419,15 @@ class ModelQuery:
             payload = {"model": model, "messages": messages, "stream": stream_enabled}
             if context_size is not None:
                 payload["options"] = {"num_ctx": context_size}
+            if tools := kwargs.get('tools'):
+                payload["tools"] = tools
             return f"{self.base_url}/api/chat", payload, {'Content-Type': 'application/json'}
         elif backend == "llamacpp":
             payload = {"model": model, "messages": messages, "stream": stream_enabled}
             if context_size is not None:
                 payload["max_tokens"] = context_size
+            if tools := kwargs.get('tools'):
+                payload["tools"] = tools
             for param in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]:
                 if param in kwargs:
                     payload[param] = kwargs[param]
@@ -2261,6 +2436,8 @@ class ModelQuery:
             payload = {"model": model, "messages": messages, "stream": stream_enabled}
             if context_size is not None:
                 payload["max_tokens"] = context_size
+            if tools := kwargs.get('tools'):
+                payload["tools"] = tools
             for param in ["temperature", "top_p", "presence_penalty", "repeat_penalty"]:
                 if param in kwargs:
                     payload[param] = kwargs[param]
@@ -2269,13 +2446,14 @@ class ModelQuery:
             raise ValueError(f"Unknown backend: {backend}")
 
     def _parse_chunk(self, chunk, backend):
-        """Extract (thought, content, is_final, usage) from a chunk for any backend."""
+        """Extract (thought, content, is_final, usage, tool_calls) from a chunk for any backend."""
         if backend == "ollama":
             thought = (chunk.get("message", {}).get("thought") or
                        chunk.get("message", {}).get("thinking")) or ""
             content = chunk.get("message", {}).get("content", "")
             is_final = chunk.get("done", False)
             usage = None
+            tool_calls = chunk.get("message", {}).get("tool_calls", [])
             if is_final:
                 if "usage" in chunk:
                     usage = chunk["usage"]
@@ -2284,23 +2462,25 @@ class ModelQuery:
                         "prompt_eval_count": chunk.get("prompt_eval_count", 0),
                         "eval_count": chunk.get("eval_count", 0),
                     }
-            return thought, content, is_final, usage
+            return thought, content, is_final, usage, tool_calls
         elif backend == "llamacpp":
             choices = chunk.get("choices", [])
             is_final = bool(choices and choices[0].get("finish_reason") is not None)
             delta = choices[0].get("delta", {}) if choices else {}
             thought = delta.get("reasoning_content") or ""
             content = delta.get("content") or ""
+            tool_calls = delta.get("tool_calls", [])
             usage = self._normalize_llamacpp_usage(chunk) if is_final else None
-            return thought, content, is_final, usage
+            return thought, content, is_final, usage, tool_calls
         elif backend == "lmstudio":
             choices = chunk.get("choices", [])
             is_final = bool(choices and choices[0].get("finish_reason") is not None)
             delta = choices[0].get("delta", {}) if choices else {}
             thought = delta.get("reasoning") or ""
             content = delta.get("content") or ""
+            tool_calls = delta.get("tool_calls", [])
             usage = self._normalize_llamacpp_usage(chunk) if is_final else None
-            return thought, content, is_final, usage
+            return thought, content, is_final, usage, tool_calls
         else:
             raise ValueError(f"Unknown backend: {backend}")
 
@@ -2334,9 +2514,15 @@ class ModelQuery:
     def query_stream(
         self,
         messages, model, stream_enabled=True, debug=False,
-        show_thinking=True, context_size=None, images=None, **kwargs
+        show_thinking=True, context_size=None, images=None,
+        tool_calls_out=None, **kwargs
     ):
-        """Stream response from any backend. Dispatches to backend-specific chunk parsing."""
+        """Stream response from any backend. Dispatches to backend-specific chunk parsing.
+        
+        Args:
+            tool_calls_out: Optional list to populate with accumulated tool_calls from streaming.
+                For OpenAI-compatible streaming, incremental tool_calls are merged by index.
+        """
         full_content = ""
         start_time = time.time()
         backend = self.backend
@@ -2370,16 +2556,40 @@ class ModelQuery:
         started_content = False
         first_chunk = True
         aggregated_usage = {}
+        stream_tool_calls = []  # Accumulated tool calls from streaming (merged by index)
+        stream_tool_call_index = {}  # Maps index -> partial tool call dict
 
         try:
             with _request_with_retry(req) as response:
                 for raw_line in self._iter_stream_lines(response, backend):
                     try:
                         chunk = json.loads(raw_line)
-                        thought, content, is_final, usage = self._parse_chunk(chunk, backend)
+                        thought, content, is_final, usage, tool_calls = self._parse_chunk(chunk, backend)
 
                         self._debug_response_chunk(chunk, first_chunk, is_final)
                         first_chunk = False
+
+                        # Accumulate tool_calls from streaming chunks
+                        if tool_calls:
+                            for tc in tool_calls:
+                                idx = tc.get("index", 0)
+                                if idx not in stream_tool_call_index:
+                                    stream_tool_call_index[idx] = {
+                                        "id": tc.get("id", ""),
+                                        "type": tc.get("type", "function"),
+                                        "function": {
+                                            "name": tc.get("function", {}).get("name", ""),
+                                            "arguments": tc.get("function", {}).get("arguments", ""),
+                                        }
+                                    }
+                                else:
+                                    existing = stream_tool_call_index[idx]
+                                    if tc.get("id"):
+                                        existing["id"] = tc["id"]
+                                    if tc.get("function", {}).get("name"):
+                                        existing["function"]["name"] = tc["function"]["name"]
+                                    if tc.get("function", {}).get("arguments"):
+                                        existing["function"]["arguments"] += tc["function"]["arguments"]
 
                         if is_final and usage:
                             self._debug_final_stats(usage)
@@ -2414,6 +2624,21 @@ class ModelQuery:
 
                     except json.JSONDecodeError:
                         continue
+
+            # Finalize accumulated tool_calls
+            if stream_tool_call_index:
+                for idx in sorted(stream_tool_call_index):
+                    tc = stream_tool_call_index[idx]
+                    stream_tool_calls.append({
+                        "id": tc["id"],
+                        "type": tc["type"],
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"],
+                        }
+                    })
+                if tool_calls_out is not None:
+                    tool_calls_out.extend(stream_tool_calls)
 
             if start_thinking and not started_content:
                 sys.stderr.write("\n</thinking>\n")
@@ -3692,19 +3917,6 @@ class ChatLoop:
             marker = ">" if (value not in ("off", "false", "host", "0") and "off" not in value) else " "
             print(f"  {marker} {name:<12} [{value:<8}] {desc}", file=sys.stderr)
         print()
-        subcmd = parts[1]
-        if subcmd == "sandbox":
-            new_mode = "container" if self.executor.mode != "container" else "host"
-            self.executor.mode = new_mode
-            self.tool_registry.executor.mode = new_mode
-            print(colorize(f"[Executor mode: {self.executor.mode}]", 'info'), file=sys.stderr)
-        elif subcmd == "auto":
-            self.ctx.auto_confirm = not self.ctx.auto_confirm
-            state = "ON" if self.ctx.auto_confirm else "OFF"
-            print(colorize(f"[Auto-confirm: {state}]", 'info'), file=sys.stderr)
-        else:
-            print(colorize("[Usage: /agentic [sandbox|auto]]", 'warning'), file=sys.stderr)
-        return False
 
     def run_handle_listtool(self, full_input: str) -> Optional[bool]:
         """Handle /listtool command."""
@@ -3781,15 +3993,31 @@ class ChatLoop:
         return -1
 
     def _extract_json_balanced(self, text, start):
-        """Extract balanced JSON from text starting at an opening brace."""
-        depth, end = 0, start
+        """Extract balanced JSON from text starting at an opening brace.
+        
+        Handles braces inside JSON string values correctly by tracking
+        string boundaries and escape sequences.
+        """
+        depth = 0
+        in_string = False
+        escaped = False
         for i, ch in enumerate(text[start:], start):
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-            if depth == 0:
-                return text[start:i + 1]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == '\\':
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:i + 1]
         return None
 
     def parse_tool_call(self, text: str) -> Optional[dict]:
@@ -3855,6 +4083,9 @@ class ChatLoop:
     def parse_tool_calls(self, text: str) -> list[dict]:
         """Extract ALL tool call JSONs from the response.
         
+        First tries direct JSON parse (works for clean tool calls at start of text).
+        Falls back to strict/lazy extraction for embedded or malformed JSON.
+        
         In strict mode (default): only matches consecutive tool calls starting
         from the beginning of the response (no preamble).
         In lazy mode (/agentic lazytool): finds tool calls anywhere in the text.
@@ -3863,6 +4094,17 @@ class ChatLoop:
         lazy = getattr(self.ctx, 'lazy_tool', False)
         text = text.strip()
         results = []
+        
+        # Pass 0: Quick check — if text starts with '{', try direct JSON parse.
+        # A proper JSON parser handles braces inside string values correctly,
+        # unlike brace-counting approaches.
+        if text.startswith('{'):
+            try:
+                obj = json.loads(text)
+                if isinstance(obj, dict) and 'tool' in obj:
+                    return [obj]
+            except (json.JSONDecodeError, ValueError):
+                pass
         
         if lazy:
             # Lazy mode: find ALL tool call JSONs anywhere in the text
@@ -3963,9 +4205,20 @@ class ChatLoop:
             if not getattr(self, 'messages', None):
                 self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
 
-            # Use model-specific system prompt with tool definitions for agentic ReAct loop
-            tool_defs = self.tool_registry.get_system_prompt_block()
-            messages = [{'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs)}]
+            # Determine tool delivery strategy for this model
+            tool_format = get_tool_format(self.ctx.model)
+            if tool_format == "openai":
+                # Native tools API: strip inline tool defs from prompt, pass via API param
+                include_tool_defs = False
+                send_tools_api = True
+            else:
+                # Inline: embed tool defs in prompt, don't pass via API
+                include_tool_defs = True
+                send_tools_api = False
+
+            # Build system prompt with or without inline tool definitions
+            tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
+            messages = [{'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs)}]
             if len(self.messages) > 1:
                 messages.extend(self.messages[1:])  # conversation history
             messages.append({'role': 'user', 'content': final_content})
@@ -4001,18 +4254,39 @@ class ChatLoop:
                 print(colorize(f"\r[Agentic] Step {iteration}/{max_iterations}…", 'muted'), file=sys.stderr, end="")
                 sys.stderr.flush()
 
+                images_to_send = [] if self.ctx.supports_vision is False else self.ctx.current_images
+                sync_kwargs = dict(get_inference_params(self.ctx.model))
+                if send_tools_api:
+                    sync_kwargs["tools"] = openai_tools
                 response = self._call_with_timeout(
                     self.query_handler.query_sync, step_timeout,
                     messages, self.ctx.model,
                     context_size=self.ctx.context_size,
-                    images=self.ctx.current_images,
-                    tools=openai_tools,
-                    **get_inference_params(self.ctx.model)
+                    images=images_to_send,
+                    **sync_kwargs
                 )
 
                 if response is None:
                     print(colorize(f"\n[Agentic] Step timed out after {step_timeout}s.", 'error'), file=sys.stderr)
                     break
+
+                # Reactive vision detection: if images were sent and the model rejected them,
+                # mark as non-vision and retry the iteration without images.
+                if images_to_send and self.ctx.supports_vision is not False:
+                    if check_vision_error(response):
+                        self.ctx.supports_vision = False
+                        print(colorize("\n[WARNING] Model does not support vision. Stripping images for subsequent queries.", 'warning'), file=sys.stderr)
+                        continue
+
+                # Reactive tools detection: if native tools API was used and the model rejected it,
+                # fall back to inline tool definitions for subsequent iterations.
+                if send_tools_api and check_tools_error(response):
+                    send_tools_api = False
+                    include_tool_defs = True
+                    tool_defs_block = self.tool_registry.get_system_prompt_block()
+                    messages[0] = {'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs_block, include_tool_defs=True)}
+                    print(colorize("\n[WARNING] Model does not support native tools API. Falling back to inline tool definitions.", 'warning'), file=sys.stderr)
+                    continue
 
                 response_text = ""
                 api_tool_calls = []
@@ -4094,10 +4368,11 @@ class ChatLoop:
                     tool_name = tool_call["tool"]
                     tool_args = tool_call.get("arguments", {})
                     args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-                    print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr)
+                    print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
+                    sys.stderr.flush()
 
                     if self.ctx.agentic_trace:
-                        print(colorize(f"[Trace] Full args: {json.dumps(tool_args, default=str)[:2000]}", 'muted'), file=sys.stderr)
+                        print(colorize(f"\n[Trace] Full args: {json.dumps(tool_args, default=str)[:2000]}", 'muted'), file=sys.stderr)
 
                     # Detect same-tool loop: same name + same args twice in a row
                     current_call = (tool_name, json.dumps(tool_args, sort_keys=True))
@@ -4109,12 +4384,24 @@ class ChatLoop:
                     if i == 0:
                         last_tool_call = current_call
 
+                    t_start = time.time()
                     result = self.tool_registry.execute(tool_name, tool_args)
-                    observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
+                    elapsed = time.time() - t_start
+                    status = "OK" if result["success"] else "ERROR"
+                    print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
+                    if result["success"]:
+                        observation = result["output"]
+                    else:
+                        full = result["output"] or ""
+                        error_msg = result.get("error", "") or ""
+                        lines = full.split("\n")[:4]
+                        context = "\n".join(lines).strip()
+                        observation = f"{context}\nERROR: {error_msg}" if context else f"ERROR: {error_msg}"
                     if not observation:
                         observation = "[Tool returned no output]"
                     if len(observation) > 4000:
                         observation = observation[:4000] + "\n... [truncated]"
+                    timed_observation = json.dumps({"tool": tool_name, "duration_s": round(elapsed, 1), "success": result["success"], "output": observation})
 
                     if self.ctx.agentic_trace:
                         trace_out = result["output"] if len(result["output"]) < 2000 else result["output"][:2000] + "..."
@@ -4130,13 +4417,19 @@ class ChatLoop:
                         abort_loop = True
                         break
 
-                    observations.append(f"[{tool_name}] {observation}")
+                    observations.append(f"[{tool_name}] {timed_observation}")
 
                 if abort_loop:
                     break
 
                 combined = "\n---\n".join(observations) if observations else "[No tool output]"
-                assistant_msg = {'role': 'assistant', 'content': response_text}
+                # When using native API tool_calls, also populate content with inline JSON
+                # so the model can always see tool calls as text in the conversation history.
+                assistant_content = response_text
+                if api_tool_calls and not response_text and tool_calls:
+                    tool_json = json.dumps(tool_calls[0])
+                    assistant_content = tool_json
+                assistant_msg = {'role': 'assistant', 'content': assistant_content}
                 if api_tool_calls:
                     assistant_msg['tool_calls'] = api_tool_calls
                 messages.append(assistant_msg)
@@ -4176,35 +4469,73 @@ class ChatLoop:
                     if final_messages and final_messages[-1]['role'] != 'user':
                         final_messages.append({'role': 'user', 'content': final_content})
 
+                    stream_kwargs = dict(get_inference_params(self.ctx.model))
+                    stream_tool_calls_out = []
+                    if send_tools_api:
+                        stream_kwargs["tools"] = openai_tools
                     response = self.query_handler.query_stream(
                         final_messages, self.ctx.model,
                         stream_enabled=self.ctx.stream_enabled,
                         debug=self.ctx.debug_mode,
                         show_thinking=(not self.ctx.force_no_thinking),
                         context_size=self.ctx.context_size,
-                        images=self.ctx.current_images,
-                        **get_inference_params(self.ctx.model)
+                        images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
+                        tool_calls_out=stream_tool_calls_out,
+                        **stream_kwargs
                     )
-                    if response:
-                        stream_tool_calls = self.parse_tool_calls(response)
-                        if not stream_tool_calls:
-                            single = self.parse_tool_call(response)
-                            if single:
-                                stream_tool_calls = [single]
+                    if response or stream_tool_calls_out:
+                        stream_tool_calls = []
+                        if stream_tool_calls_out:
+                            for tc in stream_tool_calls_out:
+                                func = tc.get("function", {})
+                                name = func.get("name", "")
+                                args_raw = func.get("arguments", "{}")
+                                try:
+                                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                                except json.JSONDecodeError:
+                                    args = {"raw": args_raw}
+                                stream_tool_calls.append({"tool": name, "arguments": args})
+                        if not stream_tool_calls and response:
+                            stream_tool_calls = self.parse_tool_calls(response)
+                            if not stream_tool_calls:
+                                single = self.parse_tool_call(response)
+                                if single:
+                                    stream_tool_calls = [single]
                         if stream_tool_calls:
                             for stream_tc in stream_tool_calls:
                                 tool_name = stream_tc["tool"]
                                 tool_args = stream_tc.get("arguments", {})
                                 args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-                                print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr)
+                                print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
+                                sys.stderr.flush()
+                                t_start = time.time()
                                 result = self.tool_registry.execute(tool_name, tool_args)
+                                elapsed = time.time() - t_start
+                                status = "OK" if result["success"] else "ERROR"
+                                print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
                                 observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
                                 if not observation:
                                     observation = "[Tool returned no output]"
                                 if len(observation) > 4000:
                                     observation = observation[:4000] + "\n... [truncated]"
                                 print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
-                            self.messages.append({'role': 'assistant', 'content': response})
+                            if stream_tool_calls_out:
+                                # Populate content with inline JSON for conversation history consistency
+                                stream_content = response or ""
+                                if not stream_content:
+                                    inline_parts = []
+                                    for stc in stream_tool_calls_out:
+                                        fn = stc.get("function", {})
+                                        inline_parts.append(json.dumps({
+                                            "tool": fn.get("name", ""),
+                                            "arguments": fn.get("arguments", "{}")
+                                        }))
+                                    stream_content = "\n".join(inline_parts)
+                                assistant_msg = {'role': 'assistant', 'content': stream_content}
+                                assistant_msg['tool_calls'] = stream_tool_calls_out
+                                self.messages.append(assistant_msg)
+                            else:
+                                self.messages.append({'role': 'assistant', 'content': response})
                             print()
                         else:
                             self.messages.append({'role': 'assistant', 'content': response})
@@ -4263,7 +4594,7 @@ class ChatLoop:
                 debug=self.ctx.debug_mode,
                 show_thinking=(not self.ctx.force_no_thinking),
                 context_size=self.ctx.context_size,
-                images=self.ctx.current_images
+                images=([] if self.ctx.supports_vision is False else self.ctx.current_images)
             )
 
             if response:

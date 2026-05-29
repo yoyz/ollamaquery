@@ -274,6 +274,11 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
         self.ctx.agentic_mode = True
         self.ctx.agentic_logging = False
         self.ctx.auto_confirm = True  # skip prompts
+        self.ctx.agentic_verbose = True
+        self.ctx.agentic_show_thinking = True
+        self.ctx.agentic_trace = True
+        self.ctx.lazy_tool = True
+        self.ctx.agentic_max_iterations = 30
         self.loop = q.ChatLoop(self.ctx)
 
     def test_direct_answer_no_tool(self):
@@ -342,6 +347,100 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
                 self.assertTrue(
                     os.path.exists("dns_resolver"),
                     msg="dns_resolver binary was not created by the agentic workflow"
+                )
+            finally:
+                os.chdir(old_cwd)
+
+    def test_port_scanner_write_compile_run(self):
+        """End-to-end: LLM writes a simple TCP port scanner, compiles, and tests it.
+
+        Writes a C program that takes an IP and port, does a TCP connect,
+        prints 'OPEN' or 'CLOSED'. Compiles with gcc, tests against
+        localhost:11434 (ollama port) and localhost:19999 (expected closed).
+        """
+        import tempfile
+        query = (
+            "Write a C program called 'portscanner' that takes two arguments: "
+            "<IP address> and <port number>. "
+            "It attempts a TCP connect() to that IP:port and prints "
+            "'PORT <port> is OPEN' or 'PORT <port> is CLOSED'. "
+            "Save it as portscanner.c, compile it with gcc -o portscanner portscanner.c, "
+            "then test it twice: "
+            "first against 127.0.0.1:11434 (which should be OPEN), "
+            "then against 127.0.0.1:19999 (which should be CLOSED)."
+        )
+        self.ctx.lazy_tool = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                self.loop.run_agentic_query(query)
+                self.assertTrue(
+                    os.path.exists("portscanner"),
+                    msg="portscanner binary was not created by the agentic workflow"
+                )
+            finally:
+                os.chdir(old_cwd)
+
+    def test_web_server_write_compile_run(self):
+        """End-to-end: LLM writes a simple HTTP web server, compiles, starts, and tests with curl.
+
+        Writes a C program that listens on a given port, responds with
+        'Hello World' to any HTTP GET. Compiles, starts in background,
+        curls it, then reports the response.
+        """
+        import tempfile
+        query = (
+            "Write a C program called 'webserver' that takes one argument <port>. "
+            "It binds to 0.0.0.0, listens, accepts ONE connection, "
+            "reads the HTTP request, responds with "
+            "'HTTP/1.1 200 OK\\r\\nContent-Length: 12\\r\\n\\r\\nHello World\\n', "
+            "then closes and exits. "
+            "Save it as webserver.c, compile it with gcc -o webserver webserver.c. "
+            "Then use run_python to test it: start webserver in background "
+            "with subprocess.Popen on port 18999, "
+            "curl http://127.0.0.1:18999 with urllib.request, "
+            "print the response body, then kill the server."
+        )
+        self.ctx.lazy_tool = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                self.loop.run_agentic_query(query)
+                self.assertTrue(
+                    os.path.exists("webserver"),
+                    msg="webserver binary was not created by the agentic workflow"
+                )
+            finally:
+                os.chdir(old_cwd)
+
+    def test_directory_lister_write_compile_run(self):
+        """End-to-end: LLM writes a program that lists directory contents, compiles, and tests.
+
+        Writes a C program that takes a directory path as argument and
+        prints all file names (one per line) in that directory.
+        Compiles with gcc, tests against the current directory.
+        """
+        import tempfile
+        query = (
+            "Write a C program called 'dirlister' that takes one argument: <directory path>. "
+            "It opens the directory using opendir(), reads entries with readdir(), "
+            "and prints each entry name on its own line. "
+            "If no argument given, default to current directory '.'. "
+            "Save it as dirlister.c, compile with gcc -o dirlister dirlister.c, "
+            "then test it by listing the contents of the current directory "
+            "and verifying that files like 'dirlister.c' and 'portscanner.c' appear."
+        )
+        self.ctx.lazy_tool = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                self.loop.run_agentic_query(query)
+                self.assertTrue(
+                    os.path.exists("dirlister"),
+                    msg="dirlister binary was not created by the agentic workflow"
                 )
             finally:
                 os.chdir(old_cwd)

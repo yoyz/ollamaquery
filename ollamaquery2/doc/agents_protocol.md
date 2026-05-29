@@ -60,7 +60,7 @@ messages = [
 
 ## Available tools
 - fetch_url: Fetch a URL and return its content as plain text. Arguments: url: Full URL (http/https only) (required: url)
-- run_command: Execute a shell command (compiler, build tool, etc.). Returns stdout/stderr. Timeout: 120s. Arguments: command: Shell command to execute (required: command)
+- run_command: Execute a shell command (compiler, build tool, etc.). Returns stdout/stderr. Default timeout: 10s, max: 300s. Arguments: command: Shell command to execute, timeout: Seconds (default 10, max 300). (required: command)
 - read_file: Read a file from disk (text, max 100KB). Path relative to CWD. Arguments: file_path: File path relative to CWD (required: file_path)
 [... other tools omitted for brevity ...]
 
@@ -211,7 +211,138 @@ If you ask a follow-up question ("Can you explain what script.py does?"), the LL
 
 ---
 
-### 4. Areas for Improvement in the Workflow
+### 4. Two-Tier Timeout System
+
+```
+                   ┌──────────────────────────────────────────────────────────┐
+                   │               ReAct STEP (default 120s)                  │
+                   │                                                          │
+   User Query      │   ┌──────────────┐    ┌──────────────┐                   │
+ ──────────────────┼──▶│  LLM thinks  │───▶│ Tool executes │                   │
+                   │   │  (generates  │    │  (timeout:    │                   │
+                   │   │   tool call) │    │   default 10s)│                   │
+                   │   └──────────────┘    └──────┬───────┘                   │
+                   │                              │                           │
+                   │                              ▼                           │
+                   │                      ┌──────────────┐                   │
+                   │                      │  Result fed   │                   │
+                   │                      │  back to LLM  │                   │
+                   │                      └──────┬───────┘                   │
+                   │                             │                           │
+                   │            ┌─────────────────┼──────────────┐            │
+                   │            ▼                 ▼              ▼            │
+                   │    ┌────────────┐    ┌──────────────┐  ┌───────────┐    │
+                   │    │ More tools?│    │ Have answer? │  │ Timed out │    │
+                   │    │  ──▶ loop  │    │  ──▶ output  │  │  ──▶ abort│    │
+                   │    └────────────┘    └──────────────┘  └───────────┘    │
+                   └──────────────────────────────────────────────────────────┘
+
+   Timeline (seconds):
+   ──┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┬──▶
+     │     │     │     │     │     │     │     │     │     │     │
+    0│     │   10│     │     │     │   60│     │     │   90│     │  120
+     │     │     │     │     │     │     │     │     │     │     │
+     ▼     ▼     ▼     ▼     ▼     ▼     ▼     ▼     ▼     ▼     ▼
+
+   Example 1: Fast tool, fast LLM
+   ┌───────┐  ┌──────┐
+   │ LLM   │  │ Tool │
+   │ thinks│  │ runs │
+   │ 2s    │  │ 0.5s │
+   └───────┘  └──────┘
+   ←──── 2.5s total ────→   ✓ Within step timeout
+
+   Example 2: Slow tool, LLM overrides timeout
+   ┌───────┐  ┌────────────────────┐
+   │ LLM   │  │ Tool runs for 30s  │
+   │ thinks│  │ (LLM set timeout:  │
+   │ 3s    │  │  "timeout": 60)    │
+   └───────┘  └────────────────────┘
+   ←──── 33s total ────→   ✓ Within step timeout, tool didn't hit its 60s limit
+
+   Example 3: LLM stuck thinking → step timeout kills it
+   ┌─────────────────────────────────────────┐
+   │ LLM thinks ... and thinks ... and thinks │
+   │ (never outputs tool call or answer)      │
+   └─────────────────────────────────────────┘
+   ←────────── 120s total ──────────→   ✗ Step timeout: "timed out after 120s"
+
+   Example 4: Tool stuck → tool timeout kills it
+   ┌───────┐  ┌──────────────────────┐
+   │ LLM   │  │ Tool runs but hangs  │
+   │ thinks│  │ (e.g. ./dnsresolver  │
+   │ 3s    │  │  waiting for DNS)    │
+   └───────┘  └──────────────────────┘
+   ←──── total ────→   Tool killed at 10s: "Timed out after 10s"
+                        Step continues because 10s < 120s step timeout
+
+The agentic loop has two independent timeout mechanisms that protect against stuck commands and runaway LLM thinking.
+
+#### Tool-Level Timeout
+
+Each tool call has its own timeout, enforced by Python's `subprocess.run(timeout=...)`.
+
+| Tool | Default timeout | Max | Controlled by |
+|------|----------------|-----|---------------|
+| `run_command` | 10s | 300s | `args.get("timeout", 10)` |
+| `run_python` | 10s | 300s | `args.get("timeout", 10)` |
+| Other tools | N/A | N/A | Instant execution |
+
+The LLM can override the timeout per-call by passing a `timeout` argument:
+```json
+{"tool": "run_command", "arguments": {"command": "gcc -o bigfile bigfile.c", "timeout": 60}}
+```
+
+If the tool exceeds its timeout, the user sees:
+```
+[Tool] run_command(command='gcc -o bigfile bigfile.c') → ERROR (10.0s)
+```
+
+The LLM receives a JSON error: `{"stdout": "", "stderr": "Timed out after 60s", "returncode": -1}` and can retry with a higher timeout.
+
+#### Step-Level (ReAct Loop) Timeout
+
+Each iteration of the ReAct loop has a global timeout that covers the entire round-trip:
+
+```
+LLM thinking time  +  tool execution time  ≤  step timeout
+```
+
+Default: **120s**. Configurable via `/agentic timeout <seconds>`.
+
+If the LLM takes 115s to think and the tool takes 10s, that's 125s total → the step times out:
+```
+[Agentic] Step timed out after 120s.
+```
+
+This protects against the LLM getting stuck in infinite thinking loops (repetitive reasoning without generating a tool call or answer).
+
+#### Comparison
+
+| Aspect | Tool timeout | Step timeout |
+|--------|-------------|-------------|
+| What it limits | One command execution | Full round-trip (LLM + tool) |
+| Default | 10s | 120s |
+| Configurable by LLM? | Yes (via `timeout` arg) | No (user setting via `/agentic timeout`) |
+| Configurable by user? | No (hardcoded max 300s) | Yes (`/agentic timeout <sec>`) |
+| Visible in output? | Yes — `ERROR (10.0s)` | Yes — `timed out after 120s` |
+
+#### Timing Display
+
+The user sees elapsed time for every tool call:
+
+```
+[Tool] write_file(path='test.c', content='...') → OK (0.1s)
+[Tool] run_command(command='gcc test.c -o test') → OK (2.3s)
+[Tool] run_command(command='./test') → ERROR (10.0s)
+```
+
+The timing information is also included in the observation sent to the LLM as structured JSON:
+```json
+{"tool": "run_command", "duration_s": 10.0, "success": false, "output": "..."}
+```
+
+### 5. Areas for Improvement in the Workflow
 
 While highly effective, there are a few architectural bottlenecks in this workflow that you could highlight in your documentation as future improvement areas:
 
