@@ -8,11 +8,9 @@ import socket
 import sys
 import json
 import re
-import html
 import base64
 import argparse
 import subprocess
-import shutil
 import shlex
 import threading
 import time
@@ -22,8 +20,8 @@ import difflib
 from datetime import datetime
 
 from html.parser import HTMLParser
-from typing import Optional, Dict, Any, List
-from urllib.parse import urljoin, urlparse
+from typing import Optional, Dict, List
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -48,7 +46,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 
 # ============================================================================
@@ -405,15 +403,6 @@ def is_known_command(text):
     return False, None
 
 
-def get_command_by_alias(alias):
-    """Look up command metadata by any of its aliases."""
-    alias_lower = alias.lower().strip()
-    for name, info in COMMANDS.items():
-        if alias_lower in [a.lower() for a in info['aliases']]:
-            return name, info
-    return None, None
-
-
 #
 # === Color management 
 # 
@@ -609,7 +598,7 @@ def sanitize_shell_command(command):
             return None
 
     # Escape special shell characters
-    command = re.sub(r'`+', '', command)  # Remove backticks
+    command = command.replace('`', '')  # Remove backticks
     command = re.sub(r'\$\{[^}]+\}', 'SAFE_VAR', command)  # Hide variable expansion
 
     return command
@@ -645,7 +634,7 @@ def validate_shell_command_safety(command, max_length=500):
         return False
 
     # Check for shell escape sequences
-    if re.search(r'\\[\"\'\$\`]', command):
+    if '\\"' in command or "\\'" in command or '\\$' in command or '\\`' in command:
         return False
 
     # Block command chaining operators — only one command at a time
@@ -830,7 +819,8 @@ def estimate_token_count(text: str) -> int:
     if not text:
         return 0
     tokens = len(re.findall(r'\b\w+\b|[^\w\s]', text))
-    if re.search(r'\b(def|class|import|from|if|else|elif|return|for|while|try|except|with|as|pass|raise|lambda|yield|async|await)\b', text):
+    code_keywords = {'def', 'class', 'import', 'from', 'if', 'else', 'elif', 'return', 'for', 'while', 'try', 'except', 'with', 'as', 'pass', 'raise', 'lambda', 'yield', 'async', 'await'}
+    if any(kw in text for kw in code_keywords):
         return max(1, int(tokens * 2.0))
     return max(1, int(tokens * 1.5))
 
@@ -852,6 +842,13 @@ class CommandContext:
     
     Replaces the scattered self.* attributes across ChatLoop, ModelQuery,
     and other classes with a single centralized state object.
+    
+    Call map:
+      create_completer() → ChatCompleter
+      create_query_handler() → ModelQuery
+      create_executor() → Executor
+      create_tool_registry() → ToolRegistry
+      update_stats / get_cumulative_stats / estimate_tokens / calculate_context_tokens
     """
     _instance = None
     _initialized = False
@@ -1103,8 +1100,12 @@ AGENTIC_PROMPT_STYLE_DEFAULT = "strict"
 # IMPORTANT: Longer/more-specific substrings must come before shorter ones
 # to avoid false matches (e.g. "qwen3.5" before "qwen3").
 TOOL_FORMAT_REGISTRY = [
-    ("qwen3.5", "inline"),
+    ("qwen3.5", "openai"),
     ("qwen3", "openai"),
+    ("granite4", "openai"),
+    ("granite-code", "openai"),
+    ("rnj", "openai"),
+    ("ministral", "inline"),
     ("glm-4", "inline"),
     ("glm4", "inline"),
     ("llama", "openai"),
@@ -1355,7 +1356,12 @@ def check_tools_error(response) -> bool:
 # ============================================================================
 
 class Executor:
-    """Runs shell commands on host or inside a container sandbox."""
+    """Runs shell commands on host or inside a container sandbox.
+    
+    Call map:
+      run() → _run_shell() or _pre_pull_image()
+      _run_shell() → subprocess.run / podman|docker exec
+    """
 
     def __init__(self, mode="host", container_runtime=None, container_image=None):
         self.mode = mode
@@ -1864,7 +1870,7 @@ def _parse_unified_hunks(body):
             new_collected = 0
             while i < n and (old_collected < old_count or new_collected < new_count):
                 cl = lines[i]
-                if cl.strip() == "":
+                if cl.strip() == "" and not cl.startswith(("+", "-")):
                     new_lines.append(cl[1:] if cl.startswith(" ") else cl)
                     old_lines.append(cl[1:] if cl.startswith(" ") else cl)
                     new_collected += 1
@@ -1993,7 +1999,13 @@ TOOL_ARG_ALIASES = {
 }
 
 class ToolRegistry:
-    """Registers and executes agentic tools with confirmation support."""
+    """Registers and executes agentic tools with confirmation support.
+    
+    Call map:
+      get_system_prompt_block() → AGENTIC_TOOL_DEFS
+      execute() → _confirm() then handler
+      list_tools_str() → AGENTIC_TOOL_DEFS
+    """
 
     def __init__(self, ctx=None, executor=None):
         self._ctx = ctx
@@ -2073,6 +2085,11 @@ class AgenticLogger:
     
     Automatically cleans up log files older than AGENTIC_LOG_RETENTION_DAYS
     (default 1) on initialization to prevent unbounded disk growth.
+    
+    Call map:
+      __init__() → _cleanup_old_logs()
+      write() → appends JSONL line
+      close() → flushes file
     """
 
     AGENTIC_LOG_RETENTION_DAYS = 1
@@ -2111,7 +2128,12 @@ class AgenticLogger:
 # ============================================================================
 
 class DebugManager:
-    """Manages per-category debug levels."""
+    """Manages per-category debug levels.
+    
+    Call map:
+      set_level() → is_enabled() / should_log()
+      get_status() → get_level()
+    """
     
     CATEGORIES = {
         'network':    "HTTP requests/responses to LLM server",
@@ -2220,7 +2242,18 @@ def debug_log(debug_mgr, category: str, level: int, message: str,
 # ============================================================================
 
 class ModelQuery:
-    """Unified query handler for both Ollama and Llama.cpp backends."""
+    """Unified query handler for both Ollama and Llama.cpp backends.
+    
+    Call map:
+      query_stream() → _build_stream_request() → build_request_payload()
+                      → _parse_chunk() → _normalize_llamacpp_usage()
+                      → _iter_stream_lines()
+                      → _update_context_tokens()
+      query_sync() → build_request_payload() → _inject_images_into_messages()
+                   → _get_chat_url()
+      build_request_payload() / _build_stream_request() → _get_chat_url()
+      calculate_stats() → print_stats_display()
+    """
 
     def __init__(self, base_url=None, backend=None, context=None):
         if context is not None:
@@ -2468,13 +2501,16 @@ class ModelQuery:
         
         return payload
 
+    def _get_chat_url(self, backend):
+        """Return the chat API URL for the given backend."""
+        return f"{self.base_url}/api/chat" if backend == "ollama" else f"{self.base_url}/v1/chat/completions"
+
     def query_sync(self, messages, model, stream_enabled=False, **kwargs):
         """Non-streaming sync query wrapper."""
         payload = self.build_request_payload(messages, model, stream_enabled=False, **kwargs)
 
         try:
-            url = f"{self.base_url}/api/chat" if self.backend == "ollama" else \
-                  f"{self.base_url}/v1/chat/completions"
+            url = self._get_chat_url(self.backend)
 
             data = json.dumps(payload).encode('utf-8')
             req = Request(url, data=data, headers={'Content-Type': 'application/json'})
@@ -2526,35 +2562,8 @@ class ModelQuery:
 
     def _build_stream_request(self, backend, messages, model, stream_enabled, context_size, **kwargs):
         """Build URL, payload and headers for the backend."""
-        if backend == "ollama":
-            payload = {"model": model, "messages": messages, "stream": stream_enabled}
-            if context_size is not None:
-                payload["options"] = {"num_ctx": context_size}
-            if tools := kwargs.get('tools'):
-                payload["tools"] = tools
-            return f"{self.base_url}/api/chat", payload, {'Content-Type': 'application/json'}
-        elif backend == "llamacpp":
-            payload = {"model": model, "messages": messages, "stream": stream_enabled}
-            if context_size is not None:
-                payload["max_tokens"] = context_size
-            if tools := kwargs.get('tools'):
-                payload["tools"] = tools
-            for param in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]:
-                if param in kwargs:
-                    payload[param] = kwargs[param]
-            return f"{self.base_url}/v1/chat/completions", payload, {'Content-Type': 'application/json'}
-        elif backend == "lmstudio":
-            payload = {"model": model, "messages": messages, "stream": stream_enabled}
-            if context_size is not None:
-                payload["max_tokens"] = context_size
-            if tools := kwargs.get('tools'):
-                payload["tools"] = tools
-            for param in ["temperature", "top_p", "presence_penalty", "repeat_penalty"]:
-                if param in kwargs:
-                    payload[param] = kwargs[param]
-            return f"{self.base_url}/v1/chat/completions", payload, {'Content-Type': 'application/json'}
-        else:
-            raise ValueError(f"Unknown backend: {backend}")
+        payload = self.build_request_payload(messages, model, stream_enabled=stream_enabled, context_size=context_size, **kwargs)
+        return self._get_chat_url(backend), payload, {'Content-Type': 'application/json'}
 
     def _parse_chunk(self, chunk, backend):
         """Extract (thought, content, is_final, usage, tool_calls) from a chunk for any backend."""
@@ -2639,6 +2648,7 @@ class ModelQuery:
         backend = self.backend
 
         if images and messages and messages[-1].get("role") == "user":
+            messages[-1] = dict(messages[-1])
             self._inject_images_into_messages(messages, images, self.backend)
 
         api_url, payload, headers = self._build_stream_request(
@@ -2777,17 +2787,15 @@ class ChatCompleter:
     - Commands (/listmodel, /switchmodel, etc.)
     - Paths (for /cwd, /ls)
     - Model names
+    
+    Call map:
+      complete() → fetch_models() → fetch_models_ollama / fetch_models_llamacpp
+                 → get_command_aliases() for command completion
     """
 
     def __init__(self, base_url, backend):
         self.base_url = base_url
         self.backend = backend
-#        self.commands = [
-#            '/?', '/help', '/listmodel', '/switchmodel',
-#            '/cwd', '/ls', '/curl', '/spawnshell', '/clear',
-#            '/thinkingon', '/thinkingoff', '/contextsizeset',
-#            '/debug on', '/debug off', '/stats', '/quit', '/exit'
-#        ]
         self.commands = get_command_aliases()  # ✅ Use registry function
         self.models = []
 
@@ -2932,7 +2940,8 @@ def _process_file_inclusions(text):
     inclusions = []
     for word in text.split():
         if word.startswith('@') and len(word) > 1:
-            filepath = word[1:]
+            raw_path = word[1:]
+            filepath = raw_path.rstrip('.,?!;:)"\'')
             expanded_path = os.path.expanduser(filepath)
             if os.path.isfile(expanded_path):
                 file_size = os.path.getsize(expanded_path)
@@ -3112,6 +3121,10 @@ class CoreHTMLStripper(HTMLParser):
 
     Tracks skip-depth instead of a single tag name, so nested or sequential
     skipped tags (script, style, etc.) properly resume text capture.
+    
+    Call map:
+      feed(text) → handle_starttag / handle_endtag / handle_data
+      get_text() → returns accumulated text
     """
     skip_tags = {'script', 'style', 'head', 'meta', 'noscript', 'link', 'title'}
 
@@ -3151,6 +3164,23 @@ class ChatLoop:
     
     State is managed through a shared CommandContext singleton instead of
     individual self.* attributes.
+    
+    Call map:
+      run() → run_init_session() → run_update_ollama_context()
+            → dispatches to run_handle_*() by command
+            → run_process_query() on non-command input
+      
+      run_process_query() → query_handler.query_stream()
+      run_agentic_query() → _init_agentic_query()
+                          → query_handler.query_sync() (ReAct loop)
+                          → parse_tool_call() / parse_tool_calls()
+                          → _execute_tool_calls() → tool_registry.execute()
+                          → _finalize_agentic_query() → query_handler.query_stream()
+      
+      parse_tool_call() → _normalize_tool_json() / _extract_json_balanced()
+      parse_tool_calls() → _find_tool_call_brace() / _extract_json_balanced()
+      _execute_tool_calls() → tool_registry.execute()
+      _finalize_agentic_query() → parse_tool_call() / parse_tool_calls()
     """
 
     def __init__(self, context: CommandContext):
@@ -3399,8 +3429,8 @@ class ChatLoop:
 
     def _filter_smart_blocks(self, blocks):
         """Filter out trivial commands (cd, ls, pwd, clear, echo, exit)."""
-        boring = re.compile(r'^\s*(cd|ls|pwd|clear|exit|echo)\b')
-        return [b for b in blocks if not boring.match(b.split('\n')[0].strip()) and len(b.strip()) > 20]
+        boring_commands = {'cd', 'ls', 'pwd', 'clear', 'exit', 'echo'}
+        return [b for b in blocks if b.split('\n')[0].strip().split()[0] not in boring_commands if b.split() and len(b.strip()) > 20]
 
     def _edit_session(self, content):
         """Open content in editor (VISUAL > EDITOR > vim) and return the edited result."""
@@ -3476,11 +3506,11 @@ class ChatLoop:
     @staticmethod
     def _parse_number_ranges(text, max_val):
         """Parse '1,3-5,7' into [1, 3, 4, 5, 7]. Returns None on invalid input."""
-        import re
-        if not text or not re.match(r'^[\d,\- ]+$', text):
+        valid_chars = set('0123456789,- ')
+        if not text or not all(c in valid_chars for c in text):
             return None
         result = set()
-        for part in re.split(r'[,\s]+', text):
+        for part in text.replace(',', ' ').split():
             part = part.strip()
             if not part:
                 continue
@@ -3561,6 +3591,8 @@ class ChatLoop:
     def run_update_ollama_context(self, host_clean: str) -> None:
         """Update context window size for Ollama backend."""
         if self.ctx.backend == "ollama" and self.ctx.context_window_size == 0:
+            if not self.ctx.model:
+                return
             model_ctx_list = fetch_loaded_models_context_ollama(self.ctx.base_url)
             for m, c in model_ctx_list:
                 if m.startswith(self.ctx.model.split(':')[0]):
@@ -4047,20 +4079,28 @@ class ChatLoop:
             return {"tool": tool_name, "arguments": tool_args}
         return None
 
-    _TOOL_CALL_OPEN_RE = re.compile(r'\{\s*"(tool|function|type)"')
-
-    def _find_tool_call_json(self, text, pos=0):
-        """Find the next JSON tool call opening brace, handling multi-line whitespace."""
-        m = self._TOOL_CALL_OPEN_RE.search(text, pos)
-        if m:
-            return m.start()
+    @staticmethod
+    def _find_tool_call_brace(text, pos=0):
+        """Find the next { that introduces a tool call JSON (with tool/function/type key)."""
+        idx = text.find('{', pos)
+        while idx != -1:
+            rest = text[idx+1:].lstrip()
+            if rest.startswith(('"tool"', '"function"', '"type"')):
+                return idx
+            idx = text.find('{', idx + 1)
         return -1
 
-    def _rfind_tool_call_json(self, text):
-        """Find the last JSON tool call opening brace, handling multi-line whitespace."""
-        matches = list(self._TOOL_CALL_OPEN_RE.finditer(text))
-        if matches:
-            return matches[-1].start()
+    @staticmethod
+    def _rfind_tool_call_brace(text):
+        """Find the last { that introduces a tool call JSON, scanning right-to-left."""
+        idx = text.rfind('{')
+        while idx != -1:
+            rest = text[idx+1:].lstrip()
+            if rest.startswith(('"tool"', '"function"', '"type"')):
+                return idx
+            if idx == 0:
+                break
+            idx = text.rfind('{', 0, idx)
         return -1
 
     def _extract_json_balanced(self, text, start):
@@ -4100,25 +4140,33 @@ class ChatLoop:
         if result:
             return result
         # Pass 2: fenced JSON code block
-        m = re.search(r'```(?:json)?\s*\n?(\{.*?\})\s*\n?```', text, re.DOTALL)
-        if m:
-            accept = lazy
-            if not accept:
-                prefix = text[:m.start()].strip()
-                suffix = text[m.end():].strip()
-                accept = ((not prefix or len(prefix) <= 100) and not suffix)
-            if accept:
-                result = self._normalize_tool_json(m.group(1))
-                if result:
-                    args_str = json.dumps(result.get("arguments", {}))
-                    if not ('<' in args_str and '>' in args_str):
-                        return result
+        parts = text.split("```")
+        for i in range(1, len(parts), 2):
+            block = parts[i].strip()
+            if block.startswith("json"):
+                block = block[4:].strip()
+            elif block.startswith("text"):
+                block = block[4:].strip()
+            brace_idx = ChatLoop._find_tool_call_brace(block)
+            if brace_idx != -1:
+                prefix = "```".join(parts[:i])
+                suffix = "```".join(parts[i+1:])
+                accept = lazy
+                if not accept:
+                    accept = ((not prefix or len(prefix) <= 100) and not suffix)
+                if accept:
+                    json_str = self._extract_json_balanced(block, brace_idx)
+                    if json_str:
+                        result = self._normalize_tool_json(json_str)
+                        if result:
+                            args_str = json.dumps(result.get("arguments", {}))
+                            if not ('<' in args_str and '>' in args_str):
+                                return result
         # Pass 3: bare JSON object with "tool" key
         if lazy:
-            m = self._TOOL_CALL_OPEN_RE.search(text)
-            if m:
-                start = m.start()
-                json_str = self._extract_json_balanced(text, start)
+            brace_idx = ChatLoop._find_tool_call_brace(text)
+            if brace_idx != -1:
+                json_str = self._extract_json_balanced(text, brace_idx)
                 if json_str:
                     result = self._normalize_tool_json(json_str)
                     if result:
@@ -4127,8 +4175,8 @@ class ChatLoop:
                             return result
         else:
             # Strict mode: only at START of the text
-            m = re.match(r'\s*\{\s*"(?:tool|function|type)"', text)
-            if m:
+            stripped = text.lstrip()
+            if stripped.startswith('{') and stripped[1:].lstrip().startswith(('"tool"', '"function"', '"type"')):
                 start = text.index('{')
                 json_str = self._extract_json_balanced(text, start)
                 if json_str:
@@ -4136,7 +4184,7 @@ class ChatLoop:
                     if result:
                         return result
             # Pass 4: bare JSON tool call at the END of the text (strict mode only)
-            idx = self._rfind_tool_call_json(text)
+            idx = ChatLoop._rfind_tool_call_brace(text)
             if idx >= 0:
                 json_str = self._extract_json_balanced(text, idx)
                 if json_str:
@@ -4182,7 +4230,7 @@ class ChatLoop:
             seen_keys = set()
             pos = 0
             while pos < len(text):
-                idx = self._find_tool_call_json(text, pos)
+                idx = ChatLoop._find_tool_call_brace(text, pos)
                 if idx == -1:
                     break
                 json_str = self._extract_json_balanced(text, idx)
@@ -4197,8 +4245,8 @@ class ChatLoop:
                 pos = idx + len(json_str) if json_str else idx + 1
         else:
             # Strict mode: only consecutive tool calls from the start
-            m = re.match(r'\s*\{\s*"(?:tool|function|type)"', text)
-            if not m:
+            stripped = text.lstrip()
+            if not (stripped.startswith('{') and stripped[1:].lstrip().startswith(('"tool"', '"function"', '"type"'))):
                 return []
             pos = 0
             while pos < len(text):
@@ -4208,8 +4256,7 @@ class ChatLoop:
                 if pos >= len(text):
                     break
                 # Check if next non-whitespace is a tool call
-                m2 = re.match(r'\{\s*"(?:tool|function|type)"', text[pos:])
-                if not m2:
+                if not (text[pos] == '{' and text[pos+1:].lstrip().startswith(('"tool"', '"function"', '"type"'))):
                     break
                 json_str = self._extract_json_balanced(text, pos)
                 if not json_str:
@@ -4309,6 +4356,7 @@ class ChatLoop:
         Returns (observations, abort_loop, last_tool_call, final_answer).
         """
         observations = []
+        raw_observations = []
         abort_loop = False
         final_answer = ""
         for i, tool_call in enumerate(tool_calls):
@@ -4364,8 +4412,9 @@ class ChatLoop:
                 break
 
             observations.append(f"[{tool_name}] {timed_observation}")
+            raw_observations.append(observation)
 
-        return observations, abort_loop, last_tool_call, final_answer
+        return observations, raw_observations, abort_loop, last_tool_call, final_answer
 
     def _finalize_agentic_query(self, messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text):
         """Stream final answer or execute pending tool call, then update self.messages."""
@@ -4574,8 +4623,8 @@ class ChatLoop:
                         print(colorize(f"\n<thinking>\n{thinking}\n</thinking>", 'muted'), file=sys.stderr)
 
                 if not response_text and not api_tool_calls:
-                    print(colorize("\n[Agentic] Empty response, aborting.", 'error'), file=sys.stderr)
-                    break
+                    messages.append({'role': 'user', 'content': 'Please provide a tool call or your final answer.'})
+                    continue
 
                 if response_text and self._is_stuck(response_text):
                     print(colorize("\n[Agentic] Model appears stuck (repetitive output), aborting.", 'warning'), file=sys.stderr)
@@ -4610,7 +4659,7 @@ class ChatLoop:
                     final_answer = response_text
                     break
 
-                observations, abort_loop, last_tool_call, tool_final = self._execute_tool_calls(
+                observations, raw_observations, abort_loop, last_tool_call, tool_final = self._execute_tool_calls(
                     tool_calls, last_tool_call, iteration, logger, messages, response_text, api_tool_calls
                 )
                 if tool_final:
@@ -4628,7 +4677,8 @@ class ChatLoop:
                     assistant_msg['tool_calls'] = api_tool_calls
                 messages.append(assistant_msg)
                 if send_tools_api and api_tool_calls and observations:
-                    for tc, obs in zip(api_tool_calls, observations):
+                    for idx, tc in enumerate(api_tool_calls):
+                        obs = raw_observations[idx] if idx < len(raw_observations) else "ERROR: Cancelled or skipped due to preceding tool sequence abort."
                         tool_msg = {'role': 'tool', 'tool_call_id': tc.get('id', ''), 'content': obs}
                         tool_msg['name'] = tc.get('function', {}).get('name', '')
                         messages.append(tool_msg)
@@ -4717,35 +4767,6 @@ def get_base_url(args, backend):
         base_url = f"http://{base_url}"
 
     return base_url
-
-
-def build_messages(args, input_data, image_path):
-    """Build messages payload from args."""
-    messages = [
-        {'role': 'system', 'content': args.prompt}
-    ]
-
-    if input_data:
-        messages.append({'role': 'user', 'content': input_data})
-
-    # Add image if provided
-    if image_path:
-        image_data = prepare_image_data(image_path)
-        if image_data and messages[-1]['role'] == 'user':
-            messages[-1]['images'] = [image_data]
-
-    return messages
-
-
-def list_models(base_url, backend):
-    """List all available models and exit."""
-    if backend == "llamacpp":
-        list_models_llamacpp(base_url)
-    elif backend == "lmstudio":
-        list_models_llamacpp(base_url)
-    else:
-        list_models_ollama(base_url)
-    sys.exit(0)
 
 
 def list_models_llamacpp(base_url, filter_arg=None):
@@ -5448,14 +5469,17 @@ def main():
             print(f"[Success: Output saved to {args.output}]", file=sys.stderr)
         elif response:
             content = ""
+            thinking = ""
             if isinstance(response, dict):
-                content = response.get('message', {}).get('content', '')
-                if not content:
-                    choices = response.get('choices', [])
-                    if choices:
-                        content = choices[0].get('message', {}).get('content', '')
+                msg = response.get('message', {}) if backend == "ollama" else (response.get('choices', [{}])[0].get('message', {}) if response.get('choices') else {})
+                content = msg.get('content', '')
+                if not content and isinstance(response, dict):
+                    content = response.get('message', {}).get('content', '')
+                thinking = msg.get('reasoning_content', '') or msg.get('thought', '') or msg.get('thinking', '')
             else:
                 content = str(response)
+            if thinking:
+                sys.stderr.write(f"\n<thinking>\n{thinking}\n</thinking>\n")
             print(content)
 
 

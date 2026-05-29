@@ -32,8 +32,9 @@ Defined in `MODEL_INFERENCE_PARAMS_REGISTRY` (`ollamaquery2.py:1088`). Keys are 
 | `glm-4.7`            | 0.7         | 1.0   | —     | 0.01  | 0.0              | 1.0            | Tool calling                | Medium guide + Gemini 3.5     |
 | `qwen3.5`            | 0.5         | 0.9   | 20    | 0.0   | 0.0              | 1.0            | Precise coding / tool call   | Qwen3.5-9B + Gemini 3.5      |
 | `qwen3`              | 0.5         | 0.9   | 20    | 0.0   | 0.0              | 1.0            | Agentic tool calling         | Qwen3-8B + Gemini 3.5        |
-| `nemotron`           | 0.6         | 0.95  | 40    | 0.0   | 0.0              | 1.0            | Tool calling                | Nemotron-3-Nano               |
-| `gpt-oss`            | 0.7         | 1.0   | —     | 0.0   | 0.0              | 1.0            | Agentic / tool calling       | Gemini 3.5 agentic profile    |
+| `nemotron`           | 0.6   | 0.95  | 40    | 0.0   | 0.0              | 1.0            | Tool calling                | Nemotron-3-Nano               |
+| `granite4`           | 0.7   | 0.9   | 40    | 0.0   | 0.0              | 1.0            | Tool calling (native API)   | Granite-4.1-8B + Ollama      |
+| `gpt-oss`            | 0.7   | 1.0   | —     | 0.0   | 0.0              | 1.0            | Agentic / tool calling       | Gemini 3.5 agentic profile    |
 | `(default)`          | 0.7         | 0.9   | 40    | 0.0   | 0.0              | 1.0            | Conservative fallback       | `ollamaquery2.py:1131`        |
 
 ### Prompt Style Registry
@@ -307,6 +308,154 @@ Empirical benchmarks from the 6-test suite in `tests/test_agentic.py::TestAgenti
 | repeat_penalty    | 1.0   | Default                                     |
 
 **Prompt Style:** `strict` (default).
+
+### Granite 4.1
+
+**Source:** [ibm-granite/granite-4.1-8b](https://huggingface.co/ibm-granite/granite-4.1-8b)
+
+**Registered Key:** `granite4`
+
+| Parameter         | Value | Rationale                                   |
+|-------------------|-------|---------------------------------------------|
+| temperature       | 0.7   | HF default for generation tasks             |
+| top_p             | 0.9   | HF recommended                              |
+| top_k             | 40    | HF recommended                              |
+| min_p             | 0.0   | Disabled                                    |
+| presence_penalty  | 0.0   | Disabled                                    |
+| repeat_penalty    | 1.0   | Default                                     |
+
+**Tool Format:** `openai` — Granite 4.1 uses `<tool_call>` XML tags for tool calling natively. Using the native OpenAI `tools` API parameter allows Ollama to handle the XML→JSON conversion internally. The `inline` format fails because `parse_tool_call` / `parse_tool_calls` expect bare JSON or ```json fences, not XML-wrapped tool calls.
+
+**Tool Calling Format (native):**
+```xml
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+```
+
+**Prompt Style:** `strict` (default). Works best with native tools API.
+
+**Benchmarks:**
+| Benchmark | Score |
+|-----------|-------|
+| BFCL v3   | 68.27 |
+| HumanEval | 85.37 |
+
+**Known Issues:**
+- May occasionally emit C source with missing `\n` in format strings (observed in write-compile-run pipeline)
+- Requires `"openai"` tool format — will not work with `"inline"` mode
+
+### RNJ-1
+
+**Source:** [EssentialAI/rnj-1](https://huggingface.co/EssentialAI/rnj-1)
+
+**Registered Key:** `rnj`
+
+| Parameter         | Value | Rationale                                   |
+|-------------------|-------|---------------------------------------------|
+| temperature       | 0.6   | Recommended range [0, 0.6] (HF)             |
+| top_p             | 0.95  | HF recommended                              |
+| top_k             | 40    | Default                                     |
+| min_p             | 0.0   | Disabled                                    |
+| presence_penalty  | 0.0   | Disabled                                    |
+| repeat_penalty    | 1.0   | Default                                     |
+
+**Tool Format:** `openai` — RNJ-1 uses `<tool_call>` XML tags for tool calling (hermes parser compatible), same as Granite 4.1. Requires native tools API so Ollama handles XML→JSON conversion.
+
+**Tool Calling Format (native):**
+```xml
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+```
+
+**vLLM serving:** `--enable-auto-tool-choice --tool-call-parser hermes`
+
+**Prompt Style:** `strict` (default).
+
+**Benchmarks:**
+| Benchmark | Score |
+|-----------|-------|
+| SWE-bench Verified | 20.8% (bash-only) |
+| HumanEval+ | 82.4 |
+| MBPP+ | 79.0 |
+| BFCL | Surpasses comparable models |
+
+**Architecture:** 8.3B params, Gemma 3-like architecture (global attention + YaRN), 32K context, GeGLU activation, 128K vocabulary.
+
+**Key Observations:**
+- Strong inclination to write code; system prompt should steer this for non-code tasks.
+- Agentic coding is a standout capability (SWE-bench 20.8%, dominates comparable 8B models).
+- Uses `hermes` tool-call parser format — `<tool_call>` XML tags wrapping JSON.
+
+### Ministral 3
+
+**Source:** [mistralai/Ministral-3-8B-Instruct-2512](https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512)
+
+**Registered Key:** `ministral` (inline — works well)
+
+| Parameter         | Value | Rationale                                   |
+|-------------------|-------|---------------------------------------------|
+| temperature       | 0.15  | HF recommends <0.1; 0.15 balances speed and creativity for tool calling |
+| top_p             | 0.9   | Default                                     |
+| top_k             | 40    | Default                                     |
+| min_p             | 0.0   | Disabled                                    |
+| presence_penalty  | 0.0   | Disabled                                    |
+| repeat_penalty    | 1.0   | Default                                     |
+
+**Tool Format:** `inline` — Ministral 3 outputs clean JSON tool calls inside ```json fences naturally. No need for native tools API.
+
+**vLLM serving:** `--enable-auto-tool-choice --tool-call-parser mistral`
+
+**Prompt Style:** `strict` (default).
+
+**Architecture:** 8.4B language model + 0.4B vision encoder. 256K context window. Apache 2.0 license.
+
+**Benchmarks (Instruct):**
+| Benchmark | Score |
+|-----------|-------|
+| Arena Hard | 0.509 |
+| MATH Maj@1 | 0.876 |
+| WildBench | 66.8 |
+
+**Key Observations:**
+- Outputs clean JSON tool calls in ```json fences — no special tool format needed
+- Used `edit_file` to fix a compilation warning (missing `#include <unistd.h>`) — intelligent debugging
+- Multilingual: responded in French after English queries
+- Vision capable (0.4B encoder)
+- Edge-optimized: fits in 12GB VRAM in FP8
+
+### DeepSeek-Coder-V2
+
+**Source:** [deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct](https://huggingface.co/deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct)
+
+**Registered Key:** Not registered (defaults to `inline`)
+
+| Parameter         | Value | Rationale                                   |
+|-------------------|-------|---------------------------------------------|
+| temperature       | 0.3   | HF recommended (0.3 for code gen)           |
+| top_p             | 0.95  | HF recommended                              |
+| top_k             | 50    | HF recommended                              |
+| min_p             | 0.0   | Disabled                                    |
+| presence_penalty  | 0.0   | Disabled                                    |
+| repeat_penalty    | 1.0   | Default                                     |
+
+**Tool Format:** `inline` (default) — No native tool calling support documented. Works via JSON extraction from text output.
+
+**Prompt Style:** `strict` (default).
+
+**Architecture:** MoE (16B total, 2.4B active). 128K context. DeepSeek license.
+
+**Benchmarks:**
+| Benchmark | Score |
+|-----------|-------|
+| HumanEval | 85+ (comparable to GPT-4 Turbo in code) |
+
+**Key Observations:**
+- Strong code generation (MoE architecture with only 2.4B active params)
+- No native tool calling — works via `inline` JSON extraction
+- Made ordering mistake: tried to compile before writing the file, but recovered
+- Decent code quality but missing `#include <arpa/inet.h>` and `<unistd.h>`
 
 ### Default (unknown models)
 

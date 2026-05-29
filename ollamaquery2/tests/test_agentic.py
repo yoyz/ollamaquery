@@ -25,6 +25,9 @@ BACKEND_AVAILABLE = False
 
 def _check_backend(url, label):
     """Try to reach a backend, return (available, model_name)."""
+    # Normalize URL — add http:// if missing
+    if not url.startswith(('http://', 'https://')):
+        url = f"http://{url}"
     try:
         req = q.Request(url, method='HEAD')
         q.urlopen(req, timeout=2)
@@ -92,6 +95,8 @@ class TestParseToolCall(unittest.TestCase):
 
     def test_parse_inline_in_text(self):
         text = 'I think I need to fetch the URL. {"tool": "fetch_url", "arguments": {"url": "http://example.com"}} Let me do that.'
+        # Strict mode (lazy_tool=False): embedded calls should not be extracted
+        self.ctx.lazy_tool = False
         result = self.loop.parse_tool_call(text)
         self.assertIsNone(result, "Embedded tool calls in text should not be extracted in strict mode")
 
@@ -561,7 +566,7 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
 
         Writes a C program that takes an IP and port, does a TCP connect,
         prints 'OPEN' or 'CLOSED'. Compiles with gcc, tests against
-        localhost:11434 (ollama port) and localhost:19999 (expected closed).
+        localhost:22 (SSH, usually open) and localhost:19999 (expected closed).
         """
         import tempfile
         query = (
@@ -571,8 +576,8 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
             "'PORT <port> is OPEN' or 'PORT <port> is CLOSED'. "
             "Save it as portscanner.c, compile it with gcc -o portscanner portscanner.c, "
             "then test it twice: "
-            "first against 127.0.0.1:11434 (which should be OPEN), "
-            "then against 127.0.0.1:19999 (which should be CLOSED)."
+            "first against 127.0.0.1:22 (SSH, should be OPEN), "
+            "then against 127.0.0.1:19999 (should be CLOSED)."
         )
         self.ctx.lazy_tool = True
         with tempfile.TemporaryDirectory() as tmpdir:
