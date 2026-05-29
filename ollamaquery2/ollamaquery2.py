@@ -440,10 +440,13 @@ def load_custom_themes():
     return {}
 
 
-def get_theme(theme_name: str = "default"):
+def get_theme(theme_name: Optional[str] = None):
     """Get theme color dictionary."""
     if os.environ.get('NO_COLOR'):
         return BUILTIN_THEMES["minimal"]
+    
+    if theme_name is None:
+        theme_name = os.environ.get('OLLAMAQUERY_THEME', 'default')
     
     custom_themes = load_custom_themes()
     if theme_name in custom_themes:
@@ -1001,7 +1004,20 @@ class CommandContext:
         total = 0
         for msg in messages:
             content = msg.get("content", "")
+            image_count = 0
+            if isinstance(content, list):
+                extracted = ""
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            extracted += part.get("text", "")
+                        elif part.get("type") == "image_url":
+                            image_count += 1
+                content = extracted
+            if isinstance(msg.get("images"), list):
+                image_count += len(msg["images"])
             total += self.estimate_tokens(content)
+            total += image_count * 1024
             total += 2
         return total
 
@@ -1368,12 +1384,13 @@ class Executor:
                 f"{shlex.quote(self.image)} "
                 f"sh -c {shlex.quote(command)}"
             )
-            return self._run_shell(wrapped, timeout)
+            return self._run_shell(wrapped, timeout, is_container=True)
         return self._run_shell(command, timeout)
 
-    def _run_shell(self, command: str, timeout: int) -> dict:
-        if not validate_shell_command_safety(command, max_length=1000):
-            return {"stdout": "", "stderr": "Command rejected by safety validator", "returncode": -1}
+    def _run_shell(self, command: str, timeout: int, is_container: bool = False) -> dict:
+        if not is_container and "python3 -c" not in command:
+            if not validate_shell_command_safety(command, max_length=1000):
+                return {"stdout": "", "stderr": "Command rejected by safety validator", "returncode": -1}
         try:
             args_list = shlex.split(command)
             proc = subprocess.run(
@@ -1594,9 +1611,9 @@ def _tool_handle_run_python(self, args):
     if "code" in args:
         command = f"python3 -c {shlex.quote(args['code'])}"
     elif "file_path" in args:
-        command = f"python3 {shlex.quote(os.path.join(os.getcwd(), args['file_path']))}"
+        command = f"python3 {shlex.quote(args['file_path'])}"
     elif "file" in args:
-        command = f"python3 {shlex.quote(os.path.join(os.getcwd(), args['file']))}"
+        command = f"python3 {shlex.quote(args['file'])}"
     else:
         return {"success": False, "output": "", "error": "Provide either 'code' or 'file'"}
     cmd_timeout = int(args.get("timeout", 10))
@@ -1611,7 +1628,7 @@ def _tool_handle_run_python(self, args):
 
 def _tool_handle_run_command(self, args):
     command = args["command"]
-    for op in ("&&", "||", "|", ";", "`", "$("):
+    for op in ("&&", "||", "|", ";", "`", "$(", ">", "<"):
         if op in command:
             return {"success": False, "output": "", "error": f"Only one command at a time is supported. Remove shell operators like '{op}' and run commands separately."}
     cmd_timeout = int(args.get("timeout", 10))
@@ -1649,23 +1666,30 @@ def _tool_handle_diff(self, args):
 def _tool_handle_patch(self, args):
     import tempfile
     diff_text = args["diff"]
-    base_dir = os.path.abspath(os.getcwd())
-    target_raw = os.path.abspath(os.path.join(os.getcwd(), args.get("target", "")))
-    if os.path.commonpath([base_dir, target_raw]) != base_dir:
-        return {"success": False, "output": "", "error": "Path traversal denied"}
-    target = shlex.quote(target_raw)
+    diff_path = None
+    target_arg = args.get("target", "").strip()
+    if target_arg:
+        base_dir = os.path.abspath(os.getcwd())
+        target_raw = os.path.abspath(os.path.join(os.getcwd(), target_arg))
+        if os.path.commonpath([base_dir, target_raw]) != base_dir:
+            return {"success": False, "output": "", "error": "Path traversal denied"}
+        target = shlex.quote(target_raw)
+    else:
+        target = ""
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".diff", delete=False) as f:
             f.write(diff_text)
             diff_path = f.name
-        command = f"patch {target} {shlex.quote(diff_path)}" if target else f"patch -i {shlex.quote(diff_path)}"
+        command = f"patch -i {shlex.quote(diff_path)} {target}" if target else f"patch -i {shlex.quote(diff_path)}"
         result = self.executor.run(command, timeout=120)
-        os.unlink(diff_path)
         if result["returncode"] == 0:
             return {"success": True, "output": result["stdout"], "error": None}
         return {"success": False, "output": result["stdout"], "error": result["stderr"]}
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
+    finally:
+        if diff_path and os.path.exists(diff_path):
+            os.unlink(diff_path)
 
 
 def _tool_handle_edit_file(self, args):
@@ -1736,7 +1760,9 @@ def _parse_patch_sections(patch_text):
             i += 1
             # Collect the diff body (---/+++ lines + hunks) that follows the marker
             body_start = i
-            while i < n and not lines[i].startswith("*** ") and not (i > 0 and lines[i].startswith("--- ") and lines[i-1].startswith("*** ")):
+            while i < n and not lines[i].startswith("*** "):
+                if i > body_start and lines[i].startswith("--- ") and lines[i-1].startswith("*** "):
+                    break
                 i += 1
             body = "".join(lines[body_start:i])
             hunks, detected_path, is_delete = _parse_unified_hunks(body)
@@ -1827,7 +1853,7 @@ def _parse_unified_hunks(body):
         # Parse hunk header: @@ -start,count +start,count @@
         m = re.match(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', line)
         if m:
-            start = int(m.group(3))
+            start = int(m.group(1))
             old_count = int(m.group(2) or 1)
             new_count = int(m.group(4) or 1)
             i += 1
@@ -1838,6 +1864,13 @@ def _parse_unified_hunks(body):
             new_collected = 0
             while i < n and (old_collected < old_count or new_collected < new_count):
                 cl = lines[i]
+                if cl.strip() == "":
+                    new_lines.append(cl[1:] if cl.startswith(" ") else cl)
+                    old_lines.append(cl[1:] if cl.startswith(" ") else cl)
+                    new_collected += 1
+                    old_collected += 1
+                    i += 1
+                    continue
                 if cl.startswith("+") or cl.startswith(" "):
                     new_lines.append(cl[1:] if cl.startswith("+") else cl[1:])
                     new_collected += 1
@@ -1917,7 +1950,9 @@ def _apply_unified_diff(patch_text):
 
             existing = content[start_idx:start_idx + old_count]
             expected = hunk.get("old_lines", [])
-            if expected and existing != expected:
+            existing_clean = [line.rstrip('\r\n') for line in existing]
+            expected_clean = [line.rstrip('\r\n') for line in expected]
+            if expected and existing_clean != expected_clean:
                 applied.append(f"SKIPPED {path} hunk at line {hunk['start']} (context mismatch)")
                 continue
 
@@ -2407,7 +2442,12 @@ class ModelQuery:
             "stream": stream_enabled
         }
         
-        if context_size := kwargs.get('context_size'):
+        if kwargs.get('is_warmup'):
+            if self.backend == "ollama":
+                payload["options"] = {"num_predict": 1}
+            elif self.backend in ("llamacpp", "lmstudio"):
+                payload["max_tokens"] = 1
+        elif context_size := kwargs.get('context_size'):
             if self.backend == "ollama":
                 payload["options"] = {"num_ctx": context_size}
             elif self.backend in ("llamacpp", "lmstudio"):
@@ -2628,6 +2668,16 @@ class ModelQuery:
                         # Accumulate tool_calls from streaming chunks
                         if tool_calls:
                             for tc in tool_calls:
+                                if "index" not in tc:
+                                    stream_tool_calls.append({
+                                        "id": tc.get("id", ""),
+                                        "type": tc.get("type", "function"),
+                                        "function": {
+                                            "name": tc.get("function", {}).get("name", ""),
+                                            "arguments": tc.get("function", {}).get("arguments", ""),
+                                        }
+                                    })
+                                    continue
                                 idx = tc.get("index", 0)
                                 if idx not in stream_tool_call_index:
                                     stream_tool_call_index[idx] = {
@@ -2693,8 +2743,8 @@ class ModelQuery:
                             "arguments": tc["function"]["arguments"],
                         }
                     })
-                if tool_calls_out is not None:
-                    tool_calls_out.extend(stream_tool_calls)
+            if tool_calls_out is not None and stream_tool_calls:
+                tool_calls_out.extend(stream_tool_calls)
 
             if start_thinking and not started_content:
                 sys.stderr.write("\n</thinking>\n")
@@ -3041,104 +3091,54 @@ def execute_os_command(command, timeout=None):
 
 
 def fetch_and_convert_url(url):
-    """Fetch HTML from URL and convert to plain text. Returns (text, tool_name)."""
+    """Fetch URL and extract clean text using core standard libraries only."""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
-        html_bytes = get_html_bytes(url)
-        if not html_bytes:
+        req = Request(url, headers=headers)
+        with _request_with_retry(req, timeout=15) as response:
+            charset = response.info().get_content_charset() or 'utf-8'
+            html_content = response.read().decode(charset, errors='ignore')
+        if not html_content.strip():
             return "", "None"
-
-        tool_map = {
-            'html2text': 'html2text',
-            'pandoc': 'pandoc',
-            'lynx': 'lynx',
-        }
-        for converter in ['html2text', 'pandoc', 'lynx']:
-            if converter == 'lynx':
-                cmd = [converter, '-stdin']             
-            elif converter == 'pandoc':
-                cmd = [converter, '--from', 'html', '--to', 'markdown_strict']
-            elif converter == 'html2text':
-                cmd = [converter]
-            try:
-                if not shutil.which(converter):
-                    continue
-                proc = subprocess.run(
-                    cmd, input=html_bytes, capture_output=True,
-                    timeout=5, check=False
-                )
-                if proc.returncode == 0 and proc.stdout.strip():
-                    return proc.stdout.decode('utf-8', errors='replace'), f"{tool_map[converter]}"
-            except Exception:
-                print(colorize("Exception in converter, falling back to HTMLStripper\n", 'muted'), file=sys.stderr)
-                continue
-
-        # Fallback: Simple HTML strip
-        html_str = html_bytes.decode('utf-8', errors='ignore')
-        stripper = HTMLStripper()
-        stripper.feed(html_str)
+        stripper = CoreHTMLStripper()
+        stripper.feed(html_content)
         return stripper.get_text(), "htmlstrip"
-
     except Exception as e:
         return f"[Failed to fetch URL: {e}]", "None"
 
 
-def get_html_bytes(url, depth=0):
-    """Fetch HTML bytes while following redirects gracefully."""
-    if depth > 3:
-        return b""
+class CoreHTMLStripper(HTMLParser):
+    """Zero-dependency HTML text extractor using a robust nesting-depth counter.
 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-
-    # Try curl/wget first, fallback to urllib
-    for tool in ['curl', 'wget']:
-        if shutil.which(tool):
-            if tool == 'curl':
-                cmd = [tool, '-L', '-s', '-A', headers['User-Agent'], url]
-            else:
-                cmd = [tool, '-q', '-O', '-', '--user-agent', headers['User-Agent'], url]
-            proc = subprocess.run(
-                cmd,
-                capture_output=True, timeout=15, check=False
-            )
-            if proc.returncode == 0 and proc.stdout:
-                return proc.stdout
-            # Non-zero exit or empty output: try next tool instead
-
-    # Fallback to urllib with retry
-    try:
-        req = Request(url, headers=headers)
-        with _request_with_retry(req, timeout=15) as response:
-            return response.read()
-    except Exception:
-        return b""
-
-
-class HTMLStripper(HTMLParser):
-    """Simple HTML parser that extracts text content, skipping specified tags."""
-    skip_tags = {'script', 'style', 'head', 'meta', 'title', 'link', 'noscript'}
+    Tracks skip-depth instead of a single tag name, so nested or sequential
+    skipped tags (script, style, etc.) properly resume text capture.
+    """
+    skip_tags = {'script', 'style', 'head', 'meta', 'noscript', 'link', 'title'}
 
     def __init__(self):
         super().__init__()
         self.text_parts = []
-        self._current_tag = ""
+        self.skip_depth = 0
 
     def handle_starttag(self, tag, attrs):
-        self._current_tag = tag
-        if tag not in self.skip_tags:
-            super().handle_starttag(tag, attrs)
+        if tag.lower() in self.skip_tags:
+            self.skip_depth += 1
 
     def handle_endtag(self, tag):
-        if tag not in self.skip_tags:
-            super().handle_endtag(tag)
+        if tag.lower() in self.skip_tags:
+            self.skip_depth = max(0, self.skip_depth - 1)
 
     def handle_data(self, data):
-        if self._current_tag not in self.skip_tags:
+        if self.skip_depth == 0:
             cleaned = data.strip()
             if cleaned:
                 self.text_parts.append(cleaned)
 
     def get_text(self):
-        return ' '.join(self.text_parts)
+        return '\n'.join(self.text_parts)
+
+
+HTMLStripper = CoreHTMLStripper  # Backward-compat alias for tests
 
 
 # ============================================================================
@@ -3467,7 +3467,7 @@ class ChatLoop:
             # Try numeric selection (e.g. "1", "1,3,7", "1-5", "1,3-5,7")
             indices = self._parse_number_ranges(choice, len(blocks))
             if indices:
-                content = "\n---\n".join(f"$ {blocks[i].split(chr(10))[0].strip()}\n{chr(10).join(blocks[i].split(chr(10))[1:]).strip()}" for i in indices)
+                content = "\n---\n".join(f"$ {blocks[i - 1].split(chr(10))[0].strip()}\n{chr(10).join(blocks[i - 1].split(chr(10))[1:]).strip()}" for i in indices)
                 print(colorize(f"[Selected {len(indices)}/{len(blocks)} commands]", 'info'), file=sys.stderr)
                 self.run_process_query(f"Shell session transcript (selected commands):\n{content}")
             else:
@@ -3586,7 +3586,7 @@ class ChatLoop:
         else:
             prompt_prefix = f"{self.ctx.backend}@{host_clean}/(no model selected)"
         if self.ctx.current_images:
-            prompt_prefix += colorize("[img]", 'info')
+            prompt_prefix += colorize("[img]", 'info', is_prompt=True)
         return prompt_prefix
 
     def run_handle_exit(self, full_input: str) -> Optional[bool]:
@@ -3648,6 +3648,8 @@ class ChatLoop:
         if full_input == '/clear':
             print(colorize("[Context memory wiped clean]", 'success'), file=sys.stderr)
             self.ctx.reset()
+            if hasattr(self, 'messages'):
+                del self.messages
             refresh_context_window_size(self.ctx)
             return False
         return None
@@ -3660,7 +3662,7 @@ class ChatLoop:
                 self.ctx.current_images = []
                 print(colorize("[Image cleared]", 'info'), file=sys.stderr)
             else:
-                paths = parts[1].strip().split()
+                paths = shlex.split(parts[1].strip())
                 new_images = []
                 loaded = 0
                 for p in paths:
@@ -3855,9 +3857,13 @@ class ChatLoop:
                         ping_messages = list(self.messages)
                     else:
                         ping_messages = [{"role": "system", "content": self.ctx.system_prompt}]
-                    res_ping = self.query_handler.query_sync(ping_messages, new_model, stream_enabled=False)
+                    res_ping = self.query_handler.query_sync(ping_messages, new_model, stream_enabled=False, is_warmup=True)
 
-                    ptokens = res_ping.get("prompt_eval_count", 0)
+                    if self.ctx.backend == "ollama":
+                        ptokens = res_ping.get("prompt_eval_count", 0)
+                    else:
+                        usage_block = res_ping.get("usage", {})
+                        ptokens = usage_block.get("prompt_tokens", 0)
                     if ptokens > 0:
                         self.ctx.current_context_tokens = ptokens
 
@@ -4279,7 +4285,6 @@ class ChatLoop:
         messages = [{'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs)}]
         if len(self.messages) > 1:
             messages.extend(self.messages[1:])
-        messages.append({'role': 'user', 'content': final_content})
 
         logger = AgenticLogger() if self.ctx.agentic_logging else None
         if logger:
@@ -4428,6 +4433,7 @@ class ChatLoop:
                         if single:
                             stream_tool_calls = [single]
                 if stream_tool_calls:
+                    stream_observations = []
                     for stream_tc in stream_tool_calls:
                         tool_name = stream_tc["tool"]
                         tool_args = stream_tc.get("arguments", {})
@@ -4445,6 +4451,7 @@ class ChatLoop:
                         if len(observation) > 4000:
                             observation = observation[:4000] + "\n... [truncated]"
                         print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
+                        stream_observations.append(f"[{tool_name}] {observation}")
                     if stream_tool_calls_out:
                         stream_content = response or ""
                         if not stream_content:
@@ -4461,6 +4468,8 @@ class ChatLoop:
                         self.messages.append(assistant_msg)
                     else:
                         self.messages.append({'role': 'assistant', 'content': response})
+                    if stream_observations:
+                        self.messages.append({'role': 'user', 'content': "Tool result:\n" + "\n---\n".join(stream_observations)})
                     print()
                 else:
                     self.messages.append({'role': 'assistant', 'content': response})
@@ -4475,6 +4484,10 @@ class ChatLoop:
             final_content = process_inline_commands(full_input)
             if not final_content.strip():
                 return
+
+            if not getattr(self, 'messages', None):
+                self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
+            self.messages.append({'role': 'user', 'content': final_content})
 
             inited = self._init_agentic_query(final_content)
             if inited is None:
@@ -4614,7 +4627,13 @@ class ChatLoop:
                 if api_tool_calls:
                     assistant_msg['tool_calls'] = api_tool_calls
                 messages.append(assistant_msg)
-                messages.append({'role': 'user', 'content': f"Tool result:\n{combined}"})
+                if send_tools_api and api_tool_calls and observations:
+                    for tc, obs in zip(api_tool_calls, observations):
+                        tool_msg = {'role': 'tool', 'tool_call_id': tc.get('id', ''), 'content': obs}
+                        tool_msg['name'] = tc.get('function', {}).get('name', '')
+                        messages.append(tool_msg)
+                else:
+                    messages.append({'role': 'user', 'content': f"Tool result:\n{combined}"})
 
             if iteration >= max_iterations and not final_answer:
                 final_answer = response_text
@@ -4886,7 +4905,7 @@ def fetch_loaded_models_ollama(base_url):
 
 def fetch_loaded_models_context_ollama(base_url: str) -> list[tuple[str, int]]:
     """
-    Query Ollama /api/ps and return a list of (model_name, context_length).
+    Query Ollama /api/ps and return a list of (model_name, context_size).
 
     Example output:
         [ ("nemotron-cascade-2:30b", 131072),
@@ -4899,9 +4918,9 @@ def fetch_loaded_models_context_ollama(base_url: str) -> list[tuple[str, int]]:
         ) as response:
             data = json.loads(response.read().decode('utf-8'))
             return [
-                (m["model"], m.get("context_length", 0))
+                (m["name"], m.get("context_size", 0))
                 for m in data.get("models", [])
-                if isinstance(m, dict) and "model" in m
+                if isinstance(m, dict) and "name" in m
             ]
     except Exception:                     # network error, parsing error, etc.
         sys.stderr.write(colorize("[ERROR] Could not read Ollama model info", "error"))
@@ -4986,7 +5005,10 @@ def auto_detect_backend():
 
 
     # grab the ip of the host 
-    list_of_ip = socket.gethostbyname_ex(socket.gethostname())[-1]
+    try:
+        list_of_ip = socket.gethostbyname_ex(socket.gethostname())[-1]
+    except socket.error:
+        list_of_ip = []
     for ip in list_of_ip:
         
         url="http://"+ip + ":" + str(DEFAULT_LLAMACPP_PORT)
@@ -5366,6 +5388,8 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
         for filename in sorted(os.listdir(args.input_dir)):
             input_path = os.path.join(args.input_dir, filename)
+            if not os.path.isfile(input_path):
+                continue
             print(f"[Processing: {filename}...]")
             with open(input_path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -5422,7 +5446,7 @@ def main():
             with open(args.output, 'w', encoding='utf-8') as f:
                 f.write(content)
             print(f"[Success: Output saved to {args.output}]", file=sys.stderr)
-        elif not should_stream and response:
+        elif response:
             content = ""
             if isinstance(response, dict):
                 content = response.get('message', {}).get('content', '')

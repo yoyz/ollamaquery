@@ -438,6 +438,178 @@ class TestPathTraversal(unittest.TestCase):
         self.assertIn("Path traversal denied", result.get("error", ""))
 
 
+class TestUnifiedDiffHunkParsing(unittest.TestCase):
+    """_parse_unified_hunks must use old-file (group 1) coordinates, not new-file (group 3)."""
+
+    def test_parse_unified_hunks_uses_old_file_coordinates(self):
+        """Hunk @@ -50,5 +60,5 @@ should set start=50, not start=60."""
+        body = (
+            "--- a/test.txt\n"
+            "+++ b/test.txt\n"
+            "@@ -50,5 +60,5 @@\n"
+            " context\n"
+            "-old_line\n"
+            "+new_line\n"
+            " context\n"
+        )
+        hunks, path, is_delete = m._parse_unified_hunks(body)
+        self.assertEqual(len(hunks), 1)
+        self.assertEqual(
+            hunks[0]["start"], 50,
+            f"Expected start=50 (old-file coordinate), got start={hunks[0]['start']}"
+        )
+
+    def test_parse_unified_hunks_start_not_end(self):
+        """Multi-hunk diff where old/new coordinates differ."""
+        body = (
+            "--- a/test.txt\n"
+            "+++ b/test.txt\n"
+            "@@ -10,3 +10,5 @@\n"
+            " line1\n"
+            " line2\n"
+            "+inserted_a\n"
+            "+inserted_b\n"
+            " line3\n"
+            "@@ -15,2 +20,2 @@\n"
+            " unchanged\n"
+            "-gone\n"
+            "+added\n"
+        )
+        hunks, path, is_delete = m._parse_unified_hunks(body)
+        self.assertEqual(len(hunks), 2)
+        self.assertEqual(
+            hunks[1]["start"], 15,
+            f"Second hunk: expected start=15 (old-file), got start={hunks[1]['start']}"
+        )
+
+    def test_parse_unified_hunks_blank_lines(self):
+        """Empty lines in hunks must not cause premature truncation (regression: break on empty line)."""
+        body = (
+            "--- a/test.txt\n"
+            "+++ b/test.txt\n"
+            "@@ -1,5 +1,5 @@\n"
+            " line1\n"
+            "-\n"
+            "+\n"
+            " line3\n"
+            " line4\n"
+            " line5\n"
+        )
+        hunks, path, is_delete = m._parse_unified_hunks(body)
+        self.assertEqual(len(hunks), 1)
+        self.assertEqual(len(hunks[0]["old_lines"]), 5,
+                         "old_lines truncated by blank line break")
+        self.assertEqual(len(hunks[0]["new_lines"]), 5,
+                         "new_lines truncated by blank line break")
+
+    def test_parse_unified_hunks_trailing_empty_line(self):
+        """Hunk ending with an empty line must not truncate."""
+        body = (
+            "--- a/test.txt\n"
+            "+++ b/test.txt\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-old\n"
+            "+new\n"
+            "\n"
+        )
+        hunks, path, is_delete = m._parse_unified_hunks(body)
+        self.assertEqual(len(hunks), 1)
+        self.assertEqual(len(hunks[0]["old_lines"]), 2)
+        self.assertEqual(len(hunks[0]["new_lines"]), 2)
+
+    def test_apply_unified_diff_no_trailing_newline(self):
+        """_apply_unified_diff must not reject patches on files lacking terminal newline (regression)."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("test.txt", "w") as f:
+                    f.write("hello\nworld")
+                patch = (
+                    "--- a/test.txt\n"
+                    "+++ b/test.txt\n"
+                    "@@ -1,2 +1,2 @@\n"
+                    " hello\n"
+                    "-world\n"
+                    "+earth\n"
+                )
+                result = m._apply_unified_diff(patch)
+                self.assertTrue(result["success"], msg=result.get("error", ""))
+                with open("test.txt") as f:
+                    content = f.read()
+                self.assertIn("earth", content)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_apply_unified_diff_blank_lines_in_patch(self):
+        """_apply_unified_diff must handle patches containing blank context lines."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("test.txt", "w") as f:
+                    f.write("a\n\nc")
+                patch = (
+                    "--- a/test.txt\n"
+                    "+++ b/test.txt\n"
+                    "@@ -1,3 +1,3 @@\n"
+                    " a\n"
+                    " \n"
+                    "-c\n"
+                    "+C\n"
+                )
+                result = m._apply_unified_diff(patch)
+                self.assertTrue(result["success"], msg=result.get("error", ""))
+                with open("test.txt") as f:
+                    content = f.read()
+                self.assertIn("C", content)
+            finally:
+                os.chdir(old_cwd)
+
+
+class TestParsePatchSections(unittest.TestCase):
+    """_parse_patch_sections must correctly parse OpenCode-style markers with --- headers."""
+
+    def test_parse_patch_sections_opencode_with_hunks(self):
+        """OpenCode *** Update File: marker followed by ---/+++ must extract hunks (regression: breakpoint bug)."""
+        patch = (
+            "*** Update File: test.txt\n"
+            "--- a/test.txt\n"
+            "+++ b/test.txt\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-hello\n"
+            "+hi\n"
+            " world\n"
+        )
+        sections = m._parse_patch_sections(patch)
+        self.assertEqual(len(sections), 1, "Section was lost by premature loop exit")
+        self.assertEqual(sections[0]["path"], "test.txt")
+        self.assertEqual(len(sections[0]["hunks"]), 1, "Hunk not parsed — body was empty")
+
+    def test_parse_patch_sections_opencode_multi_hunk(self):
+        """Multiple hunks under a single OpenCode marker must all be captured."""
+        patch = (
+            "*** Update File: test.txt\n"
+            "--- a/test.txt\n"
+            "+++ b/test.txt\n"
+            "@@ -1,3 +1,3 @@\n"
+            "-a\n"
+            "+A\n"
+            " b\n"
+            " c\n"
+            "@@ -10,2 +10,2 @@\n"
+            " d\n"
+            "-e\n"
+            "+E\n"
+        )
+        sections = m._parse_patch_sections(patch)
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(len(sections[0]["hunks"]), 2,
+                         "Second hunk was truncated by premature loop exit")
+
+
 # ============================================================================
 # 3.  No bare `except:` remains
 # ============================================================================

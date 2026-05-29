@@ -196,6 +196,46 @@ class TestToolRegistry(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_patch_with_target(self):
+        """patch tool with explicit target file."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("test.txt", "w") as f:
+                    f.write("hello\nworld\n")
+                diff = "--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n-hello\n+hi\n world\n"
+                result = self.reg.execute("patch", {"diff": diff, "target": "test.txt"})
+                self.assertTrue(result["success"], f"patch failed: {result.get('error')}")
+                with open("test.txt") as f:
+                    content = f.read()
+                self.assertIn("hi", content)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_patch_without_target_uses_inline_flag(self):
+        """patch tool without target must use -i (regression: cwd-as-target bug).
+
+        When target is omitted, args.get('target', '') → '' → os.path.join(cwd, '')
+        returns cwd itself, making target always truthy. The -i fallback was dead code.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("test.txt", "w") as f:
+                    f.write("hello\nworld\n")
+                diff = "--- test.txt\n+++ test.txt\n@@ -1,2 +1,2 @@\n-hello\n+hi\n world\n"
+                result = self.reg.execute("patch", {"diff": diff})
+                self.assertTrue(result["success"], f"patch without target failed: {result.get('error')}")
+                with open("test.txt") as f:
+                    content = f.read()
+                self.assertIn("hi", content)
+            finally:
+                os.chdir(old_cwd)
+
     def test_write_compile_run(self):
         """Full write_file → run_command(gcc) → run_command(test) pipeline."""
         c_code = (
@@ -231,6 +271,107 @@ class TestToolRegistry(unittest.TestCase):
                 os.chdir(old_cwd)
 
 
+class TestRunPythonPath(unittest.TestCase):
+    """run_python tool must handle file_path without host absolute paths."""
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.auto_confirm = True
+        self.reg = q.ToolRegistry(ctx=self.ctx)
+
+    def test_run_python_with_file_path_uses_direct_path(self):
+        """run_python with file_path should use the path directly (regression: sandbox absolute path)."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("test_script.py", "w") as f:
+                    f.write("print('hello from script')")
+                result = self.reg.execute("run_python", {"file_path": "test_script.py"})
+                self.assertTrue(result["success"], msg=result.get("error", ""))
+                self.assertIn("hello from script", result["output"])
+            finally:
+                os.chdir(old_cwd)
+
+    def test_run_python_with_file_uses_direct_path(self):
+        """run_python with 'file' alias should use the path directly."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("script.py", "w") as f:
+                    f.write("print('direct')")
+                result = self.reg.execute("run_python", {"file": "script.py"})
+                self.assertTrue(result["success"], msg=result.get("error", ""))
+                self.assertIn("direct", result["output"])
+            finally:
+                os.chdir(old_cwd)
+
+
+class TestExecutorContainerModeSafety(unittest.TestCase):
+    """Container mode must bypass host-side safety validator."""
+
+    def test_container_mode_passes_semicolon_commands(self):
+        """Container mode commands with ; should not be rejected by safety validator."""
+        exec = q.Executor(mode="container")
+        with patch.object(exec, '_run_shell') as mock_shell:
+            mock_shell.return_value = {"stdout": "ok", "stderr": "", "returncode": 0}
+            result = exec.run("echo hello; echo world", timeout=5)
+            self.assertEqual(result["returncode"], 0,
+                             "Container mode should not reject multi-statement commands")
+            # Verify _run_shell was called with is_container=True
+            _, kwargs = mock_shell.call_args
+            self.assertTrue(kwargs.get('is_container', False),
+                            "_run_shell should be called with is_container=True in container mode")
+
+
+class TestAgenticStreamObservations(unittest.TestCase):
+    """Streaming tool observations must be persisted in self.messages."""
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.auto_confirm = True
+        self.ctx.base_url = "http://localhost:9999"
+        self.ctx.backend = "ollama"
+        self.ctx.model = "test-model"
+        self.loop = q.ChatLoop(self.ctx)
+
+    def test_finalize_appends_observations_for_stream_tool_calls(self):
+        """_finalize_agentic_query must append tool observations after stream tool calls."""
+        self.loop.messages = []
+        messages = [{'role': 'system', 'content': 'test'}]
+        # Mock query_stream to populate tool_calls_out
+        with patch.object(self.loop.query_handler, 'query_stream',
+                          return_value="") as mock_stream:
+            mock_stream.return_value = ""
+            def side_effect(*args, **kwargs):
+                tool_calls_out = kwargs.get('tool_calls_out')
+                if tool_calls_out is not None:
+                    tool_calls_out.append({
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "fetch_url", "arguments": '{"url": "http://example.com"}'}
+                    })
+                return ""
+            mock_stream.side_effect = side_effect
+
+            with patch.object(self.loop.tool_registry, 'execute',
+                              return_value={"success": True, "output": "Fetched example.com", "error": None}):
+                self.loop._finalize_agentic_query(
+                    messages, final_answer="Hello world", final_content="test content",
+                    send_tools_api=False, openai_tools=[], logger=None,
+                    iteration=1, response_text=""
+                )
+
+        user_msgs = [m for m in self.loop.messages if m['role'] == 'user']
+        tool_result_msgs = [m for m in user_msgs if 'Tool result' in m.get('content', '')]
+        self.assertGreaterEqual(len(tool_result_msgs), 1,
+                                "Tool observations not appended to self.messages")
+        self.assertIn("fetch_url", tool_result_msgs[0]['content'],
+                      "Tool result content missing tool name")
+
+
 class TestExecutor(unittest.TestCase):
     """Test Executor (host mode only — no container runtime required)."""
 
@@ -253,6 +394,29 @@ class TestExecutor(unittest.TestCase):
     def test_safety_blocklist(self):
         result = self.exec.run("rm -rf /", timeout=5)
         self.assertIn("rejected", result["stderr"])
+
+    def test_run_python_with_semicolon(self):
+        """run_python with semicolons in code must not be rejected by safety validator (regression)."""
+        command = "python3 -c 'import sys; print(sys.version)'"
+        result = self.exec.run(command, timeout=5)
+        self.assertEqual(result["returncode"], 0,
+                         "Semicolons inside quoted python -c should not trigger safety rejection")
+        self.assertIn('.', result["stdout"],
+                      "Should print Python version")
+
+    def test_run_python_with_pipe_in_string(self):
+        """run_python with pipe character inside a string literal must not be rejected."""
+        command = "python3 -c \"import re; print(re.match('a|b', 'a').group())\""
+        result = self.exec.run(command, timeout=5)
+        self.assertEqual(result["returncode"], 0,
+                         "Pipe chars inside quoted python -c should pass safety validator")
+        self.assertIn('a', result["stdout"])
+
+    def test_run_python_with_semicolon_multiple_statements(self):
+        """Multi-statement python code with semicolons must execute."""
+        command = "python3 -c 'x=1; y=2; print(x + y)'"
+        result = self.exec.run(command, timeout=5)
+        self.assertEqual(result["stdout"].strip(), "3")
 
 
 class TestAgenticReActEndToEnd(unittest.TestCase):
@@ -294,16 +458,52 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
         self.assertIsInstance(last["content"], str)
         self.assertGreater(len(last["content"]), 0)
 
+    def test_user_prompt_persisted_in_history(self):
+        """Agentic mode must save user prompts to self.messages (regression: history amnesia).
+
+        Without the fix, self.messages only gets assistant responses but never
+        the user's prompt — on the next turn the model loses all user context.
+        """
+        self.loop.run_agentic_query("My name is Alex")
+        # self.messages must contain the user prompt
+        self.assertTrue(hasattr(self.loop, 'messages'))
+        user_msgs = [m for m in self.loop.messages if m['role'] == 'user']
+        self.assertGreaterEqual(len(user_msgs), 1,
+                                "User prompt was not saved to self.messages")
+        self.assertTrue(
+            any('Alex' in m['content'] for m in user_msgs),
+            "User message content 'Alex' not found in self.messages"
+        )
+
+    def test_multi_turn_user_history_preserved(self):
+        """Multiple agentic turns preserve all user prompts in self.messages."""
+        self.loop.run_agentic_query("My favorite color is blue")
+        self.loop.run_agentic_query("My name is Bob")
+        user_msgs = [m for m in self.loop.messages if m['role'] == 'user']
+        self.assertGreaterEqual(len(user_msgs), 2,
+                                "Not all user prompts saved across turns")
+        contents = [m['content'] for m in user_msgs]
+        self.assertTrue(
+            any('blue' in c for c in contents),
+            "First turn content lost from history"
+        )
+        self.assertTrue(
+            any('Bob' in c for c in contents),
+            "Second turn content lost from history"
+        )
+
     def test_fetch_url_tool(self):
         """Query that requires fetch_url — fetch a known URL."""
         result = self.loop.run_agentic_query(
             "Fetch http://example.com and tell me what the page title is"
         )
         self.assertTrue(hasattr(self.loop, 'messages'))
-        last = self.loop.messages[-1]
-        self.assertEqual(last["role"], "assistant")
-        # Should have some content
-        self.assertGreater(len(last["content"]), 0)
+        # Observations are now stored in history, so the last message may be a
+        # tool result (user role). Verify an assistant response exists somewhere.
+        assistant_msgs = [m for m in self.loop.messages if m['role'] == 'assistant']
+        self.assertGreaterEqual(len(assistant_msgs), 1,
+                                "No assistant response found in history")
+        self.assertGreater(len(assistant_msgs[-1]['content']), 0)
 
     def test_multi_step_write_file(self):
         """Multi-step: write a file with write_file tool, then verify via read_file.
@@ -321,9 +521,12 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
                     "IMPORTANT: You MUST use the write_file and read_file tools, do NOT simulate."
                 )
                 self.assertTrue(hasattr(self.loop, 'messages'))
-                last = self.loop.messages[-1]
-                self.assertEqual(last["role"], "assistant")
-                self.assertGreater(len(last["content"]), 0)
+                # Observations are now stored, so the last message may be a
+                # tool result. Check that an assistant response exists.
+                assistant_msgs = [m for m in self.loop.messages if m['role'] == 'assistant']
+                self.assertGreaterEqual(len(assistant_msgs), 1,
+                                        "No assistant response found in history")
+                self.assertGreater(len(assistant_msgs[-1]['content']), 0)
             finally:
                 os.chdir(old_cwd)
 

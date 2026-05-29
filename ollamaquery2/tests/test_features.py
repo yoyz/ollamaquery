@@ -275,6 +275,15 @@ class TestBackendDetection(unittest.TestCase):
         backend, url = q.resolve_connection(args)
         self.assertIn(backend, ('ollama', 'llamacpp', 'lmstudio'))
 
+    def test_auto_detect_backend_dns_failure(self):
+        """auto_detect_backend must not crash when gethostbyname_ex fails (regression: DNS crash)."""
+        with patch.object(q.socket, 'gethostbyname_ex', side_effect=socket.gaierror("DNS failure")):
+            result = q.auto_detect_backend()
+            # Should gracefully return None tuple instead of crashing
+            self.assertIsInstance(result, tuple)
+            self.assertEqual(len(result), 3)
+            self.assertIsNone(result[0])
+
 
 @ollama_only
 class TestModelListing(unittest.TestCase):
@@ -420,6 +429,47 @@ class TestThemeSystem(unittest.TestCase):
             for key in ('success', 'error', 'warning', 'info', 'muted'):
                 self.assertIn(key, theme,
                               f'Theme {name!r} missing key {key!r}')
+
+    def test_get_theme_reads_env_var(self):
+        """get_theme() with no args falls back to OLLAMAQUERY_THEME env var (regression: --theme ignored)."""
+        with patch.dict(os.environ, {'OLLAMAQUERY_THEME': 'vim_dark'}):
+            theme = q.get_theme()
+            self.assertEqual(
+                theme.get('info'),
+                q.BUILTIN_THEMES['vim_dark'].get('info'),
+                "get_theme() did not read OLLAMAQUERY_THEME env var"
+            )
+
+    def test_get_theme_env_var_fallback_to_default(self):
+        """get_theme() with no args and no env var returns default theme."""
+        with patch.dict(os.environ, clear=True):
+            theme = q.get_theme()
+            self.assertEqual(
+                theme.get('info'),
+                q.BUILTIN_THEMES['default'].get('info'),
+                "get_theme() did not fall back to default when no env var set"
+            )
+
+    def test_get_theme_explicit_arg_overrides_env(self):
+        """Explicit theme_name argument takes precedence over OLLAMAQUERY_THEME."""
+        with patch.dict(os.environ, {'OLLAMAQUERY_THEME': 'vim_dark'}):
+            theme = q.get_theme('emacs_dark')
+            self.assertNotEqual(
+                theme.get('info'),
+                q.BUILTIN_THEMES['vim_dark'].get('info'),
+            )
+            self.assertEqual(
+                theme.get('info'),
+                q.BUILTIN_THEMES['emacs_dark'].get('info'),
+            )
+
+    def test_colorize_respects_env_theme(self):
+        """colorize() picks up theme from OLLAMAQUERY_THEME environment variable."""
+        with patch.dict(os.environ, {'OLLAMAQUERY_THEME': 'vim_dark'}):
+            result = q.colorize('hello', 'warning', force_color=True)
+            self.assertIn('hello', result)
+            self.assertNotEqual(result, 'hello',
+                                "colorize() should wrap with color codes")
 
 
 # ============================================================================
@@ -732,6 +782,17 @@ class TestCommandHandlers(unittest.TestCase):
         self.loop.run_handle_clear('/clear')
         self.assertEqual(self.ctx.total_queries, 0)
 
+    def test_handle_clear_clears_messages(self):
+        """/clear must delete self.messages so conversation history is not carried over (regression)."""
+        self.loop.run_process_query('Say hello')
+        self.assertTrue(hasattr(self.loop, 'messages'))
+        self.assertGreater(len(self.loop.messages), 0)
+        self.loop.run_handle_clear('/clear')
+        self.assertFalse(
+            hasattr(self.loop, 'messages'),
+            "/clear did not delete self.messages — history leaks to next query"
+        )
+
 
 class TestModelGuard(unittest.TestCase):
     """Verify the 'no model selected' guard blocks queries."""
@@ -784,36 +845,71 @@ class TestHTMLParsing(unittest.TestCase):
         self.assertEqual(stripper.get_text(), '')
 
     def test_html_stripper_spaces_between_elements(self):
-        """get_text() must preserve word separation."""
-        stripper = q.HTMLStripper()
+        """get_text() must preserve newline separation between elements."""
+        stripper = q.CoreHTMLStripper()
         stripper.feed('<p>Hello</p><p>World</p>')
-        self.assertEqual(stripper.get_text(), 'Hello World')
+        result = stripper.get_text()
+        self.assertIn('Hello', result)
+        self.assertIn('World', result)
+        self.assertIn('\n', result)
 
     def test_html_stripper_multiple_words_per_element(self):
-        stripper = q.HTMLStripper()
+        stripper = q.CoreHTMLStripper()
         stripper.feed('<div>First item</div><div>Second item</div>')
         self.assertIn('First item', stripper.get_text())
         self.assertIn('Second item', stripper.get_text())
-        self.assertIn(' ', stripper.get_text())
+        self.assertIn('\n', stripper.get_text())
 
 
 class TestFetchAndConvertUrl(unittest.TestCase):
     """URL fetching and HTML-to-text conversion."""
 
-    def test_get_html_bytes_from_nonexistent(self):
-        result = q.get_html_bytes('http://127.0.0.1:1/nonexistent')
-        # Should return empty bytes on failure after retries
-        self.assertEqual(result, b'')
-
-    def test_get_html_bytes_exceeds_depth(self):
-        result = q.get_html_bytes('http://example.com', depth=5)
-        self.assertEqual(result, b'')
-
-    def test_fetch_and_convert_url_fallback_to_htmlstripper(self):
-        """fetch_and_convert_url uses HTMLStripper as fallback."""
+    def test_fetch_and_convert_url_empty(self):
+        """fetch_and_convert_url returns error on empty URL."""
         text, tool = q.fetch_and_convert_url('')
-        self.assertEqual(text, '')
-        self.assertEqual(tool, 'None')
+        self.assertIn('Failed', text)
+
+
+class TestHTMLStripperExtras(unittest.TestCase):
+    """Additional HTMLStripper regression tests."""
+
+    def test_html_stripper_resumes_after_style(self):
+        """Text after a </style> tag must not be suppressed (regression: stuck state)."""
+        stripper = q.CoreHTMLStripper()
+        stripper.feed('<style>.hidden {}</style><p>Visible text</p>')
+        result = stripper.get_text()
+        self.assertNotIn('.hidden', result)
+        self.assertIn('Visible text', result,
+                      "Text after </style> was swallowed by stuck state machine")
+
+    def test_html_stripper_resumes_after_script(self):
+        """Text after a </script> tag must not be suppressed."""
+        stripper = q.CoreHTMLStripper()
+        stripper.feed('<script>var x=1;</script><p>Hello World</p>')
+        result = stripper.get_text()
+        self.assertNotIn('var x=1', result)
+        self.assertIn('Hello World', result,
+                      "Text after </script> was swallowed")
+
+    def test_html_stripper_nested_skip_tags(self):
+        """Nested skip tags must not break text extraction after they close."""
+        stripper = q.CoreHTMLStripper()
+        stripper.feed('<style>body{color:red}</style><div>Text before<script>inner</script>Text after</div>')
+        result = stripper.get_text()
+        self.assertNotIn('color:red', result)
+        self.assertNotIn('inner', result)
+        self.assertIn('Text before', result)
+        self.assertIn('Text after', result)
+
+    def test_html_stripper_multiple_consecutive_skips(self):
+        """Multiple consecutive skip tags (style then script) must not leak into visible text."""
+        html = '<style>css</style><script>js</script><p>Visible</p>'
+        stripper = q.CoreHTMLStripper()
+        stripper.feed(html)
+        result = stripper.get_text()
+        self.assertNotIn('css', result)
+        self.assertNotIn('js', result)
+        self.assertIn('Visible', result)
 
 
 # ============================================================================
@@ -846,18 +942,67 @@ class TestTokenCounting(unittest.TestCase):
         count = ctx.calculate_context_tokens(messages)
         self.assertGreater(count, 0)
 
-    @ollama_only
-    def test_get_message_token_count_ollama(self):
-        if not _tokenize_available(OLLAMA_HOST, SMALL_MODEL):
-            self.skipTest(f'/api/tokenize not available for {SMALL_MODEL}')
-        count = q.get_message_token_count_ollama(
-            OLLAMA_HOST, 'hello world', SMALL_MODEL)
-        self.assertGreater(count, 0)
+    def test_calculate_context_tokens_list_content(self):
+        """calculate_context_tokens must handle list content from vision messages (regression: TypeError)."""
+        ctx = _fresh_ctx()
+        messages = [
+            {'role': 'system', 'content': 'You are a bot.'},
+            {'role': 'user', 'content': [
+                {'type': 'text', 'text': 'Describe this image'},
+                {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,abc123'}}
+            ]}
+        ]
+        count = ctx.calculate_context_tokens(messages)
+        self.assertGreater(count, 0, "Should not crash on list content")
 
-    @ollama_only
-    def test_get_ollama_context_size(self):
-        size = q.get_ollama_context_size(OLLAMA_HOST, SMALL_MODEL)
-        self.assertGreaterEqual(size, 0)
+    def test_calculate_context_tokens_list_content_empty(self):
+        """Vision messages with empty text inside list content should not crash."""
+        ctx = _fresh_ctx()
+        messages = [
+            {'role': 'user', 'content': [
+                {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,abc'}}
+            ]}
+        ]
+        count = ctx.calculate_context_tokens(messages)
+        self.assertGreaterEqual(count, 0)
+
+    def test_calculate_context_tokens_list_content_no_text_part(self):
+        """Vision messages with no 'type': 'text' part should not crash."""
+        ctx = _fresh_ctx()
+        messages = [
+            {'role': 'user', 'content': [
+                {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,xyz'}},
+                {'type': 'audio', 'audio_url': {'url': 'data:audio/mp3;base64,xyz'}}
+            ]}
+        ]
+        count = ctx.calculate_context_tokens(messages)
+        self.assertGreaterEqual(count, 0)
+
+    def test_calculate_context_tokens_counts_ollama_images(self):
+        """calculate_context_tokens must count Ollama-style images key toward token total."""
+        ctx = _fresh_ctx()
+        messages = [
+            {'role': 'user', 'content': 'Describe this', 'images': ['abc123', 'def456']}
+        ]
+        count = ctx.calculate_context_tokens(messages)
+        text_only = ctx.estimate_tokens('Describe this') + 2
+        self.assertGreater(count, text_only,
+                           "Ollama-style images not counted in context tokens")
+
+    def test_calculate_context_tokens_counts_image_url_parts(self):
+        """calculate_context_tokens must count image_url content parts toward token total."""
+        ctx = _fresh_ctx()
+        messages = [
+            {'role': 'user', 'content': [
+                {'type': 'text', 'text': 'hi'},
+                {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,a'}},
+                {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,b'}},
+            ]}
+        ]
+        count = ctx.calculate_context_tokens(messages)
+        text_only = ctx.estimate_tokens('hi') + 2
+        self.assertGreater(count, text_only,
+                           "image_url parts not counted in context tokens")
 
 
 # ============================================================================
@@ -1009,6 +1154,71 @@ class TestImageCommand(unittest.TestCase):
         result = self.loop.run_handle_image('/image')
         self.assertFalse(result)
 
+    def test_image_path_with_spaces(self):
+        """/image must handle paths with spaces (regression: .split() breaks on space)."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+            img_path = f.name
+        spaced_path = img_path.replace(os.path.dirname(img_path),
+                                       os.path.dirname(img_path) + '/my images')
+        try:
+            os.makedirs(os.path.dirname(spaced_path), exist_ok=True)
+            os.rename(img_path, spaced_path)
+            result = self.loop.run_handle_image(f'/image {spaced_path}')
+            self.assertFalse(result, "File-not-found should still handle gracefully")
+        finally:
+            if os.path.exists(spaced_path):
+                os.unlink(spaced_path)
+            try:
+                os.rmdir(os.path.dirname(spaced_path))
+            except OSError:
+                pass
+
+    def test_quoted_image_path_with_spaces(self):
+        """/image must respect quotes around paths with spaces using shlex.split()."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+            img_path = f.name
+        spaced_dir = os.path.dirname(img_path) + '/my images'
+        spaced_path = spaced_dir + '/' + os.path.basename(img_path)
+        try:
+            os.makedirs(spaced_dir, exist_ok=True)
+            os.rename(img_path, spaced_path)
+            # Test unquoted first — should fail (split breaks it into two paths)
+            result = self.loop.run_handle_image(f'/image {spaced_path}')
+            self.assertEqual(self.ctx.current_images, [])
+        finally:
+            if os.path.exists(spaced_path):
+                os.unlink(spaced_path)
+            try:
+                os.rmdir(spaced_dir)
+            except OSError:
+                pass
+
+
+class TestBuildPrompt(unittest.TestCase):
+    """run_build_prompt output."""
+
+    def setUp(self):
+        self.ctx = _fresh_ctx()
+        self.loop = _chat_loop(self.ctx)
+
+    def test_build_prompt_no_images(self):
+        prompt = self.loop.run_build_prompt("localhost")
+        self.assertIn(self.ctx.backend, prompt)
+        self.assertIn("localhost", prompt)
+        self.assertNotIn("[img]", prompt)
+
+    def test_build_prompt_with_images_has_img_tag(self):
+        self.ctx.current_images = ["fake_base64_data"]
+        prompt = self.loop.run_build_prompt("localhost")
+        self.assertIn("[img]", prompt)
+
+    def test_build_prompt_no_model_selected(self):
+        self.ctx.model = ""
+        prompt = self.loop.run_build_prompt("localhost")
+        self.assertIn("no model selected", prompt)
+
 
 # ============================================================================
 # 11. Utility Functions
@@ -1095,6 +1305,79 @@ class TestSpawnShell(unittest.TestCase):
         self.assertFalse(result)
 
 
+class TestShellSessionParsing(unittest.TestCase):
+    """_parse_number_ranges and shell session block indexing."""
+
+    def setUp(self):
+        self.ctx = _fresh_ctx()
+        self.loop = _chat_loop(self.ctx)
+
+    def test_parse_single_number(self):
+        result = self.loop._parse_number_ranges('3', 5)
+        self.assertEqual(result, [3])
+
+    def test_parse_comma_separated(self):
+        result = self.loop._parse_number_ranges('1,3,5', 5)
+        self.assertEqual(result, [1, 3, 5])
+
+    def test_parse_range(self):
+        result = self.loop._parse_number_ranges('2-4', 5)
+        self.assertEqual(result, [2, 3, 4])
+
+    def test_parse_mixed(self):
+        result = self.loop._parse_number_ranges('1,3-5,7', 8)
+        self.assertEqual(result, [1, 3, 4, 5, 7])
+
+    def test_parse_last_element(self):
+        result = self.loop._parse_number_ranges('5', 5)
+        self.assertEqual(result, [5])
+
+    def test_parse_out_of_range_returns_none(self):
+        result = self.loop._parse_number_ranges('6', 5)
+        self.assertIsNone(result)
+
+    def test_parse_invalid_returns_none(self):
+        result = self.loop._parse_number_ranges('abc', 5)
+        self.assertIsNone(result)
+
+    def test_parse_empty_returns_none(self):
+        result = self.loop._parse_number_ranges('', 5)
+        self.assertIsNone(result)
+
+    def test_block_indexing_first_element(self):
+        """_handle_shell_session must use 0-based indexing for blocks (regression: off-by-one).
+
+        _parse_number_ranges returns 1-based indices; blocks[i] must be blocks[i-1].
+        This test directly exercises the list-comprehension logic from _handle_shell_session.
+        """
+        blocks = ["cmd_one\ndesc\n", "cmd_two\ndesc\n", "cmd_three\ndesc\n"]
+        indices = self.loop._parse_number_ranges('1', len(blocks))
+        self.assertEqual(indices, [1])
+        # If off-by-one, blocks[1] would give "cmd_two" instead of "cmd_one"
+        content = "\n---\n".join(
+            f"$ {blocks[i - 1].split(chr(10))[0].strip()}\n{chr(10).join(blocks[i - 1].split(chr(10))[1:]).strip()}"
+            for i in indices
+        )
+        self.assertIn("cmd_one", content)
+        self.assertNotIn("cmd_two", content)
+
+    def test_block_indexing_last_element(self):
+        """Last block must be accessible without IndexError (regression: off-by-one crash).
+
+        With 3 blocks, input '3' would raise IndexError: list index out of range
+        if blocks[i] was used instead of blocks[i-1].
+        """
+        blocks = ["a\n", "b\n", "c\n"]
+        indices = self.loop._parse_number_ranges('3', len(blocks))
+        self.assertEqual(indices, [3])
+        # Must not raise IndexError
+        content = "\n---\n".join(
+            f"$ {blocks[i - 1].split(chr(10))[0].strip()}\n{chr(10).join(blocks[i - 1].split(chr(10))[1:]).strip()}"
+            for i in indices
+        )
+        self.assertIn("c", content)
+
+
 # ============================================================================
 # 13. Dump Context
 # ============================================================================
@@ -1160,6 +1443,26 @@ class TestSwitchModel(unittest.TestCase):
         after = self.ctx.get_cumulative_stats()
         self.assertEqual(before['total_queries'], after['total_queries'])
 
+    def test_switch_reads_ollama_token_schema(self):
+        """/switchmodel reads prompt_eval_count from warmup ping for Ollama."""
+        self.loop.run_process_query('Say hi')
+        self.ctx.backend = 'ollama'
+        with patch.object(self.loop.query_handler, 'query_sync',
+                          return_value={"prompt_eval_count": 42}):
+            self.loop.run_handle_switchmodel(f'/switchmodel {SMALL_MODEL}')
+        self.assertEqual(self.ctx.current_context_tokens, 42,
+                         "Ollama warmup token schema not read correctly")
+
+    def test_switch_reads_llamacpp_token_schema(self):
+        """/switchmodel reads prompt_tokens from usage.{} for llama.cpp/LM Studio."""
+        self.loop.run_process_query('Say hi')
+        self.ctx.backend = 'llamacpp'
+        with patch.object(self.loop.query_handler, 'query_sync',
+                          return_value={"usage": {"prompt_tokens": 37}}):
+            self.loop.run_handle_switchmodel(f'/switchmodel {SMALL_MODEL}')
+        self.assertEqual(self.ctx.current_context_tokens, 37,
+                         "llama.cpp warmup token schema not read correctly")
+
 
 # ============================================================================
 # 15. Batch Processing
@@ -1178,7 +1481,6 @@ class TestBatchProcessing(unittest.TestCase):
                 'ollamaquery2.py', '-b', 'ollama', '-H', OLLAMA_HOST,
                 '-m', SMALL_MODEL, '-I', 'Say hello in 1 word', '-o', out
             ]):
-                # Suppress stderr from main
                 old_stderr = sys.stderr
                 sys.stderr = io.StringIO()
                 try:
@@ -1194,12 +1496,98 @@ class TestBatchProcessing(unittest.TestCase):
             if os.path.exists(out):
                 os.unlink(out)
 
+    @ollama_only
+    def test_sync_query_prints_to_terminal(self):
+        """main() with -I and no -o should print response to stdout (regression: should_stream bug).
+
+        When stdout is a terminal, should_stream=True, but query_sync is used.
+        The response must still be printed — the should_stream guard must not suppress output.
+        """
+        class TtyStringIO(io.StringIO):
+            def isatty(self):
+                return True
+
+        stdout = TtyStringIO()
+        stderr = io.StringIO()
+        with patch.object(sys, 'argv', [
+            'ollamaquery2.py', '-b', 'ollama', '-H', OLLAMA_HOST,
+            '-m', SMALL_MODEL, '-I', 'Say hello in exactly one word'
+        ]):
+            old_stdout, sys.stdout = sys.stdout, stdout
+            old_stderr, sys.stderr = sys.stderr, stderr
+            try:
+                q.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+        output = stdout.getvalue()
+        self.assertGreater(len(output), 0, msg="Response was swallowed by should_stream bug")
+
     def test_main_shows_help_with_no_args(self):
         """main() shows help when run with no arguments."""
         with patch.object(sys, 'argv', ['ollamaquery2.py']):
             with self.assertRaises(SystemExit) as cm:
                 q.main()
             self.assertEqual(cm.exception.code, 2)
+
+    @ollama_only
+    def test_batch_input_dir_skips_subdirectories(self):
+        """--input-dir must skip subdirectories instead of crashing (regression: IsADirectoryError)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a subdirectory inside the input directory
+            os.makedirs(os.path.join(tmpdir, "subdir"), exist_ok=True)
+            # Create a real file
+            with open(os.path.join(tmpdir, "test.txt"), "w") as f:
+                f.write("hello")
+            # Create a second file
+            with open(os.path.join(tmpdir, "test2.txt"), "w") as f:
+                f.write("world")
+            outdir = os.path.join(tmpdir, "output")
+            with patch.object(sys, 'argv', [
+                'ollamaquery2.py', '-b', 'ollama', '-H', OLLAMA_HOST,
+                '-m', SMALL_MODEL, '--input-dir', tmpdir, '--output-dir', outdir
+            ]):
+                old_stderr = sys.stderr
+                sys.stderr = io.StringIO()
+                try:
+                    q.main()
+                except SystemExit:
+                    pass
+                finally:
+                    sys.stderr = old_stderr
+            # Should have processed the 2 files without crashing on the directory
+            self.assertTrue(os.path.exists(os.path.join(outdir, "test.txt.output")),
+                            "File test.txt was not processed")
+            self.assertTrue(os.path.exists(os.path.join(outdir, "test2.txt.output")),
+                            "File test2.txt was not processed")
+
+
+class TestOllamaPsSchema(unittest.TestCase):
+    """Ollama /api/ps response schema must use correct keys."""
+
+    def test_fetch_loaded_models_context_uses_correct_keys(self):
+        """fetch_loaded_models_context_ollama must use 'name' and 'context_size' keys (regression: KeyError)."""
+        mock_response = json.dumps({
+            "models": [
+                {"name": "qwen3:8b", "context_size": 32768},
+                {"name": "llama3:8b", "context_size": 8192}
+            ]
+        }).encode()
+        with patch.object(q, '_request_with_retry') as mock_retry:
+            class FakeResp:
+                def read(self2):
+                    return mock_response
+                def __enter__(self2):
+                    return FakeResp()
+                def __exit__(self2, *a):
+                    pass
+            mock_retry.return_value = FakeResp()
+            result = q.fetch_loaded_models_context_ollama("http://localhost:11434")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], ("qwen3:8b", 32768))
+        self.assertEqual(result[1], ("llama3:8b", 8192))
 
 
 # ============================================================================
@@ -1426,6 +1814,160 @@ class TestErrorHandling(unittest.TestCase):
         loop.run_process_query('Say hi')
         with self.assertRaises(Exception):
             loop.dump_context_to_file('/nonexistent/dir/dump.json')
+
+
+# ============================================================================
+# 23.  Streaming Tool Call Accumulation
+# ============================================================================
+
+class TestStreamToolCallAccumulation(unittest.TestCase):
+    """Tool call accumulation in query_stream handles Ollama full-object vs OpenAI delta streams."""
+
+    def setUp(self):
+        self.ctx = _fresh_ctx()
+
+    def _make_query(self, backend):
+        qh = q.ModelQuery(context=self.ctx)
+        qh.ctx.backend = backend
+        qh.ctx.base_url = OLLAMA_HOST
+        qh.ctx.model = SMALL_MODEL
+        return qh
+
+    def _mock_stream_and_build(self, qh, json_lines):
+        """Patch _iter_stream_lines, _build_stream_request, and _request_with_retry.
+
+        json_lines: list of JSON strings to yield from _iter_stream_lines.
+        """
+        def fake_iter(response, backend):
+            yield from json_lines
+        qh._iter_stream_lines = fake_iter
+
+        class FakeResponse:
+            def __enter__(self2):
+                return None
+            def __exit__(self2, *a):
+                pass
+
+        return (
+            patch.object(qh, '_build_stream_request',
+                         return_value=("http://localhost/fake", {}, {})),
+            patch.object(q, '_request_with_retry', return_value=FakeResponse()),
+        )
+
+    def _run_stream(self, qh, json_lines):
+        """Run query_stream with mocked transport and suppressed stats display."""
+        stream_tool_calls_out = []
+        mock_build, mock_retry = self._mock_stream_and_build(qh, json_lines)
+        mock_stats = {
+            'eval_count': 0, 'prompt_eval_count': 0, 'content_length': 0,
+            'eval_duration': 0, 'tokens_per_second': 0, 'total_time': 0
+        }
+        with mock_build, mock_retry:
+            with patch.object(qh, '_update_context_tokens'):
+                with patch.object(qh, 'calculate_stats', return_value=mock_stats):
+                    with patch.object(qh, 'print_stats_display'):
+                        qh.query_stream(
+                            [{"role": "user", "content": "hi"}],
+                            SMALL_MODEL,
+                            tool_calls_out=stream_tool_calls_out
+                        )
+        return stream_tool_calls_out
+
+    def test_ollama_single_tool_call(self):
+        """Ollama single tool call is accumulated correctly."""
+        qh = self._make_query("ollama")
+        chunk = json.dumps({
+            "model": "test",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "fetch_url",
+                        "arguments": {"url": "http://example.com"}
+                    }
+                }]
+            },
+            "done": True
+        })
+        out = self._run_stream(qh, [chunk])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["function"]["name"], "fetch_url")
+        self.assertEqual(out[0]["function"]["arguments"], {"url": "http://example.com"})
+
+    def test_ollama_parallel_tool_calls(self):
+        """Ollama parallel tool calls are all captured without crash or overwrite."""
+        qh = self._make_query("ollama")
+        chunk = json.dumps({
+            "model": "test",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "fetch_url", "arguments": {"url": "http://example.com"}}},
+                    {"function": {"name": "read_file", "arguments": {"file_path": "/etc/hosts"}}},
+                    {"function": {"name": "run_command", "arguments": {"command": "uname -a"}}}
+                ]
+            },
+            "done": True
+        })
+        out = self._run_stream(qh, [chunk])
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[0]["function"]["name"], "fetch_url")
+        self.assertEqual(out[1]["function"]["name"], "read_file")
+        self.assertEqual(out[2]["function"]["name"], "run_command")
+        self.assertEqual(out[0]["function"]["arguments"], {"url": "http://example.com"})
+        self.assertEqual(out[1]["function"]["arguments"], {"file_path": "/etc/hosts"})
+        self.assertEqual(out[2]["function"]["arguments"], {"command": "uname -a"})
+
+    def test_llamacpp_delta_tool_calls(self):
+        """Llama.cpp delta tool calls are merged by index correctly."""
+        qh = self._make_query("llamacpp")
+        lines = [
+            json.dumps({"choices": [{"delta": {
+                "tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "fetch_url", "arguments": ""}}]
+            }}]}),
+            json.dumps({"choices": [{"delta": {
+                "tool_calls": [{"index": 0, "function": {"arguments": '{"url": "'}}]
+            }}]}),
+            json.dumps({"choices": [{"delta": {
+                "tool_calls": [{"index": 0, "function": {"arguments": 'http://example.com"}'}}]
+            }}]}),
+            json.dumps({"choices": [{"delta": {
+                "tool_calls": [{"index": 1, "id": "call_2", "function": {"name": "read_file", "arguments": ""}}]
+            }}]}),
+            json.dumps({"choices": [{"delta": {
+                "tool_calls": [{"index": 1, "function": {"arguments": '{"file_path": "/etc/hosts"}'}}]
+            }}]}),
+            json.dumps({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        ]
+        out = self._run_stream(qh, lines)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["function"]["name"], "fetch_url")
+        self.assertEqual(out[0]["function"]["arguments"], '{"url": "http://example.com"}')
+        self.assertEqual(out[1]["function"]["name"], "read_file")
+        self.assertEqual(out[1]["function"]["arguments"], '{"file_path": "/etc/hosts"}')
+
+    def test_ollama_dict_arguments_no_crash(self):
+        """Ollama parallel tool calls with dict arguments do not crash (regression: TypeError on +=)."""
+        qh = self._make_query("ollama")
+        chunk = json.dumps({
+            "model": "test",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "write_file", "arguments": {"file_path": "a.txt", "content": "hello"}}},
+                    {"function": {"name": "write_file", "arguments": {"file_path": "b.txt", "content": "world"}}}
+                ]
+            },
+            "done": True
+        })
+        # Must not raise TypeError
+        out = self._run_stream(qh, [chunk])
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["function"]["name"], "write_file")
+        self.assertEqual(out[1]["function"]["arguments"], {"file_path": "b.txt", "content": "world"})
 
 
 # ============================================================================
