@@ -185,3 +185,7 @@ from composable blocks (role, tool definitions, format, examples, rules).
 | `LLAMACPP_HOST` | `http://127.0.0.1:8080` | Llama.cpp API URL |
 | `OLLAMAQUERY_THEME` | `default` | Color theme name |
 | `NO_COLOR` | (unset) | Disable colors |
+
+## Similar Projects
+
+See `doc/similar_project.md` for a detailed comparison with Aider, Open Interpreter, ShellGPT, and Fabric — the closest alternatives depending on whether you need agentic coding, pipeline CLIs, or sandboxed execution.

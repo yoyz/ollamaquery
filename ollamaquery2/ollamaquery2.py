@@ -1,5 +1,15 @@
 #!/usr/bin/python3
 # vim: set ts=4 sw=4 sts=4 et:
+#
+# Design choices:
+#   - Single file: maximally portable (cp/scp and run), zero install, no packaging
+#   - CLI-only: no GUI dependencies, works over SSH, headless servers
+#   - Tests: tests/test_features.py (138+), tests/test_modifications.py (34+),
+#     tests/test_agentic.py (55+) — over 200 unit + end-to-end tests total
+#     Run: python3 -m unittest discover tests -v
+#   - 3rd-party deps: none required (yaml, html2text, pandoc, lynx optional)
+#   - Print/callbacks in business logic: intentional for CLI; would decouple for GUI port
+#
 # ============================================================================
 # ============= IMPORTS & CONFIGURATION ======================================
 # ============================================================================
@@ -46,7 +56,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 
 # ============================================================================
@@ -471,7 +481,7 @@ def colorize(text, role, theme=None, force_color=False, is_prompt=False):
 # ============= RETRY UTILITY ================================================
 # ============================================================================
 
-def _request_with_retry(req, max_retries=3, delay=1, **kwargs):
+def _request_with_retry(req, max_retries=3, delay=1, timeout=120, **kwargs):
     """Open URL with retry on transient network errors.
 
     Retries on URLError, HTTPError (5xx only), ConnectionError, TimeoutError,
@@ -481,6 +491,7 @@ def _request_with_retry(req, max_retries=3, delay=1, **kwargs):
         req: URL string or Request object to pass to urlopen
         max_retries: Maximum number of attempts (default 3)
         delay: Seconds to wait between retries (default 1)
+        timeout: Socket timeout in seconds for urlopen (default 120)
         **kwargs: Additional arguments passed to urlopen (e.g. timeout)
 
     Returns:
@@ -493,7 +504,7 @@ def _request_with_retry(req, max_retries=3, delay=1, **kwargs):
     last_exception = None
     for attempt in range(max_retries):
         try:
-            return urlopen(req, **kwargs)
+            return urlopen(req, timeout=timeout, **kwargs)
         except (URLError, HTTPError, ConnectionResetError, ConnectionError, TimeoutError, OSError) as e:
             last_exception = e
             if isinstance(e, HTTPError) and e.code < 500:
@@ -820,7 +831,8 @@ def estimate_token_count(text: str) -> int:
         return 0
     tokens = len(re.findall(r'\b\w+\b|[^\w\s]', text))
     code_keywords = {'def', 'class', 'import', 'from', 'if', 'else', 'elif', 'return', 'for', 'while', 'try', 'except', 'with', 'as', 'pass', 'raise', 'lambda', 'yield', 'async', 'await'}
-    if any(kw in text for kw in code_keywords):
+    words = set(re.findall(r'\b\w+\b', text.lower()))
+    if words.intersection(code_keywords):
         return max(1, int(tokens * 2.0))
     return max(1, int(tokens * 1.5))
 
@@ -842,6 +854,14 @@ class CommandContext:
     
     Replaces the scattered self.* attributes across ChatLoop, ModelQuery,
     and other classes with a single centralized state object.
+    
+    Design rationale: factory methods (create_completer, create_tool_registry,
+    etc.) live here as thin convenience wrappers rather than in separate factory
+    classes because the codebase is a single file and the indirection would add
+    no benefit. Token counting heuristic (calculate_context_tokens) lives here
+    because it is context-state-dependent, not a pure text utility.
+    All print() calls in business logic are intentional for CLI mode;
+    a GUI port would inject a callback/emitter pattern instead.
     
     Call map:
       create_completer() → ChatCompleter
@@ -1014,6 +1034,11 @@ class CommandContext:
             if isinstance(msg.get("images"), list):
                 image_count += len(msg["images"])
             total += self.estimate_tokens(content)
+            if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    tc_text = f"{tc.get('id', '')} {fn.get('name', '')} {fn.get('arguments', '')}"
+                    total += self.estimate_tokens(tc_text)
             total += image_count * 1024
             total += 2
         return total
@@ -1623,8 +1648,8 @@ def _tool_handle_run_python(self, args):
     else:
         return {"success": False, "output": "", "error": "Provide either 'code' or 'file'"}
     cmd_timeout = int(args.get("timeout", 10))
-    if cmd_timeout > 300:
-        return {"success": False, "output": "", "error": f"Invalid timeout: {cmd_timeout}. Timeout is in seconds (max 300). Use a lower value."}
+    if cmd_timeout <= 0 or cmd_timeout > 300:
+        return {"success": False, "output": "", "error": f"Invalid timeout: {cmd_timeout}. Timeout is in seconds (1-300). Use a value between 1 and 300."}
     result = self.executor.run(command, timeout=cmd_timeout)
     output = result["stdout"]
     if result["stderr"]:
@@ -1638,8 +1663,8 @@ def _tool_handle_run_command(self, args):
         if op in command:
             return {"success": False, "output": "", "error": f"Only one command at a time is supported. Remove shell operators like '{op}' and run commands separately."}
     cmd_timeout = int(args.get("timeout", 10))
-    if cmd_timeout > 300:
-        return {"success": False, "output": "", "error": f"Invalid timeout: {cmd_timeout}. Timeout is in seconds (max 300). Use a lower value."}
+    if cmd_timeout <= 0 or cmd_timeout > 300:
+        return {"success": False, "output": "", "error": f"Invalid timeout: {cmd_timeout}. Timeout is in seconds (1-300). Use a value between 1 and 300."}
     result = self.executor.run(command, timeout=cmd_timeout)
     output = result["stdout"]
     if result["stderr"]:
@@ -1658,9 +1683,9 @@ def _tool_handle_diff(self, args):
     label1 = args.get("label1", args["file1"])
     label2 = args.get("label2", args["file2"])
     try:
-        with open(filepath1, "r") as f:
+        with open(filepath1, "r", encoding="utf-8", errors="replace") as f:
             lines1 = f.readlines()
-        with open(filepath2, "r") as f:
+        with open(filepath2, "r", encoding="utf-8", errors="replace") as f:
             lines2 = f.readlines()
         diff = list(difflib.unified_diff(lines1, lines2, fromfile=label1, tofile=label2))
         output = "".join(diff) if diff else "Files are identical"
@@ -1681,6 +1706,12 @@ def _tool_handle_patch(self, args):
             return {"success": False, "output": "", "error": "Path traversal denied"}
         target = shlex.quote(target_raw)
     else:
+        base_dir = os.path.abspath(os.getcwd())
+        sections = _parse_patch_sections(diff_text)
+        for sec in sections:
+            abspath = os.path.abspath(os.path.join(os.getcwd(), sec["path"]))
+            if os.path.commonpath([base_dir, abspath]) != base_dir:
+                return {"success": False, "output": "", "error": f"Path traversal denied within diff headers: {sec['path']}"}
         target = ""
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".diff", delete=False) as f:
@@ -1712,6 +1743,9 @@ def _tool_handle_edit_file(self, args):
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
+        if os.name == 'nt':
+            content = content.replace('\r\n', '\n')
+            old = old.replace('\r\n', '\n')
         count = content.count(old)
         if count == 0:
             return {"success": False, "output": "", "error": "old_string not found in file"}
@@ -1798,7 +1832,9 @@ def _parse_patch_sections(patch_text):
 
                 # Collect hunks
                 body_start = i
-                while i < n and not lines[i].startswith("--- "):
+                while i < n:
+                    if lines[i].startswith("--- ") and i + 1 < n and lines[i + 1].startswith("+++ "):
+                        break
                     i += 1
                 body = "".join(lines[body_start:i])
                 hunks, _, _ = _parse_unified_hunks(body)
@@ -1840,7 +1876,7 @@ def _parse_unified_hunks(body):
 
         # Extract file path from /dev/null detection
         if line.startswith("--- "):
-            p = line[4:].strip()
+            p = line[4:].split('\t')[0].strip()
             if p != "/dev/null":
                 detected_path = p[2:] if p.startswith(("a/", "b/")) else p
             else:
@@ -1848,7 +1884,7 @@ def _parse_unified_hunks(body):
             i += 1
             continue
         if line.startswith("+++ "):
-            p = line[4:].strip()
+            p = line[4:].split('\t')[0].strip()
             if p != "/dev/null":
                 detected_path = p[2:] if p.startswith(("a/", "b/")) else p
             else:
@@ -2702,10 +2738,11 @@ class ModelQuery:
                                     existing = stream_tool_call_index[idx]
                                     if tc.get("id"):
                                         existing["id"] = tc["id"]
-                                    if tc.get("function", {}).get("name"):
-                                        existing["function"]["name"] = tc["function"]["name"]
-                                    if tc.get("function", {}).get("arguments"):
-                                        existing["function"]["arguments"] += tc["function"]["arguments"]
+                                    fn_delta = tc.get("function") or {}
+                                    if fn_delta.get("name"):
+                                        existing["function"]["name"] = fn_delta["name"]
+                                    if "arguments" in fn_delta and fn_delta["arguments"]:
+                                        existing["function"]["arguments"] += fn_delta["arguments"]
 
                         if is_final and usage:
                             self._debug_final_stats(usage)
@@ -2894,13 +2931,21 @@ def gather_user_input(prompt_prefix, show_multiline=True):
                 while True:
                     try:
                         m_line = input(cont_prompt_str)
+                        if READLINE_AVAILABLE:
+                            try:
+                                readline.remove_history_item(readline.get_current_history_length() - 1)
+                            except Exception:
+                                pass
                         if m_line.strip() == '"""':
                             break
                         lines.append(m_line)
                     except KeyboardInterrupt:
                         print(colorize("\n[Multiline entry cancelled]", 'warning'), file=sys.stderr)
                         return None # Escape out of multiline without quitting
-                return "\n".join(lines)
+                result = "\n".join(lines)
+                if READLINE_AVAILABLE and result:
+                    readline.add_history(result)
+                return result
 
             # 2. Handle \ Line Continuation
             if line.endswith('\\'):
@@ -2908,6 +2953,11 @@ def gather_user_input(prompt_prefix, show_multiline=True):
                 while True:
                     try:
                         m_line = input(cont_prompt_str)
+                        if READLINE_AVAILABLE:
+                            try:
+                                readline.remove_history_item(readline.get_current_history_length() - 1)
+                            except Exception:
+                                pass
                         if m_line.endswith('\\'):
                             lines.append(m_line[:-1])
                         else:
@@ -2916,7 +2966,10 @@ def gather_user_input(prompt_prefix, show_multiline=True):
                     except KeyboardInterrupt:
                         print(colorize("\n[Multiline entry cancelled]", 'warning'), file=sys.stderr)
                         return None
-                return "\n".join(lines)
+                result = "\n".join(lines)
+                if READLINE_AVAILABLE:
+                    readline.add_history(result)
+                return result
 
             # 3. Standard Single Line
             return line
@@ -2949,6 +3002,16 @@ def _process_file_inclusions(text):
                     err_msg = f"[Failed to load `{filepath}`: File too large ({file_size / 1024 / 1024:.1f} MB, max 5 MB)]"
                     print(colorize(err_msg, 'error'), file=sys.stderr)
                     continue
+                if expanded_path.startswith('/etc/') or '/.' in expanded_path:
+                    print(colorize(f"[WARNING] Attempting to load sensitive file: {filepath}", 'warning'), file=sys.stderr)
+                    print(colorize(f"  This could leak private data (keys, tokens, passwords) to the LLM.", 'warning'), file=sys.stderr)
+                    try:
+                        confirm = input(colorize(f"  Confirm file inclusion? [y/N] ", 'warning', is_prompt=True)).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        confirm = 'n'
+                    if confirm != 'y':
+                        print(colorize(f"[Skipped: {filepath}]", 'warning'), file=sys.stderr)
+                        continue
                 print(colorize(f"[--- Loading file: {filepath} ---]", 'muted'), file=sys.stderr)
                 try:
                     with open(expanded_path, 'r', encoding='utf-8') as f:
@@ -2992,10 +3055,16 @@ def _process_file_inclusions(text):
 def _process_command_lines(text):
     """Process lines starting with ! (shell) or /curl (URL fetch)."""
     processed = []
+    in_literal_block = False
     for line in text.split('\n'):
         stripped = line.lstrip()
 
-        if stripped.startswith("!"):
+        if stripped.startswith('"""'):
+            in_literal_block = not in_literal_block
+            processed.append(line)
+            continue
+
+        if not in_literal_block and stripped.startswith("!"):
             command = stripped[1:].strip()
             if command and validate_shell_command_safety(command):
                 output_str = execute_os_command(sanitize_shell_command(command))
@@ -3598,6 +3667,8 @@ class ChatLoop:
                 if m.startswith(self.ctx.model.split(':')[0]):
                     if c > 0:
                         self.ctx.context_window_size = c
+            if self.ctx.context_window_size == 0:
+                self.ctx.context_window_size = -1
 
     def run_display_context_bar(self) -> None:
         """Display context bar and warnings."""
@@ -3618,7 +3689,7 @@ class ChatLoop:
         else:
             prompt_prefix = f"{self.ctx.backend}@{host_clean}/(no model selected)"
         if self.ctx.current_images:
-            prompt_prefix += colorize("[img]", 'info', is_prompt=True)
+            prompt_prefix += "[img]"
         return prompt_prefix
 
     def run_handle_exit(self, full_input: str) -> Optional[bool]:
@@ -3694,7 +3765,7 @@ class ChatLoop:
                 self.ctx.current_images = []
                 print(colorize("[Image cleared]", 'info'), file=sys.stderr)
             else:
-                paths = shlex.split(parts[1].strip())
+                paths = shlex.split(parts[1].strip(), posix=(os.name != 'nt'))
                 new_images = []
                 loaded = 0
                 for p in paths:
@@ -4235,7 +4306,8 @@ class ChatLoop:
                     break
                 json_str = self._extract_json_balanced(text, idx)
                 if not json_str:
-                    break
+                    pos = idx + 1
+                    continue
                 result = self._normalize_tool_json(json_str)
                 if result:
                     key = (result["tool"], json.dumps(result.get("arguments", {}), sort_keys=True))
@@ -4271,25 +4343,22 @@ class ChatLoop:
 
     @staticmethod
     def _is_stuck(text: str, threshold: float = 0.8) -> bool:
-        """Detect if the model is repeating itself (stuck in a loop).
+        """Detect if the model is repeating itself using sliding-window frequency check.
         
-        Checks if the last ~500 chars show strong self-similarity.
-        Returns True if the response appears stuck.
+        Checks if the last ~400 chars contain a phrase that appears 3+ times.
+        Uses multiple window sizes to catch variable-length repetition periods.
         """
         if len(text) < 200:
             return False
-        tail = text[-500:]
-        chunk_size = 50
-        chunks = [tail[i:i + chunk_size] for i in range(0, len(tail) - chunk_size + 1, chunk_size)]
-        if len(chunks) < 4:
-            return False
-        similar = 0
-        for i in range(len(chunks) - 1):
-            common = sum(1 for a, b in zip(chunks[i], chunks[i + 1]) if a == b)
-            ratio = common / max(len(chunks[i]), len(chunks[i + 1]))
-            if ratio > 0.85:
-                similar += 1
-        return similar / (len(chunks) - 1) > threshold
+        tail = text[-400:]
+        half_len = len(tail) // 2
+        for window_size in (30, 50, 80):
+            if window_size > half_len:
+                continue
+            match_tail = tail[-window_size:]
+            if tail.count(match_tail) >= 3:
+                return True
+        return False
 
     @staticmethod
     def _call_with_timeout(func, timeout_sec: int, *args, **kwargs):
@@ -4440,6 +4509,7 @@ class ChatLoop:
             self.messages.append({'role': 'assistant', 'content': final_answer})
             print()
         else:
+            stream_tool_used = False
             if not getattr(self, 'messages', None):
                 self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
             final_messages = list(messages)
@@ -4491,6 +4561,9 @@ class ChatLoop:
                         sys.stderr.flush()
                         t_start = time.time()
                         result = self.tool_registry.execute(tool_name, tool_args)
+                        if not result["success"] and "Cancelled" in (result.get("error") or ""):
+                            print(colorize("[Agentic] Streaming tool sequence cancelled by user, aborting.", 'warning'), file=sys.stderr)
+                            break
                         elapsed = time.time() - t_start
                         status = "OK" if result["success"] else "ERROR"
                         print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
@@ -4501,15 +4574,22 @@ class ChatLoop:
                             observation = observation[:4000] + "\n... [truncated]"
                         print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
                         stream_observations.append(f"[{tool_name}] {observation}")
+                    if stream_observations:
+                        stream_tool_used = True
                     if stream_tool_calls_out:
                         stream_content = response or ""
                         if not stream_content:
                             inline_parts = []
                             for stc in stream_tool_calls_out:
                                 fn = stc.get("function", {})
+                                args_raw = fn.get("arguments", "{}")
+                                try:
+                                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                                except json.JSONDecodeError:
+                                    args = {"raw": args_raw}
                                 inline_parts.append(json.dumps({
                                     "tool": fn.get("name", ""),
-                                    "arguments": fn.get("arguments", "{}")
+                                    "arguments": args
                                 }))
                             stream_content = "\n".join(inline_parts)
                         assistant_msg = {'role': 'assistant', 'content': stream_content}
@@ -4518,16 +4598,65 @@ class ChatLoop:
                     else:
                         self.messages.append({'role': 'assistant', 'content': response})
                     if stream_observations:
-                        self.messages.append({'role': 'user', 'content': "Tool result:\n" + "\n---\n".join(stream_observations)})
+                        if send_tools_api and stream_tool_calls_out:
+                            for idx, tc in enumerate(stream_tool_calls_out):
+                                obs = stream_observations[idx] if idx < len(stream_observations) else "ERROR: Tool execution declined by the user."
+                                clean_obs = obs.split("] ", 1)[1] if "] " in obs else obs
+                                self.messages.append({
+                                    'role': 'tool',
+                                    'tool_call_id': tc.get('id', ''),
+                                    'name': tc.get('function', {}).get('name', ''),
+                                    'content': clean_obs
+                                })
+                        else:
+                            self.messages.append({'role': 'user', 'content': "Tool result:\n" + "\n---\n".join(stream_observations)})
+                    elif send_tools_api and stream_tool_calls_out:
+                        for tc in stream_tool_calls_out:
+                            self.messages.append({
+                                'role': 'tool',
+                                'tool_call_id': tc.get('id', ''),
+                                'name': tc.get('function', {}).get('name', ''),
+                                'content': "ERROR: Tool execution declined by the user."
+                            })
                     print()
                 else:
                     self.messages.append({'role': 'assistant', 'content': response})
                     print()
             else:
                 print(colorize(f"\n{final_answer}", 'success'), file=sys.stdout)
+        if stream_tool_used and getattr(self, '_agentic_streaming_reentry', 0) < 1:
+            self._agentic_streaming_reentry = getattr(self, '_agentic_streaming_reentry', 0) + 1
+            tool_format = get_tool_format(self.ctx.model)
+            include_tool_defs = tool_format != "openai"
+            tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
+            reentry_messages = [{'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs)}]
+            if len(self.messages) > 1:
+                reentry_messages.extend(self.messages[1:])
+            sync_kwargs = dict(get_inference_params(self.ctx.model))
+            if send_tools_api:
+                sync_kwargs["tools"] = openai_tools
+            reentry_response = self.query_handler.query_sync(
+                reentry_messages, self.ctx.model,
+                context_size=self.ctx.context_size,
+                images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
+                **sync_kwargs
+            )
+            if reentry_response and isinstance(reentry_response, dict):
+                reentry_text = ""
+                if self.ctx.backend == "ollama":
+                    reentry_text = reentry_response.get('message', {}).get('content', '')
+                else:
+                    choices = reentry_response.get('choices', [])
+                    if choices:
+                        reentry_text = choices[0].get('message', {}).get('content', '')
+                if reentry_text:
+                    self.messages.append({'role': 'assistant', 'content': reentry_text})
+                    print(colorize(f"\n{reentry_text}", 'success'), file=sys.stdout)
+                    print()
 
     def run_agentic_query(self, full_input: str) -> None:
         """ReAct loop: query model, parse tool calls, execute tools, stream final answer."""
+        self._agentic_streaming_reentry = 0
         logger = None
         try:
             final_content = process_inline_commands(full_input)
@@ -4689,6 +4818,10 @@ class ChatLoop:
                 final_answer = response_text
 
             self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text)
+
+            if len(messages) > 2:
+                for msg in messages[2:]:
+                    self.messages.insert(len(self.messages) - 1, msg)
 
             if logger:
                 logger.write(type="end", total_iterations=iteration)
@@ -4948,22 +5081,22 @@ def fetch_loaded_models_context_ollama(base_url: str) -> list[tuple[str, int]]:
         return []
 
 
-def check_backend_with_head(url, server_marker):
+def check_backend_with_head(url, server_marker, timeout=1):
     """Attempt HEAD request to URL and check for server header."""
     try:
         request = Request(url, method='HEAD')
-        with urlopen(request, timeout=1) as response:  # startup-probe
+        with urlopen(request, timeout=timeout) as response:  # startup-probe
             server_header = response.headers.get('Server', '').lower()
             return server_marker.lower() in server_header
     except Exception:
         return False
 
 
-def check_backend_with_get(url, server_marker):
+def check_backend_with_get(url, server_marker, timeout=1):
     """Attempt GET request to URL and check for server marker."""
     try:
         request = Request(url, method='GET')
-        with urlopen(request, timeout=1) as response:  # startup-probe
+        with urlopen(request, timeout=timeout) as response:  # startup-probe
             my_response = str(response.read())
             my_response = my_response.lower()
             if server_marker.lower() in my_response:
@@ -4973,11 +5106,11 @@ def check_backend_with_get(url, server_marker):
 
 
 
-def check_lmstudio(url):
+def check_lmstudio(url, timeout=2):
     """Check if LM Studio is running by querying /v1/models."""
     try:
         request = Request(f"{url}/v1/models", method='GET')
-        with urlopen(request, timeout=2) as response:  # startup-probe
+        with urlopen(request, timeout=timeout) as response:  # startup-probe
             data = json.loads(response.read().decode('utf-8'))
             models = data.get('data', [])
             return bool(models)
@@ -5034,7 +5167,7 @@ def auto_detect_backend():
         
         url="http://"+ip + ":" + str(DEFAULT_LLAMACPP_PORT)
         sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + url    + " ", 'info'))
-        if check_backend_with_head(url, 'llama.cpp'):
+        if check_backend_with_head(url, 'llama.cpp', timeout=0.2):
             sys.stderr.write(colorize(f"Success\n", 'info'))
             return True,'llamacpp',url
         else:
@@ -5042,7 +5175,7 @@ def auto_detect_backend():
 
         url="http://"+ip + ":" + str(DEFAULT_OLLAMA_PORT)
         sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + url    + " ", 'info'))
-        if check_backend_with_get("http://"+ip + ":" +  str(DEFAULT_OLLAMA_PORT),   'ollama'):
+        if check_backend_with_get("http://"+ip + ":" +  str(DEFAULT_OLLAMA_PORT),   'ollama', timeout=0.2):
             sys.stderr.write(colorize(f"Success\n", 'info'))
             return True,'ollama',url
         else:
@@ -5050,7 +5183,7 @@ def auto_detect_backend():
 
         url="http://"+ip + ":" + str(DEFAULT_LMSTUDIO_PORT)
         sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + url    + " ", 'info'))
-        if check_lmstudio(url):
+        if check_lmstudio(url, timeout=0.2):
             sys.stderr.write(colorize(f"Success\n", 'info'))
             return True,'lmstudio',url
         else:
@@ -5312,6 +5445,11 @@ def _select_model(backend, base_url, args):
         sys.stderr.write(colorize(f"[INFO] Auto-selected hosted model: '{model}'\n", 'success'))
         return model
 
+    if backend in ("llamacpp", "lmstudio"):
+        label = "LM Studio" if backend == "lmstudio" else "Llama.cpp"
+        sys.stderr.write(colorize(f"[INFO] {label} endpoint reachable but no model list exposed; using placeholder 'hosted-model'\n", 'info'))
+        return "hosted-model"
+
     label = "LM Studio" if backend == "lmstudio" else "Llama.cpp"
     print(colorize(f"\n[No models available on {backend} server. Use /listmodel to see available models.]", 'warning'), file=sys.stderr)
     return ""
@@ -5426,11 +5564,15 @@ def main():
             response = qh.query_sync(messages, target_model, context_size=None, show_thinking=True, debug=args.debug, images=images_list)
             output_text = ""
             if isinstance(response, dict):
-                output_text = response.get('message', {}).get('content', '')
-                if not output_text:
-                    choices = response.get('choices', [])
-                    if choices:
-                        output_text = choices[0].get('message', {}).get('content', '')
+                if "error" in response:
+                    err = response["error"]
+                    output_text = f"[API ERROR] {err.get('message', err) if isinstance(err, dict) else err}"
+                else:
+                    output_text = response.get('message', {}).get('content', '')
+                    if not output_text:
+                        choices = response.get('choices', [])
+                        if choices:
+                            output_text = choices[0].get('message', {}).get('content', '')
             else:
                 output_text = str(response)
             with open(os.path.join(args.output_dir, filename + '.output'), 'w', encoding='utf-8') as f:
@@ -5471,11 +5613,15 @@ def main():
             content = ""
             thinking = ""
             if isinstance(response, dict):
-                msg = response.get('message', {}) if backend == "ollama" else (response.get('choices', [{}])[0].get('message', {}) if response.get('choices') else {})
-                content = msg.get('content', '')
-                if not content and isinstance(response, dict):
-                    content = response.get('message', {}).get('content', '')
-                thinking = msg.get('reasoning_content', '') or msg.get('thought', '') or msg.get('thinking', '')
+                if "error" in response:
+                    err = response["error"]
+                    content = f"[API ERROR] {err.get('message', err) if isinstance(err, dict) else err}"
+                else:
+                    msg = response.get('message', {}) if backend == "ollama" else (response.get('choices', [{}])[0].get('message', {}) if response.get('choices') else {})
+                    content = msg.get('content', '')
+                    if not content:
+                        content = response.get('message', {}).get('content', '')
+                    thinking = msg.get('reasoning_content', '') or msg.get('thought', '') or msg.get('thinking', '')
             else:
                 content = str(response)
             if thinking:

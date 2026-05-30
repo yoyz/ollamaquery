@@ -797,7 +797,11 @@ class TestStuckDetection(unittest.TestCase):
 
     def test_is_stuck_normal_text(self):
         """Diverse text should not be detected as stuck."""
-        text = "The quick brown fox jumps over the lazy dog. " * 20
+        text = ("The quick brown fox jumps over the lazy dog. "
+                "Pack my box with five dozen liquor jugs. "
+                "How vexingly quick daft zebras jump! "
+                "The five boxing wizards jump quickly. "
+                "Sphinx of black quartz, judge my vow. " * 5)
         self.assertFalse(self.loop._is_stuck(text))
 
     def test_is_stuck_repetitive(self):
