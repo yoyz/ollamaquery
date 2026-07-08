@@ -277,7 +277,10 @@ class TestBackendDetection(unittest.TestCase):
 
     def test_auto_detect_backend_dns_failure(self):
         """auto_detect_backend must not crash when gethostbyname_ex fails (regression: DNS crash)."""
-        with patch.object(q.socket, 'gethostbyname_ex', side_effect=socket.gaierror("DNS failure")):
+        with patch.object(q, 'check_backend_with_head', return_value=False), \
+             patch.object(q, 'check_backend_with_get', return_value=False), \
+             patch.object(q, 'check_lmstudio', return_value=False), \
+             patch.object(q.socket, 'gethostbyname_ex', side_effect=socket.gaierror("DNS failure")):
             result = q.auto_detect_backend()
             # Should gracefully return None tuple instead of crashing
             self.assertIsInstance(result, tuple)

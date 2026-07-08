@@ -56,7 +56,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 
 # ============================================================================
@@ -525,26 +525,65 @@ def _request_with_retry(req, max_retries=3, delay=1, timeout=120, **kwargs):
 # ============= CONTEXT WINDOW TRACKING ======================================
 # ============================================================================
 
+def _extract_context_size_from_show(data: dict) -> int:
+    """Extract context window size from Ollama /api/show response.
+
+    Prefers the model's own architecture-specific context_length key
+    (e.g. mistral3.context_length), then falls back to any
+    .context_length in model_info, then modelfile/parameters.
+    """
+    model_info = data.get("model_info", {}) or {}
+    arch = model_info.get("general.architecture", "")
+
+    if arch:
+        arch_key = f"{arch}.context_length"
+        val = model_info.get(arch_key)
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+
+    for key, val in model_info.items():
+        if key.endswith(".context_length") and isinstance(val, (int, float)) and val > 0:
+            return int(val)
+
+    for source in ("modelfile", "parameters"):
+        text = data.get(source, "") or ""
+        m = re.search(r'(?:PARAMETER\s+)?num_ctx\s+(\d+)', text, re.IGNORECASE)
+        if m:
+            val = int(m.group(1))
+            if val > 0:
+                return val
+
+    return data.get("context_size", 0)
+
+
+def _get_ollama_ps_context_size(models: list, model_name: str) -> int:
+    """Search /api/ps model list for context_size or context_length."""
+    for model in models:
+        if model.get("name", "").startswith(model_name):
+            for field in ("context_size", "context_length"):
+                val = model.get(field, 0)
+                if isinstance(val, (int, float)) and val > 0:
+                    return int(val)
+    return 0
+
+
 def get_ollama_context_size(base_url: str, model_name: str) -> int:
     """Get the actual context window size from Ollama's running model."""
     try:
         url = f"{base_url}/api/ps"
         with _request_with_retry(Request(url)) as response:
             data = json.loads(response.read().decode('utf-8'))
-            models = data.get("models", [])
-            for model in models:
-                if model.get("name", "").startswith(model_name):
-                    size = model.get("context_size", 0)
-                    if size > 0:
-                        return size
-        
+            size = _get_ollama_ps_context_size(data.get("models", []), model_name)
+            if size > 0:
+                return size
+
         url = f"{base_url}/api/show"
         payload = json.dumps({"name": model_name}).encode('utf-8')
-        req = Request(url, data=payload, 
+        req = Request(url, data=payload,
                      headers={'Content-Type': 'application/json'}, method='POST')
         with _request_with_retry(req) as response:
             data = json.loads(response.read().decode('utf-8'))
-            return data.get("context_size", 0)
+            return _extract_context_size_from_show(data)
     except Exception:
         sys.stderr.write(colorize(f"[WARNING] Failed to get Ollama context size for '{model_name}'\n", 'warning'))
     return 0
@@ -565,6 +604,25 @@ def refresh_context_window_size(ctx):
         ctx.context_window_size = size
         return True
     return False
+
+def refresh_ollama_context_window_size_from_ps(ctx):
+    """Re-check /api/ps to get the real context window size now that the model is loaded.
+
+    Called after a query completes (model is guaranteed to be in /api/ps).
+    Only updates if /api/ps returns a positive value (which is the runtime
+    context_length, more reliable than /api/show's model_info metadata).
+    """
+    try:
+        url = f"{ctx.base_url}/api/ps"
+        req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with _request_with_retry(req) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            size = _get_ollama_ps_context_size(data.get("models", []), ctx.model)
+            if size > 0:
+                ctx.context_window_size = size
+    except Exception:
+        pass
+
 
 def context_bar(current: int, maximum: int, width: int = 20) -> str:
     """Render a simple [====    ] NN% bar."""
@@ -2663,6 +2721,7 @@ class ModelQuery:
                 if self.ctx.debug_manager.is_enabled('context'):
                     debug_log(self.ctx.debug_manager, 'context', 1,
                              f"Updated context tokens: {total_tokens}", prefix="CTX")
+            refresh_ollama_context_window_size_from_ps(self.ctx)
         elif backend in ("llamacpp", "lmstudio"):
             if messages:
                 self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(messages)
@@ -3456,7 +3515,11 @@ class ChatLoop:
                 if val > MAX_CONTEXT_SIZE:
                     print(colorize(f"[ERROR] Context size {val} exceeds maximum {MAX_CONTEXT_SIZE}", 'error'), file=sys.stderr)
                     return
+                if self.ctx.backend in ("llamacpp", "lmstudio"):
+                    print(colorize(f"[contextsizeset is not supported on {self.ctx.backend} backend]", 'warning'), file=sys.stderr)
+                    return
                 self.ctx.context_size = val
+                self.ctx.context_window_size = val
                 print(f"[Context size set to {val}]", file=sys.stderr)
         else:
             print("[Usage: /contextsizeset <integer> (use 0 for default)]", file=sys.stderr)
@@ -3667,8 +3730,6 @@ class ChatLoop:
                 if m.startswith(self.ctx.model.split(':')[0]):
                     if c > 0:
                         self.ctx.context_window_size = c
-            if self.ctx.context_window_size == 0:
-                self.ctx.context_window_size = -1
 
     def run_display_context_bar(self) -> None:
         """Display context bar and warnings."""
@@ -5071,11 +5132,15 @@ def fetch_loaded_models_context_ollama(base_url: str) -> list[tuple[str, int]]:
             Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         ) as response:
             data = json.loads(response.read().decode('utf-8'))
-            return [
-                (m["name"], m.get("context_size", 0))
-                for m in data.get("models", [])
-                if isinstance(m, dict) and "name" in m
-            ]
+            result = []
+            for m in data.get("models", []):
+                if isinstance(m, dict) and "name" in m:
+                    val = m.get("context_size", m.get("context_length", 0))
+                    if isinstance(val, (int, float)):
+                        result.append((m["name"], int(val)))
+                    else:
+                        result.append((m["name"], 0))
+            return result
     except Exception:                     # network error, parsing error, etc.
         sys.stderr.write(colorize("[ERROR] Could not read Ollama model info", "error"))
         return []

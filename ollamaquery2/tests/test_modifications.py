@@ -798,7 +798,7 @@ class TestClearPreservesPreferences(unittest.TestCase):
         m.CommandContext._initialized = False
         self.ctx = m.CommandContext()
         self.ctx.base_url = BACKEND_URL
-        self.ctx.backend = 'ollama'
+        self.ctx.backend = BACKEND_TYPE
         self.ctx.model = SMALL_MODEL
         self.ctx.system_prompt = 'Test prompt'
         self.ctx.force_no_thinking = True
@@ -827,7 +827,7 @@ class TestClearPreservesPreferences(unittest.TestCase):
         self.assertEqual(self.ctx.current_context_tokens, 0)
         self.assertEqual(self.ctx.current_images, [])
         self.assertEqual(self.ctx.query_history, [])
-        self.assertEqual(self.ctx.context_window_size, 0)
+        self.assertGreater(self.ctx.context_window_size, 0)
 
 
 # ============================================================================
@@ -842,7 +842,7 @@ class TestSwitchmodelPreservesMessages(unittest.TestCase):
         m.CommandContext._initialized = False
         self.ctx = m.CommandContext()
         self.ctx.base_url = BACKEND_URL
-        self.ctx.backend = 'ollama'
+        self.ctx.backend = BACKEND_TYPE
         self.ctx.model = SMALL_MODEL
         self.ctx.system_prompt = 'Reply in 1 word.'
 
