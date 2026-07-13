@@ -56,7 +56,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 
 # ============================================================================
@@ -148,6 +148,11 @@ MAX_FILE_INCLUSION_SIZE = 5 * 1024 * 1024  # 5MB max for @file inclusions
 DEFAULT_OLLAMA_HOST    = 'http://127.0.0.1:11434'
 DEFAULT_LLAMACPP_HOST  = 'http://127.0.0.1:8080'
 DEFAULT_LMSTUDIO_HOST  = 'http://127.0.0.1:1234'
+DEFAULT_GEMINI_HOST    = 'https://generativelanguage.googleapis.com/v1beta/openai'
+DEFAULT_OPENCODEZEN_HOST = 'https://opencode.ai/zen'
+DEFAULT_OPENCODEGO_HOST  = 'https://opencode.ai/zen/go'
+DEFAULT_MISTRAL_HOST     = 'https://api.mistral.ai'
+DEFAULT_DEEPSEEK_HOST    = 'https://api.deepseek.com'
 DEFAULT_OLLAMA_PORT    =  11434
 DEFAULT_LLAMACPP_PORT  =  8080
 DEFAULT_LMSTUDIO_PORT  =  1234
@@ -597,6 +602,14 @@ def refresh_context_window_size(ctx):
         size = get_ollama_context_size(ctx.base_url, ctx.model)
     elif ctx.backend == "lmstudio":
         size = 0
+    elif ctx.backend == "gemini":
+        size = 1048576  # Gemini 3.5 Flash: 1M token context
+    elif ctx.backend in ("opencodezen", "opencodego"):
+        size = 131072  # OpenCode models typically have 128K context
+    elif ctx.backend == "mistral":
+        size = 131072  # Mistral models: 32K-128K context
+    elif ctx.backend == "deepseek":
+        size = 131072  # DeepSeek: 128K context (deepseek-v4)
     else:
         size = get_llamacpp_context_size(ctx.base_url)
     
@@ -758,16 +771,21 @@ def fetch_models_ollama(base_url):
         return []
 
 
-def fetch_models_llamacpp(base_url):
-    """Fetch available models from Llama.cpp API."""
+def fetch_models_llamacpp(base_url, api_key=None):
+    """Fetch available models from Llama.cpp API (or Gemini OAI-compatible endpoint)."""
     try:
         url = f"{base_url}/v1/models"
-        with _request_with_retry(Request(url, headers={'User-Agent': 'Mozilla/5.0'})) as response:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+        with _request_with_retry(Request(url, headers=headers)) as response:
             data = json.loads(response.read().decode('utf-8'))
             models = data.get('data', [])
             if not models:
                 models = data.get('models', [])
-            return [{'name': m.get('id', m.get('name', 'unknown'))} for m in models]
+            raw_names = [m.get('id', m.get('name', 'unknown')) for m in models]
+            # Strip leading 'models/' prefix from Gemini API
+            return [{'name': n[7:] if n.startswith('models/') else n} for n in raw_names]
     except Exception:
         return []
 
@@ -838,19 +856,20 @@ def is_available_ollama_model(base_url: str, model_name: str) -> bool:
     except Exception:
         return False
 
-def is_available_llamacpp_model(base_url: str, model_name: str) -> bool:
+def is_available_llamacpp_model(base_url: str, model_name: str, api_key: str = None) -> bool:
     """
-    Check if a model exists on the Llama.cpp server.
+    Check if a model exists on the Llama.cpp (or Gemini) server.
     
     Args:
-        base_url: Llama.cpp server URL
+        base_url: Server URL
         model_name: Model name to check
+        api_key: Optional API key for cloud backends
     
     Returns:
         True if model exists, False otherwise
     """
     try:
-        models = fetch_models_llamacpp(base_url)
+        models = fetch_models_llamacpp(base_url, api_key=api_key)
         model_names = [m.get('name', '') for m in models]
         return model_name in model_names
     except Exception:
@@ -946,6 +965,7 @@ class CommandContext:
         self._base_url: str = ""
         self._backend: str = "ollama"
         self._model: str = "llama3"
+        self.api_key: str = ""
         
         # Session state
         self.system_prompt: str = DEFAULT_SYSTEM_PROMPT
@@ -1023,7 +1043,7 @@ class CommandContext:
 
     def create_completer(self):
         """Create a ChatCompleter using this context's connection info."""
-        return ChatCompleter(self.base_url, self.backend)
+        return ChatCompleter(self.base_url, self.backend, api_key=self.api_key)
     
     def create_query_handler(self):
         """Create a ModelQuery using this context's connection info."""
@@ -1194,6 +1214,11 @@ TOOL_FORMAT_REGISTRY = [
     ("llama", "openai"),
     ("gpt-oss", "openai"),
     ("nemotron", "inline"),
+    ("gemini", "openai"),
+    ("opencodezen", "openai"),
+    ("opencodego", "openai"),
+    ("mistral", "openai"),
+    ("deepseek", "openai"),
 ]
 
 TOOL_FORMAT_DEFAULT = "inline"
@@ -1353,6 +1378,30 @@ MODEL_INFERENCE_PARAMS_REGISTRY = {
         "temperature": 0.7,
         "top_p": 1.0,
         "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+    "gemini": {
+        # Lower temperature for deterministic tool calling; top_k helps
+        # reduce wandering during JSON generation.
+        "temperature": 0.4,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+    "mistral": {
+        # Mistral API does not support top_k or min_p
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+    "deepseek": {
+        # DeepSeek API: same as OpenAI, no top_k needed
+        "temperature": 0.7,
+        "top_p": 0.95,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
     },
@@ -2479,6 +2528,13 @@ class ModelQuery:
     def backend(self):
         return self.ctx.backend
 
+    def _get_headers(self):
+        """Build request headers, injecting API key for cloud backends."""
+        headers = {'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'}
+        if self.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek") and self.ctx.api_key:
+            headers['Authorization'] = f'Bearer {self.ctx.api_key}'
+        return headers
+
     def estimate_tokens(self, text):
         """Estimate token count. Delegates to CommandContext."""
         return self.ctx.estimate_tokens(text)
@@ -2572,12 +2628,12 @@ class ModelQuery:
         if kwargs.get('is_warmup'):
             if self.backend == "ollama":
                 payload["options"] = {"num_predict": 1}
-            elif self.backend in ("llamacpp", "lmstudio"):
+            elif self.backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
                 payload["max_tokens"] = 1
         elif context_size := kwargs.get('context_size'):
             if self.backend == "ollama":
                 payload["options"] = {"num_ctx": context_size}
-            elif self.backend in ("llamacpp", "lmstudio"):
+            elif self.backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
                 payload["max_tokens"] = context_size
         
         if tools := kwargs.get('tools'):
@@ -2592,7 +2648,15 @@ class ModelQuery:
             for param in ["temperature", "top_p", "presence_penalty", "repeat_penalty"]:
                 if param in kwargs:
                     payload[param] = kwargs[param]
-        
+        elif self.backend in ("gemini", "opencodezen", "opencodego"):
+            for param in ["temperature", "top_p", "top_k"]:
+                if param in kwargs:
+                    payload[param] = kwargs[param]
+        elif self.backend in ("mistral", "deepseek"):
+            for param in ["temperature", "top_p"]:
+                if param in kwargs:
+                    payload[param] = kwargs[param]
+
         return payload
 
     def _get_chat_url(self, backend):
@@ -2607,16 +2671,19 @@ class ModelQuery:
             url = self._get_chat_url(self.backend)
 
             data = json.dumps(payload).encode('utf-8')
-            req = Request(url, data=data, headers={'Content-Type': 'application/json'})
+            req = Request(url, data=data, headers=self._get_headers())
             self._debug_request(url, payload)
-
 
             with _request_with_retry(req) as response:
                 return json.loads(response.read().decode('utf-8'))
         except Exception as e:
             msg = f"[ERROR] Sync query failed: {e}"
-            if isinstance(e, HTTPError) and e.code == 403 and ":cloud" in model:
-                msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
+            if isinstance(e, HTTPError) and e.code == 403:
+                if self.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+                    env_hint = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+                    msg += f"\n[HINT] {self.backend} authentication failed. Check your --api-key or {env_hint.get(self.backend, 'API_KEY')} env var."
+                elif ":cloud" in model:
+                    msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
             sys.stderr.write(colorize(msg, 'error'))
             return {}
 
@@ -2657,7 +2724,7 @@ class ModelQuery:
     def _build_stream_request(self, backend, messages, model, stream_enabled, context_size, **kwargs):
         """Build URL, payload and headers for the backend."""
         payload = self.build_request_payload(messages, model, stream_enabled=stream_enabled, context_size=context_size, **kwargs)
-        return self._get_chat_url(backend), payload, {'Content-Type': 'application/json'}
+        return self._get_chat_url(backend), payload, self._get_headers()
 
     def _parse_chunk(self, chunk, backend):
         """Extract (thought, content, is_final, usage, tool_calls) from a chunk for any backend."""
@@ -2677,7 +2744,7 @@ class ModelQuery:
                         "eval_count": chunk.get("eval_count", 0),
                     }
             return thought, content, is_final, usage, tool_calls
-        elif backend == "llamacpp":
+        elif backend in ("llamacpp", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
             choices = chunk.get("choices", [])
             is_final = bool(choices and choices[0].get("finish_reason") is not None)
             delta = choices[0].get("delta", {}) if choices else {}
@@ -2704,7 +2771,7 @@ class ModelQuery:
             decoded = line.decode('utf-8').strip()
             if not decoded:
                 continue
-            if backend in ("llamacpp", "lmstudio"):
+            if backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
                 if decoded.startswith('data: '):
                     decoded = decoded[6:].strip()
             if decoded == '[DONE]':
@@ -2722,8 +2789,13 @@ class ModelQuery:
                     debug_log(self.ctx.debug_manager, 'context', 1,
                              f"Updated context tokens: {total_tokens}", prefix="CTX")
             refresh_ollama_context_window_size_from_ps(self.ctx)
-        elif backend in ("llamacpp", "lmstudio"):
-            if messages:
+        elif backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            # Use API-reported prompt_tokens if available (most accurate),
+            # fall back to estimation for backends that don't report it
+            prompt_tokens = aggregated_usage.get("prompt_tokens", 0) if aggregated_usage else 0
+            if prompt_tokens > 0:
+                self.ctx.current_context_tokens = prompt_tokens
+            elif messages:
                 self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(messages)
 
     def query_stream(
@@ -2865,8 +2937,12 @@ class ModelQuery:
 
         except Exception as e:
             msg = f"\n[ERROR] {backend} streaming failed: {e}"
-            if isinstance(e, HTTPError) and e.code == 403 and ":cloud" in model:
-                msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
+            if isinstance(e, HTTPError) and e.code == 403:
+                if self.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+                    env_hint = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+                    msg += f"\n[HINT] {self.backend} authentication failed. Check your --api-key or {env_hint.get(self.backend, 'API_KEY')} env var."
+                elif ":cloud" in model:
+                    msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
             sys.stderr.write(colorize(f"{msg}\n", 'error'))
             return full_content
 
@@ -2889,16 +2965,19 @@ class ChatCompleter:
                  → get_command_aliases() for command completion
     """
 
-    def __init__(self, base_url, backend):
+    def __init__(self, base_url, backend, api_key=None):
         self.base_url = base_url
         self.backend = backend
-        self.commands = get_command_aliases()  # ✅ Use registry function
+        self.api_key = api_key
+        self.commands = get_command_aliases()
         self.models = []
 
     def fetch_models(self):
         """Fetch available models from the backend."""
         if self.backend == "llamacpp":
             self.models = [m['name'] for m in fetch_models_llamacpp(self.base_url)]
+        elif self.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            self.models = [m['name'] for m in fetch_models_llamacpp(self.base_url, api_key=self.api_key)]
         else:
             self.models = [m['name'] for m in fetch_models_ollama(self.base_url)]
 
@@ -3372,6 +3451,8 @@ class ChatLoop:
         """Fetch available models from the backend."""
         if self.ctx.backend in ("llamacpp", "lmstudio"):
             self.ctx.models = [m['name'] for m in fetch_models_llamacpp(self.ctx.base_url)]
+        elif self.ctx.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            self.ctx.models = [m['name'] for m in fetch_models_llamacpp(self.ctx.base_url, api_key=self.ctx.api_key)]
         else:
             self.ctx.models = [m['name'] for m in fetch_models_ollama(self.ctx.base_url)]
         
@@ -3489,19 +3570,21 @@ class ChatLoop:
         """List available models from the backend, with optional name filter."""
         if self.ctx.backend == "ollama":
             list_models_ollama(self.ctx.base_url, filter_arg, file=sys.stdout)
+        elif self.ctx.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            models = fetch_models_llamacpp(self.ctx.base_url, api_key=self.ctx.api_key)
         else:
             models = fetch_models_llamacpp(self.ctx.base_url)
-            if not models:
-                print(colorize(f"\n[No models found via {self.ctx.backend} API]", 'warning'), file=sys.stderr)
-                return
-            models.sort(key=lambda x: x.get('name', ''))
-            header = f"{'NAME':<50} | {'OWNED BY'}"
-            print(colorize(header, 'muted'))
-            print(colorize("-" * len(header), 'muted'))
-            for m in models:
-                owned_by = m.get('owned_by', 'N/A')
-                print(f"{m['name']:<50} | {owned_by}")
-            print()
+        if not models:
+            print(colorize(f"\n[No models found via {self.ctx.backend} API]", 'warning'), file=sys.stderr)
+            return
+        models.sort(key=lambda x: x.get('name', ''))
+        header = f"{'NAME':<50} | {'OWNED BY'}"
+        print(colorize(header, 'muted'))
+        print(colorize("-" * len(header), 'muted'))
+        for m in models:
+            owned_by = m.get('owned_by', 'N/A')
+            print(f"{m['name']:<50} | {owned_by}")
+        print()
 
     def set_context_size(self, full_input: str) -> None:
         """Parse and apply /contextsizeset command argument."""
@@ -3991,6 +4074,8 @@ class ChatLoop:
                 new_model = parts[1].strip()
                 if self.ctx.backend == "ollama":
                     model_exists = is_available_ollama_model(self.ctx.base_url, new_model)
+                elif self.ctx.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+                    model_exists = is_available_llamacpp_model(self.ctx.base_url, new_model, api_key=self.ctx.api_key)
                 else:
                     model_exists = is_available_llamacpp_model(self.ctx.base_url, new_model)
 
@@ -4016,20 +4101,24 @@ class ChatLoop:
                             print(colorize(f"[Loading   '{new_model}' ({size_str})]", 'muted'), file=sys.stderr)
                         else:
                             print(colorize(f"[Loading   '{new_model}']", 'muted'), file=sys.stderr)
-
-                    if hasattr(self, 'messages') and self.messages:
-                        ping_messages = list(self.messages)
                     else:
-                        ping_messages = [{"role": "system", "content": self.ctx.system_prompt}]
-                    res_ping = self.query_handler.query_sync(ping_messages, new_model, stream_enabled=False, is_warmup=True)
+                        refresh_context_window_size(self.ctx)
 
-                    if self.ctx.backend == "ollama":
-                        ptokens = res_ping.get("prompt_eval_count", 0)
-                    else:
-                        usage_block = res_ping.get("usage", {})
-                        ptokens = usage_block.get("prompt_tokens", 0)
-                    if ptokens > 0:
-                        self.ctx.current_context_tokens = ptokens
+                    if self.ctx.backend not in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+                        # Warmup ping to trigger model loading (not needed for cloud APIs)
+                        if hasattr(self, 'messages') and self.messages:
+                            ping_messages = list(self.messages)
+                        else:
+                            ping_messages = [{"role": "system", "content": self.ctx.system_prompt}]
+                        res_ping = self.query_handler.query_sync(ping_messages, new_model, stream_enabled=False, is_warmup=True)
+
+                        if self.ctx.backend == "ollama":
+                            ptokens = res_ping.get("prompt_eval_count", 0)
+                        else:
+                            usage_block = res_ping.get("usage", {})
+                            ptokens = usage_block.get("prompt_tokens", 0)
+                        if ptokens > 0:
+                            self.ctx.current_context_tokens = ptokens
 
                     print(colorize(f"[Switched to '{new_model}']", 'success'), file=sys.stderr)
                     return False
@@ -4952,7 +5041,7 @@ def get_base_url(args, backend):
     if args.host:
         base_url = args.host
     else:
-        default = DEFAULT_LLAMACPP_HOST if backend in ("llamacpp", "lmstudio") else DEFAULT_OLLAMA_HOST
+        default = {"llamacpp": DEFAULT_LLAMACPP_HOST, "lmstudio": DEFAULT_LMSTUDIO_HOST, "gemini": DEFAULT_GEMINI_HOST, "opencodezen": DEFAULT_OPENCODEZEN_HOST, "opencodego": DEFAULT_OPENCODEGO_HOST, "mistral": DEFAULT_MISTRAL_HOST, "deepseek": DEFAULT_DEEPSEEK_HOST}.get(backend, DEFAULT_OLLAMA_HOST)
         env_var = f'{backend.upper()}_HOST'
         base_url = os.environ.get(env_var, default)
 
@@ -4963,9 +5052,9 @@ def get_base_url(args, backend):
     return base_url
 
 
-def list_models_llamacpp(base_url, filter_arg=None):
-    """List Llama.cpp models."""
-    models = fetch_models_llamacpp(base_url)
+def list_models_llamacpp(base_url, filter_arg=None, api_key=None):
+    """List Llama.cpp / Gemini models."""
+    models = fetch_models_llamacpp(base_url, api_key=api_key)
 
     if not models:
         print(f"\n[No models found via llamacpp API]", file=sys.stderr)
@@ -5153,6 +5242,11 @@ def check_backend_with_head(url, server_marker, timeout=1):
         with urlopen(request, timeout=timeout) as response:  # startup-probe
             server_header = response.headers.get('Server', '').lower()
             return server_marker.lower() in server_header
+    except HTTPError as e:
+        # Even on error responses (e.g. 415 from llama.cpp root),
+        # the Server header is still present and valid for detection
+        server_header = e.headers.get('Server', '').lower()
+        return server_marker.lower() in server_header
     except Exception:
         return False
 
@@ -5181,6 +5275,22 @@ def check_lmstudio(url, timeout=2):
             return bool(models)
     except Exception:
         return False
+
+
+def check_gemini(url, api_key=None, timeout=2):
+    """Check if Gemini API is reachable by querying /v1/models."""
+    if not api_key:
+        return False
+    try:
+        request = Request(f"{url}/v1/models", method='GET',
+                          headers={'Authorization': f'Bearer {api_key}', 'User-Agent': 'Mozilla/5.0'})
+        with urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            models = data.get('data', [])
+            return bool(models)
+    except Exception:
+        return False
+
 
 def auto_detect_backend():
     """Auto-detect backend based on default ports using HEAD request.
@@ -5315,7 +5425,22 @@ def resolve_connection(args):
                     selected_backend = "lmstudio"
             if not selected_backend:
                 selected_backend = "ollama"
+        elif selected_backend == "gemini" and not base_url.startswith(('http://', 'https://')):
+            # Treat bare host as gemini API URL, ensure https
+            base_url = f"https://{base_url}" if not base_url.startswith('http') else base_url
         return selected_backend, base_url
+
+    # Cloud services with fixed URLs — skip local probes
+    cloud_hosts = {
+        "gemini": ("GEMINI_HOST", DEFAULT_GEMINI_HOST),
+        "opencodezen": ("OPENCODEZEN_HOST", DEFAULT_OPENCODEZEN_HOST),
+        "opencodego": ("OPENCODEGO_HOST", DEFAULT_OPENCODEGO_HOST),
+        "mistral": ("MISTRAL_HOST", DEFAULT_MISTRAL_HOST),
+        "deepseek": ("DEEPSEEK_HOST", DEFAULT_DEEPSEEK_HOST),
+    }
+    if args.backend in cloud_hosts:
+        env_var, default = cloud_hosts[args.backend]
+        return args.backend, os.environ.get(env_var, default)
 
     saved_backends = load_saved_backends()
     
@@ -5337,6 +5462,11 @@ def resolve_connection(args):
             is_valid = check_backend_with_get(s_host, 'ollama')
         elif s_backend == 'lmstudio':
             is_valid = check_lmstudio(s_host)
+        elif s_backend == 'gemini':
+            is_valid = check_gemini(s_host, args.api_key or os.environ.get('GEMINI_API_KEY', ''))
+        elif s_backend in ('opencodezen', 'opencodego', 'mistral', 'deepseek'):
+            env_keys = {'opencodezen': 'OPENCODEZEN_API_KEY', 'opencodego': 'OPENCODEGO_API_KEY', 'mistral': 'MISTRAL_API_KEY', 'deepseek': 'DEEPSEEK_API_KEY'}
+            is_valid = check_gemini(s_host, args.api_key or os.environ.get(env_keys.get(s_backend, ''), ''))
 
         if is_valid:
             sys.stderr.write(colorize("Success\n", 'success'))
@@ -5357,7 +5487,10 @@ def resolve_connection(args):
     # 4. Ultimate Fallback
     sys.stderr.write(colorize(f"[WARNING] Auto-discovery failed. Falling back to defaults.\n", 'error'))
     fallback_backend = args.backend or "ollama"
-    if fallback_backend == "llamacpp":
+    if fallback_backend in cloud_hosts:
+        env_var, default = cloud_hosts[fallback_backend]
+        fallback_host = os.environ.get(env_var, default)
+    elif fallback_backend == "llamacpp":
         fallback_host = os.environ.get('LLAMACPP_HOST', DEFAULT_LLAMACPP_HOST)
     elif fallback_backend == "lmstudio":
         fallback_host = os.environ.get('LMSTUDIO_HOST', DEFAULT_LMSTUDIO_HOST)
@@ -5378,8 +5511,9 @@ def _build_parser():
     )
 
     parser.add_argument_group('Backend')
-    parser.add_argument("-b", "--backend", choices=["ollama", "llamacpp", "lmstudio"], default=None, help="API backend to use (auto-detected if omitted).")
+    parser.add_argument("-b", "--backend", choices=["ollama", "llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"], default=None, help="API backend to use (auto-detected if omitted).")
     parser.add_argument('-H', '--host', help='Custom API URL')
+    parser.add_argument('-k', '--api-key', help='API key for cloud backends (Gemini, etc.)')
     parser.add_argument('--version', action='store_true', help='Show version and exit')
 
     list_group = parser.add_mutually_exclusive_group()
@@ -5423,6 +5557,15 @@ def _verify_server(backend, base_url, args):
     Returns (backend, base_url) — may fall back to a different backend/port
     if the initial guess was wrong. Exits with code 1 if unreachable.
     """
+    CLOUD_BACKENDS = {"gemini", "opencodezen", "opencodego", "mistral", "deepseek"}
+    CLOUD_ENV_VARS = {
+        "gemini": "GEMINI_API_KEY",
+        "opencodezen": "OPENCODEZEN_API_KEY",
+        "opencodego": "OPENCODEGO_API_KEY",
+        "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+    }
+
     server_reachable = False
     if backend == "ollama":
         server_reachable = check_backend_with_get(base_url, 'ollama')
@@ -5430,8 +5573,14 @@ def _verify_server(backend, base_url, args):
         server_reachable = check_backend_with_head(base_url, 'llama.cpp')
     elif backend == "lmstudio":
         server_reachable = check_lmstudio(base_url)
+    elif backend in CLOUD_BACKENDS:
+        api_key = args.api_key or os.environ.get(CLOUD_ENV_VARS.get(backend, ''), '')
+        if not api_key:
+            sys.stderr.write(colorize(f"[ERROR] {backend} requires an API key. Set --api-key, {CLOUD_ENV_VARS.get(backend, '')} env var, or save to config.\n", 'error'))
+            sys.exit(1)
+        server_reachable = check_gemini(base_url, api_key)
 
-    if not server_reachable and not re.search(r':\d{2,5}(/|$)', base_url):
+    if not server_reachable and not re.search(r':\d{2,5}(/|$)', base_url) and backend not in CLOUD_BACKENDS:
         port_map = {"ollama": DEFAULT_OLLAMA_PORT, "llamacpp": DEFAULT_LLAMACPP_PORT, "lmstudio": DEFAULT_LMSTUDIO_PORT}
 
         if args.backend:
@@ -5470,7 +5619,9 @@ def _verify_server(backend, base_url, args):
     if not server_reachable:
         hint = ""
         has_port = re.search(r':\d{2,5}(/|$)', base_url)
-        if backend == "llamacpp" and not has_port:
+        if backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            hint = " (check your API key and internet connection)"
+        elif backend == "llamacpp" and not has_port:
             hint = f" (try {base_url}:{DEFAULT_LLAMACPP_PORT})"
         elif backend == "lmstudio" and not has_port:
             hint = f" (try {base_url}:{DEFAULT_LMSTUDIO_PORT})"
@@ -5503,19 +5654,35 @@ def _select_model(backend, base_url, args):
         sys.stderr.write(colorize("[WARNING] No models available on Ollama server.\n", 'warning'))
         return ""
 
-    available = fetch_models_llamacpp(base_url)
+    CLOUD_ENV_VARS = {
+        "gemini": "GEMINI_API_KEY",
+        "opencodezen": "OPENCODEZEN_API_KEY",
+        "opencodego": "OPENCODEGO_API_KEY",
+        "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+    }
+    CLOUD_BACKENDS = {"gemini", "opencodezen", "opencodego", "mistral", "deepseek"}
+    LABELS = {"lmstudio": "LM Studio", "gemini": "Gemini", "opencodezen": "OpenCode Zen", "opencodego": "OpenCode Go", "mistral": "Mistral", "deepseek": "DeepSeek"}
+
+    api_key = args.api_key or os.environ.get(CLOUD_ENV_VARS.get(backend, ''), '')
+    available = fetch_models_llamacpp(base_url, api_key=api_key if backend in CLOUD_BACKENDS else None)
     if available:
         model = available[0]['name']
-        label = "LM Studio" if backend == "lmstudio" else "Llama.cpp"
+        label = LABELS.get(backend, "Llama.cpp")
         sys.stderr.write(colorize(f"[INFO] Auto-selected hosted model: '{model}'\n", 'success'))
         return model
 
     if backend in ("llamacpp", "lmstudio"):
-        label = "LM Studio" if backend == "lmstudio" else "Llama.cpp"
+        label = LABELS.get(backend, "Llama.cpp")
         sys.stderr.write(colorize(f"[INFO] {label} endpoint reachable but no model list exposed; using placeholder 'hosted-model'\n", 'info'))
         return "hosted-model"
 
-    label = "LM Studio" if backend == "lmstudio" else "Llama.cpp"
+    if backend in CLOUD_BACKENDS:
+        label = LABELS.get(backend, backend)
+        sys.stderr.write(colorize(f"[INFO] {label} endpoint reachable but no models listed; using placeholder '{backend}-model'\n", 'info'))
+        return f"{backend}-model"
+
+    label = LABELS.get(backend, "Llama.cpp")
     print(colorize(f"\n[No models available on {backend} server. Use /listmodel to see available models.]", 'warning'), file=sys.stderr)
     return ""
 
@@ -5569,7 +5736,10 @@ def main():
 
     # Listing operations
     if args.list or args.list_all:
-        if backend in ("llamacpp", "lmstudio"):
+        if backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            env_keys = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+            list_models_llamacpp(base_url, filter_arg=args.model, api_key=args.api_key or os.environ.get(env_keys.get(backend, ''), ''))
+        elif backend in ("llamacpp", "lmstudio"):
             list_models_llamacpp(base_url, filter_arg=args.model)
         elif args.list_all:
             list_models_ollama(base_url, filter_arg=args.model, include_capabilities=True)
@@ -5591,6 +5761,8 @@ def main():
         ctx.model = target_model
         ctx.system_prompt = args.prompt
         ctx.shell_timeout = args.shell_timeout
+        env_keys = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+        ctx.api_key = args.api_key or os.environ.get(env_keys.get(backend, ''), '')
 
         images_list = None
         if args.image:
@@ -5626,6 +5798,8 @@ def main():
             qh.ctx.base_url = base_url
             qh.ctx.backend = backend
             qh.ctx.shell_timeout = args.shell_timeout
+            env_keys = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+            qh.ctx.api_key = args.api_key or os.environ.get(env_keys.get(backend, ''), '')
             response = qh.query_sync(messages, target_model, context_size=None, show_thinking=True, debug=args.debug, images=images_list)
             output_text = ""
             if isinstance(response, dict):
@@ -5657,6 +5831,8 @@ def main():
         qh.ctx.base_url = base_url
         qh.ctx.backend = backend
         qh.ctx.shell_timeout = args.shell_timeout
+        env_keys = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+        qh.ctx.api_key = args.api_key or os.environ.get(env_keys.get(backend, ''), '')
         should_stream = not args.no_stream and sys.stdout.isatty()
 
         response = qh.query_sync(messages, target_model, context_size=None, show_thinking=True, debug=args.debug, images=images_list)
