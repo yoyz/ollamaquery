@@ -355,6 +355,48 @@ COMMANDS = {
         'usage': '/spawnshell',
         'handler': None
     },
+    'compact': {
+        'aliases': ['/compact'],
+        'category': 'Core',
+        'description': 'Compact conversation history to save context space',
+        'usage': '/compact',
+        'handler': None
+    },
+    'drop': {
+        'aliases': ['/drop'],
+        'category': 'Core',
+        'description': 'Drop specific message(s) by index (use /tokencount to see indices)',
+        'usage': '/drop <index> [index2 ...]',
+        'handler': None
+    },
+    'tokencount': {
+        'aliases': ['/tokencount'],
+        'category': 'Core',
+        'description': 'Show token breakdown of current conversation',
+        'usage': '/tokencount',
+        'handler': None
+    },
+    'sessions': {
+        'aliases': ['/sessions'],
+        'category': 'Core',
+        'description': 'List saved sessions',
+        'usage': '/sessions [count]',
+        'handler': None
+    },
+    'resume': {
+        'aliases': ['/resume'],
+        'category': 'Core',
+        'description': 'Resume a previous session',
+        'usage': '/resume <session_id>',
+        'handler': None
+    },
+    'save': {
+        'aliases': ['/save'],
+        'category': 'Core',
+        'description': 'Save current session to disk',
+        'usage': '/save',
+        'handler': None
+    },
 }
 
 # Category order for help display
@@ -804,6 +846,7 @@ def get_llamacpp_context_size(base_url: str) -> int:
 
 def get_message_token_count_llamacpp(base_url: str, text: str) -> int:
     """Get exact token count using the /tokenize endpoint (no GPU overhead)."""
+    global _TOKEN_COUNT_WARNED
     try:
         url = f"{base_url}/tokenize"
         payload = json.dumps({"content": text}).encode('utf-8')
@@ -812,7 +855,6 @@ def get_message_token_count_llamacpp(base_url: str, text: str) -> int:
             data = json.loads(response.read().decode('utf-8'))
             return len(data.get('tokens', []))
     except Exception as e:
-        global _TOKEN_COUNT_WARNED
         if not _TOKEN_COUNT_WARNED:
             sys.stderr.write(colorize(f"[WARNING] Token counting failed (llama.cpp): {e}\n", 'warning'))
             _TOKEN_COUNT_WARNED = True
@@ -821,6 +863,7 @@ def get_message_token_count_llamacpp(base_url: str, text: str) -> int:
 
 def get_message_token_count_ollama(base_url: str, text: str, model: str) -> int:
     """Get exact token count using the /api/tokenize endpoint (no GPU overhead)."""
+    global _TOKEN_COUNT_WARNED
     if not model:
         return estimate_token_count(text)
     try:
@@ -831,7 +874,6 @@ def get_message_token_count_ollama(base_url: str, text: str, model: str) -> int:
             data = json.loads(response.read().decode('utf-8'))
             return len(data.get('tokens', []))
     except Exception as e:
-        global _TOKEN_COUNT_WARNED
         if not _TOKEN_COUNT_WARNED:
             sys.stderr.write(colorize(f"[WARNING] Token counting failed (ollama): {e}\n", 'warning'))
             _TOKEN_COUNT_WARNED = True
@@ -1094,32 +1136,268 @@ class CommandContext:
         """Estimate token count from text. Delegates to standalone estimator."""
         return estimate_token_count(text)
 
+    def tokenize(self, text: str) -> int:
+        """Get exact token count via the backend's tokenize endpoint.
+
+        Falls back to heuristic estimation if the endpoint is unavailable.
+        Result should be cached by the caller (e.g., in msg['_tokens']).
+        """
+        if not text:
+            return 0
+        if self.backend == "llamacpp":
+            return get_message_token_count_llamacpp(self.base_url, text)
+        elif self.backend == "ollama":
+            return get_message_token_count_ollama(self.base_url, text, self.model)
+        return self.estimate_tokens(text)
+
+    def stamp_tokens(self, msg: dict) -> dict:
+        """Compute and cache the token count for a message dict.
+
+        Stores the count in msg['_tokens'] so it only needs to be computed once.
+        Returns the same dict (mutated in place) for convenience.
+        """
+        if '_tokens' in msg:
+            return msg
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            extracted = ""
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        extracted += part.get("text", "")
+            content = extracted
+        tokens = self.tokenize(content)
+        if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function", {})
+                tc_text = f"{tc.get('id', '')} {fn.get('name', '')} {fn.get('arguments', '')}"
+                tokens += self.tokenize(tc_text)
+        if isinstance(msg.get("images"), list):
+            tokens += len(msg["images"]) * 1024
+        tokens += 2  # role overhead
+        msg['_tokens'] = tokens
+        return msg
+
     def calculate_context_tokens(self, messages: list) -> int:
-        """Calculate estimated total tokens in conversation context."""
+        """Calculate total tokens in conversation context.
+
+        Uses cached _tokens when available (exact), falls back to estimation.
+        """
         total = 0
         for msg in messages:
-            content = msg.get("content", "")
-            image_count = 0
-            if isinstance(content, list):
-                extracted = ""
-                for part in content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            extracted += part.get("text", "")
-                        elif part.get("type") == "image_url":
-                            image_count += 1
-                content = extracted
-            if isinstance(msg.get("images"), list):
-                image_count += len(msg["images"])
-            total += self.estimate_tokens(content)
-            if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
-                for tc in msg["tool_calls"]:
-                    fn = tc.get("function", {})
-                    tc_text = f"{tc.get('id', '')} {fn.get('name', '')} {fn.get('arguments', '')}"
-                    total += self.estimate_tokens(tc_text)
-            total += image_count * 1024
-            total += 2
+            if '_tokens' in msg:
+                total += msg['_tokens']
+            else:
+                content = msg.get("content", "")
+                image_count = 0
+                if isinstance(content, list):
+                    extracted = ""
+                    for part in content:
+                        if isinstance(part, dict):
+                            if part.get("type") == "text":
+                                extracted += part.get("text", "")
+                            elif part.get("type") == "image_url":
+                                image_count += 1
+                    content = extracted
+                if isinstance(msg.get("images"), list):
+                    image_count += len(msg["images"])
+                total += self.estimate_tokens(content)
+                if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
+                    for tc in msg["tool_calls"]:
+                        fn = tc.get("function", {})
+                        tc_text = f"{tc.get('id', '')} {fn.get('name', '')} {fn.get('arguments', '')}"
+                        total += self.estimate_tokens(tc_text)
+                total += image_count * 1024
+                total += 2
         return total
+
+
+# ============================================================================
+# ============= CONTEXT COMPACTION  ===========================================
+# ============================================================================
+
+COMPACTION_THRESHOLD = 0.75  # Trigger auto-compaction at 75% of context window
+COMPACTION_TARGET = 0.50     # Compact down to 50% of context window
+COMPACTION_KEEP_RECENT = 6   # Always keep last 6 messages (3 user/assistant turns)
+
+
+def compact_messages(messages: list, ctx, target_tokens: int = 0,
+                     keep_recent: int = COMPACTION_KEEP_RECENT) -> list:
+    """Compact conversation history to fit within token budget.
+
+    Strategy:
+    1. Always keep messages[0] (system prompt)
+    2. Always keep the last `keep_recent` messages
+    3. Replace everything in between with a condensed summary message
+    4. Tool result messages are summarized most aggressively (name + status only)
+
+    Args:
+        messages: Full message list (not mutated — returns a new list)
+        ctx: CommandContext for token estimation
+        target_tokens: Target token count after compaction (0 = use COMPACTION_TARGET)
+        keep_recent: Number of recent messages to always preserve
+
+    Returns:
+        A new compacted message list
+    """
+    if len(messages) <= keep_recent + 1:
+        return list(messages)
+
+    if target_tokens <= 0 and ctx.context_window_size > 0:
+        target_tokens = int(ctx.context_window_size * COMPACTION_TARGET)
+
+    current_tokens = ctx.calculate_context_tokens(messages)
+    if target_tokens > 0 and current_tokens <= target_tokens:
+        return list(messages)
+
+    system_msg = messages[0]
+    recent = messages[-keep_recent:]
+    middle = messages[1:-keep_recent]
+
+    if not middle:
+        return list(messages)
+
+    summary_parts = []
+    for msg in middle:
+        role = msg.get('role', 'unknown')
+        content = msg.get('content', '')
+        if role == 'tool':
+            name = msg.get('name', 'unknown')
+            success = 'OK' if 'ERROR' not in content[:100] else 'FAILED'
+            summary_parts.append(f"[Tool {name}: {success}]")
+        elif role == 'assistant':
+            preview = content[:200].replace('\n', ' ')
+            if len(content) > 200:
+                preview += '...'
+            summary_parts.append(f"Assistant: {preview}")
+        elif role == 'user':
+            if content.startswith("Tool result:") or content.startswith("<tool_result"):
+                tool_lines = content.split('\n')[:2]
+                summary_parts.append(f"[Tool observation: {tool_lines[0][:80]}]")
+            else:
+                preview = content[:150].replace('\n', ' ')
+                if len(content) > 150:
+                    preview += '...'
+                summary_parts.append(f"User: {preview}")
+
+    summary_text = (
+        "[CONVERSATION HISTORY COMPACTED]\n"
+        "The following is a condensed summary of earlier conversation turns:\n"
+        + "\n".join(summary_parts)
+    )
+
+    summary_tokens = ctx.estimate_tokens(summary_text)
+    system_tokens = ctx.estimate_tokens(system_msg.get('content', ''))
+    recent_tokens = sum(ctx.estimate_tokens(m.get('content', '')) for m in recent)
+    available = target_tokens - system_tokens - recent_tokens - 100
+
+    if available > 0 and summary_tokens > available:
+        ratio = available / summary_tokens
+        max_chars = int(len(summary_text) * ratio)
+        summary_text = summary_text[:max_chars] + "\n[... older history truncated ...]"
+
+    compacted_msg = {'role': 'user', 'content': summary_text}
+    return [system_msg, compacted_msg] + recent
+
+
+# ============================================================================
+# ============= SESSION PERSISTENCE  ==========================================
+# ============================================================================
+
+SESSION_DIR = os.path.expanduser("~/.ollamaquery.d/sessions")
+SESSION_INDEX = os.path.join(SESSION_DIR, "index.json")
+MAX_SESSIONS = 50
+
+
+class SessionManager:
+    """Manages session persistence: save, list, resume."""
+
+    def __init__(self):
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        self._index = self._load_index()
+
+    def _load_index(self) -> list:
+        if os.path.exists(SESSION_INDEX):
+            try:
+                with open(SESSION_INDEX, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return []
+
+    def _save_index(self):
+        with open(SESSION_INDEX, 'w') as f:
+            json.dump(self._index, f, indent=2)
+
+    def save_session(self, messages: list, ctx) -> str:
+        """Save current session to disk. Returns session ID."""
+        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join(SESSION_DIR, f"{session_id}.json")
+
+        summary = ""
+        for msg in messages:
+            if msg.get('role') == 'user':
+                content = msg.get('content', '')
+                if not content.startswith("[CONVERSATION HISTORY COMPACTED]"):
+                    summary = content[:100].replace('\n', ' ')
+                    break
+
+        session_data = {
+            "id": session_id,
+            "created": datetime.now().isoformat(),
+            "updated": datetime.now().isoformat(),
+            "model": ctx.model,
+            "backend": ctx.backend,
+            "base_url": ctx.base_url,
+            "message_count": len(messages),
+            "total_tokens": ctx.current_context_tokens,
+            "summary": summary,
+            "messages": messages
+        }
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(session_data, f, ensure_ascii=False)
+
+        self._index = [e for e in self._index if e['id'] != session_id]
+        self._index.insert(0, {
+            "id": session_id,
+            "created": session_data["created"],
+            "model": ctx.model,
+            "message_count": len(messages),
+            "summary": summary
+        })
+
+        if len(self._index) > MAX_SESSIONS:
+            for old in self._index[MAX_SESSIONS:]:
+                old_path = os.path.join(SESSION_DIR, f"{old['id']}.json")
+                if os.path.exists(old_path):
+                    try:
+                        os.unlink(old_path)
+                    except OSError:
+                        pass
+            self._index = self._index[:MAX_SESSIONS]
+
+        self._save_index()
+        return session_id
+
+    def list_sessions(self, limit: int = 10) -> list:
+        """Return recent session metadata."""
+        return self._index[:limit]
+
+    def load_session(self, session_id: str) -> Optional[dict]:
+        """Load a session by ID (exact or prefix match)."""
+        matches = [e for e in self._index if e['id'].startswith(session_id)]
+        if not matches:
+            return None
+        target = matches[0]
+        filepath = os.path.join(SESSION_DIR, f"{target['id']}.json")
+        if not os.path.exists(filepath):
+            return None
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return None
 
 
 # ============================================================================
@@ -2169,13 +2447,17 @@ class ToolRegistry:
 
     def get_system_prompt_block(self) -> str:
         """Build tool definitions section for embedding in the agentic system prompt."""
-        lines = ["## Available tools"]
+        lines = ["## Available tools\n"]
         for name, defn in AGENTIC_TOOL_DEFS.items():
-            params = defn["parameters"]["properties"]
-            args_str = ", ".join(f"{n}: {d['description']}" for n, d in params.items())
-            reqs = defn["parameters"].get("required", [])
-            required_str = f" (required: {', '.join(reqs)})" if reqs else ""
-            lines.append(f"- {name}: {defn['description']} Arguments: {args_str}{required_str}")
+            lines.append(f"### {name}")
+            lines.append(f"{defn['description']}\n")
+            lines.append("Parameters:")
+            props = defn["parameters"]["properties"]
+            required = set(defn["parameters"].get("required", []))
+            for pname, pdef in props.items():
+                req_mark = " (REQUIRED)" if pname in required else ""
+                lines.append(f"  - {pname} ({pdef['type']}): {pdef['description']}{req_mark}")
+            lines.append(f"\nCall format: {{\"tool\": \"{name}\", \"arguments\": {{...}}}}\n")
         return "\n".join(lines)
 
     def list_tools_str(self) -> str:
@@ -2685,7 +2967,7 @@ class ModelQuery:
                 elif ":cloud" in model:
                     msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
             sys.stderr.write(colorize(msg, 'error'))
-            return {}
+            return {"error": {"message": str(e), "type": type(e).__name__}}
 
 
 
@@ -2790,12 +3072,10 @@ class ModelQuery:
                              f"Updated context tokens: {total_tokens}", prefix="CTX")
             refresh_ollama_context_window_size_from_ps(self.ctx)
         elif backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-            # Use API-reported prompt_tokens if available (most accurate),
-            # fall back to estimation for backends that don't report it
-            prompt_tokens = aggregated_usage.get("prompt_tokens", 0) if aggregated_usage else 0
-            if prompt_tokens > 0:
-                self.ctx.current_context_tokens = prompt_tokens
-            elif messages:
+            # llama.cpp with KV cache reports only newly-evaluated tokens as
+            # prompt_tokens, NOT the full context size. Always recalculate from
+            # the actual messages array for an accurate context bar.
+            if messages:
                 self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(messages)
 
     def query_stream(
@@ -3549,6 +3829,30 @@ class ChatLoop:
                 if result is False:
                     continue
 
+                result = self.run_handle_compact(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_drop(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_tokencount(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_sessions(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_resume(full_input)
+                if result is False:
+                    continue
+
+                result = self.run_handle_save(full_input)
+                if result is False:
+                    continue
+
                 self.run_process_query(full_input)
 
             except KeyboardInterrupt:
@@ -3839,6 +4143,14 @@ class ChatLoop:
     def run_handle_exit(self, full_input: str) -> Optional[bool]:
         """Handle exit/quit commands. Returns True to break loop."""
         if full_input.lower() in ['exit', 'quit', '/exit', '/quit']:
+            # Auto-save session on exit if there's meaningful conversation
+            if hasattr(self, 'messages') and len(self.messages) > 2:
+                try:
+                    sm = SessionManager()
+                    session_id = sm.save_session(self.messages, self.ctx)
+                    print(colorize(f"[Auto-save] Session saved as {session_id}", 'muted'), file=sys.stderr)
+                except Exception:
+                    pass
             print(colorize("\n[Goodbye!]", 'info'), file=sys.stderr)
             return True
         return None
@@ -4613,8 +4925,19 @@ class ChatLoop:
                 observation = f"{context}\nERROR: {error_msg}" if context else f"ERROR: {error_msg}"
             if not observation:
                 observation = "[Tool returned no output]"
-            if len(observation) > 4000:
-                observation = observation[:4000] + "\n... [truncated]"
+
+            # Progressive observation truncation based on context usage
+            max_obs_chars = 4000
+            usage_ratio = 0.0
+            if self.ctx.context_window_size > 0:
+                msg_tokens = self.ctx.calculate_context_tokens(messages)
+                usage_ratio = msg_tokens / self.ctx.context_window_size
+                if usage_ratio > 0.7:
+                    max_obs_chars = 2000
+                elif usage_ratio > 0.5:
+                    max_obs_chars = 3000
+            if len(observation) > max_obs_chars:
+                observation = observation[:max_obs_chars] + f"\n... [truncated to {max_obs_chars} chars]"
 
             timed_observation = json.dumps({"tool": tool_name, "duration_s": round(elapsed, 1), "success": result["success"], "output": observation})
             if self.ctx.agentic_trace:
@@ -4814,8 +5137,12 @@ class ChatLoop:
                 return
 
             if not getattr(self, 'messages', None):
-                self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
-            self.messages.append({'role': 'user', 'content': final_content})
+                sys_msg = {'role': 'system', 'content': self.ctx.system_prompt}
+                self.ctx.stamp_tokens(sys_msg)
+                self.messages = [sys_msg]
+            user_msg = {'role': 'user', 'content': final_content}
+            self.ctx.stamp_tokens(user_msg)
+            self.messages.append(user_msg)
 
             inited = self._init_agentic_query(final_content)
             if inited is None:
@@ -4836,6 +5163,22 @@ class ChatLoop:
                 print(colorize(f"\r[Agentic] Step {iteration}/{max_iterations}…", 'muted'), file=sys.stderr, end="")
                 sys.stderr.flush()
 
+                # Auto-compact agentic messages if approaching context limit
+                if self.ctx.context_window_size > 0:
+                    msg_tokens = self.ctx.calculate_context_tokens(messages)
+                    if msg_tokens > int(self.ctx.context_window_size * 0.85):
+                        before_len = len(messages)
+                        messages = compact_messages(messages, self.ctx,
+                                                   keep_recent=max(8, COMPACTION_KEEP_RECENT))
+                        print(colorize(f"\n[Auto-compact] Agentic context: {before_len} → {len(messages)} msgs",
+                                       'warning'), file=sys.stderr)
+
+                # Verbose: show payload token count
+                if self.ctx.agentic_verbose and self.ctx.context_window_size > 0:
+                    payload_tokens = self.ctx.calculate_context_tokens(messages)
+                    pct = payload_tokens / self.ctx.context_window_size
+                    print(colorize(f" [{payload_tokens} tokens, {pct:.0%} of ctx]", 'muted'), file=sys.stderr, end="")
+
                 images_to_send = [] if self.ctx.supports_vision is False else self.ctx.current_images
                 sync_kwargs = dict(get_inference_params(self.ctx.model))
                 if send_tools_api:
@@ -4850,6 +5193,24 @@ class ChatLoop:
 
                 if response is None:
                     print(colorize(f"\n[Agentic] Step timed out after {step_timeout}s.", 'error'), file=sys.stderr)
+                    break
+
+                # Track tokens from sync response to keep context bar accurate
+                if isinstance(response, dict):
+                    if self.ctx.backend == "ollama":
+                        _pt = response.get("prompt_eval_count", 0)
+                        _et = response.get("eval_count", 0)
+                        if _pt > 0:
+                            self.ctx.current_context_tokens = _pt + _et
+                    else:
+                        # llama.cpp KV cache makes prompt_tokens unreliable;
+                        # recalculate from actual messages for accuracy
+                        self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(messages)
+
+                # Check for API-level errors from query_sync
+                if isinstance(response, dict) and "error" in response and not response.get("choices") and not response.get("message", {}).get("content"):
+                    err_msg = response["error"].get("message", "Unknown error") if isinstance(response["error"], dict) else str(response["error"])
+                    print(colorize(f"\n[Agentic] API error: {err_msg}", 'error'), file=sys.stderr)
                     break
 
                 if images_to_send and self.ctx.supports_vision is not False:
@@ -4973,6 +5334,9 @@ class ChatLoop:
                 for msg in messages[2:]:
                     self.messages.insert(len(self.messages) - 1, msg)
 
+            # Recalculate context tokens after merging agentic history
+            self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
+
             if logger:
                 logger.write(type="end", total_iterations=iteration)
         except Exception as e:
@@ -4991,6 +5355,194 @@ class ChatLoop:
             return False
         return None
 
+    def run_handle_compact(self, full_input: str) -> Optional[bool]:
+        """Handle /compact command to manually compact conversation history."""
+        if full_input.startswith('/compact'):
+            if not hasattr(self, 'messages') or len(self.messages) <= 2:
+                print(colorize("[Compact] Nothing to compact.", 'warning'), file=sys.stderr)
+                return False
+            before_len = len(self.messages)
+            before_tokens = self.ctx.calculate_context_tokens(self.messages)
+
+            # Phase 1: standard sliding-window compaction
+            self.messages = compact_messages(self.messages, self.ctx)
+            after_tokens = self.ctx.calculate_context_tokens(self.messages)
+
+            # Phase 2: if still over 70% and there's a giant message, truncate it
+            if self.ctx.context_window_size > 0:
+                target = int(self.ctx.context_window_size * COMPACTION_TARGET)
+                if after_tokens > target and len(self.messages) > 1:
+                    largest_idx = -1
+                    largest_tokens = 0
+                    for i, msg in enumerate(self.messages):
+                        if i == 0:
+                            continue
+                        t = msg.get('_tokens', self.ctx.estimate_tokens(msg.get('content', '')))
+                        if t > largest_tokens:
+                            largest_tokens = t
+                            largest_idx = i
+                    if largest_idx > 0 and largest_tokens > target * 0.3:
+                        excess = after_tokens - target
+                        msg = self.messages[largest_idx]
+                        content = msg.get('content', '')
+                        chars_to_cut = int(excess * 4)  # rough tokens→chars
+                        if chars_to_cut > 0 and chars_to_cut < len(content):
+                            role = msg.get('role', 'unknown')
+                            msg['content'] = content[:len(content) - chars_to_cut] + \
+                                f"\n\n[... truncated {chars_to_cut} chars to fit context budget ...]"
+                            msg.pop('_tokens', None)
+                            self.ctx.stamp_tokens(msg)
+                            after_tokens = self.ctx.calculate_context_tokens(self.messages)
+                            print(colorize(
+                                f"[Compact] Truncated large {role} message (index {largest_idx}) to fit budget.",
+                                'warning'), file=sys.stderr)
+
+            self.ctx.current_context_tokens = after_tokens
+            print(colorize(
+                f"[Compact] {before_len} → {len(self.messages)} messages, "
+                f"{before_tokens} → {after_tokens} tokens "
+                f"(saved {before_tokens - after_tokens} tokens)",
+                'success'), file=sys.stderr)
+            return False
+        return None
+
+    def run_handle_drop(self, full_input: str) -> Optional[bool]:
+        """Handle /drop command to remove specific messages by index."""
+        if full_input.startswith('/drop'):
+            parts = full_input.split()
+            if len(parts) < 2:
+                print(colorize("[Drop] Usage: /drop <index> [index2 ...] — use /tokencount to see indices", 'warning'), file=sys.stderr)
+                return False
+            if not hasattr(self, 'messages') or not self.messages:
+                print(colorize("[Drop] No messages in session.", 'warning'), file=sys.stderr)
+                return False
+
+            indices = []
+            for p in parts[1:]:
+                try:
+                    idx = int(p)
+                    if idx == 0:
+                        print(colorize("[Drop] Cannot drop system prompt (index 0).", 'error'), file=sys.stderr)
+                        return False
+                    if 0 < idx < len(self.messages):
+                        indices.append(idx)
+                    else:
+                        print(colorize(f"[Drop] Index {idx} out of range (1-{len(self.messages)-1}).", 'error'), file=sys.stderr)
+                        return False
+                except ValueError:
+                    print(colorize(f"[Drop] '{p}' is not a valid index.", 'error'), file=sys.stderr)
+                    return False
+
+            indices.sort(reverse=True)
+            dropped_tokens = 0
+            for idx in indices:
+                msg = self.messages[idx]
+                tokens = msg.get('_tokens', self.ctx.estimate_tokens(msg.get('content', '')) + 2)
+                dropped_tokens += tokens
+                del self.messages[idx]
+
+            self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
+            print(colorize(
+                f"[Drop] Removed {len(indices)} message(s), freed ~{dropped_tokens} tokens. "
+                f"Now: {len(self.messages)} msgs, {self.ctx.current_context_tokens} tokens.",
+                'success'), file=sys.stderr)
+            return False
+        return None
+
+    def run_handle_tokencount(self, full_input: str) -> Optional[bool]:
+        """Handle /tokencount command to show token breakdown."""
+        if full_input.startswith('/tokencount'):
+            if not hasattr(self, 'messages') or not self.messages:
+                print(colorize("[TokenCount] No messages in session.", 'warning'), file=sys.stderr)
+                return False
+            total = 0
+            exact_count = 0
+            print(colorize("\n--- Token Breakdown ---", 'info'), file=sys.stderr)
+            for i, msg in enumerate(self.messages):
+                role = msg.get('role', 'unknown')
+                content = msg.get('content', '')
+                if '_tokens' in msg:
+                    tokens = msg['_tokens']
+                    marker = "·"
+                    exact_count += 1
+                else:
+                    tokens = self.ctx.estimate_tokens(content) + 2
+                    marker = "~"
+                total += tokens
+                preview = content[:60].replace('\n', ' ') if isinstance(content, str) else str(content)[:60]
+                if len(content) > 60:
+                    preview += '...'
+                print(colorize(f"  [{i:3d}] {role:10s} {marker}{tokens:6d} tok  {preview}", 'info'), file=sys.stderr)
+            print(colorize(f"\n  Total: {total} tokens ({exact_count}/{len(self.messages)} exact, · = exact, ~ = estimated)", 'info'), file=sys.stderr)
+            if self.ctx.context_window_size > 0:
+                pct = total / self.ctx.context_window_size
+                print(colorize(f"  Context: {total}/{self.ctx.context_window_size} ({pct:.1%})", 'info'), file=sys.stderr)
+            print(colorize("--- End Token Breakdown ---\n", 'info'), file=sys.stderr)
+            return False
+        return None
+
+    def run_handle_sessions(self, full_input: str) -> Optional[bool]:
+        """Handle /sessions command to list saved sessions."""
+        if full_input.startswith('/sessions'):
+            parts = full_input.split()
+            limit = 10
+            if len(parts) > 1:
+                try:
+                    limit = int(parts[1])
+                except ValueError:
+                    pass
+            sm = SessionManager()
+            sessions = sm.list_sessions(limit=limit)
+            if not sessions:
+                print(colorize("[Sessions] No saved sessions found.", 'warning'), file=sys.stderr)
+                return False
+            print(colorize(f"\n--- Saved Sessions (last {len(sessions)}) ---", 'info'), file=sys.stderr)
+            for s in sessions:
+                model = s.get('model', 'unknown')
+                msgs = s.get('message_count', 0)
+                summary = s.get('summary', '')[:60]
+                created = s.get('created', '')[:16]
+                print(colorize(f"  {s['id']}  {model:20s}  {msgs:3d} msgs  {created}  {summary}", 'info'), file=sys.stderr)
+            print(colorize("--- End Sessions ---\n", 'info'), file=sys.stderr)
+            return False
+        return None
+
+    def run_handle_resume(self, full_input: str) -> Optional[bool]:
+        """Handle /resume command to resume a previous session."""
+        if full_input.startswith('/resume'):
+            parts = full_input.split()
+            if len(parts) < 2:
+                print(colorize("[Resume] Usage: /resume <session_id>", 'warning'), file=sys.stderr)
+                return False
+            session_id = parts[1]
+            sm = SessionManager()
+            session_data = sm.load_session(session_id)
+            if not session_data:
+                print(colorize(f"[Resume] Session '{session_id}' not found.", 'error'), file=sys.stderr)
+                return False
+            self.messages = session_data.get('messages', [])
+            msg_count = len(self.messages)
+            self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
+            model = session_data.get('model', '')
+            print(colorize(
+                f"[Resume] Loaded session {session_data['id']} ({msg_count} messages, "
+                f"model: {model}, tokens: {self.ctx.current_context_tokens})",
+                'success'), file=sys.stderr)
+            return False
+        return None
+
+    def run_handle_save(self, full_input: str) -> Optional[bool]:
+        """Handle /save command to save current session."""
+        if full_input.startswith('/save'):
+            if not hasattr(self, 'messages') or len(self.messages) <= 1:
+                print(colorize("[Save] Nothing to save (empty session).", 'warning'), file=sys.stderr)
+                return False
+            sm = SessionManager()
+            session_id = sm.save_session(self.messages, self.ctx)
+            print(colorize(f"[Save] Session saved as {session_id}", 'success'), file=sys.stderr)
+            return False
+        return None
+
     def run_process_query(self, full_input: str) -> None:
         """Process regular user query (non-command input)."""
         if self.ctx.agentic_mode:
@@ -5001,8 +5553,25 @@ class ChatLoop:
             return
 
         if not hasattr(self, 'messages'):
-            self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
-        self.messages.append({'role': 'user', 'content': final_content})
+            sys_msg = {'role': 'system', 'content': self.ctx.system_prompt}
+            self.ctx.stamp_tokens(sys_msg)
+            self.messages = [sys_msg]
+        user_msg = {'role': 'user', 'content': final_content}
+        self.ctx.stamp_tokens(user_msg)
+        self.messages.append(user_msg)
+
+        # Auto-compaction: compact if approaching context limit
+        if self.ctx.context_window_size > 0:
+            msg_tokens = self.ctx.calculate_context_tokens(self.messages)
+            threshold = int(self.ctx.context_window_size * COMPACTION_THRESHOLD)
+            if msg_tokens > threshold:
+                before_len = len(self.messages)
+                self.messages = compact_messages(self.messages, self.ctx)
+                after_tokens = self.ctx.calculate_context_tokens(self.messages)
+                print(colorize(
+                    f"[Auto-compact] {before_len} → {len(self.messages)} msgs, "
+                    f"{msg_tokens} → {after_tokens} tokens",
+                    'warning'), file=sys.stderr)
 
         payload_messages = list(self.messages)
 
@@ -5028,7 +5597,10 @@ class ChatLoop:
             )
 
             if response:
-                self.messages.append({'role': 'assistant', 'content': response})
+                assistant_msg = {'role': 'assistant', 'content': response}
+                self.ctx.stamp_tokens(assistant_msg)
+                self.messages.append(assistant_msg)
+                self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
                 print()
 
 
