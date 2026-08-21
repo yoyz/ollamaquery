@@ -23,48 +23,97 @@ MODEL = None
 BACKEND_AVAILABLE = False
 
 
-def _check_backend(url, label):
-    """Try to reach a backend, return (available, model_name)."""
-    # Normalize URL — add http:// if missing
+def _normalize_url(url):
     if not url.startswith(('http://', 'https://')):
         url = f"http://{url}"
-    try:
-        req = q.Request(url, method='HEAD')
-        q.urlopen(req, timeout=2)
-        # Try to get a loaded model
-        try:
-            tags = json.loads(q.urlopen(q.Request(f"{url}/api/tags"), timeout=3).read())
-            models = [m['name'] for m in tags.get('models', [])]
-            # Prefer models with "dns" capability, or pick first non-embedding
-            for m in models:
-                if 'embed' not in m.lower() and '3.5:9b' in m:
-                    return True, m
-            for m in models:
-                if 'embed' not in m.lower():
-                    return True, m
-        except Exception:
-            pass
-        return True, None
-    except Exception:
+    return url
+
+def _try_ollama(url):
+    """Check ollama at url, return (ok, model). Prefer gpt-oss:20b for E2E speed."""
+    url = _normalize_url(url)
+    if not q.check_backend_with_get(url, 'ollama'):
         return False, None
+    # Try to pick a model via /api/tags — prefer gpt-oss:20b (fast, passes web-server E2E in 37s)
+    try:
+        tags = json.loads(q.urlopen(q.Request(f"{url}/api/tags"), timeout=3).read().decode('utf-8'))
+        models = [m['name'] for m in tags.get('models', [])]
+        for m in models:
+            if 'gpt-oss:20b' in m.lower():
+                return True, m
+        for m in models:
+            if 'embed' not in m.lower() and '3.5:9b' in m:
+                return True, m
+        for m in models:
+            if 'embed' not in m.lower():
+                return True, m
+    except Exception:
+        pass
+    return True, None
+
+def _try_llamacpp(url):
+    """Check llamacpp at url, return (ok, model). Handles 415 via check_backend_with_head."""
+    url = _normalize_url(url)
+    if not q.check_backend_with_head(url, 'llama.cpp'):
+        return False, None
+    # Try /v1/models for a model name (llamacpp /v1/models)
+    try:
+        data = json.loads(q.urlopen(q.Request(f"{url}/v1/models"), timeout=3).read().decode('utf-8'))
+        models = data.get('data', [])
+        if models:
+            m = models[0].get('id', models[0].get('name', ''))
+            if m.startswith('models/'):
+                m = m[7:]
+            return True, m
+    except Exception:
+        pass
+    return True, None
+
+def _discover_with_fallback(env_url, default_url, probe_fn):
+    """Try env_url, then default, then local IPs via probe_fn."""
+    candidates = []
+    if env_url:
+        candidates.append(_normalize_url(env_url))
+    candidates.append(_normalize_url(default_url))
+    # Add local network IPs (like test_features)
+    try:
+        import socket
+        ips = socket.gethostbyname_ex(socket.gethostname())[-1]
+        for ip in ips:
+            port = default_url.split(':')[-1]
+            candidates.append(f"http://{ip}:{port}")
+    except Exception:
+        pass
+    seen = set()
+    for url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
+        ok, model = probe_fn(url)
+        if ok:
+            return True, url, model
+    return False, None, None
 
 
 def setUpModule():
-    """Detect available backend and pick a model."""
+    """Detect available backend and pick a model (no hardcoded URL required).
+
+    Probes env → localhost → local IPs using the same helpers as
+    ollamaquery2.py (handles 415, Server header, missing http://).
+    """
     global BACKEND, BASE_URL, MODEL, BACKEND_AVAILABLE
 
-    avail, model = _check_backend(OLLAMA_HOST, "Ollama")
-    if avail:
+    ok, url, model = _discover_with_fallback(OLLAMA_HOST, 'http://127.0.0.1:11434', _try_ollama)
+    if ok:
         BACKEND = "ollama"
-        BASE_URL = OLLAMA_HOST
-        MODEL = os.environ.get("TEST_MODEL") or model or "qwen3.5:9b"
+        BASE_URL = url
+        MODEL = os.environ.get("TEST_MODEL") or model or "gpt-oss:20b"
         BACKEND_AVAILABLE = True
         return
 
-    avail, model = _check_backend(LLAMACPP_HOST, "llama.cpp")
-    if avail:
+    ok, url, model = _discover_with_fallback(LLAMACPP_HOST, 'http://127.0.0.1:8080', _try_llamacpp)
+    if ok:
         BACKEND = "llamacpp"
-        BASE_URL = LLAMACPP_HOST
+        BASE_URL = url
         MODEL = os.environ.get("TEST_MODEL") or model or "google_gemma-4-E4B-it-Q4_K_M.gguf"
         BACKEND_AVAILABLE = True
         return
@@ -713,7 +762,7 @@ class TestReActLoopUnit(unittest.TestCase):
             call_idx[0] += 1
             return calls[idx] if idx < len(calls) else self._make_sync_response("done")
 
-        self.loop.query_handler.query_sync = mock_sync
+        self.loop.query_handler.query_sync_stream = mock_sync
         self.loop.query_handler.query_stream = MagicMock(return_value="The file was written successfully.")
 
         self.loop.run_agentic_query("Create a file with hello world")
@@ -739,7 +788,7 @@ class TestReActLoopUnit(unittest.TestCase):
             call_idx[0] += 1
             return calls[idx] if idx < len(calls) else self._make_sync_response("done")
 
-        self.loop.query_handler.query_sync = mock_sync
+        self.loop.query_handler.query_sync_stream = mock_sync
         self.loop.query_handler.query_stream = MagicMock(return_value="")
 
         # Mock input() to say 'n' (cancel)
@@ -762,7 +811,7 @@ class TestReActLoopUnit(unittest.TestCase):
         def mock_sync(*args, **kwargs):
             return tool_response
 
-        self.loop.query_handler.query_sync = mock_sync
+        self.loop.query_handler.query_sync_stream = mock_sync
         self.loop.query_handler.query_stream = MagicMock(return_value="")
 
         self.loop.run_agentic_query("Keep using tools")
@@ -772,7 +821,7 @@ class TestReActLoopUnit(unittest.TestCase):
 
     def test_parse_tool_call_with_real_usage(self):
         """Real parse_tool_call usage within the loop."""
-        self.loop.query_handler.query_sync = MagicMock(
+        self.loop.query_handler.query_sync_stream = MagicMock(
             side_effect=[
                 self._make_sync_response(
                     '{"tool": "read_file", "arguments": {"file": "nonexistent.txt"}}'

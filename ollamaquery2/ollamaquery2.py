@@ -27,6 +27,8 @@ import time
 import traceback
 import glob
 import difflib
+import fnmatch
+import unicodedata
 from datetime import datetime
 
 from html.parser import HTMLParser
@@ -56,7 +58,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.1.8"
+__version__ = "0.2.0"
 
 
 # ============================================================================
@@ -359,7 +361,7 @@ COMMANDS = {
         'aliases': ['/compact'],
         'category': 'Core',
         'description': 'Compact conversation history to save context space',
-        'usage': '/compact',
+        'usage': '/compact [now|force [index]|llm|threshold <v>|list|status]',
         'handler': None
     },
     'drop': {
@@ -1037,12 +1039,17 @@ class CommandContext:
         self.agentic_logging: bool = True
         self.agentic_max_iterations: int = 50
         self.agentic_step_timeout: int = 120
+        self.agentic_timeout_max: int = 480
+        self.agentic_consecutive_timeouts: int = 0
+        self.agentic_has_executed_tool: bool = False
+        self.agentic_last_tool_name: str = ""
         self.lazy_tool: bool = True  # Enabled by default: many models embed tool calls after thinking/preamble
         self.supports_vision: Optional[bool] = None  # None = unknown (treated as capable)
         
         # Context window tracking
         self.context_window_size: int = 0  # Will be fetched from server
         self.current_context_tokens: int = 0  # Updated after each query
+        self.compaction_threshold: float = COMPACTION_THRESHOLD  # Auto-compact trigger (0.0-1.0)
 
     # === Properties ===
     @property
@@ -1222,7 +1229,7 @@ COMPACTION_KEEP_RECENT = 6   # Always keep last 6 messages (3 user/assistant tur
 
 
 def compact_messages(messages: list, ctx, target_tokens: int = 0,
-                     keep_recent: int = COMPACTION_KEEP_RECENT) -> list:
+                     keep_recent: int = COMPACTION_KEEP_RECENT, force: bool = False) -> list:
     """Compact conversation history to fit within token budget.
 
     Strategy:
@@ -1236,6 +1243,7 @@ def compact_messages(messages: list, ctx, target_tokens: int = 0,
         ctx: CommandContext for token estimation
         target_tokens: Target token count after compaction (0 = use COMPACTION_TARGET)
         keep_recent: Number of recent messages to always preserve
+        force: If True, compact even when already under the token budget
 
     Returns:
         A new compacted message list
@@ -1247,7 +1255,7 @@ def compact_messages(messages: list, ctx, target_tokens: int = 0,
         target_tokens = int(ctx.context_window_size * COMPACTION_TARGET)
 
     current_tokens = ctx.calculate_context_tokens(messages)
-    if target_tokens > 0 and current_tokens <= target_tokens:
+    if target_tokens > 0 and current_tokens <= target_tokens and not force:
         return list(messages)
 
     system_msg = messages[0]
@@ -1287,8 +1295,8 @@ def compact_messages(messages: list, ctx, target_tokens: int = 0,
     )
 
     summary_tokens = ctx.estimate_tokens(summary_text)
-    system_tokens = ctx.estimate_tokens(system_msg.get('content', ''))
-    recent_tokens = sum(ctx.estimate_tokens(m.get('content', '')) for m in recent)
+    system_tokens = system_msg.get('_tokens', ctx.estimate_tokens(system_msg.get('content', '')))
+    recent_tokens = sum(m.get('_tokens', ctx.estimate_tokens(m.get('content', ''))) for m in recent)
     available = target_tokens - system_tokens - recent_tokens - 100
 
     if available > 0 and summary_tokens > available:
@@ -1297,7 +1305,99 @@ def compact_messages(messages: list, ctx, target_tokens: int = 0,
         summary_text = summary_text[:max_chars] + "\n[... older history truncated ...]"
 
     compacted_msg = {'role': 'user', 'content': summary_text}
-    return [system_msg, compacted_msg] + recent
+    ctx.stamp_tokens(compacted_msg)
+    result = [system_msg, compacted_msg]
+    if recent and recent[-1].get('role') == 'user':
+        result.append({'role': 'assistant', 'content': '[Context continued...]'})
+    result.extend(recent)
+    return result
+
+
+# LLM-assisted tool-result summarization (qwen36 improvement A).
+SUMMARIZE_TOOL_MIN_CHARS = 1000  # Only summarize tool results larger than this
+SUMMARIZE_TOOL_MAX = 3           # Cap tool results summarized per invocation
+SUMMARIZE_TOOL_EXCLUDE = {"list_directory", "diff", "patch", "edit_file", "apply_patch"}
+
+
+def _llm_summarize_tool_result(ctx, query_handler, name, content):
+    """Ask the model to summarize a single tool result. Returns summary text or None."""
+    system = (
+        "You are a context optimizer. Summarize the tool result below, keeping only "
+        "information relevant to the ongoing task: key findings, file paths, errors, "
+        "and decisions. Drop verbose output. Be concise — a few sentences at most."
+    )
+    user = f"[{name}]\n{content[:4000]}"
+    try:
+        response = query_handler.query_sync(
+            [{'role': 'system', 'content': system},
+             {'role': 'user', 'content': user}],
+            ctx.model,
+            temperature=0.3,
+        )
+    except Exception:
+        return None
+    summary = ""
+    if isinstance(response, dict):
+        if ctx.backend == "ollama":
+            summary = response.get('message', {}).get('content', '')
+        else:
+            choices = response.get('choices', [])
+            if choices:
+                summary = choices[0].get('message', {}).get('content', '')
+    elif isinstance(response, str):
+        summary = response
+    summary = (summary or "").strip()
+    return summary or None
+
+
+def summarize_tool_results(messages, ctx, query_handler):
+    """Summarize large tool results via the LLM to preserve key findings.
+
+    Replaces the content of eligible tool-result messages (in place) with a
+    model-generated summary, so compaction doesn't blindly drop their content.
+    Only the oldest half of tool results are considered (newest stay raw), and
+    only results larger than SUMMARIZE_TOOL_MIN_CHARS whose tool is not in
+    SUMMARIZE_TOOL_EXCLUDE are summarized.
+
+    Args:
+        messages: Conversation list (mutated in place).
+        ctx: CommandContext for token stamping.
+        query_handler: ModelQuery for the summarization call.
+
+    Returns:
+        messages (tool result contents replaced in place).
+    """
+    tool_idxs = [i for i, m in enumerate(messages) if m.get('role') == 'tool']
+    if not tool_idxs:
+        return messages
+
+    eligible = tool_idxs[:len(tool_idxs) // 2] if len(tool_idxs) > 1 else []
+
+    candidates = []
+    for i in eligible:
+        m = messages[i]
+        name = m.get('name', '')
+        content = m.get('content', '')
+        if name in SUMMARIZE_TOOL_EXCLUDE:
+            continue
+        if not isinstance(content, str) or len(content) <= SUMMARIZE_TOOL_MIN_CHARS:
+            continue
+        candidates.append(i)
+
+    candidates = candidates[:SUMMARIZE_TOOL_MAX]
+
+    for i in candidates:
+        m = messages[i]
+        name = m.get('name', '')
+        content = m.get('content', '')
+        summary = _llm_summarize_tool_result(ctx, query_handler, name, content)
+        if not summary:
+            continue
+        m['content'] = f"[Summarized tool result ({name})]\n{summary}"
+        m.pop('_tokens', None)
+        ctx.stamp_tokens(m)
+
+    return messages
 
 
 # ============================================================================
@@ -1760,7 +1860,589 @@ def check_tools_error(response) -> bool:
 
 
 # ============================================================================
-# ============= EXECUTOR (CONTAINER/HOST)  ===================================
+# ============= SHELL APPROVAL GATE (opencode-style + home guard + CWD leniency)
+# ============================================================================
+# Port of shell_permission_parser.py (opencode) + Hermes home-fold normalization.
+# Whole-string executed via shell=True; approval is per-component.
+# Design: ~/ hard deny (bypass-immune) → opencode breakdown → CWD leniency → prompt
+# Single-file, stdlib-only, no packaging.
+
+# --- Default permission config: opencode-style, pipes/redirs allowed ---
+DEFAULT_SHELL_PERMISSION = {
+    "bash": {
+        "*": "ask",
+        "git *": "allow",
+        "grep *": "allow",
+        "ls *": "allow",
+        "cat *": "allow",
+        "head *": "allow",
+        "tail *": "allow",
+        "wc *": "allow",
+        "sort *": "allow",
+        "uniq *": "allow",
+        "cut *": "allow",
+        "awk *": "allow",
+        "sed *": "allow",
+        "find *": "allow",
+        "glob *": "allow",
+        "echo *": "allow",
+        "printf *": "allow",
+        "pwd *": "allow",
+        "whoami *": "allow",
+        "uname *": "allow",
+        "date *": "allow",
+        "env *": "allow",
+        "which *": "allow",
+        "npm *": "allow",
+        "pip *": "allow",
+        "pip3 *": "allow",
+        "python *": "allow",
+        "python3 *": "allow",
+        "node *": "allow",
+        "cargo *": "allow",
+        "go *": "allow",
+        "make *": "allow",
+        "gcc *": "allow",
+        "g++ *": "allow",
+        "javac *": "allow",
+        "java *": "allow",
+        "curl *": "allow",
+        "wget *": "allow",
+        "tar *": "allow",
+        "gzip *": "allow",
+        "gunzip *": "allow",
+        "zip *": "allow",
+        "unzip *": "allow",
+        "diff *": "allow",
+        "patch *": "allow",
+        "chmod *": "ask",
+        "chown *": "ask",
+        "rm *": "ask",
+        # Home hard-deny overrides the ask above (last-match-wins needs explicit deny after)
+        "rm -rf ~": "deny",
+        "rm -rf ~/ *": "deny",
+        "rm -rf ~/*": "deny",
+        "rm -rf $HOME *": "deny",
+        "rm -rf $HOME/*": "deny",
+        "rm -rf ${HOME} *": "deny",
+    }
+}
+
+_SHELL_SESSION_APPROVED = []  # list of {"permission":"bash","pattern":..., "action":"allow"}
+
+_ANSI_RE_SHELL = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+def _shell_strip_ansi(text):
+    return _ANSI_RE_SHELL.sub("", text)
+
+def _shell_rewrite_home(cmd):
+    home = os.path.expanduser("~")
+    if home and home != "~":
+        cmd = cmd.replace(home + "/", "~/").replace(home, "~")
+    return cmd
+
+def _shell_normalize_for_home(cmd):
+    """Normalization subset from hermes_style_approval.py for home guard."""
+    cmd = _shell_strip_ansi(cmd)
+    cmd = cmd.replace("\x00", "")
+    cmd = unicodedata.normalize("NFKC", cmd)
+    cmd = re.sub(r"\\\r?\n", "", cmd)
+    cmd = _shell_rewrite_home(cmd)
+    cmd = re.sub(r"\\([^\n])", r"\1", cmd)
+    cmd = re.sub(r"''|\"\"", "", cmd)
+    cmd = re.sub(r"\$\{IFS\b[^}]*\}|\$IFS\b", " ", cmd)
+    return cmd
+
+def _shell_escape_regex(pattern: str) -> str:
+    out = []
+    for ch in pattern:
+        if ch in r".+^${}()|[\]\\":
+            out.append("\\")
+        out.append(ch)
+    return "".join(out)
+
+def _shell_wildcard_match(input_str: str, pattern: str) -> bool:
+    normalized = input_str.replace("\\", "/")
+    escaped = _shell_escape_regex(pattern.replace("\\", "/"))
+    escaped = escaped.replace("*", ".*").replace("?", ".")
+    if escaped.endswith(" .*"):
+        escaped = escaped[:-3] + "( .*)?"
+    return re.match("^" + escaped + "$", normalized, re.S) is not None
+
+_SHELL_ARITY = {
+    "cat": 1, "cd": 1, "chmod": 1, "chown": 1, "cp": 1, "echo": 1, "env": 1,
+    "export": 1, "grep": 1, "kill": 1, "killall": 1, "ln": 1, "ls": 1,
+    "mkdir": 1, "mv": 1, "ps": 1, "pwd": 1, "rm": 1, "rmdir": 1, "sleep": 1,
+    "source": 1, "tail": 1, "touch": 1, "unset": 1, "which": 1,
+    "aws": 3, "az": 3, "bazel": 2, "brew": 2, "bun": 2, "bun run": 3,
+    "bun x": 3, "cargo": 2, "cargo add": 3, "cargo run": 3, "cdk": 2,
+    "cf": 2, "cmake": 2, "composer": 2, "consul": 2, "consul kv": 3,
+    "crictl": 2, "deno": 2, "deno task": 3, "doctl": 3,
+    "docker": 2, "docker builder": 3, "docker compose": 3,
+    "docker container": 3, "docker image": 3, "docker network": 3,
+    "docker volume": 3, "eksctl": 2, "eksctl create": 3, "firebase": 2,
+    "flyctl": 2, "gcloud": 3, "gh": 3, "git": 2, "git config": 3,
+    "git remote": 3, "git stash": 3, "go": 2, "gradle": 2, "helm": 2,
+    "heroku": 2, "hugo": 2, "ip": 2, "ip addr": 3, "ip link": 3,
+    "ip netns": 3, "ip route": 3, "kind": 2, "kind create": 3, "kubectl": 2,
+    "kubectl kustomize": 3, "kubectl rollout": 3, "kustomize": 2, "make": 2,
+    "mc": 2, "mc admin": 3, "minikube": 2, "mongosh": 2, "mysql": 2,
+    "mvn": 2, "ng": 2, "npm": 2, "npm exec": 3, "npm init": 3, "npm run": 3,
+    "npm view": 3, "nvm": 2, "nx": 2, "openssl": 2, "openssl req": 3,
+    "openssl x509": 3, "pip": 2, "pipenv": 2, "pnpm": 2, "pnpm dlx": 3,
+    "pnpm exec": 3, "pnpm run": 3, "poetry": 2, "podman": 2,
+    "podman container": 3, "podman image": 3, "psql": 2, "pulumi": 2,
+    "pulumi stack": 3, "pyenv": 2, "python": 2, "rake": 2, "rbenv": 2,
+    "redis-cli": 2, "rustup": 2, "serverless": 2, "sfdx": 3, "skaffold": 2,
+    "sls": 2, "sst": 2, "swift": 2, "systemctl": 2, "terraform": 2,
+    "terraform workspace": 3, "tmux": 2, "turbo": 2, "ufw": 2, "vault": 2,
+    "vault auth": 3, "vault kv": 3, "vercel": 2, "volta": 2, "wp": 2,
+    "yarn": 2, "yarn dlx": 3, "yarn run": 3,
+}
+
+def _shell_arity_prefix(tokens):
+    for length in range(len(tokens), 0, -1):
+        prefix = " ".join(tokens[:length])
+        arity = _SHELL_ARITY.get(prefix)
+        if arity is not None:
+            return tokens[:arity]
+    if not tokens:
+        return []
+    return tokens[:1]
+
+_SHELL_CWD = {"cd", "chdir", "popd", "pushd", "push-location", "set-location"}
+
+_SHELL_WORD = "word"
+_SHELL_REDIR = "redir"
+_SHELL_CTRL = "ctrl"
+
+class _ShellToken:
+    __slots__ = ("kind", "text", "start", "end", "nested")
+    def __init__(self, kind, text, start, end, nested=None):
+        self.kind = kind
+        self.text = text
+        self.start = start
+        self.end = end
+        self.nested = nested or []
+
+def _shell_find_closing(s, i, open_, close):
+    depth = 1
+    n = len(s)
+    j = i
+    while j < n:
+        c = s[j]
+        if c == "'":
+            k = s.find("'", j + 1)
+            j = n if k == -1 else k + 1
+            continue
+        if c == '"':
+            k = j + 1
+            while k < n:
+                if s[k] == "\\":
+                    k += 2
+                    continue
+                if s[k] == '"':
+                    break
+                k += 1
+            j = k + 1
+            continue
+        if c == "\\":
+            j += 2
+            continue
+        if c == "$" and s[j:j + 2] == "$(":
+            depth += 1
+            j += 2
+            continue
+        if c == open_:
+            depth += 1
+        elif c == close:
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return n
+
+def _shell_scan_word(s, i):
+    n = len(s)
+    j = i
+    parts = []
+    nested = []
+    while j < n:
+        c = s[j]
+        if c in " \t\r\n" or c in "|;&<>":
+            break
+        if c == "'":
+            k = s.find("'", j + 1)
+            if k == -1:
+                k = n
+            parts.append(s[j:k + 1])
+            j = k + 1
+            continue
+        if c == '"':
+            k = j + 1
+            while k < n:
+                if s[k] == "\\":
+                    k += 2
+                    continue
+                if s[k] == '"':
+                    break
+                k += 1
+            parts.append(s[j:k + 1])
+            j = k + 1
+            continue
+        if c == "\\":
+            parts.append(s[j:j + 2])
+            j += 2
+            continue
+        if c == "`":
+            k = s.find("`", j + 1)
+            if k == -1:
+                k = n
+            parts.append(s[j:k + 1])
+            nested.append(s[j + 1:k])
+            j = k + 1
+            continue
+        if c == "$" and s[j:j + 2] == "$(":
+            k = _shell_find_closing(s, j + 2, "(", ")")
+            parts.append(s[j:k + 1])
+            nested.append(s[j + 2:k])
+            j = k + 1
+            continue
+        if c == "$" and s[j:j + 2] == "${":
+            k = _shell_find_closing(s, j + 2, "{", "}")
+            parts.append(s[j:k + 1])
+            j = k + 1
+            continue
+        if c == "$":
+            parts.append(c)
+            j += 1
+            continue
+        if c == "(":
+            k = _shell_find_closing(s, j + 1, "(", ")")
+            parts.append(s[j:k + 1])
+            nested.append(s[j + 1:k])
+            j = k + 1
+            continue
+        parts.append(c)
+        j += 1
+    return "".join(parts), j, nested
+
+_SHELL_REDIR_OPS = ("&>>", "<<-", "<<<", ">>", ">&", "<&", "<>", ">|", "<<", "&>", ">", "<")
+
+def _shell_tokenize(s):
+    tokens = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c in " \t\r\n":
+            i += 1
+            continue
+        two = s[i:i + 2]
+        if two == "||" or two == "&&" or two == "|&" or two == ";;":
+            tokens.append(_ShellToken(_SHELL_CTRL, two, i, i + 2))
+            i += 2
+            continue
+        if c in "<>" and s[i + 1:i + 2] == "(":
+            k = _shell_find_closing(s, i + 2, "(", ")")
+            tok = _ShellToken(_SHELL_WORD, s[i:k + 1], i, k + 1)
+            tok.nested.append(s[i + 2:k])
+            tokens.append(tok)
+            i = k + 1
+            continue
+        if c == "&":
+            op = None
+            for cand in ("&>>", "&&", "&>"):
+                if s.startswith(cand, i):
+                    op = cand
+                    break
+            if op is None:
+                op = "&"
+            kind = _SHELL_CTRL if op == "&&" or op == "&" else _SHELL_REDIR
+            tokens.append(_ShellToken(kind, op, i, i + len(op)))
+            i += len(op)
+            continue
+        if c == "|":
+            tokens.append(_ShellToken(_SHELL_CTRL, "|", i, i + 1))
+            i += 1
+            continue
+        if c == ";":
+            tokens.append(_ShellToken(_SHELL_CTRL, ";", i, i + 1))
+            i += 1
+            continue
+        if c in "<>":
+            op = None
+            for cand in _SHELL_REDIR_OPS:
+                if s.startswith(cand, i):
+                    op = cand
+                    break
+            tokens.append(_ShellToken(_SHELL_REDIR, op, i, i + len(op)))
+            i += len(op)
+            continue
+        text, j, nested = _shell_scan_word(s, i)
+        tokens.append(_ShellToken(_SHELL_WORD, text, i, j, nested))
+        i = j
+    return tokens
+
+class _ShellNode:
+    __slots__ = ("source", "pattern", "tokens")
+    def __init__(self, source, pattern, tokens):
+        self.source = source
+        self.pattern = pattern
+        self.tokens = tokens
+
+def _shell_arity_tokens(tokens):
+    skip = set()
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t.kind == _SHELL_REDIR:
+            skip.add(i)
+            if i + 1 < len(tokens) and tokens[i + 1].kind == _SHELL_WORD:
+                skip.add(i + 1)
+            i += 2
+            continue
+        i += 1
+    out = []
+    for idx, t in enumerate(tokens):
+        if idx in skip or t.kind != _SHELL_WORD:
+            continue
+        if t.text.isdigit() and idx + 1 < len(tokens) and tokens[idx + 1].kind == _SHELL_REDIR and t.end == tokens[idx + 1].start:
+            continue
+        out.append(t.text)
+    return out
+
+def _shell_breakdown(command):
+    tokens = _shell_tokenize(command)
+    segments = []
+    current = []
+    for t in tokens:
+        if t.kind == _SHELL_CTRL:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(t)
+    if current:
+        segments.append(current)
+    nodes = []
+    for seg in segments:
+        if len(seg) == 1 and seg[0].kind == _SHELL_WORD and seg[0].text.startswith(("(", "$(", "<(", ">(")):
+            for inner in seg[0].nested:
+                if inner.strip():
+                    nodes.extend(_shell_breakdown(inner))
+            continue
+        source = command[seg[0].start:seg[-1].end].strip()
+        tokens_ = _shell_arity_tokens(seg)
+        nodes.append(_ShellNode(source, source, tokens_))
+        for t in seg:
+            if t.kind == _SHELL_WORD:
+                for inner in t.nested:
+                    if inner.strip():
+                        nodes.extend(_shell_breakdown(inner))
+    return nodes
+
+def _shell_from_config(permission):
+    rules = []
+    if isinstance(permission, str):
+        permission = {"*": permission}
+    for key, value in permission.items():
+        if isinstance(value, str):
+            rules.append({"permission": key, "pattern": "*", "action": value})
+        elif isinstance(value, dict):
+            for pattern, action in value.items():
+                rules.append({"permission": key, "pattern": pattern, "action": action})
+    return rules
+
+def _shell_as_bash_rules(config):
+    if isinstance(config, str):
+        return _shell_from_config({"bash": {"*": config}})
+    if isinstance(config, dict):
+        if "bash" in config:
+            return _shell_from_config(config)
+        return _shell_from_config({"bash": config})
+    return list(config)
+
+def _shell_evaluate(permission, pattern, *rulesets):
+    found = None
+    for ruleset in rulesets:
+        for rule in ruleset:
+            if _shell_wildcard_match(permission, rule["permission"]) and _shell_wildcard_match(pattern, rule["pattern"]):
+                found = rule
+    if found is not None:
+        return found
+    return {"permission": permission, "pattern": "*", "action": "ask"}
+
+def shell_check_command(command, config, approved=None):
+    rules = _shell_as_bash_rules(config)
+    approved = list(approved) if approved else []
+    nodes = _shell_breakdown(command)
+    patterns = []
+    always = []
+    for node in nodes:
+        if not node.tokens:
+            continue
+        cmd = node.tokens[0].strip("'\"")
+        if cmd in _SHELL_CWD:
+            continue
+        patterns.append(node.pattern)
+        always.append(" ".join(_shell_arity_prefix(node.tokens)) + " *")
+    all_rulesets = (rules, approved)
+    effect = "allow"
+    details = []
+    for pattern in patterns:
+        rule = _shell_evaluate("bash", pattern, *all_rulesets)
+        details.append({"pattern": pattern, "action": rule["action"], "rule": rule["pattern"]})
+        if rule["action"] == "deny":
+            effect = "deny"
+            break
+        if rule["action"] == "ask":
+            effect = "ask"
+    return {"command": command, "nodes": [{"source": n.source, "pattern": n.pattern, "tokens": n.tokens} for n in nodes], "patterns": patterns, "always": always, "effect": effect, "details": details}
+
+# --- CWD leniency helpers ---
+def _shell_path_inside_cwd(path_str, cwd=None):
+    if cwd is None:
+        cwd = os.getcwd()
+    # Strip quotes
+    p = path_str.strip().strip("'\"")
+    # Skip flags, globs without slash, bare commands
+    if not p or p.startswith("-"):
+        return True
+    # Expand ~ and vars: treat as outside if contains ~
+    if "~" in p or "$HOME" in p or "${HOME" in p:
+        return False
+    # If no slash and no dot, it's likely a cmd arg not a path -> treat as inside
+    if "/" not in p and "." not in p and "*" not in p:
+        return True
+    # Resolve against cwd
+    try:
+        abs_p = os.path.abspath(os.path.join(cwd, os.path.expanduser(p)))
+        real_cwd = os.path.realpath(cwd)
+        real_p = os.path.realpath(abs_p)
+        # For globs, check base directory
+        if "*" in p or "?" in p:
+            base = os.path.dirname(abs_p.split("*")[0].split("?")[0])
+            if not base:
+                base = cwd
+            real_p = os.path.realpath(os.path.abspath(base))
+        return os.path.commonpath([real_cwd, real_p]) == real_cwd
+    except Exception:
+        return False
+
+def _shell_all_operands_inside_cwd(nodes, cwd=None):
+    if cwd is None:
+        cwd = os.getcwd()
+    for n in nodes:
+        src = n.get("source") if isinstance(n, dict) else n.source
+        toks = n.get("tokens") if isinstance(n, dict) else n.tokens
+        if not toks:
+            continue
+        head = toks[0].strip("'\"") if toks[0] else ""
+        if head in _SHELL_CWD:
+            continue
+        for tok in toks[1:]:
+            # Skip flags
+            if tok.startswith("-"):
+                continue
+            if not _shell_path_inside_cwd(tok, cwd):
+                return False
+    return True
+
+# --- Home/root destructive guard (bypass-immune) ---
+def _shell_is_home_destructive(nodes):
+    for n in nodes:
+        toks = n.get("tokens") if isinstance(n, dict) else n.tokens
+        if not toks:
+            continue
+        head = toks[0].strip("'\"").lower()
+        if head != "rm":
+            continue
+        for tok in toks[1:]:
+            low = tok.lower()
+            # Home markers
+            if "~" in tok or "$home" in low or "${home" in low:
+                return True
+            # Root filesystem markers
+            stripped = tok.strip("'\"")
+            if stripped in ("/", "/*", "/ *", "//", "///"):
+                return True
+            if stripped.startswith("/") and stripped.strip("/ ") in ("", "*"):
+                return True
+        # Also check source for folded home/root
+        src = n.get("source") if isinstance(n, dict) else n.source
+        if "~" in src or "$HOME" in src or "${HOME" in src:
+            # Verify it's rm with home operand, not echo
+            if head == "rm":
+                return True
+        # Direct rm -rf / detection on source
+        if re.search(r'\brm\s+.*\s/+(\s|$|;|\||&)', src):
+            # Only hard-block when operand is exactly root or root glob, not /tmp etc.
+            if re.search(r'\brm\s+[^;|&]*\s/(?:\s|$|;|\||&|"|\\\')', src):
+                # Check that it's not /tmp, /home etc. — only bare /
+                # Use token check above for precision, fallback to root pattern
+                toks_src = [t.strip("'\"") for t in toks[1:] if not t.startswith("-")]
+                if "/" in toks_src or "/*" in toks_src:
+                    return True
+    return False
+
+def check_shell_approval(command, ctx=None, executor_mode="host"):
+    """Gate: home hard-deny → opencode breakdown → CWD leniency → prompt.
+
+    Returns dict: {"approved": bool, "effect": str, "message": str|None, "verdict": dict}
+    """
+    if not command or not command.strip():
+        return {"approved": False, "effect": "deny", "message": "Empty command", "verdict": None}
+    if executor_mode == "container":
+        return {"approved": True, "effect": "allow", "message": None, "verdict": None}
+    # Normalize for home check (fold resolved home)
+    norm = _shell_normalize_for_home(command)
+    # Build verdict via opencode
+    verdict = shell_check_command(command, DEFAULT_SHELL_PERMISSION, _SHELL_SESSION_APPROVED)
+    nodes = verdict["nodes"]
+    # Also check normalized variant for home destructive via tokens of norm
+    norm_verdict = shell_check_command(norm, DEFAULT_SHELL_PERMISSION, _SHELL_SESSION_APPROVED)
+    # Home/root guard: either original or normalized hits destructive rm (bypass-immune, contains 'rejected' for test compat)
+    if _shell_is_home_destructive(nodes) or _shell_is_home_destructive(norm_verdict["nodes"]):
+        return {"approved": False, "effect": "deny", "message": "BLOCKED (rejected): recursive delete of home directory (~/ or $HOME) or root filesystem is never allowed", "verdict": verdict}
+    # Also catch opencode deny (explicit rules) — include 'rejected' for compat with safety_blocklist test
+    if verdict["effect"] == "deny":
+        return {"approved": False, "effect": "deny", "message": "BLOCKED (rejected): denied by permission rules (%s)" % ", ".join(d["pattern"] for d in verdict["details"] if d["action"]=="deny"), "verdict": verdict}
+    if verdict["effect"] == "allow":
+        return {"approved": True, "effect": "allow", "message": None, "verdict": verdict}
+    # effect == ask → check CWD leniency
+    if _shell_all_operands_inside_cwd(nodes):
+        return {"approved": True, "effect": "allow", "message": None, "verdict": verdict, "cwd_leniency": True}
+    # Auto-confirm (yolo) respects home deny but allows ask
+    if ctx is not None and getattr(ctx, "auto_confirm", False):
+        return {"approved": True, "effect": "allow", "message": None, "verdict": verdict, "auto": True}
+    # Interactive prompt (TTY required)
+    if not sys.stdin.isatty():
+        return {"approved": False, "effect": "ask", "message": "Approval required but no TTY — denied (use /agentic auto to allow)", "verdict": verdict}
+    # Prompt user: once / session / always / deny
+    print(colorize(f"\n[Shell approval] `{command}`", 'warning'), file=sys.stderr)
+    for d in verdict["details"]:
+        if d["action"] == "ask":
+            print(colorize(f"  → {d['pattern']} needs approval (rule: {d['rule']})", 'muted'), file=sys.stderr)
+    try:
+        reply = input(colorize("Allow? [y/N/s/a/d] (y=once, s=session, a=always, d=deny): ", 'warning')).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return {"approved": False, "effect": "ask", "message": "Denied (no input)", "verdict": verdict}
+    if reply in ("y", "yes", "o", "once"):
+        return {"approved": True, "effect": "allow", "message": None, "verdict": verdict}
+    if reply in ("s", "session"):
+        for pat in verdict["patterns"]:
+            _SHELL_SESSION_APPROVED.append({"permission": "bash", "pattern": pat, "action": "allow"})
+        return {"approved": True, "effect": "allow", "message": None, "verdict": verdict}
+    if reply in ("a", "always"):
+        for pat in verdict["patterns"]:
+            _SHELL_SESSION_APPROVED.append({"permission": "bash", "pattern": pat, "action": "allow"})
+        # Also store always pattern for future sessions (same list, session-scoped)
+        for pat in verdict["always"]:
+            _SHELL_SESSION_APPROVED.append({"permission": "bash", "pattern": pat, "action": "allow"})
+        return {"approved": True, "effect": "allow", "message": None, "verdict": verdict}
+    return {"approved": False, "effect": "ask", "message": "Denied by user", "verdict": verdict}
+
 # ============================================================================
 # ============= EXECUTOR (CONTAINER/HOST)  ===================================
 # ============================================================================
@@ -1804,16 +2486,25 @@ class Executor:
         return self._run_shell(command, timeout)
 
     def _run_shell(self, command: str, timeout: int, is_container: bool = False) -> dict:
-        if not is_container and "python3 -c" not in command:
-            if not validate_shell_command_safety(command, max_length=1000):
-                return {"stdout": "", "stderr": "Command rejected by safety validator", "returncode": -1}
+        if not is_container:
+            ctx = CommandContext() if CommandContext._initialized else None
+            res = check_shell_approval(command, ctx=ctx, executor_mode=self.mode)
+            if not res["approved"]:
+                return {"stdout": "", "stderr": res.get("message") or "Blocked by shell approval gate", "returncode": -1}
         try:
-            args_list = shlex.split(command)
-            proc = subprocess.run(
-                args_list, shell=False,  # Intentional: shell=True would enable pipes/redirects but risks injection. Single commands only.
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=timeout
-            )
+            if is_container:
+                args_list = shlex.split(command)
+                proc = subprocess.run(
+                    args_list, shell=False,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, timeout=timeout
+                )
+            else:
+                proc = subprocess.run(
+                    command, shell=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, timeout=timeout, executable="/bin/bash"
+                )
             return {"stdout": proc.stdout, "stderr": proc.stderr, "returncode": proc.returncode}
         except subprocess.TimeoutExpired:
             return {"stdout": "", "stderr": f"Timed out after {timeout}s", "returncode": -1}
@@ -1949,6 +2640,10 @@ AGENTIC_TOOL_DEFS = {
 
 DESTRUCTIVE_TOOLS = {"write_file", "run_python", "run_command", "patch", "edit_file", "apply_patch"}
 
+# Tools whose re-execution can cause harm; used by the agentic timeout escalation
+# policy to abort (rather than extend) when the last executed tool was one of these.
+AGENTIC_TIMEOUT_ABORT_TOOLS = {"run_command", "patch", "edit_file"}
+
 
 # ============================================================================
 # ============= AGENTIC TOOL HANDLERS         ================================
@@ -1960,11 +2655,115 @@ def _tool_handle_fetch_url(self, args):
     return {"success": True, "output": text, "error": None}
 
 
+def _resolve_tool_path(raw_path, allow_home=False):
+    """Resolve raw_path handling ~, absolute, and symlink.
+
+    Returns (abspath, allowed, error). When allow_home=True, paths
+    explicitly starting with ~ or absolute inside $HOME are allowed
+    even though they are outside CWD (needed for ~/.vimrc etc.).
+    All other paths must be inside CWD via realpath commonpath check.
+    """
+    expanded = os.path.expanduser(raw_path)
+    if os.path.isabs(expanded):
+        abspath = os.path.abspath(expanded)
+    else:
+        abspath = os.path.abspath(os.path.join(os.getcwd(), expanded))
+    base_real = os.path.realpath(os.getcwd())
+    file_real = os.path.realpath(abspath)
+    # Check CWD containment
+    try:
+        if os.path.commonpath([base_real, file_real]) == base_real:
+            return abspath, True, None
+    except ValueError:
+        pass
+    # Optionally allow explicit home reads (~/... or /home/... when requested via ~)
+    if allow_home:
+        try:
+            home_real = os.path.realpath(os.path.expanduser("~"))
+            is_home_request = raw_path.startswith("~") or raw_path.startswith(home_real) or expanded.startswith(home_real)
+            if is_home_request and os.path.commonpath([home_real, file_real]) == home_real:
+                return abspath, True, None
+        except ValueError:
+            pass
+    return abspath, False, "Path traversal denied"
+
+# --- Dotfile guard for ~/.* (opencode-style per-session ask) ---
+_FILE_DOTFILE_SESSION_APPROVED = set()
+
+def _is_home_dotfile(abspath):
+    """True if abspath is inside $HOME (but outside CWD) and any component is dotfile.
+
+    Dotfiles inside the current working directory (e.g. ./.gitignore, ./.env)
+    are NOT considered home dotfiles even when CWD itself is inside $HOME —
+    they are project files and should not trigger the guard. Only files that
+    are in $HOME but not in CWD are guarded (e.g. ~/.vimrc, ~/.ssh/id_rsa).
+    """
+    try:
+        home_real = os.path.realpath(os.path.expanduser("~"))
+        cwd_real = os.path.realpath(os.getcwd())
+        file_real = os.path.realpath(abspath)
+        # If inside CWD, it's a project dotfile — not a home dotfile
+        try:
+            if os.path.commonpath([cwd_real, file_real]) == cwd_real:
+                return False
+        except ValueError:
+            pass
+        if os.path.commonpath([home_real, file_real]) != home_real:
+            return False
+        rel = os.path.relpath(file_real, home_real)
+        for part in rel.split(os.sep):
+            if part.startswith(".") and part not in (".", "..") and part != "":
+                return True
+        return False
+    except ValueError:
+        return False
+
+def _check_dotfile_gate(abspath, operation="read", ctx=None):
+    """Gate for ~/ dotfiles: refused by default, ask per session like opencode.
+
+    Mirrors opencode permission.bash last-match-wins but for files:
+      deny dotfile by default → allow if in _FILE_DOTFILE_SESSION_APPROVED → else prompt.
+
+    Returns (approved: bool, message: str|None).
+    Prompt options: [y/N/s/a/d]  y=once, s=session, a=always (session), d=deny.
+    Even with ctx.auto_confirm, dotfiles still require explicit approval (bypass-immune).
+    """
+    if not _is_home_dotfile(abspath):
+        return True, None
+    file_real = os.path.realpath(abspath)
+    if file_real in _FILE_DOTFILE_SESSION_APPROVED:
+        return True, None
+    # Also check wildcard session (e.g. ~/.vimrc allowed covers ~/.vimrc)
+    # For now exact match only; opencode-style always pattern could be added later.
+    if not sys.stdin.isatty():
+        return False, f"BLOCKED (rejected): reading dotfile {abspath} requires approval — not a TTY (use interactive session or allow via /agentic session)"
+    # Prompt
+    print(colorize(f"\n[File approval] {operation} dotfile `{abspath}`", 'warning'), file=sys.stderr)
+    print(colorize(f"  Dotfiles under ~ are blocked by default (e.g. ~/.vimrc, ~/.ssh/*).", 'muted'), file=sys.stderr)
+    try:
+        reply = input(colorize("Allow? [y/N/s/a/d] (y=once, s=session, a=always, d=deny): ", 'warning')).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False, "Denied (no input)"
+    if reply in ("y", "yes", "o", "once"):
+        return True, None
+    if reply in ("s", "session"):
+        _FILE_DOTFILE_SESSION_APPROVED.add(file_real)
+        return True, None
+    if reply in ("a", "always"):
+        _FILE_DOTFILE_SESSION_APPROVED.add(file_real)
+        # Also allow siblings? For now same as session; could persist to disk later
+        return True, None
+    return False, f"BLOCKED (rejected): dotfile {abspath} denied by user"
+
 def _tool_handle_read_file(self, args):
-    base_dir = os.path.abspath(os.getcwd())
-    filepath = os.path.abspath(os.path.join(os.getcwd(), args["file_path"]))
-    if os.path.commonpath([base_dir, filepath]) != base_dir:
-        return {"success": False, "output": "", "error": "Path traversal denied"}
+    filepath, allowed, err = _resolve_tool_path(args["file_path"], allow_home=True)
+    if not allowed:
+        return {"success": False, "output": "", "error": err}
+    # Dotfile guard (~/.*)
+    ctx = CommandContext() if CommandContext._initialized else None
+    ok, msg = _check_dotfile_gate(filepath, operation="read", ctx=ctx)
+    if not ok:
+        return {"success": False, "output": "", "error": msg}
     if not os.path.isfile(filepath):
         return {"success": False, "output": "", "error": "File not found"}
     try:
@@ -1976,10 +2775,35 @@ def _tool_handle_read_file(self, args):
 
 
 def _tool_handle_write_file(self, args):
-    base_dir = os.path.abspath(os.getcwd())
-    filepath = os.path.abspath(os.path.join(os.getcwd(), args["file_path"]))
-    if os.path.commonpath([base_dir, filepath]) != base_dir:
-        return {"success": False, "output": "", "error": "Path traversal denied"}
+    # Writes to ~/.* are also dotfile-guarded (even stricter than reads)
+    # First try CWD; if not, try home with guard (so ~/.vimrc can be written after approval)
+    filepath, allowed, err = _resolve_tool_path(args["file_path"], allow_home=False)
+    if not allowed:
+        # Fallback: check if it's an explicit home dotfile request
+        home_path, home_allowed, _ = _resolve_tool_path(args["file_path"], allow_home=True)
+        if home_allowed and _is_home_dotfile(home_path):
+            filepath = home_path
+            ctx = CommandContext() if CommandContext._initialized else None
+            ok, msg = _check_dotfile_gate(filepath, operation="write", ctx=ctx)
+            if not ok:
+                return {"success": False, "output": "", "error": msg}
+            allowed = True
+        else:
+            return {"success": False, "output": "", "error": err}
+    else:
+        # Inside CWD but still check if it's a dotfile under CWD's home? No, only home dotfiles
+        if _is_home_dotfile(filepath):
+            ctx = CommandContext() if CommandContext._initialized else None
+            ok, msg = _check_dotfile_gate(filepath, operation="write", ctx=ctx)
+            if not ok:
+                return {"success": False, "output": "", "error": msg}
+    # Also guard dotfiles inside CWD? No, per request only ~/ dotfiles
+    # But if filepath itself is inside home and dotfile, double-check
+    if _is_home_dotfile(filepath):
+        ctx = CommandContext() if CommandContext._initialized else None
+        ok, msg = _check_dotfile_gate(filepath, operation="write", ctx=ctx)
+        if not ok:
+            return {"success": False, "output": "", "error": msg}
     content = args["content"]
     if len(content) > MAX_WRITE_FILE_SIZE:
         return {"success": False, "output": "", "error": "Content too large (max 1MB)"}
@@ -1993,10 +2817,9 @@ def _tool_handle_write_file(self, args):
 
 
 def _tool_handle_list_directory(self, args):
-    base_dir = os.path.abspath(os.getcwd())
-    path = os.path.abspath(os.path.join(os.getcwd(), args.get("path", ".")))
-    if os.path.commonpath([base_dir, path]) != base_dir:
-        return {"success": False, "output": "", "error": "Path traversal denied"}
+    path, allowed, err = _resolve_tool_path(args.get("path", "."), allow_home=False)
+    if not allowed:
+        return {"success": False, "output": "", "error": err}
     if not os.path.isdir(path):
         return {"success": False, "output": "", "error": "Not a directory"}
     try:
@@ -2044,9 +2867,8 @@ def _tool_handle_run_python(self, args):
 
 def _tool_handle_run_command(self, args):
     command = args["command"]
-    for op in ("&&", "||", "|", ";", "`", "$(", ">", "<"):
-        if op in command:
-            return {"success": False, "output": "", "error": f"Only one command at a time is supported. Remove shell operators like '{op}' and run commands separately."}
+    # Gate is now in Executor._run_shell (opencode breakdown + home guard + CWD leniency)
+    # Pipes/redirections are allowed when per-component rules permit; no operator ban here.
     cmd_timeout = int(args.get("timeout", 10))
     if cmd_timeout <= 0 or cmd_timeout > 300:
         return {"success": False, "output": "", "error": f"Invalid timeout: {cmd_timeout}. Timeout is in seconds (1-300). Use a value between 1 and 300."}
@@ -2058,13 +2880,12 @@ def _tool_handle_run_command(self, args):
 
 
 def _tool_handle_diff(self, args):
-    base_dir = os.path.abspath(os.getcwd())
-    filepath1 = os.path.abspath(os.path.join(os.getcwd(), args["file1"]))
-    filepath2 = os.path.abspath(os.path.join(os.getcwd(), args["file2"]))
-    if os.path.commonpath([base_dir, filepath1]) != base_dir:
-        return {"success": False, "output": "", "error": "Path traversal denied"}
-    if os.path.commonpath([base_dir, filepath2]) != base_dir:
-        return {"success": False, "output": "", "error": "Path traversal denied"}
+    filepath1, ok1, err1 = _resolve_tool_path(args["file1"], allow_home=False)
+    if not ok1:
+        return {"success": False, "output": "", "error": err1}
+    filepath2, ok2, err2 = _resolve_tool_path(args["file2"], allow_home=False)
+    if not ok2:
+        return {"success": False, "output": "", "error": err2}
     label1 = args.get("label1", args["file1"])
     label2 = args.get("label2", args["file2"])
     try:
@@ -2085,17 +2906,15 @@ def _tool_handle_patch(self, args):
     diff_path = None
     target_arg = args.get("target", "").strip()
     if target_arg:
-        base_dir = os.path.abspath(os.getcwd())
-        target_raw = os.path.abspath(os.path.join(os.getcwd(), target_arg))
-        if os.path.commonpath([base_dir, target_raw]) != base_dir:
-            return {"success": False, "output": "", "error": "Path traversal denied"}
+        target_raw, ok, err = _resolve_tool_path(target_arg, allow_home=False)
+        if not ok:
+            return {"success": False, "output": "", "error": err}
         target = shlex.quote(target_raw)
     else:
-        base_dir = os.path.abspath(os.getcwd())
         sections = _parse_patch_sections(diff_text)
         for sec in sections:
-            abspath = os.path.abspath(os.path.join(os.getcwd(), sec["path"]))
-            if os.path.commonpath([base_dir, abspath]) != base_dir:
+            abspath, ok, err = _resolve_tool_path(sec["path"], allow_home=False)
+            if not ok:
                 return {"success": False, "output": "", "error": f"Path traversal denied within diff headers: {sec['path']}"}
         target = ""
     try:
@@ -2115,10 +2934,24 @@ def _tool_handle_patch(self, args):
 
 
 def _tool_handle_edit_file(self, args):
-    base_dir = os.path.abspath(os.getcwd())
-    filepath = os.path.abspath(os.path.join(os.getcwd(), args["file_path"]))
-    if os.path.commonpath([base_dir, filepath]) != base_dir:
-        return {"success": False, "output": "", "error": "Path traversal denied"}
+    filepath, allowed, err = _resolve_tool_path(args["file_path"], allow_home=False)
+    if not allowed:
+        # Allow explicit home dotfile after gate (same as write_file)
+        home_path, home_allowed, _ = _resolve_tool_path(args["file_path"], allow_home=True)
+        if home_allowed and _is_home_dotfile(home_path):
+            filepath = home_path
+            ctx = CommandContext() if CommandContext._initialized else None
+            ok, msg = _check_dotfile_gate(filepath, operation="edit", ctx=ctx)
+            if not ok:
+                return {"success": False, "output": "", "error": msg}
+            allowed = True
+        else:
+            return {"success": False, "output": "", "error": err}
+    if _is_home_dotfile(filepath):
+        ctx = CommandContext() if CommandContext._initialized else None
+        ok, msg = _check_dotfile_gate(filepath, operation="edit", ctx=ctx)
+        if not ok:
+            return {"success": False, "output": "", "error": msg}
     if not os.path.isfile(filepath):
         return {"success": False, "output": "", "error": f"File not found: {args['file_path']}"}
     old = args["old_string"]
@@ -2969,7 +3802,158 @@ class ModelQuery:
             sys.stderr.write(colorize(msg, 'error'))
             return {"error": {"message": str(e), "type": type(e).__name__}}
 
+    @staticmethod
+    def _accumulate_stream_tool_calls(tool_calls, tool_call_index, new_calls):
+        """Merge incremental tool-call chunks into `tool_calls` and `tool_call_index`.
 
+        Handles both OpenAI-compatible deltas (arguments accumulate as strings, keyed by
+        `index`) and Ollama full-object tool calls (no `index`, arguments already a dict).
+        """
+        for tc in new_calls:
+            if "index" not in tc:
+                tool_calls.append({
+                    "id": tc.get("id", ""),
+                    "type": tc.get("type", "function"),
+                    "function": {
+                        "name": tc.get("function", {}).get("name", ""),
+                        "arguments": tc.get("function", {}).get("arguments", ""),
+                    }
+                })
+                continue
+            idx = tc.get("index", 0)
+            if idx not in tool_call_index:
+                tool_call_index[idx] = {
+                    "id": tc.get("id", ""),
+                    "type": tc.get("type", "function"),
+                    "function": {
+                        "name": tc.get("function", {}).get("name", ""),
+                        "arguments": tc.get("function", {}).get("arguments", ""),
+                    }
+                }
+            else:
+                existing = tool_call_index[idx]
+                if tc.get("id"):
+                    existing["id"] = tc["id"]
+                fn_delta = tc.get("function") or {}
+                if fn_delta.get("name"):
+                    existing["function"]["name"] = fn_delta["name"]
+                if "arguments" in fn_delta and fn_delta["arguments"]:
+                    existing["function"]["arguments"] += fn_delta["arguments"]
+
+    def _synthesize_sync_response(self, content, thinking, tool_calls, usage):
+        """Build a non-streaming-shaped response dict from aggregated stream chunks.
+
+        Mirrors the shape returned by `query_sync` for the current backend so callers
+        (e.g. the ReAct loop) can parse it identically.
+        """
+        backend = self.backend
+        if backend == "ollama":
+            resp = {
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls,
+                },
+            }
+            if thinking:
+                resp["message"]["reasoning_content"] = thinking
+            resp["prompt_eval_count"] = usage.get("prompt_eval_count", 0)
+            resp["eval_count"] = usage.get("eval_count", 0)
+            return resp
+        resp = {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls,
+                },
+                "finish_reason": "stop",
+            }],
+        }
+        if thinking:
+            resp["choices"][0]["message"]["reasoning_content"] = thinking
+        if usage:
+            resp["usage"] = {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
+        return resp
+
+    def query_sync_stream(self, messages, model, stream_enabled=True, **kwargs):
+        """Streaming variant of `query_sync` that aggregates chunks into a single dict.
+
+        Performs a streaming request and synthesizes a non-streaming-shaped response
+        dict (same as `query_sync`) so callers can parse it identically. Optionally
+        invokes `kwargs['on_chunk'](thought, content, is_final)` per chunk for live
+        feedback (e.g. real-time thinking/heartbeat display). Unlike `query_stream`,
+        it does NOT write anything to stdout — display is the caller's responsibility.
+
+        Args:
+            messages: Conversation list.
+            model: Model name.
+            on_chunk: Optional callback invoked per parsed chunk.
+            context_size, images, tools, inference params: passed through to payload.
+
+        Returns:
+            dict shaped like `query_sync` (or `{"error": {...}}` on failure).
+        """
+        on_chunk = kwargs.pop("on_chunk", None)
+        images = kwargs.pop("images", None)
+        context_size = kwargs.pop("context_size", None)
+        backend = self.backend
+
+        full_content = ""
+        full_thinking = ""
+        tool_calls = []          # ordered, deduped accumulated tool calls
+        tool_call_index = {}     # index -> partial tool call dict
+        usage = {}
+
+        if images and messages and messages[-1].get("role") == "user":
+            messages[-1] = dict(messages[-1])
+            self._inject_images_into_messages(messages, images, backend)
+
+        api_url, payload, headers = self._build_stream_request(
+            backend, messages, model, True, context_size, **kwargs)
+
+        data = json.dumps(payload).encode('utf-8')
+        req = Request(api_url, data=data, headers=headers)
+        self._debug_request(api_url, payload)
+
+        try:
+            with _request_with_retry(req) as response:
+                for raw_line in self._iter_stream_lines(response, backend):
+                    try:
+                        chunk = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    thought, content, is_final, u, tcs = self._parse_chunk(chunk, backend)
+                    if thought:
+                        full_thinking += thought
+                    if content:
+                        full_content += content
+                    if tcs:
+                        self._accumulate_stream_tool_calls(tool_calls, tool_call_index, tcs)
+                    if u:
+                        usage.update(u)
+                    if on_chunk:
+                        on_chunk(thought, content, is_final)
+        except Exception as e:
+            sys.stderr.write(colorize(f"[ERROR] {backend} sync stream failed: {e}\n", 'error'))
+            return {"error": {"message": str(e), "type": type(e).__name__}}
+
+        for idx in sorted(tool_call_index):
+            tc = tool_call_index[idx]
+            tool_calls.append({
+                "id": tc["id"],
+                "type": tc["type"],
+                "function": {
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"]["arguments"],
+                }
+            })
+
+        return self._synthesize_sync_response(full_content, full_thinking, tool_calls, usage)
 
 
     def _normalize_llamacpp_usage(self, chunk: dict) -> dict:
@@ -3124,36 +4108,7 @@ class ModelQuery:
 
                         # Accumulate tool_calls from streaming chunks
                         if tool_calls:
-                            for tc in tool_calls:
-                                if "index" not in tc:
-                                    stream_tool_calls.append({
-                                        "id": tc.get("id", ""),
-                                        "type": tc.get("type", "function"),
-                                        "function": {
-                                            "name": tc.get("function", {}).get("name", ""),
-                                            "arguments": tc.get("function", {}).get("arguments", ""),
-                                        }
-                                    })
-                                    continue
-                                idx = tc.get("index", 0)
-                                if idx not in stream_tool_call_index:
-                                    stream_tool_call_index[idx] = {
-                                        "id": tc.get("id", ""),
-                                        "type": tc.get("type", "function"),
-                                        "function": {
-                                            "name": tc.get("function", {}).get("name", ""),
-                                            "arguments": tc.get("function", {}).get("arguments", ""),
-                                        }
-                                    }
-                                else:
-                                    existing = stream_tool_call_index[idx]
-                                    if tc.get("id"):
-                                        existing["id"] = tc["id"]
-                                    fn_delta = tc.get("function") or {}
-                                    if fn_delta.get("name"):
-                                        existing["function"]["name"] = fn_delta["name"]
-                                    if "arguments" in fn_delta and fn_delta["arguments"]:
-                                        existing["function"]["arguments"] += fn_delta["arguments"]
+                            self._accumulate_stream_tool_calls(stream_tool_calls, stream_tool_call_index, tool_calls)
 
                         if is_final and usage:
                             self._debug_final_stats(usage)
@@ -3484,8 +4439,8 @@ def _process_command_lines(text):
 
         if not in_literal_block and stripped.startswith("!"):
             command = stripped[1:].strip()
-            if command and validate_shell_command_safety(command):
-                output_str = execute_os_command(sanitize_shell_command(command))
+            if command:
+                output_str = execute_os_command(command)
             else:
                 output_str = "[Command rejected: Invalid characters]"
             processed.append(output_str)
@@ -3544,23 +4499,31 @@ def execute_os_command(command, timeout=None):
         timeout = CommandContext().shell_timeout
     if timeout is None:
         timeout = 5
-    if not validate_shell_command_safety(command, max_length=500):
-        msg = "[Command rejected: Invalid characters]"
+    # Gate: opencode breakdown + home guard + CWD leniency (pipes/redirs allowed)
+    if command and len(command) > 500:
+        msg = "[Command rejected: too long]"
         print(colorize(msg, 'error'), file=sys.stderr)
-        return "[Command rejected: Invalid characters]"
+        return "[Command rejected: too long]"
+    ctx = CommandContext() if CommandContext._initialized else None
+    # Use host mode for inline ! commands (never container)
+    gate = check_shell_approval(command, ctx=ctx, executor_mode="host")
+    if not gate["approved"]:
+        msg = gate.get("message") or "[Command rejected by shell approval gate]"
+        print(colorize(msg, 'error'), file=sys.stderr)
+        return f"[Command rejected: {msg}]"
 
     print(f"[--- Executing (max {timeout}s): {command} ---]", file=sys.stderr)
     output_lines = []
 
     try:
-        args_list = shlex.split(command)
         process = subprocess.run(
-            args_list, shell=False,  # Intentional: shell=False prevents pipes/redirects but blocks injection. Single commands only.
+            command, shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            timeout=timeout
+            timeout=timeout,
+            executable="/bin/bash"
         )
 
         raw_output = process.stdout if process.stdout else ""
@@ -3874,6 +4837,7 @@ class ChatLoop:
         """List available models from the backend, with optional name filter."""
         if self.ctx.backend == "ollama":
             list_models_ollama(self.ctx.base_url, filter_arg, file=sys.stdout)
+            return
         elif self.ctx.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
             models = fetch_models_llamacpp(self.ctx.base_url, api_key=self.ctx.api_key)
         else:
@@ -4843,6 +5807,116 @@ class ChatLoop:
             raise exception[0]
         return result[0]
 
+    def _make_agentic_step_feedback(self):
+        """Build live feedback callbacks for an agentic ReAct step.
+
+        Returns (on_chunk, finalize). `on_chunk(thought, content, is_final)` streams
+        model thinking to stderr in real time when `agentic_show_thinking` is enabled;
+        otherwise it emits a heartbeat dot (~1/s) so the user sees the model is still
+        generating. `finalize()` closes any open `<thinking>` block and stops the
+        lingering worker thread (on timeout) from writing further feedback.
+        """
+        state = {
+            "thinking_open": False,
+            "last_heartbeat": time.time(),
+            "cancelled": False,
+            "heartbeat_shown": False,
+        }
+        show_thinking = self.ctx.agentic_show_thinking
+
+        def on_chunk(thought, content, is_final):
+            if state["cancelled"]:
+                return
+            if show_thinking:
+                if thought:
+                    if not state["thinking_open"]:
+                        state["thinking_open"] = True
+                        sys.stderr.write("\n<thinking>\n")
+                    sys.stderr.write(thought)
+                    sys.stderr.flush()
+                if content and state["thinking_open"]:
+                    sys.stderr.write("\n</thinking>\n")
+                    sys.stderr.flush()
+                    state["thinking_open"] = False
+            else:
+                now = time.time()
+                if now - state["last_heartbeat"] >= 1.0:
+                    state["last_heartbeat"] = now
+                    state["heartbeat_shown"] = True
+                    sys.stderr.write(".")
+                    sys.stderr.flush()
+
+        def finalize():
+            if state["thinking_open"]:
+                sys.stderr.write("\n</thinking>\n")
+                sys.stderr.flush()
+                state["thinking_open"] = False
+            elif state["heartbeat_shown"]:
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+                state["heartbeat_shown"] = False
+            state["cancelled"] = True
+
+        return on_chunk, finalize
+
+    def _handle_agentic_timeout(self, iteration: int, step_timeout: int, messages: list):
+        """Handle a step timeout in the ReAct loop.
+
+        Applies the escalation policy based on model state:
+          State C — last tool was destructive → abort immediately.
+          State A — no tool executed yet       → retry once, abort after two.
+          State B — a tool already ran         → exponential backoff up to max.
+
+        Args:
+            iteration: Current ReAct iteration number.
+            step_timeout: The timeout (seconds) that just expired.
+            messages: The conversation list (a nudge message is appended on continue).
+
+        Returns:
+            (should_break: bool, new_step_timeout: int)
+        """
+        self.ctx.agentic_consecutive_timeouts += 1
+        last_tool = self.ctx.agentic_last_tool_name
+        expired = step_timeout
+
+        if last_tool in AGENTIC_TIMEOUT_ABORT_TOOLS:
+            # State C: destructive last tool — don't risk re-execution.
+            print(colorize(
+                f"\n[Agentic] Step {iteration} timed out after {expired}s. "
+                f"Last tool was '{last_tool}' (destructive). Aborting.",
+                'error'), file=sys.stderr)
+            return True, step_timeout
+
+        if not self.ctx.agentic_has_executed_tool:
+            # State A: no tool executed yet — conservative; abort after two timeouts.
+            if self.ctx.agentic_consecutive_timeouts >= 2:
+                print(colorize(
+                    f"\n[Agentic] Step {iteration} timed out twice. Model may be stuck. Aborting.",
+                    'error'), file=sys.stderr)
+                return True, step_timeout
+            print(colorize(
+                f"\n[Agentic] Step {iteration} timed out after {expired}s. "
+                "Model may be thinking — retrying.",
+                'warning'), file=sys.stderr)
+        else:
+            # State B: a tool already ran — escalate with exponential backoff.
+            if step_timeout >= self.ctx.agentic_timeout_max:
+                print(colorize(
+                    f"\n[Agentic] Max timeout ({self.ctx.agentic_timeout_max}s) reached. Aborting agentic query.",
+                    'error'), file=sys.stderr)
+                return True, step_timeout
+            step_timeout = min(step_timeout * 2, self.ctx.agentic_timeout_max)
+            print(colorize(
+                f"\n[Agentic] Step {iteration} timed out after {expired}s. "
+                f"Model was executing tools — extending to {step_timeout}s.",
+                'warning'), file=sys.stderr)
+
+        messages.append({'role': 'user', 'content': (
+            "You were interrupted by a timeout while generating your response. "
+            "Please continue your previous response."
+        )})
+        return False, step_timeout
+
     def _init_agentic_query(self, final_content):
         """Initialize messages, logger, and tool format for an agentic query.
 
@@ -5156,6 +6230,11 @@ class ChatLoop:
             step_timeout = self.ctx.agentic_step_timeout
             response_text = ""
 
+            # Reset timeout escalation state at the start of each agentic query.
+            self.ctx.agentic_consecutive_timeouts = 0
+            self.ctx.agentic_has_executed_tool = False
+            self.ctx.agentic_last_tool_name = ""
+
             while iteration < max_iterations:
                 iteration += 1
                 if logger:
@@ -5183,17 +6262,23 @@ class ChatLoop:
                 sync_kwargs = dict(get_inference_params(self.ctx.model))
                 if send_tools_api:
                     sync_kwargs["tools"] = openai_tools
+                on_chunk, finalize_step = self._make_agentic_step_feedback()
                 response = self._call_with_timeout(
-                    self.query_handler.query_sync, step_timeout,
+                    self.query_handler.query_sync_stream, step_timeout,
                     messages, self.ctx.model,
                     context_size=self.ctx.context_size,
                     images=images_to_send,
+                    on_chunk=on_chunk,
                     **sync_kwargs
                 )
+                finalize_step()
 
                 if response is None:
-                    print(colorize(f"\n[Agentic] Step timed out after {step_timeout}s.", 'error'), file=sys.stderr)
-                    break
+                    should_break, step_timeout = self._handle_agentic_timeout(iteration, step_timeout, messages)
+                    if should_break:
+                        break
+                    response_text = ""
+                    continue
 
                 # Track tokens from sync response to keep context bar accurate
                 if isinstance(response, dict):
@@ -5250,18 +6335,6 @@ class ChatLoop:
                     if truncated:
                         print(colorize(f"[Verbose] ({len(response_text)} total chars, showing first 500)", 'muted'), file=sys.stderr)
 
-                if self.ctx.agentic_show_thinking and isinstance(response, dict):
-                    thinking = ""
-                    if self.ctx.backend == "ollama":
-                        thinking = response.get('message', {}).get('reasoning_content', '')
-                    else:
-                        choices = response.get('choices', [])
-                        if choices:
-                            msg = choices[0].get('message', {})
-                            thinking = msg.get('reasoning_content', '') or msg.get('reasoning', '')
-                    if thinking:
-                        print(colorize(f"\n<thinking>\n{thinking}\n</thinking>", 'muted'), file=sys.stderr)
-
                 if not response_text and not api_tool_calls:
                     messages.append({'role': 'user', 'content': 'Please provide a tool call or your final answer.'})
                     continue
@@ -5297,11 +6370,16 @@ class ChatLoop:
 
                 if not tool_calls:
                     final_answer = response_text
+                    self.ctx.agentic_consecutive_timeouts = 0
                     break
 
                 observations, raw_observations, abort_loop, last_tool_call, tool_final = self._execute_tool_calls(
                     tool_calls, last_tool_call, iteration, logger, messages, response_text, api_tool_calls
                 )
+                if tool_calls:
+                    self.ctx.agentic_has_executed_tool = True
+                    self.ctx.agentic_last_tool_name = tool_calls[0]["tool"]
+                    self.ctx.agentic_consecutive_timeouts = 0
                 if tool_final:
                     final_answer = tool_final
                 if abort_loop:
@@ -5334,6 +6412,19 @@ class ChatLoop:
                 for msg in messages[2:]:
                     self.messages.insert(len(self.messages) - 1, msg)
 
+            # Persist compaction savings: the ReAct loop may have auto-compacted its
+            # local `messages`, but that compaction is discarded by the merge above.
+            # Re-check the merged history and compact if it exceeds the threshold.
+            if self.ctx.context_window_size > 0:
+                msg_tokens = self.ctx.calculate_context_tokens(self.messages)
+                threshold = int(self.ctx.context_window_size * self.ctx.compaction_threshold)
+                if msg_tokens > threshold:
+                    before_len = len(self.messages)
+                    self.messages = compact_messages(self.messages, self.ctx)
+                    print(colorize(
+                        f"[Auto-compact] Agentic history persisted: {before_len} → {len(self.messages)} msgs",
+                        'warning'), file=sys.stderr)
+
             # Recalculate context tokens after merging agentic history
             self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
 
@@ -5356,55 +6447,210 @@ class ChatLoop:
         return None
 
     def run_handle_compact(self, full_input: str) -> Optional[bool]:
-        """Handle /compact command to manually compact conversation history."""
-        if full_input.startswith('/compact'):
-            if not hasattr(self, 'messages') or len(self.messages) <= 2:
-                print(colorize("[Compact] Nothing to compact.", 'warning'), file=sys.stderr)
-                return False
-            before_len = len(self.messages)
-            before_tokens = self.ctx.calculate_context_tokens(self.messages)
+        """Handle /compact command and subcommands (like /agentic)."""
+        if not full_input.startswith('/compact'):
+            return None
+        parts = full_input.split()
+        subcmd = parts[1] if len(parts) > 1 else ""
 
-            # Phase 1: standard sliding-window compaction
-            self.messages = compact_messages(self.messages, self.ctx)
-            after_tokens = self.ctx.calculate_context_tokens(self.messages)
+        if subcmd == "list":
+            return self._compact_list()
+        if subcmd == "threshold":
+            return self._compact_threshold(parts)
+        if subcmd == "now":
+            return self._compact_run()
+        if subcmd == "force":
+            if len(parts) > 2:
+                return self._compact_force_message(parts[2])
+            return self._compact_run(force=True)
+        if subcmd == "llm":
+            return self._compact_run(use_llm=True)
+        if subcmd in ("", "status"):
+            return self._print_compact_status()
 
-            # Phase 2: if still over 70% and there's a giant message, truncate it
-            if self.ctx.context_window_size > 0:
-                target = int(self.ctx.context_window_size * COMPACTION_TARGET)
-                if after_tokens > target and len(self.messages) > 1:
-                    largest_idx = -1
-                    largest_tokens = 0
-                    for i, msg in enumerate(self.messages):
-                        if i == 0:
-                            continue
-                        t = msg.get('_tokens', self.ctx.estimate_tokens(msg.get('content', '')))
-                        if t > largest_tokens:
-                            largest_tokens = t
-                            largest_idx = i
-                    if largest_idx > 0 and largest_tokens > target * 0.3:
-                        excess = after_tokens - target
-                        msg = self.messages[largest_idx]
-                        content = msg.get('content', '')
-                        chars_to_cut = int(excess * 4)  # rough tokens→chars
-                        if chars_to_cut > 0 and chars_to_cut < len(content):
-                            role = msg.get('role', 'unknown')
-                            msg['content'] = content[:len(content) - chars_to_cut] + \
-                                f"\n\n[... truncated {chars_to_cut} chars to fit context budget ...]"
-                            msg.pop('_tokens', None)
-                            self.ctx.stamp_tokens(msg)
-                            after_tokens = self.ctx.calculate_context_tokens(self.messages)
-                            print(colorize(
-                                f"[Compact] Truncated large {role} message (index {largest_idx}) to fit budget.",
-                                'warning'), file=sys.stderr)
+        print(colorize("[Usage: /compact [now|force [index]|llm|threshold <v>|list|status]]", 'warning'), file=sys.stderr)
+        return False
 
-            self.ctx.current_context_tokens = after_tokens
-            print(colorize(
-                f"[Compact] {before_len} → {len(self.messages)} messages, "
-                f"{before_tokens} → {after_tokens} tokens "
-                f"(saved {before_tokens - after_tokens} tokens)",
-                'success'), file=sys.stderr)
+    def _compact_run(self, force: bool = False, use_llm: bool = False) -> bool:
+        """Perform compaction. Returns False to keep the loop running."""
+        if not hasattr(self, 'messages') or len(self.messages) <= 2:
+            print(colorize("[Compact] Nothing to compact.", 'warning'), file=sys.stderr)
             return False
-        return None
+        before_len = len(self.messages)
+        before_tokens = self.ctx.calculate_context_tokens(self.messages)
+
+        # Optional: LLM-summarize large tool results before mechanical compaction.
+        if use_llm:
+            summarize_tool_results(self.messages, self.ctx, self.query_handler)
+            summarized = len([m for m in self.messages
+                              if isinstance(m.get('content', ''), str)
+                              and m.get('content', '').startswith('[Summarized tool result')])
+            if summarized:
+                print(colorize(
+                    f"[Compact] LLM-summarized {summarized} tool result(s).",
+                    'info'), file=sys.stderr)
+            else:
+                print(colorize(
+                    "[Compact] No eligible tool results to summarize.",
+                    'muted'), file=sys.stderr)
+
+        # Phase 1: sliding-window compaction
+        self.messages = compact_messages(self.messages, self.ctx, force=force)
+        after_tokens = self.ctx.calculate_context_tokens(self.messages)
+
+        # Phase 2: if still over the target budget (COMPACTION_TARGET) and
+        # there's a giant message, truncate it
+        if self.ctx.context_window_size > 0:
+            target = int(self.ctx.context_window_size * COMPACTION_TARGET)
+            if after_tokens > target and len(self.messages) > 1:
+                largest_idx = -1
+                largest_tokens = 0
+                for i, msg in enumerate(self.messages):
+                    if i == 0:
+                        continue
+                    t = msg.get('_tokens', self.ctx.estimate_tokens(msg.get('content', '')))
+                    if t > largest_tokens:
+                        largest_tokens = t
+                        largest_idx = i
+                if largest_idx > 0 and largest_tokens > target * 0.3:
+                    excess = after_tokens - target
+                    msg = self.messages[largest_idx]
+                    content = msg.get('content', '')
+                    chars_to_cut = int(excess * 4)  # rough tokens→chars
+                    if chars_to_cut > 0 and chars_to_cut < len(content):
+                        role = msg.get('role', 'unknown')
+                        msg['content'] = content[:len(content) - chars_to_cut] + \
+                            f"\n\n[... truncated {chars_to_cut} chars to fit context budget ...]"
+                        msg.pop('_tokens', None)
+                        self.ctx.stamp_tokens(msg)
+                        after_tokens = self.ctx.calculate_context_tokens(self.messages)
+                        print(colorize(
+                            f"[Compact] Truncated large {role} message (index {largest_idx}) to fit budget.",
+                            'warning'), file=sys.stderr)
+
+        self.ctx.current_context_tokens = after_tokens
+        print(colorize(
+            f"[Compact] {before_len} → {len(self.messages)} messages, "
+            f"{before_tokens} → {after_tokens} tokens "
+            f"(saved {before_tokens - after_tokens} tokens)",
+            'success'), file=sys.stderr)
+        return False
+
+    def _compact_list(self) -> bool:
+        """List all messages with sizes (like /tokencount)."""
+        if not hasattr(self, 'messages') or not self.messages:
+            print(colorize("[Compact] No messages in session.", 'warning'), file=sys.stderr)
+            return False
+        total = 0
+        print(colorize("\n--- Conversation Messages ---", 'info'), file=sys.stderr)
+        for i, msg in enumerate(self.messages):
+            role = msg.get('role', 'unknown')
+            name = msg.get('name', '')
+            content = msg.get('content', '')
+            if '_tokens' in msg:
+                tokens = msg['_tokens']
+                marker = "·"
+            else:
+                tokens = self.ctx.estimate_tokens(content) + 2
+                marker = "~"
+            total += tokens
+            preview = content[:60].replace('\n', ' ') if isinstance(content, str) else str(content)[:60]
+            if len(content) > 60:
+                preview += '...'
+            tag = f" ({name})" if name else ""
+            print(colorize(f"  [{i:3d}] {role:10s}{tag:<14s}{marker}{tokens:6d} tok  {preview}",
+                           'info'), file=sys.stderr)
+        print(colorize(f"\n  Total: {total} tokens", 'info'), file=sys.stderr)
+        if self.ctx.context_window_size > 0:
+            pct = total / self.ctx.context_window_size
+            print(colorize(f"  Context: {total}/{self.ctx.context_window_size} ({pct:.1%})", 'info'), file=sys.stderr)
+        print(colorize("--- End ---\n", 'info'), file=sys.stderr)
+        return False
+
+    def _print_compact_status(self) -> bool:
+        """Display current compaction settings like /agentic status."""
+        c = self.ctx
+        print(colorize("\n[Compaction Settings - Use /compact <option> [value]]", 'info'), file=sys.stderr)
+        print("  Subcommands: now, force [index], llm, threshold <v>, list, status", file=sys.stderr)
+        print(file=sys.stderr)
+
+        settings = [
+            ("threshold", "Auto-compact trigger", f"{c.compaction_threshold:.0%}"),
+            ("target",    "Compact down to",      f"{COMPACTION_TARGET:.0%}"),
+            ("keep",      "Recent messages kept", str(COMPACTION_KEEP_RECENT)),
+        ]
+        for name, desc, value in settings:
+            print(f"  > {name:<12} [{value:<8}] {desc}", file=sys.stderr)
+
+        total = c.calculate_context_tokens(getattr(self, 'messages', [])) if hasattr(self, 'messages') else 0
+        if c.context_window_size > 0:
+            pct = total / c.context_window_size
+            threshold_tok = int(c.context_window_size * c.compaction_threshold)
+            print(f"\n  Window size:       {c.context_window_size}", file=sys.stderr)
+            print(f"  Current usage:     {total}/{c.context_window_size} ({pct:.1%})", file=sys.stderr)
+            print(f"  Auto-compact at:   {threshold_tok} tokens", file=sys.stderr)
+        else:
+            print(f"\n  Current usage:     {total} tokens", file=sys.stderr)
+            print("  Window size:       unknown (auto-compact disabled)", file=sys.stderr)
+        print(file=sys.stderr)
+        return False
+
+    def _compact_threshold(self, parts) -> bool:
+        """Set the auto-compaction trigger threshold."""
+        if len(parts) < 3:
+            print(colorize("[Usage: /compact threshold <value>]  (e.g. 0.6 or 60)", 'warning'), file=sys.stderr)
+            return False
+        try:
+            val = float(parts[2])
+        except ValueError:
+            print(colorize(f"[Compact] '{parts[2]}' is not a number.", 'error'), file=sys.stderr)
+            return False
+        if val > 1:
+            val = val / 100.0
+        if not (0.0 < val < 1.0):
+            print(colorize("[Compact] Threshold must be between 0 and 1 (or 1-99 as percent).", 'error'), file=sys.stderr)
+            return False
+        self.ctx.compaction_threshold = val
+        print(colorize(f"[Compact] Auto-compaction threshold set to {val:.0%}.", 'success'), file=sys.stderr)
+        return False
+
+    def _compact_force_message(self, index_str: str) -> bool:
+        """Force-summarize (tool result) or truncate a single message by index."""
+        try:
+            idx = int(index_str)
+        except ValueError:
+            print(colorize(f"[Compact] '{index_str}' is not a valid index.", 'error'), file=sys.stderr)
+            return False
+        if not hasattr(self, 'messages') or not (0 < idx < len(self.messages)):
+            print(colorize(f"[Compact] Index {idx} out of range (1-{len(self.messages) - 1}).", 'error'), file=sys.stderr)
+            return False
+        msg = self.messages[idx]
+        content = msg.get('content', '')
+        if not isinstance(content, str) or len(content) <= SUMMARIZE_TOOL_MIN_CHARS:
+            print(colorize(f"[Compact] Message {idx} is already small ({len(content)} chars).", 'muted'), file=sys.stderr)
+            return False
+        before = len(content)
+        role = msg.get('role', 'unknown')
+        name = msg.get('name', '')
+        if role == 'tool' and name and name not in SUMMARIZE_TOOL_EXCLUDE:
+            summary = _llm_summarize_tool_result(self.ctx, self.query_handler, name, content)
+            if summary:
+                msg['content'] = f"[Summarized tool result ({name})]\n{summary}"
+                msg.pop('_tokens', None)
+                self.ctx.stamp_tokens(msg)
+                print(colorize(
+                    f"[Compact] LLM-summarized message {idx} ({before} → {len(msg['content'])} chars).",
+                    'success'), file=sys.stderr)
+                return False
+            print(colorize(f"[Compact] LLM summarization failed for message {idx}; truncating instead.", 'warning'), file=sys.stderr)
+        max_chars = 2000
+        msg['content'] = content[:max_chars] + f"\n\n[... truncated {before - max_chars} chars by /compact force ...]"
+        msg.pop('_tokens', None)
+        self.ctx.stamp_tokens(msg)
+        print(colorize(
+            f"[Compact] Truncated message {idx} ({role}) from {before} → {len(msg['content'])} chars.",
+            'success'), file=sys.stderr)
+        return False
 
     def run_handle_drop(self, full_input: str) -> Optional[bool]:
         """Handle /drop command to remove specific messages by index."""
@@ -5563,7 +6809,7 @@ class ChatLoop:
         # Auto-compaction: compact if approaching context limit
         if self.ctx.context_window_size > 0:
             msg_tokens = self.ctx.calculate_context_tokens(self.messages)
-            threshold = int(self.ctx.context_window_size * COMPACTION_THRESHOLD)
+            threshold = int(self.ctx.context_window_size * self.ctx.compaction_threshold)
             if msg_tokens > threshold:
                 before_len = len(self.messages)
                 self.messages = compact_messages(self.messages, self.ctx)
@@ -5856,7 +7102,7 @@ def check_gemini(url, api_key=None, timeout=2):
     try:
         request = Request(f"{url}/v1/models", method='GET',
                           headers={'Authorization': f'Bearer {api_key}', 'User-Agent': 'Mozilla/5.0'})
-        with urlopen(request, timeout=timeout) as response:
+        with _request_with_retry(request, timeout=timeout) as response:
             data = json.loads(response.read().decode('utf-8'))
             models = data.get('data', [])
             return bool(models)

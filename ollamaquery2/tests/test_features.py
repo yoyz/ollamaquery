@@ -1974,6 +1974,112 @@ class TestStreamToolCallAccumulation(unittest.TestCase):
 
 
 # ============================================================================
+# 24.  Streaming Sync Query (query_sync_stream) for Agentic Feedback
+# ============================================================================
+
+class TestSyncStream(unittest.TestCase):
+    """query_sync_stream aggregates stream chunks into a sync-shaped dict + live feedback."""
+
+    def setUp(self):
+        self.ctx = _fresh_ctx()
+
+    def _make_query(self, backend):
+        qh = q.ModelQuery(context=self.ctx)
+        qh.ctx.backend = backend
+        qh.ctx.base_url = "http://localhost/fake"
+        qh.ctx.model = SMALL_MODEL
+        return qh
+
+    def _mock_transport(self, qh, json_lines):
+        def fake_iter(response, backend):
+            yield from json_lines
+        qh._iter_stream_lines = fake_iter
+
+        class FakeResponse:
+            def __enter__(self):
+                return None
+            def __exit__(self, *a):
+                pass
+
+        return (
+            patch.object(qh, '_build_stream_request',
+                         return_value=("http://localhost/fake", {}, {})),
+            patch.object(q, '_request_with_retry', return_value=FakeResponse()),
+        )
+
+    def test_llamacpp_aggregates_content_and_delta_tool_calls(self):
+        """OpenAI-style delta stream is synthesized into a sync-shaped dict."""
+        qh = self._make_query("llamacpp")
+        lines = [
+            json.dumps({"choices": [{"delta": {"reasoning_content": "I need a tool."}}]}),
+            json.dumps({"choices": [{"delta": {"content": "Using tool"}}]}),
+            json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "function": {"name": "fetch_url", "arguments": ""}}
+            ]}}]}),
+            json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": '{"url": "http://x"}'}}
+            ]}}]}),
+            json.dumps({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        ]
+        m1, m2 = self._mock_transport(qh, lines)
+        with m1, m2:
+            resp = qh.query_sync_stream([{"role": "user", "content": "hi"}], SMALL_MODEL)
+
+        self.assertIn("choices", resp)
+        msg = resp["choices"][0]["message"]
+        self.assertEqual(msg["content"], "Using tool")
+        self.assertEqual(msg["reasoning_content"], "I need a tool.")
+        self.assertEqual(len(msg["tool_calls"]), 1)
+        self.assertEqual(msg["tool_calls"][0]["function"]["name"], "fetch_url")
+        self.assertEqual(msg["tool_calls"][0]["function"]["arguments"],
+                         '{"url": "http://x"}')
+
+    def test_ollama_shape_synthesis(self):
+        """Ollama stream is synthesized into the /api/chat sync shape."""
+        qh = self._make_query("ollama")
+        chunk = json.dumps({
+            "model": "test",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "run_command",
+                                            "arguments": {"command": "uname -a"}}}]
+            },
+            "done": True,
+            "prompt_eval_count": 12,
+            "eval_count": 3,
+        })
+        m1, m2 = self._mock_transport(qh, [chunk])
+        with m1, m2:
+            resp = qh.query_sync_stream([{"role": "user", "content": "hi"}], SMALL_MODEL)
+
+        self.assertIn("message", resp)
+        self.assertEqual(resp["message"]["tool_calls"][0]["function"]["name"], "run_command")
+        self.assertEqual(resp["prompt_eval_count"], 12)
+        self.assertEqual(resp["eval_count"], 3)
+
+    def test_on_chunk_callback_receives_thought_and_content(self):
+        """on_chunk callback is invoked per chunk with (thought, content, is_final)."""
+        qh = self._make_query("llamacpp")
+        lines = [
+            json.dumps({"choices": [{"delta": {"reasoning_content": "think"}}]}),
+            json.dumps({"choices": [{"delta": {"content": "answer"}}]}),
+            json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        ]
+        seen = []
+        m1, m2 = self._mock_transport(qh, lines)
+        with m1, m2:
+            qh.query_sync_stream(
+                [{"role": "user", "content": "hi"}], SMALL_MODEL,
+                on_chunk=lambda t, c, f: seen.append((t, c, f)))
+
+        self.assertEqual(seen[0], ("think", "", False))
+        self.assertEqual(seen[1], ("", "answer", False))
+        self.assertEqual(seen[2][0], "")  # final chunk: no thought/content
+        self.assertTrue(seen[2][2])       # is_final True
+
+
+# ============================================================================
 # Run
 # ============================================================================
 
