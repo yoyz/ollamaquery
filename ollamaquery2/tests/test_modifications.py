@@ -399,6 +399,41 @@ class TestPathTraversal(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("Path traversal denied", result.get("error", ""))
 
+    def test_read_file_absolute_system_proc(self):
+        # /proc is `ask` by default; non-TTY runs deny it (bypass-immune).
+        result = self.reg.execute("read_file", {"file": "/proc/version"})
+        self.assertFalse(result["success"])
+        self.assertIn("denied by path ACL rule", result.get("error", ""))
+        # After a session allow, the read goes through.
+        self.ctx.path_acl.add("read", "allow", "/proc", source="session")
+        result = self.reg.execute("read_file", {"file": "/proc/version"})
+        self.assertTrue(result["success"])
+        self.assertIn("Linux", result.get("output", ""))
+
+    def test_read_file_missing_slash_system_path(self):
+        result = self.reg.execute("read_file", {"file": "proc/self/cgroup"})
+        self.assertFalse(result["success"])
+        self.assertIn("denied by path ACL rule", result.get("error", ""))
+        self.ctx.path_acl.add("read", "allow", "/proc", source="session")
+        result = self.reg.execute("read_file", {"file": "proc/self/cgroup"})
+        self.assertTrue(result["success"])
+        self.assertIn("slice", result.get("output", ""))
+
+    def test_read_file_blocks_sensitive_proc(self):
+        result = self.reg.execute("read_file", {"file": "/proc/1/mem"})
+        self.assertFalse(result["success"])
+        self.assertIn("System file blocked", result.get("error", ""))
+
+    def test_read_file_blocks_environ(self):
+        result = self.reg.execute("read_file", {"file": "/proc/self/environ"})
+        self.assertFalse(result["success"])
+        self.assertIn("System file blocked", result.get("error", ""))
+
+    def test_read_file_system_path_not_enabled_for_write(self):
+        result = self.reg.execute("write_file", {"file": "/proc/self/cgroup", "content": "x"})
+        self.assertFalse(result["success"])
+        self.assertIn("denied by path ACL rule", result.get("error", ""))
+
     def test_write_file_rejects_traversal(self):
         result = self.reg.execute("write_file", {"file": "../outside.txt", "content": "x"})
         self.assertFalse(result["success"])

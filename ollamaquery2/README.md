@@ -100,9 +100,54 @@ spawnshell are disabled when unavailable.
 | `edit_file` | Precise string replacement |
 | `apply_patch` | Apply diff with file headers |
 
-Subcommands: `/agentic auto`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `iterations <N>`, `timeout <N>`.
+Subcommands: `/agentic auto`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `iterations <N>`, `timeout <N>`.
 
-Safety features: destructive tool confirmation, path traversal guard, step timeout (default 120s), stuck detection, same-tool-loop abort, optional container sandbox (podman/docker).
+Safety features: destructive tool confirmation, path ACL (see below), shell approval gate, step timeout (default 120s), stuck detection, same-tool-loop abort, optional container sandbox (podman/docker).
+
+### Access Control (Path ACL)
+
+File tools (`read_file`, `write_file`, `edit_file`, `list_directory`) and
+`run_command` operands are governed by a session-scoped Path ACL:
+
+| Path | read | write |
+|------|------|-------|
+| Current working directory | allow | allow |
+| `$HOME` (explicit `~` / absolute) | allow | deny |
+| `$HOME` dotfiles (`~/.*`) | ask | ask |
+| `/proc`, `/sys`, `/etc` | ask | deny |
+| anything else outside CWD/`$HOME` | deny | deny |
+
+- `ask` prompts per access and is never auto-approved (bypass-immune to
+  `/agentic auto`); non-TTY runs deny and log it.
+- Sensitive virtual files (`/proc/*/mem`, `environ`, `kcore`, `/proc/*/fd/*`) are
+  hard-blocked regardless of rules.
+- `run_command` is now path-aware: `cat /etc/passwd`, `head /sys/...` etc.
+  require approval even though `cat`/`head` are otherwise allowed.
+
+Inspect and influence the policy with `/agentic acl`:
+
+```text
+/agentic acl                    # list current rules
+/agentic acl log                # recent allow/deny decisions
+/agentic acl allow /etc read    # allow reads under /etc this session
+/agentic acl deny /proc read    # deny /proc reads this session
+/agentic acl ask /sys read      # restore prompting for /sys
+/agentic acl remove /etc        # drop session rules for a path
+/agentic acl reset              # restore defaults
+```
+
+Defaults apply per session; `reset` restores them. Longest path prefix wins,
+and session rules override defaults.
+
+**Not covered by the Path ACL** — these rely on the older CWD-containment
+check plus the destructive-tool / shell approval gates instead:
+- `run_python` **inline `code`** — the code is inlined into `python3 -c <code>`
+  and cannot be scanned for operands, so e.g. `open('/etc/passwd')` inside
+  Python is not ACL-checked (use the `file_path` form to get operand
+  coverage).
+- `diff` and `apply_patch` — paths embedded in the arguments / patch text are
+  resolved with plain CWD containment only (no ask).
+- `glob` — restricted to the working directory by design.
 
 ### Agentic Example
 
@@ -138,6 +183,38 @@ Only enable this if you trust the model's reliability — a compromised or
 unpredictable model could read, write, or execute arbitrary commands without
 oversight.
 
+### Running Agentic in a Container Sandbox
+
+`/agentic sandbox` toggles shell tool execution (`run_command`, `run_python`)
+into a throwaway container (podman/docker, image
+`python:3.12-alpine` by default — override with `OLLAMAQUERY_CONTAINER_RT` /
+`OLLAMAQUERY_CONTAINER_IMAGE`). Your working directory is mounted read-write
+at `/workspace`; the rest of the system is isolated.
+
+```text
+> /agentic on
+Agentic mode enabled.
+
+> /agentic sandbox
+Executor mode: container
+
+> what OS does this container run?
+[Agentic] Step 1/50…
+[Tool] run_command(command='cat /etc/os-release | head -1')
+
+NAME="Alpine Linux"
+```
+
+Notes:
+- Only `run_command` / `run_python` run inside the container; the file tools
+  (`read_file`, `write_file`, ...) still operate on host paths and stay
+  governed by the Path ACL.
+- Container commands skip the shell approval gate and the path-ACL operand
+  scan (the container is the sandbox — `cat /etc/passwd` reads the
+  container's `/etc`).
+- Requires a working podman/docker setup and network to pull the image on
+  first use.
+
 ## Testing
 
 ```bash
@@ -146,7 +223,7 @@ python3 -m unittest discover tests -v
 
 ~130 unit tests (no backend needed) + ~60 integration tests (require live backend).
 
-Test coverage: configuration, retry logic, theme system, command registry, shell safety, HTML parsing, token counting, debug manager, image handling, backend detection, model listing, basic queries, stats, command handlers, switch model, spawn shell, dump context, full workflow. Agentic: ReAct loop, tool execution, JSON normalization, multi-tool parsing, argument aliases, lazy mode, stuck detection, timeout, end-to-end DNS resolver pipeline.
+Test coverage: configuration, retry logic, theme system, command registry, shell safety, path ACL, compaction role-integrity, HTML parsing, token counting, debug manager, image handling, backend detection, model listing, basic queries, stats, command handlers, switch model, spawn shell, dump context, full workflow. Agentic: ReAct loop, tool execution, JSON normalization, multi-tool parsing, argument aliases, lazy mode, stuck detection, timeout, end-to-end DNS resolver pipeline.
 
 ## Requirements
 

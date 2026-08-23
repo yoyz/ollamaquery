@@ -152,5 +152,103 @@ class TestQ7RoleAlternation(unittest.TestCase):
                                     f"consecutive user roles at {i-1},{i}: {roles}")
 
 
+def _tool_session():
+    """system, some users, an assistant tool_call + tool result, then a tail."""
+    return [
+        {'role': 'system', 'content': 'sys'},
+        {'role': 'user', 'content': 'q0'},
+        {'role': 'user', 'content': 'q1'},
+        {'role': 'assistant', 'content': 'call',
+         'tool_calls': [{'id': 'tc', 'function': {'name': 'read_file', 'arguments': '{}'}}]},
+        {'role': 'tool', 'content': 'result text', 'tool_call_id': 'tc'},
+        {'role': 'assistant', 'content': 'answer'},
+        {'role': 'user', 'content': 'next'},
+    ]
+
+
+def _assert_no_orphaned_tools(testcase, msgs):
+    """Every tool message must be preceded by an assistant with tool_calls."""
+    last_non_tool_ok = False
+    for i, msg in enumerate(msgs):
+        if msg.get('role') == 'tool':
+            testcase.assertTrue(
+                last_non_tool_ok,
+                f"orphaned tool message at index {i} (prev role: "
+                f"{msgs[i - 1].get('role') if i else 'none'})")
+        else:
+            last_non_tool_ok = (msg.get('role') == 'assistant'
+                                and bool(msg.get('tool_calls')))
+
+
+class TestToolPairingBoundary(unittest.TestCase):
+    """Compaction must not split an assistant tool_call from its tool result."""
+
+    def test_boundary_never_starts_on_tool(self):
+        ctx = FakeContext()
+        for keep in (1, 2, 3, 4, 5, 6):
+            result = m.compact_messages(_tool_session(), ctx,
+                                        target_tokens=1, keep_recent=keep)
+            _assert_no_orphaned_tools(self, result)
+
+    def test_boundary_split_keeps_tool_call_pair(self):
+        # keep_recent=3 splits right before the tool result; the fix must pull
+        # the preceding assistant tool_call into the kept window.
+        ctx = FakeContext()
+        result = m.compact_messages(_tool_session(), ctx,
+                                    target_tokens=1, keep_recent=3)
+        roles = [msg.get('role') for msg in result]
+        # summary + placeholder + the preserved tool_call/result pair + tail
+        self.assertEqual(roles, ['system', 'user', 'assistant',
+                                 'assistant', 'tool', 'assistant', 'user'])
+        _assert_no_orphaned_tools(self, result)
+
+
+class TestSanitizeToolPairing(unittest.TestCase):
+    def test_orphaned_tool_demoted_to_user(self):
+        msgs = [
+            {'role': 'system', 'content': 'sys'},
+            {'role': 'user', 'content': 'hi'},
+            {'role': 'tool', 'content': 'orphan result', 'tool_call_id': 'x',
+             'name': 'read_file'},
+        ]
+        m.sanitize_tool_pairing(msgs)
+        self.assertEqual(msgs[2]['role'], 'user')
+        self.assertIn('Tool result (read_file):', msgs[2]['content'])
+        self.assertIn('orphan result', msgs[2]['content'])
+        self.assertNotIn('tool_call_id', msgs[2])
+
+    def test_valid_pair_untouched(self):
+        msgs = [
+            {'role': 'system', 'content': 'sys'},
+            {'role': 'user', 'content': 'hi'},
+            {'role': 'assistant', 'content': 'call',
+             'tool_calls': [{'id': 't1', 'function': {'name': 'x', 'arguments': '{}'}}]},
+            {'role': 'tool', 'content': 'r1', 'tool_call_id': 't1'},
+            {'role': 'assistant', 'content': 'done'},
+        ]
+        before = [dict(x) for x in msgs]
+        m.sanitize_tool_pairing(msgs)
+        self.assertEqual(msgs, before)
+
+    def test_parallel_tool_results_kept(self):
+        msgs = [
+            {'role': 'assistant', 'content': 'call',
+             'tool_calls': [{'id': 't1', 'function': {'name': 'x', 'arguments': '{}'}}]},
+            {'role': 'tool', 'content': 'r1', 'tool_call_id': 't1'},
+            {'role': 'tool', 'content': 'r2', 'tool_call_id': 't1'},
+        ]
+        m.sanitize_tool_pairing(msgs)
+        roles = [x['role'] for x in msgs]
+        self.assertEqual(roles, ['assistant', 'tool', 'tool'])
+
+    def test_tool_after_plain_assistant_demoted(self):
+        msgs = [
+            {'role': 'assistant', 'content': 'plain answer'},
+            {'role': 'tool', 'content': 'stray result'},
+        ]
+        m.sanitize_tool_pairing(msgs)
+        self.assertEqual(msgs[1]['role'], 'user')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

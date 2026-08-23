@@ -58,7 +58,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 # ============================================================================
@@ -309,7 +309,7 @@ COMMANDS = {
         'aliases': ['/agentic'],
         'category': 'Settings',
         'description': 'Configure agentic mode and sub-options',
-        'usage': '/agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|iterations|timeout|status]',
+        'usage': '/agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|acl|iterations|timeout|status]',
         'handler': None
     },
     'listtool': {
@@ -1051,6 +1051,9 @@ class CommandContext:
         self.current_context_tokens: int = 0  # Updated after each query
         self.compaction_threshold: float = COMPACTION_THRESHOLD  # Auto-compact trigger (0.0-1.0)
 
+        # Session-scoped path access policy (see /agentic acl)
+        self.path_acl: PathAcl = PathAcl()
+
     # === Properties ===
     @property
     def base_url(self) -> str:
@@ -1228,6 +1231,46 @@ COMPACTION_TARGET = 0.50     # Compact down to 50% of context window
 COMPACTION_KEEP_RECENT = 6   # Always keep last 6 messages (3 user/assistant turns)
 
 
+def sanitize_tool_pairing(messages):
+    """Repair orphaned tool-role messages so strict chat templates don't 500.
+
+    gpt-oss (and similar) chat templates hard-raise when a 'tool' role message
+    is not preceded by an assistant message carrying tool_calls. History
+    compaction / merging can split such pairs, leaving an orphaned tool result
+    that makes every subsequent request fail with a Jinja exception. This
+    walker demotes any orphaned tool message to a 'user' note, preserving its
+    content so no information is lost.
+
+    Consecutive tool messages after a single assistant-with-tool_calls are
+    valid (parallel results) and are left untouched. Only a tool message whose
+    most recent non-tool predecessor was a user or a plain assistant is
+    repaired.
+
+    Mutates messages in place and returns the same list.
+    """
+    last_non_tool_ok = False  # most recent non-tool msg was assistant with tool_calls
+    for msg in messages:
+        role = msg.get('role')
+        if role == 'tool':
+            if not last_non_tool_ok:
+                name = msg.get('name', '')
+                content = msg.get('content', '')
+                if isinstance(content, list):
+                    content = " ".join(
+                        p.get('text', '') for p in content if isinstance(p, dict)
+                    )
+                prefix = f"Tool result ({name}):" if name else "Tool result:"
+                msg['role'] = 'user'
+                msg['content'] = f"{prefix}\n{content}"
+                msg.pop('tool_call_id', None)
+        else:
+            last_non_tool_ok = (
+                role == 'assistant'
+                and bool(msg.get('tool_calls'))
+            )
+    return messages
+
+
 def compact_messages(messages: list, ctx, target_tokens: int = 0,
                      keep_recent: int = COMPACTION_KEEP_RECENT, force: bool = False) -> list:
     """Compact conversation history to fit within token budget.
@@ -1259,8 +1302,15 @@ def compact_messages(messages: list, ctx, target_tokens: int = 0,
         return list(messages)
 
     system_msg = messages[0]
-    recent = messages[-keep_recent:]
-    middle = messages[1:-keep_recent]
+    # Choose the keep-recent window so it never *starts* on a tool result whose
+    # pairing assistant tool_call lives in the dropped middle. Strict templates
+    # (gpt-oss) raise on such an orphaned tool message, so shift the boundary
+    # left until the window begins on a non-tool message.
+    start = max(1, len(messages) - keep_recent)
+    while start > 1 and messages[start].get('role') == 'tool':
+        start -= 1
+    recent = messages[start:]
+    middle = messages[1:start]
 
     if not middle:
         return list(messages)
@@ -1310,6 +1360,7 @@ def compact_messages(messages: list, ctx, target_tokens: int = 0,
     if recent and recent[-1].get('role') == 'user':
         result.append({'role': 'assistant', 'content': '[Context continued...]'})
     result.extend(recent)
+    sanitize_tool_pairing(result)
     return result
 
 
@@ -2386,6 +2437,83 @@ def _shell_is_home_destructive(nodes):
                     return True
     return False
 
+
+def _shell_operand_realpath(tok):
+    """Best-effort resolve of a shell token to an absolute realpath.
+
+    Returns a realpath string, or None if the token is not a resolvable path
+    (flags, env assignments, bare words, URLs, empty tokens).
+    """
+    t = tok.strip().strip("'\"")
+    t = t.lstrip("<>")  # strip redirection markers (>>/etc/foo)
+    if not t or t.startswith("-"):
+        return None
+    if "*" in t or "?" in t:
+        base = t.split("*")[0].split("?")[0].rstrip("/")
+        if not base:
+            return None
+        t = base
+    if "~" in t:
+        t = os.path.expanduser(t)
+    if "=" in t or "$" in t:
+        return None  # assignments / env refs are not simple paths
+    if not t.startswith("/"):
+        if "/" not in t and "." not in t and "*" not in t and "?" not in t and "~" not in t:
+            return None  # bare word arg, not a path
+        t = os.path.join(os.getcwd(), t)
+    try:
+        return os.path.realpath(t)
+    except Exception:
+        return None
+
+
+def _shell_acl_scan(command, ctx):
+    """Scan command operands against PathAcl (run_command path awareness).
+
+    Only *explicit* ACL rules trigger here — /proc, /sys, /etc, home dotfiles,
+    plus anything the user added. The generic outside-CWD default deny is NOT
+    applied (the shell gate already owns that). Sensitive virtual files
+    (/proc/*/mem etc.) are hard-denied. Returns None (no concern) or a dict
+    {"approved": bool, "reason": str|None}.
+    """
+    acl = getattr(ctx, "path_acl", None) if ctx is not None else None
+    if acl is None:
+        return None
+    deny_info = None
+    ask_info = None
+    for node in _shell_breakdown(command):
+        toks = node.tokens
+        if not toks:
+            continue
+        for tok in toks[1:]:
+            rp = _shell_operand_realpath(tok)
+            if rp is None:
+                continue
+            if _is_blocked_system_file(rp):
+                acl.log_event("run_command", rp, "deny", None)
+                return {"approved": False, "reason": f"System file blocked (sensitive virtual file): {rp}"}
+            decision, rule = acl.evaluate("read", rp, explicit_only=True)
+            if rule is None:
+                continue
+            if decision == "deny" and deny_info is None:
+                deny_info = (tok, rp, rule)
+            elif decision == "ask" and ask_info is None:
+                ask_info = (tok, rp, rule)
+    if deny_info:
+        _, rp, rule = deny_info
+        acl.log_event("run_command", rp, "deny", rule)
+        shown = rule["path"] if rule.get("kind") == "prefix" else "home dotfile"
+        return {"approved": False, "reason": f"denied by path ACL rule: {rule['action']} {shown}"}
+    if ask_info:
+        _, rp, rule = ask_info
+        granted = acl.prompt("read", rp, rule, tool="run_command", context=command)
+        acl.log_event("run_command", rp, "allow" if granted else "deny", rule)
+        if not granted:
+            shown = rule["path"] if rule.get("kind") == "prefix" else "home dotfile"
+            return {"approved": False, "reason": f"denied by user (path ACL ask {shown})"}
+    return None
+
+
 def check_shell_approval(command, ctx=None, executor_mode="host"):
     """Gate: home hard-deny → opencode breakdown → CWD leniency → prompt.
 
@@ -2408,14 +2536,24 @@ def check_shell_approval(command, ctx=None, executor_mode="host"):
     # Also catch opencode deny (explicit rules) — include 'rejected' for compat with safety_blocklist test
     if verdict["effect"] == "deny":
         return {"approved": False, "effect": "deny", "message": "BLOCKED (rejected): denied by permission rules (%s)" % ", ".join(d["pattern"] for d in verdict["details"] if d["action"]=="deny"), "verdict": verdict}
+
+    # Apply the path ACL on automatic allow paths. Explicit user approval via
+    # the shell prompt below already overrides it (the user said yes to the
+    # exact command), so those returns are left untouched.
+    def _final_allow(**extra):
+        res = _shell_acl_scan(command, ctx)
+        if res is not None and not res["approved"]:
+            return {"approved": False, "effect": "deny", "message": res["reason"], "verdict": verdict}
+        return {"approved": True, "effect": "allow", "message": None, "verdict": verdict, **extra}
+
     if verdict["effect"] == "allow":
-        return {"approved": True, "effect": "allow", "message": None, "verdict": verdict}
+        return _final_allow()
     # effect == ask → check CWD leniency
     if _shell_all_operands_inside_cwd(nodes):
-        return {"approved": True, "effect": "allow", "message": None, "verdict": verdict, "cwd_leniency": True}
+        return _final_allow(cwd_leniency=True)
     # Auto-confirm (yolo) respects home deny but allows ask
     if ctx is not None and getattr(ctx, "auto_confirm", False):
-        return {"approved": True, "effect": "allow", "message": None, "verdict": verdict, "auto": True}
+        return _final_allow(auto=True)
     # Interactive prompt (TTY required)
     if not sys.stdin.isatty():
         return {"approved": False, "effect": "ask", "message": "Approval required but no TTY — denied (use /agentic auto to allow)", "verdict": verdict}
@@ -2528,11 +2666,11 @@ AGENTIC_TOOL_DEFS = {
         }
     },
     "read_file": {
-        "description": "Read a file from disk (text, max 100KB). Path relative to CWD.",
+        "description": "Read a file from disk (text, max 100KB). Path relative to CWD. Reading outside CWD (e.g. /proc, /sys, /etc, home dotfiles) may prompt the user for approval — if denied, use run_command instead or ask the user to allow it via /agentic acl.",
         "parameters": {
             "type": "object",
             "properties": {
-                "file_path": {"type": "string", "description": "File path relative to CWD"}
+                "file_path": {"type": "string", "description": "File path relative to CWD; absolute paths outside CWD may require approval"}
             },
             "required": ["file_path"]
         }
@@ -2655,6 +2793,25 @@ def _tool_handle_fetch_url(self, args):
     return {"success": True, "output": text, "error": None}
 
 
+# First path components that hint a missing-leading-slash system path
+# (e.g. "proc/self/cgroup" → "/proc/self/cgroup").
+SYSTEM_PATH_HINTS = ("proc", "sys")
+# Sensitive virtual files that are never served (hard deny, ACL bypass-immune).
+SYSTEM_READ_BLOCKED_BASENAMES = {"mem", "environ", "kcore", "pagemap", "maps", "smaps"}
+
+
+def _is_blocked_system_file(abspath):
+    """True for sensitive /proc or /sys virtual files (secrets / huge dumps)."""
+    base = os.path.basename(abspath)
+    if base in SYSTEM_READ_BLOCKED_BASENAMES:
+        return True
+    # /proc/<pid>/fd/* can leak open descriptors; refuse the fd tree.
+    parts = abspath.split(os.sep)
+    if "/proc" in parts and len(parts) >= 4 and parts[-2] == "fd":
+        return True
+    return False
+
+
 def _resolve_tool_path(raw_path, allow_home=False):
     """Resolve raw_path handling ~, absolute, and symlink.
 
@@ -2687,8 +2844,6 @@ def _resolve_tool_path(raw_path, allow_home=False):
             pass
     return abspath, False, "Path traversal denied"
 
-# --- Dotfile guard for ~/.* (opencode-style per-session ask) ---
-_FILE_DOTFILE_SESSION_APPROVED = set()
 
 def _is_home_dotfile(abspath):
     """True if abspath is inside $HOME (but outside CWD) and any component is dotfile.
@@ -2718,52 +2873,227 @@ def _is_home_dotfile(abspath):
     except ValueError:
         return False
 
-def _check_dotfile_gate(abspath, operation="read", ctx=None):
-    """Gate for ~/ dotfiles: refused by default, ask per session like opencode.
 
-    Mirrors opencode permission.bash last-match-wins but for files:
-      deny dotfile by default → allow if in _FILE_DOTFILE_SESSION_APPROVED → else prompt.
+def _raw_is_home_explicit(raw_path):
+    """True if a raw tool path is an explicit home request (`~` prefix or an
+    absolute path under $HOME). Relative `../` escapes that happen to land in
+    $HOME are NOT explicit and stay denied."""
+    if raw_path is None:
+        return False
+    if raw_path.startswith("~"):
+        return True
+    home_real = os.path.realpath(os.path.expanduser("~"))
+    expanded = os.path.expanduser(raw_path)
+    if expanded.startswith(home_real):
+        return True
+    return False
 
-    Returns (approved: bool, message: str|None).
-    Prompt options: [y/N/s/a/d]  y=once, s=session, a=always (session), d=deny.
-    Even with ctx.auto_confirm, dotfiles still require explicit approval (bypass-immune).
+
+# ============================================================================
+# ============= PATH ACL (session-scoped allow/ask/deny)  ====================
+# ============================================================================
+
+class PathAcl:
+    """Session-scoped access policy for file tools and shell command operands.
+
+    Rules are dicts:
+      {op: 'read'|'write'|'any', action: 'allow'|'ask'|'deny',
+       kind: 'prefix'|'home_dotfile', path: realpath (prefix kind),
+       source: 'default'|'session'}
+
+    Evaluation precedence (highest wins):
+      1. explicit rule match — most-specific (longest realpath), session over default
+      2. implicit default — inside CWD → allow; read inside $HOME (non-dotfile) → allow
+      3. everything else → deny
+
+    `ask` is bypass-immune: auto_confirm never auto-approves it (same as the
+    dotfile gate). Non-TTY runs deny `ask` silently and record the denial.
+
+    Default policy (steering-first): CWD + $HOME allowed; home dotfiles,
+    /proc, /sys, /etc are `ask` (reminder prompt); everything else outside
+    CWD/$HOME is denied.
     """
-    if not _is_home_dotfile(abspath):
-        return True, None
-    file_real = os.path.realpath(abspath)
-    if file_real in _FILE_DOTFILE_SESSION_APPROVED:
-        return True, None
-    # Also check wildcard session (e.g. ~/.vimrc allowed covers ~/.vimrc)
-    # For now exact match only; opencode-style always pattern could be added later.
-    if not sys.stdin.isatty():
-        return False, f"BLOCKED (rejected): reading dotfile {abspath} requires approval — not a TTY (use interactive session or allow via /agentic session)"
-    # Prompt
-    print(colorize(f"\n[File approval] {operation} dotfile `{abspath}`", 'warning'), file=sys.stderr)
-    print(colorize(f"  Dotfiles under ~ are blocked by default (e.g. ~/.vimrc, ~/.ssh/*).", 'muted'), file=sys.stderr)
-    try:
-        reply = input(colorize("Allow? [y/N/s/a/d] (y=once, s=session, a=always, d=deny): ", 'warning')).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return False, "Denied (no input)"
-    if reply in ("y", "yes", "o", "once"):
-        return True, None
-    if reply in ("s", "session"):
-        _FILE_DOTFILE_SESSION_APPROVED.add(file_real)
-        return True, None
-    if reply in ("a", "always"):
-        _FILE_DOTFILE_SESSION_APPROVED.add(file_real)
-        # Also allow siblings? For now same as session; could persist to disk later
-        return True, None
-    return False, f"BLOCKED (rejected): dotfile {abspath} denied by user"
+
+    def __init__(self):
+        self.rules: list = []
+        self.log: list = []
+        self._install_defaults()
+
+    def _install_defaults(self):
+        for root in ("/proc", "/sys", "/etc"):
+            self.add("read", "ask", root, source="default")
+            self.add("write", "deny", root, source="default")
+        home = os.path.realpath(os.path.expanduser("~"))
+        for op in ("read", "write"):
+            self.rules.append({"op": op, "action": "ask", "kind": "home_dotfile",
+                               "path": home, "source": "default"})
+
+    def add(self, op, action, path, source="session"):
+        """Add/replace a prefix rule for `path` (read|write|any)."""
+        rp = os.path.realpath(os.path.expanduser(path))
+        self.rules = [r for r in self.rules
+                      if not (r["source"] == source and r.get("kind") == "prefix"
+                              and r["op"] in (op, "any") and r["path"] == rp)]
+        self.rules.append({"op": op, "action": action, "kind": "prefix",
+                           "path": rp, "source": source})
+
+    def remove(self, path):
+        """Remove session rules whose path equals `path` (realpath'd).
+
+        Default rules are preserved — use reset() to restore defaults.
+        """
+        rp = os.path.realpath(os.path.expanduser(path))
+        self.rules = [r for r in self.rules
+                      if not (r["source"] == "session"
+                              and r.get("kind") == "prefix" and r["path"] == rp)]
+
+    def reset(self):
+        self.rules = []
+        self.log = []
+        self._install_defaults()
+
+    def evaluate(self, op, realpath, explicit_only=False):
+        """Resolve a (op, realpath) to (decision, rule|None)."""
+        best = None
+        best_key = None
+        for rule in self.rules:
+            if rule["op"] != "any" and rule["op"] != op:
+                continue
+            if rule.get("kind") == "prefix":
+                try:
+                    if os.path.commonpath([rule["path"], realpath]) != rule["path"]:
+                        continue
+                except ValueError:
+                    continue
+                key = (1 if rule["source"] == "session" else 0, len(rule["path"]))
+            elif rule.get("kind") == "home_dotfile":
+                if not _is_home_dotfile(realpath):
+                    continue
+                key = (1 if rule["source"] == "session" else 0, len(rule["path"]) + 1)
+            else:
+                continue
+            if best_key is None or key > best_key:
+                best_key = key
+                best = rule
+        if best is not None:
+            return best["action"], best
+        if explicit_only:
+            return "allow", None
+        # Implicit defaults
+        cwd_real = os.path.realpath(os.getcwd())
+        try:
+            if os.path.commonpath([cwd_real, realpath]) == cwd_real:
+                return "allow", None
+        except ValueError:
+            pass
+        if op == "read":
+            home_real = os.path.realpath(os.path.expanduser("~"))
+            try:
+                if os.path.commonpath([home_real, realpath]) == home_real \
+                        and not _is_home_dotfile(realpath):
+                    return "allow", None
+            except ValueError:
+                pass
+        return "deny", None
+
+    def log_event(self, tool, path, decision, rule=None):
+        self.log.append({
+            "tool": tool, "path": path, "decision": decision,
+            "rule": (rule["path"] if rule and rule.get("kind") == "prefix"
+                     else "home_dotfile" if rule else None),
+            "ts": time.strftime("%H:%M:%S"),
+        })
+        if len(self.log) > 100:
+            self.log = self.log[-100:]
+
+    def prompt(self, op, realpath, rule, tool="file", context=""):
+        """Interactive `ask` gate. Bypass-immune (auto_confirm does not
+        auto-approve). Returns True if the user granted session access."""
+        if not sys.stdin.isatty():
+            return False
+        op_label = "read" if op == "read" else "write"
+        print(colorize(f"\n[Path approval] {op_label} {realpath}", 'warning'), file=sys.stderr)
+        if context:
+            print(colorize(f"  from: {context}", 'muted'), file=sys.stderr)
+        if rule and rule.get("kind") == "prefix":
+            print(colorize(f"  rule: {rule['action']} {rule['path']}", 'muted'), file=sys.stderr)
+        else:
+            print(colorize("  rule: ask home dotfile", 'muted'), file=sys.stderr)
+        try:
+            reply = input(colorize("Allow? [y/N/s/a/d] (s/a = this session, d = deny): ", 'warning')).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if reply in ("y", "yes", "o", "once", "s", "session", "a", "always"):
+            if rule and rule.get("kind") == "prefix":
+                self.add(op, "allow", rule["path"], source="session")
+            else:
+                self.add(op, "allow", realpath, source="session")
+            return True
+        return False
+
+
+def _path_acl_decision(ctx, op, realpath, tool, context="", raw_path=None):
+    """Apply PathAcl to an operation. Returns (decision, message|None).
+
+    'ask' rules are resolved via the interactive gate (bypass-immune).
+    Sensitive virtual files (/proc/*/mem etc.) are hard-denied regardless.
+    `raw_path`, when provided, gates the implicit $HOME read-allow: only an
+    explicit home request (leading `~` or absolute under $HOME) benefits from
+    it — a relative `../` escape that happens to land in $HOME stays denied.
+    """
+    acl = getattr(ctx, "path_acl", None) if ctx is not None else None
+    if acl is None:
+        return "allow", None
+    if _is_blocked_system_file(realpath):
+        acl.log_event(tool, realpath, "deny", None)
+        return "deny", "System file blocked (sensitive virtual file)"
+    decision, rule = acl.evaluate(op, realpath)
+    # Reject implicit home-read allowance for non-explicit home requests.
+    # CWD is always allowed — this only applies to $HOME paths OUTSIDE CWD,
+    # so relative `../` escapes that land in $HOME stay denied.
+    if decision == "allow" and rule is None and op == "read":
+        cwd_real = os.path.realpath(os.getcwd())
+        try:
+            in_cwd = os.path.commonpath([cwd_real, realpath]) == cwd_real
+        except ValueError:
+            in_cwd = False
+        if not in_cwd:
+            home_real = os.path.realpath(os.path.expanduser("~"))
+            try:
+                in_home = os.path.commonpath([home_real, realpath]) == home_real
+            except ValueError:
+                in_home = False
+            if in_home and not _is_home_dotfile(realpath) and not _raw_is_home_explicit(raw_path):
+                decision = "deny"
+    if decision == "ask":
+        granted = acl.prompt(op, realpath, rule, tool=tool, context=context)
+        decision = "allow" if granted else "deny"
+    acl.log_event(tool, realpath, decision, rule)
+    if decision == "deny":
+        if rule is not None:
+            shown = rule["path"] if rule.get("kind") == "prefix" else "home dotfile"
+            return "deny", f"denied by path ACL rule: {rule['action']} {shown}"
+        return "deny", "Path traversal denied"
+    return "allow", None
 
 def _tool_handle_read_file(self, args):
-    filepath, allowed, err = _resolve_tool_path(args["file_path"], allow_home=True)
-    if not allowed:
-        return {"success": False, "output": "", "error": err}
-    # Dotfile guard (~/.*)
-    ctx = CommandContext() if CommandContext._initialized else None
-    ok, msg = _check_dotfile_gate(filepath, operation="read", ctx=ctx)
-    if not ok:
-        return {"success": False, "output": "", "error": msg}
+    raw = args["file_path"]
+    filepath, _allowed, _err = _resolve_tool_path(raw, allow_home=True)
+    ctx = self._ctx if self._ctx is not None else (CommandContext() if CommandContext._initialized else None)
+    # Models frequently drop the leading slash on system paths
+    # ("proc/self/cgroup" → "/proc/self/cgroup"). If the CWD-relative
+    # resolution doesn't exist but the root-relative one does, use it.
+    if not os.path.lexists(filepath) and not os.path.isabs(raw):
+        stripped = raw.lstrip("./")
+        first = stripped.split("/", 1)[0]
+        if first in SYSTEM_PATH_HINTS:
+            alt_path, _alt_allowed, _alt_err = _resolve_tool_path("/" + stripped, allow_home=True)
+            if os.path.lexists(alt_path):
+                filepath = alt_path
+    decision, acl_err = _path_acl_decision(ctx, "read", os.path.realpath(filepath),
+                                           tool="read_file", context=raw, raw_path=raw)
+    if decision == "deny":
+        return {"success": False, "output": "", "error": acl_err or "Path traversal denied"}
     if not os.path.isfile(filepath):
         return {"success": False, "output": "", "error": "File not found"}
     try:
@@ -2775,35 +3105,14 @@ def _tool_handle_read_file(self, args):
 
 
 def _tool_handle_write_file(self, args):
-    # Writes to ~/.* are also dotfile-guarded (even stricter than reads)
-    # First try CWD; if not, try home with guard (so ~/.vimrc can be written after approval)
-    filepath, allowed, err = _resolve_tool_path(args["file_path"], allow_home=False)
-    if not allowed:
-        # Fallback: check if it's an explicit home dotfile request
-        home_path, home_allowed, _ = _resolve_tool_path(args["file_path"], allow_home=True)
-        if home_allowed and _is_home_dotfile(home_path):
-            filepath = home_path
-            ctx = CommandContext() if CommandContext._initialized else None
-            ok, msg = _check_dotfile_gate(filepath, operation="write", ctx=ctx)
-            if not ok:
-                return {"success": False, "output": "", "error": msg}
-            allowed = True
-        else:
-            return {"success": False, "output": "", "error": err}
-    else:
-        # Inside CWD but still check if it's a dotfile under CWD's home? No, only home dotfiles
-        if _is_home_dotfile(filepath):
-            ctx = CommandContext() if CommandContext._initialized else None
-            ok, msg = _check_dotfile_gate(filepath, operation="write", ctx=ctx)
-            if not ok:
-                return {"success": False, "output": "", "error": msg}
-    # Also guard dotfiles inside CWD? No, per request only ~/ dotfiles
-    # But if filepath itself is inside home and dotfile, double-check
-    if _is_home_dotfile(filepath):
-        ctx = CommandContext() if CommandContext._initialized else None
-        ok, msg = _check_dotfile_gate(filepath, operation="write", ctx=ctx)
-        if not ok:
-            return {"success": False, "output": "", "error": msg}
+    # Write policy is enforced by PathAcl: CWD allowed, home dotfiles ask,
+    # everything else outside CWD denied (system paths /etc /proc /sys deny).
+    filepath, _allowed, _err = _resolve_tool_path(args["file_path"], allow_home=True)
+    ctx = self._ctx if self._ctx is not None else (CommandContext() if CommandContext._initialized else None)
+    decision, acl_err = _path_acl_decision(ctx, "write", os.path.realpath(filepath),
+                                           tool="write_file", context=args["file_path"])
+    if decision == "deny":
+        return {"success": False, "output": "", "error": acl_err or "Path traversal denied"}
     content = args["content"]
     if len(content) > MAX_WRITE_FILE_SIZE:
         return {"success": False, "output": "", "error": "Content too large (max 1MB)"}
@@ -2817,9 +3126,12 @@ def _tool_handle_write_file(self, args):
 
 
 def _tool_handle_list_directory(self, args):
-    path, allowed, err = _resolve_tool_path(args.get("path", "."), allow_home=False)
-    if not allowed:
-        return {"success": False, "output": "", "error": err}
+    path, _allowed, _err = _resolve_tool_path(args.get("path", "."), allow_home=True)
+    ctx = self._ctx if self._ctx is not None else (CommandContext() if CommandContext._initialized else None)
+    decision, acl_err = _path_acl_decision(ctx, "read", os.path.realpath(path),
+                                           tool="list_directory", context=path, raw_path=args.get("path", "."))
+    if decision == "deny":
+        return {"success": False, "output": "", "error": acl_err or "Path traversal denied"}
     if not os.path.isdir(path):
         return {"success": False, "output": "", "error": "Not a directory"}
     try:
@@ -2934,24 +3246,12 @@ def _tool_handle_patch(self, args):
 
 
 def _tool_handle_edit_file(self, args):
-    filepath, allowed, err = _resolve_tool_path(args["file_path"], allow_home=False)
-    if not allowed:
-        # Allow explicit home dotfile after gate (same as write_file)
-        home_path, home_allowed, _ = _resolve_tool_path(args["file_path"], allow_home=True)
-        if home_allowed and _is_home_dotfile(home_path):
-            filepath = home_path
-            ctx = CommandContext() if CommandContext._initialized else None
-            ok, msg = _check_dotfile_gate(filepath, operation="edit", ctx=ctx)
-            if not ok:
-                return {"success": False, "output": "", "error": msg}
-            allowed = True
-        else:
-            return {"success": False, "output": "", "error": err}
-    if _is_home_dotfile(filepath):
-        ctx = CommandContext() if CommandContext._initialized else None
-        ok, msg = _check_dotfile_gate(filepath, operation="edit", ctx=ctx)
-        if not ok:
-            return {"success": False, "output": "", "error": msg}
+    filepath, _allowed, _err = _resolve_tool_path(args["file_path"], allow_home=True)
+    ctx = self._ctx if self._ctx is not None else (CommandContext() if CommandContext._initialized else None)
+    decision, acl_err = _path_acl_decision(ctx, "write", os.path.realpath(filepath),
+                                           tool="edit_file", context=args["file_path"])
+    if decision == "deny":
+        return {"success": False, "output": "", "error": acl_err or "Path traversal denied"}
     if not os.path.isfile(filepath):
         return {"success": False, "output": "", "error": f"File not found: {args['file_path']}"}
     old = args["old_string"]
@@ -5489,16 +5789,82 @@ class ChatLoop:
             state = "ON" if new_val else "OFF"
             print(colorize(f"[{label}: {state}]", 'info'), file=sys.stderr)
 
+        elif subcmd == "acl":
+            return self._handle_agentic_acl(parts)
+
         else:
-            print(colorize("[Usage: /agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|lazytool|iterations <N>|timeout <N>|status]]", 'warning'), file=sys.stderr)
+            print(colorize("[Usage: /agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|lazytool|acl|iterations <N>|timeout <N>|status]]", 'warning'), file=sys.stderr)
         return False
+
+    def _handle_agentic_acl(self, parts: list) -> bool:
+        """Handle /agentic acl [list|status|log|allow|ask|deny <path> [read|write]|remove <path>|reset]."""
+        acl = self.ctx.path_acl
+        action = parts[2] if len(parts) > 2 else "list"
+        if action in ("list", "status"):
+            self._print_acl(acl)
+            return False
+        if action == "log":
+            self._print_acl_log(acl)
+            return False
+        if action == "reset":
+            acl.reset()
+            print(colorize("[Path ACL reset to defaults]", 'info'), file=sys.stderr)
+            self._print_acl(acl)
+            return False
+        if action in ("allow", "ask", "deny"):
+            if len(parts) < 4:
+                print(colorize(f"[Usage: /agentic acl {action} <path> [read|write|any]]", 'warning'), file=sys.stderr)
+                return False
+            path = parts[3]
+            op = "any" if len(parts) < 5 else parts[4]
+            if op not in ("read", "write", "any"):
+                print(colorize(f"[Invalid op '{op}'. Use read, write or any]", 'warning'), file=sys.stderr)
+                return False
+            rp = os.path.realpath(os.path.expanduser(path))
+            acl.add(op, action, path, source="session")
+            print(colorize(f"[Path ACL] {op} {action} {rp}", 'success'), file=sys.stderr)
+            return False
+        if action == "remove":
+            if len(parts) < 4:
+                print(colorize("[Usage: /agentic acl remove <path>]", 'warning'), file=sys.stderr)
+                return False
+            rp = os.path.realpath(os.path.expanduser(parts[3]))
+            acl.remove(parts[3])
+            print(colorize(f"[Path ACL] removed rules for {rp}", 'info'), file=sys.stderr)
+            return False
+        print(colorize("[Usage: /agentic acl [list|status|log|allow|ask|deny <path> [read|write|any]|remove <path>|reset]]", 'warning'), file=sys.stderr)
+        return False
+
+    def _print_acl(self, acl):
+        print(colorize("\n[Path ACL - Use /agentic acl <allow|ask|deny|remove|reset|log>]", 'info'), file=sys.stderr)
+        print("  Defaults: CWD always allowed; reads inside ~ allowed.", file=sys.stderr)
+        print("  Everything else outside CWD/~ is denied unless a rule matches.", file=sys.stderr)
+        print("  'ask' rules prompt per access and are never auto-approved.", file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"  {'OP':<6} {'ACTION':<7} {'PATH':<44} SOURCE", file=sys.stderr)
+        print("  " + "-" * 74, file=sys.stderr)
+        for r in acl.rules:
+            shown = r["path"] if r.get("kind") == "prefix" else "~/.* (home dotfile)"
+            print(f"  {r['op']:<6} {r['action']:<7} {shown:<44} {r['source']}", file=sys.stderr)
+        print(file=sys.stderr)
+        print("  Recent access decisions: /agentic acl log", file=sys.stderr)
+        print(file=sys.stderr)
+
+    def _print_acl_log(self, acl):
+        if not acl.log:
+            print(colorize("[Path ACL] No access decisions recorded yet.", 'muted'), file=sys.stderr)
+            return
+        print(colorize("\n[Path ACL - recent access decisions]", 'info'), file=sys.stderr)
+        for entry in reversed(acl.log[-20:]):
+            print(f"  {entry['ts']} {entry['decision']:<6} {entry['tool']:<14} {entry['path']}  ({entry['rule'] or 'default'})", file=sys.stderr)
+        print(file=sys.stderr)
 
     def _print_agentic_status(self):
         """Display current agentic settings like /debug output."""
         c = self.ctx
         print(colorize("\n[Agentic Settings - Use /agentic <option> [value]]", 'info'), file=sys.stderr)
         print("  Subcommands: on, off, full, auto, sandbox, verbose, thinking, trace, log, lazytool,", file=sys.stderr)
-        print("               iterations <N>, timeout <N>, status", file=sys.stderr)
+        print("               iterations <N>, timeout <N>, acl, status", file=sys.stderr)
         print(file=sys.stderr)
 
         settings = [
@@ -6217,6 +6583,7 @@ class ChatLoop:
             user_msg = {'role': 'user', 'content': final_content}
             self.ctx.stamp_tokens(user_msg)
             self.messages.append(user_msg)
+            sanitize_tool_pairing(self.messages)
 
             inited = self._init_agentic_query(final_content)
             if inited is None:
@@ -6411,6 +6778,7 @@ class ChatLoop:
             if len(messages) > 2:
                 for msg in messages[2:]:
                     self.messages.insert(len(self.messages) - 1, msg)
+            sanitize_tool_pairing(self.messages)
 
             # Persist compaction savings: the ReAct loop may have auto-compacted its
             # local `messages`, but that compaction is discarded by the merge above.
@@ -6478,6 +6846,10 @@ class ChatLoop:
             return False
         before_len = len(self.messages)
         before_tokens = self.ctx.calculate_context_tokens(self.messages)
+
+        # Repair any orphaned tool messages before summarizing/compacting so
+        # strict chat templates (gpt-oss) don't reject the resulting history.
+        sanitize_tool_pairing(self.messages)
 
         # Optional: LLM-summarize large tool results before mechanical compaction.
         if use_llm:
@@ -6805,6 +7177,7 @@ class ChatLoop:
         user_msg = {'role': 'user', 'content': final_content}
         self.ctx.stamp_tokens(user_msg)
         self.messages.append(user_msg)
+        sanitize_tool_pairing(self.messages)
 
         # Auto-compaction: compact if approaching context limit
         if self.ctx.context_window_size > 0:
