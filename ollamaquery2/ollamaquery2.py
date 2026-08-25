@@ -58,7 +58,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 
 # ============================================================================
@@ -1783,7 +1783,9 @@ MODEL_INFERENCE_PARAMS_REGISTRY = {
         #   - 5/6 E2E tests passed (web server fails like all models)
         #   - Compared to qwen3:8b: similar thinking verbosity but
         #     better structured reasoning output
-        # See doc/model-parameters.md for full test results.
+        # Cloud DeepSeek API only consumes temperature/top_p (see
+        # build_request_payload), so top_k/min_p are harmless there and
+        # only apply to local llama.cpp runs. See doc/model-parameters.md.
         "temperature": 0.7,
         "top_p": 0.95,
         "top_k": 20,
@@ -1822,13 +1824,6 @@ MODEL_INFERENCE_PARAMS_REGISTRY = {
     },
     "mistral": {
         # Mistral API does not support top_k or min_p
-        "temperature": 0.7,
-        "top_p": 0.95,
-        "presence_penalty": 0.0,
-        "repeat_penalty": 1.0,
-    },
-    "deepseek": {
-        # DeepSeek API: same as OpenAI, no top_k needed
         "temperature": 0.7,
         "top_p": 0.95,
         "presence_penalty": 0.0,
@@ -3098,7 +3093,11 @@ def _tool_handle_read_file(self, args):
         return {"success": False, "output": "", "error": "File not found"}
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read(MAX_READ_FILE_SIZE)
+            content = f.read(MAX_READ_FILE_SIZE + 1)
+        truncated = len(content) > MAX_READ_FILE_SIZE
+        if truncated:
+            content = content[:MAX_READ_FILE_SIZE]
+            content += f"\n... [truncated: file exceeds {MAX_READ_FILE_SIZE} chars; showing first {MAX_READ_FILE_SIZE}]"
         return {"success": True, "output": content, "error": None}
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
@@ -3460,11 +3459,11 @@ def _apply_unified_diff(patch_text):
         return {"success": False, "output": "", "error": "No valid patch sections found in patch_text"}
 
     applied = []
-    base_dir = os.path.abspath(os.getcwd())
+    base_dir = os.path.realpath(os.getcwd())
     for sec in sections:
         path = sec["path"]
         abspath = os.path.abspath(os.path.join(os.getcwd(), path))
-        if os.path.commonpath([base_dir, abspath]) != base_dir:
+        if os.path.commonpath([base_dir, os.path.realpath(abspath)]) != base_dir:
             return {"success": False, "output": "", "error": f"Path traversal denied: {path}"}
 
         op = sec.get("operation", "modify")
@@ -3478,7 +3477,7 @@ def _apply_unified_diff(patch_text):
         if op == "move":
             dest = sec["destination"]
             absdest = os.path.abspath(os.path.join(os.getcwd(), dest))
-            if os.path.commonpath([base_dir, absdest]) != base_dir:
+            if os.path.commonpath([base_dir, os.path.realpath(absdest)]) != base_dir:
                 return {"success": False, "output": "", "error": f"Path traversal denied: {dest}"}
             if os.path.isfile(abspath):
                 os.makedirs(os.path.dirname(absdest), exist_ok=True)
@@ -4095,7 +4094,7 @@ class ModelQuery:
             msg = f"[ERROR] Sync query failed: {e}"
             if isinstance(e, HTTPError) and e.code == 403:
                 if self.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-                    env_hint = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+                    env_hint = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
                     msg += f"\n[HINT] {self.backend} authentication failed. Check your --api-key or {env_hint.get(self.backend, 'API_KEY')} env var."
                 elif ":cloud" in model:
                     msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
@@ -4201,6 +4200,7 @@ class ModelQuery:
         on_chunk = kwargs.pop("on_chunk", None)
         images = kwargs.pop("images", None)
         context_size = kwargs.pop("context_size", None)
+        socket_timeout = kwargs.pop("timeout", 120)
         backend = self.backend
 
         full_content = ""
@@ -4221,7 +4221,7 @@ class ModelQuery:
         self._debug_request(api_url, payload)
 
         try:
-            with _request_with_retry(req) as response:
+            with _request_with_retry(req, timeout=socket_timeout) as response:
                 for raw_line in self._iter_stream_lines(response, backend):
                     try:
                         chunk = json.loads(raw_line)
@@ -4474,7 +4474,7 @@ class ModelQuery:
             msg = f"\n[ERROR] {backend} streaming failed: {e}"
             if isinstance(e, HTTPError) and e.code == 403:
                 if self.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-                    env_hint = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+                    env_hint = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
                     msg += f"\n[HINT] {self.backend} authentication failed. Check your --api-key or {env_hint.get(self.backend, 'API_KEY')} env var."
                 elif ":cloud" in model:
                     msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
@@ -4664,12 +4664,26 @@ def gather_user_input(prompt_prefix, show_multiline=True):
 def _process_file_inclusions(text):
     """Scan text for @filepath mentions and load referenced files."""
     inclusions = []
-    for word in text.split():
+    words = text.split()
+    i = 0
+    while i < len(words):
+        word = words[i]
         if word.startswith('@') and len(word) > 1:
-            raw_path = word[1:]
+            candidate = word[1:]
+            j = i
+            # Reconstruct paths containing spaces: extend the candidate with
+            # following words until it resolves to an existing file.
+            while j < len(words):
+                if os.path.isfile(os.path.expanduser(candidate.rstrip('.,?!;:)"\''))):
+                    break
+                j += 1
+                if j < len(words):
+                    candidate += " " + words[j]
+            raw_path = candidate
             filepath = raw_path.rstrip('.,?!;:)"\'')
             expanded_path = os.path.expanduser(filepath)
             if os.path.isfile(expanded_path):
+                i = j + 1
                 file_size = os.path.getsize(expanded_path)
                 if file_size > MAX_FILE_INCLUSION_SIZE:
                     err_msg = f"[Failed to load `{filepath}`: File too large ({file_size / 1024 / 1024:.1f} MB, max 5 MB)]"
@@ -4722,6 +4736,10 @@ def _process_file_inclusions(text):
                     err_msg = f"[Failed to load `{filepath}`: {e}]"
                     print(colorize(err_msg, 'error'), file=sys.stderr)
                     inclusions.append(err_msg + "\n")
+                continue
+            i += 1
+        else:
+            i += 1
     return inclusions
 
 
@@ -4732,7 +4750,7 @@ def _process_command_lines(text):
     for line in text.split('\n'):
         stripped = line.lstrip()
 
-        if stripped.startswith('"""'):
+        if stripped == '"""':
             in_literal_block = not in_literal_block
             processed.append(line)
             continue
@@ -6046,20 +6064,21 @@ class ChatLoop:
                     result = self._normalize_tool_json(json_str)
                     if result:
                         return result
-            # Pass 4: bare JSON tool call at the END of the text (strict mode only)
+            # Pass 4: bare JSON tool call at the END of the text (strict mode only).
+            # The JSON must be the final content (no trailing text), but a short
+            # prose preamble is allowed — models often narrate intent ("Let me
+            # check...") then emit the JSON tool call as the last thing.
             idx = ChatLoop._rfind_tool_call_brace(text)
             if idx >= 0:
                 json_str = self._extract_json_balanced(text, idx)
                 if json_str:
                     end = idx + len(json_str)
                     if not text[end:].strip():
-                        prefix = text[:idx].strip()
-                        if not prefix:
-                            result = self._normalize_tool_json(json_str)
-                            if result:
-                                args_str = json.dumps(result.get("arguments", {}))
-                                if not ('<' in args_str and '>' in args_str):
-                                    return result
+                        result = self._normalize_tool_json(json_str)
+                        if result:
+                            args_str = json.dumps(result.get("arguments", {}))
+                            if not ('<' in args_str and '>' in args_str):
+                                return result
         return None
 
     def parse_tool_calls(self, text: str) -> list[dict]:
@@ -6148,6 +6167,8 @@ class ChatLoop:
             if window_size > half_len:
                 continue
             match_tail = tail[-window_size:]
+            if not match_tail.strip():
+                continue  # whitespace/indentation window — not a stuck loop
             if tail.count(match_tail) >= 3:
                 return True
         return False
@@ -6400,6 +6421,7 @@ class ChatLoop:
 
     def _finalize_agentic_query(self, messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text):
         """Stream final answer or execute pending tool call, then update self.messages."""
+        stream_tool_used = False
         if not final_answer:
             final_answer = response_text if response_text else "[Agentic: no answer produced]"
 
@@ -6422,7 +6444,6 @@ class ChatLoop:
             self.messages.append({'role': 'assistant', 'content': final_answer})
             print()
         else:
-            stream_tool_used = False
             if not getattr(self, 'messages', None):
                 self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
             final_messages = list(messages)
@@ -6537,7 +6558,9 @@ class ChatLoop:
                     print()
             else:
                 print(colorize(f"\n{final_answer}", 'success'), file=sys.stdout)
-        if stream_tool_used and getattr(self, '_agentic_streaming_reentry', 0) < 1:
+        reentry_round = 0
+        while stream_tool_used and reentry_round < 3:
+            reentry_round += 1
             self._agentic_streaming_reentry = getattr(self, '_agentic_streaming_reentry', 0) + 1
             tool_format = get_tool_format(self.ctx.model)
             include_tool_defs = tool_format != "openai"
@@ -6554,18 +6577,50 @@ class ChatLoop:
                 images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
                 **sync_kwargs
             )
+            reentry_text = ""
             if reentry_response and isinstance(reentry_response, dict):
-                reentry_text = ""
                 if self.ctx.backend == "ollama":
                     reentry_text = reentry_response.get('message', {}).get('content', '')
                 else:
                     choices = reentry_response.get('choices', [])
                     if choices:
                         reentry_text = choices[0].get('message', {}).get('content', '')
-                if reentry_text:
-                    self.messages.append({'role': 'assistant', 'content': reentry_text})
-                    print(colorize(f"\n{reentry_text}", 'success'), file=sys.stdout)
-                    print()
+            if not reentry_text:
+                break
+            self.messages.append({'role': 'assistant', 'content': reentry_text})
+            reentry_tools = self.parse_tool_calls(reentry_text)
+            if not reentry_tools:
+                single = self.parse_tool_call(reentry_text)
+                if single:
+                    reentry_tools = [single]
+            if not reentry_tools:
+                print(colorize(f"\n{reentry_text}", 'success'), file=sys.stdout)
+                print()
+                break
+            reentry_observations = []
+            for rt in reentry_tools:
+                rt_name = rt["tool"]
+                rt_args = rt.get("arguments", {})
+                args_display = ", ".join(f"{k}={v!r}" for k, v in rt_args.items())
+                print(colorize(f"\n[Tool] {rt_name}({args_display})", 'warning'), file=sys.stderr, end="")
+                sys.stderr.flush()
+                rt_start = time.time()
+                rt_result = self.tool_registry.execute(rt_name, rt_args)
+                rt_elapsed = time.time() - rt_start
+                rt_status = "OK" if rt_result["success"] else "ERROR"
+                print(colorize(f" → {rt_status} ({rt_elapsed:.1f}s)", 'info' if rt_result["success"] else 'error'), file=sys.stderr)
+                rt_obs = rt_result["output"] if rt_result["success"] else f"ERROR: {rt_result['error']}"
+                if not rt_obs:
+                    rt_obs = "[Tool returned no output]"
+                if len(rt_obs) > 4000:
+                    rt_obs = rt_obs[:4000] + "\n... [truncated]"
+                print(colorize(f"\n{rt_obs}", 'info'), file=sys.stdout)
+                reentry_observations.append(f"[{rt_name}] {rt_obs}")
+            if reentry_observations:
+                self.messages.append({'role': 'user', 'content': "Tool result:\n" + "\n---\n".join(reentry_observations)})
+                stream_tool_used = True
+            else:
+                stream_tool_used = False
 
     def run_agentic_query(self, full_input: str) -> None:
         """ReAct loop: query model, parse tool calls, execute tools, stream final answer."""
@@ -6583,6 +6638,7 @@ class ChatLoop:
             user_msg = {'role': 'user', 'content': final_content}
             self.ctx.stamp_tokens(user_msg)
             self.messages.append(user_msg)
+            agentic_seed_len = len(self.messages)
             sanitize_tool_pairing(self.messages)
 
             inited = self._init_agentic_query(final_content)
@@ -6636,6 +6692,7 @@ class ChatLoop:
                     context_size=self.ctx.context_size,
                     images=images_to_send,
                     on_chunk=on_chunk,
+                    timeout=step_timeout + 30,
                     **sync_kwargs
                 )
                 finalize_step()
@@ -6775,9 +6832,17 @@ class ChatLoop:
 
             self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text)
 
-            if len(messages) > 2:
-                for msg in messages[2:]:
-                    self.messages.insert(len(self.messages) - 1, msg)
+            # Merge the ReAct loop turns back into self.messages for cross-turn
+            # memory. The local `messages` array was seeded as
+            # [agentic system] + self.messages[1:], so the genuinely new turns
+            # begin at index `agentic_seed_len`. Insert them at that boundary —
+            # right after the current user query and BEFORE any messages the
+            # streaming finalize appended — so the conversation stays
+            # chronologically ordered (user query → tool work → final answer).
+            # The old insert-before-last approach duplicated history/user
+            # messages and placed tool work before the query that triggered it.
+            if len(messages) > agentic_seed_len:
+                self.messages[agentic_seed_len:agentic_seed_len] = messages[agentic_seed_len:]
             sanitize_tool_pairing(self.messages)
 
             # Persist compaction savings: the ReAct loop may have auto-compacted its
@@ -7447,7 +7512,7 @@ def check_backend_with_get(url, server_marker, timeout=1):
     try:
         request = Request(url, method='GET')
         with urlopen(request, timeout=timeout) as response:  # startup-probe
-            my_response = str(response.read())
+            my_response = response.read().decode('utf-8', errors='replace')
             my_response = my_response.lower()
             if server_marker.lower() in my_response:
                 return True
@@ -7928,7 +7993,7 @@ def main():
     # Listing operations
     if args.list or args.list_all:
         if backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-            env_keys = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+            env_keys = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
             list_models_llamacpp(base_url, filter_arg=args.model, api_key=args.api_key or os.environ.get(env_keys.get(backend, ''), ''))
         elif backend in ("llamacpp", "lmstudio"):
             list_models_llamacpp(base_url, filter_arg=args.model)

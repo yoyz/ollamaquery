@@ -641,6 +641,19 @@ class TestInlineProcessing(unittest.TestCase):
         finally:
             os.unlink(fname)
 
+    def test_file_inclusion_with_spaces(self):
+        """@path with spaces must resolve the full path (not split on whitespace)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("my file.txt", "w") as f:
+                    f.write("SPACED CONTENT")
+                result = q.process_inline_commands("read @my file.txt")
+                self.assertIn("SPACED CONTENT", result)
+            finally:
+                os.chdir(old_cwd)
+
     def test_shell_command_execution(self):
         result = q.process_inline_commands('!echo hello_shell')
         self.assertIn('hello_shell', result)

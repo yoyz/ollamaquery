@@ -224,6 +224,22 @@ class TestToolRegistry(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_read_file_truncation_marked(self):
+        """read_file on a file larger than MAX_READ_FILE_SIZE must mark truncation."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("big.txt", "w") as f:
+                    f.write("x" * (q.MAX_READ_FILE_SIZE + 1000))
+                result = self.reg.execute("read_file", {"file": "big.txt"})
+                self.assertTrue(result["success"])
+                self.assertIn("[truncated", result["output"])
+                self.assertLessEqual(len(result["output"]), q.MAX_READ_FILE_SIZE + 200)
+            finally:
+                os.chdir(old_cwd)
+
     def test_list_directory(self):
         result = self.reg.execute("list_directory", {"path": "."})
         self.assertTrue(result["success"])
@@ -871,6 +887,20 @@ class TestStuckDetection(unittest.TestCase):
         self.assertFalse(self.loop._is_stuck("Hello world"))
         self.assertFalse(self.loop._is_stuck("A" * 50))
 
+    def test_is_stuck_indentation_not_stuck(self):
+        """Deep indentation / trailing whitespace must not be flagged as stuck."""
+        body = "\n".join(f"        value_{i} = {i}" for i in range(30))
+        text = "def process():\n" + body + "\n" + " " * 80
+        self.assertGreater(len(text), 200)
+        self.assertFalse(self.loop._is_stuck(text))
+
+    def test_is_stuck_whitespace_tail_not_stuck(self):
+        """A response ending in trailing whitespace/newlines must not be flagged."""
+        text = ("The quick brown fox jumps over the lazy dog. "
+                "Pack my box with five dozen liquor jugs. " * 4
+                + "\n" * 60 + " " * 60)
+        self.assertFalse(self.loop._is_stuck(text))
+
     def test_call_with_timeout_success(self):
         """Function completing before timeout returns normally."""
         result = self.loop._call_with_timeout(lambda x: x + 1, 5, 41)
@@ -1062,10 +1092,17 @@ class TestLazyToolMode(unittest.TestCase):
         self.loop = q.ChatLoop(self.ctx)
 
     def test_strict_rejects_embedded_bare_json(self):
-        """Strict mode rejects bare JSON tool calls in the middle of text."""
-        text = 'Some explanation then {"tool": "run_command", "arguments": {"command": "ls"}}'
+        """Strict mode rejects bare JSON tool calls in the middle of text (trailing text after JSON)."""
+        text = 'Some explanation then {"tool": "run_command", "arguments": {"command": "ls"}} and more'
         result = self.loop.parse_tool_call(text)
         self.assertIsNone(result)
+
+    def test_strict_accepts_trailing_bare_json_after_prose(self):
+        """Strict mode accepts a bare JSON tool call at the very END of text, even after a prose preamble."""
+        text = 'Some explanation then {"tool": "run_command", "arguments": {"command": "ls"}}'
+        result = self.loop.parse_tool_call(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["tool"], "run_command")
 
     def test_lazy_accepts_embedded_bare_json(self):
         """Lazy mode accepts bare JSON tool calls anywhere in text."""
