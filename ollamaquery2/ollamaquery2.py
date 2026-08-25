@@ -58,7 +58,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.2"
+__version__ = "0.2.5"
 
 
 # ============================================================================
@@ -144,7 +144,9 @@ DEFAULT_SYSTEM_PROMPT = BUILTIN_PROMPTS["default"]
 
 
 MAX_CONTEXT_SIZE = 4192000  # 4M tokens maximum limit (prevent OOM)
-MAX_READ_FILE_SIZE = 102400    # 100KB max for agentic read_file tool
+MAX_READ_FILE_SIZE = 102400    # 100KB max per agentic read_file page
+MAX_READ_LINES = 2000          # max lines per agentic read_file page
+MAX_READ_LINE_LENGTH = 2000    # per-line truncation in read_file pages
 MAX_WRITE_FILE_SIZE = 1048576  # 1MB max for agentic write_file tool
 MAX_FILE_INCLUSION_SIZE = 5 * 1024 * 1024  # 5MB max for @file inclusions
 DEFAULT_OLLAMA_HOST    = 'http://127.0.0.1:11434'
@@ -1271,6 +1273,60 @@ def sanitize_tool_pairing(messages):
     return messages
 
 
+def _split_compaction_window(messages: list, keep_recent: int) -> tuple:
+    """Split messages into (system, middle, recent) for compaction.
+
+    The keep-recent window is shifted left so it never *starts* on a tool
+    result whose pairing assistant tool_call lives in the dropped middle.
+    Strict chat templates (gpt-oss) raise on such an orphaned tool message.
+
+    Returns:
+        (system_msg, middle, recent). `middle` may be empty when the whole
+        conversation fits inside the keep-recent window.
+    """
+    system_msg = messages[0]
+    start = max(1, len(messages) - keep_recent)
+    while start > 1 and messages[start].get('role') == 'tool':
+        start -= 1
+    return system_msg, messages[1:start], messages[start:]
+
+
+def _build_compaction_summary(middle: list) -> str:
+    """Render the mechanical excerpt-based summary of the dropped middle turns.
+
+    Tool results collapse to a status line; user/assistant messages keep a short
+    preview. This is the Phase-1 fallback when no LLM summary is available.
+    """
+    summary_parts = []
+    for msg in middle:
+        role = msg.get('role', 'unknown')
+        content = msg.get('content', '')
+        if role == 'tool':
+            name = msg.get('name', 'unknown')
+            success = 'OK' if 'ERROR' not in content[:100] else 'FAILED'
+            summary_parts.append(f"[Tool {name}: {success}]")
+        elif role == 'assistant':
+            preview = content[:200].replace('\n', ' ')
+            if len(content) > 200:
+                preview += '...'
+            summary_parts.append(f"Assistant: {preview}")
+        elif role == 'user':
+            if content.startswith("Tool result:") or content.startswith("<tool_result"):
+                tool_lines = content.split('\n')[:2]
+                summary_parts.append(f"[Tool observation: {tool_lines[0][:80]}]")
+            else:
+                preview = content[:150].replace('\n', ' ')
+                if len(content) > 150:
+                    preview += '...'
+                summary_parts.append(f"User: {preview}")
+
+    return (
+        "[CONVERSATION HISTORY COMPACTED]\n"
+        "The following is a condensed summary of earlier conversation turns:\n"
+        + "\n".join(summary_parts)
+    )
+
+
 def compact_messages(messages: list, ctx, target_tokens: int = 0,
                      keep_recent: int = COMPACTION_KEEP_RECENT, force: bool = False) -> list:
     """Compact conversation history to fit within token budget.
@@ -1301,48 +1357,12 @@ def compact_messages(messages: list, ctx, target_tokens: int = 0,
     if target_tokens > 0 and current_tokens <= target_tokens and not force:
         return list(messages)
 
-    system_msg = messages[0]
-    # Choose the keep-recent window so it never *starts* on a tool result whose
-    # pairing assistant tool_call lives in the dropped middle. Strict templates
-    # (gpt-oss) raise on such an orphaned tool message, so shift the boundary
-    # left until the window begins on a non-tool message.
-    start = max(1, len(messages) - keep_recent)
-    while start > 1 and messages[start].get('role') == 'tool':
-        start -= 1
-    recent = messages[start:]
-    middle = messages[1:start]
+    system_msg, middle, recent = _split_compaction_window(messages, keep_recent)
 
     if not middle:
         return list(messages)
 
-    summary_parts = []
-    for msg in middle:
-        role = msg.get('role', 'unknown')
-        content = msg.get('content', '')
-        if role == 'tool':
-            name = msg.get('name', 'unknown')
-            success = 'OK' if 'ERROR' not in content[:100] else 'FAILED'
-            summary_parts.append(f"[Tool {name}: {success}]")
-        elif role == 'assistant':
-            preview = content[:200].replace('\n', ' ')
-            if len(content) > 200:
-                preview += '...'
-            summary_parts.append(f"Assistant: {preview}")
-        elif role == 'user':
-            if content.startswith("Tool result:") or content.startswith("<tool_result"):
-                tool_lines = content.split('\n')[:2]
-                summary_parts.append(f"[Tool observation: {tool_lines[0][:80]}]")
-            else:
-                preview = content[:150].replace('\n', ' ')
-                if len(content) > 150:
-                    preview += '...'
-                summary_parts.append(f"User: {preview}")
-
-    summary_text = (
-        "[CONVERSATION HISTORY COMPACTED]\n"
-        "The following is a condensed summary of earlier conversation turns:\n"
-        + "\n".join(summary_parts)
-    )
+    summary_text = _build_compaction_summary(middle)
 
     summary_tokens = ctx.estimate_tokens(summary_text)
     system_tokens = system_msg.get('_tokens', ctx.estimate_tokens(system_msg.get('content', '')))
@@ -1370,6 +1390,28 @@ SUMMARIZE_TOOL_MAX = 3           # Cap tool results summarized per invocation
 SUMMARIZE_TOOL_EXCLUDE = {"list_directory", "diff", "patch", "edit_file", "apply_patch"}
 
 
+def _extract_sync_content(ctx, response) -> str:
+    """Extract assistant text content from a sync response (backend-aware).
+
+    Handles ollama's `message.content`, OpenAI-compatible `choices[0].message
+    .content`, and plain-string responses. Multi-modal content lists are joined
+    from their `text` parts.
+    """
+    content = ""
+    if isinstance(response, dict):
+        if ctx.backend == "ollama":
+            content = response.get('message', {}).get('content', '')
+        else:
+            choices = response.get('choices', [])
+            if choices:
+                content = choices[0].get('message', {}).get('content', '')
+    elif isinstance(response, str):
+        content = response
+    if isinstance(content, list):
+        content = "".join(p.get('text', '') for p in content if isinstance(p, dict))
+    return content or ""
+
+
 def _llm_summarize_tool_result(ctx, query_handler, name, content):
     """Ask the model to summarize a single tool result. Returns summary text or None."""
     system = (
@@ -1387,17 +1429,7 @@ def _llm_summarize_tool_result(ctx, query_handler, name, content):
         )
     except Exception:
         return None
-    summary = ""
-    if isinstance(response, dict):
-        if ctx.backend == "ollama":
-            summary = response.get('message', {}).get('content', '')
-        else:
-            choices = response.get('choices', [])
-            if choices:
-                summary = choices[0].get('message', {}).get('content', '')
-    elif isinstance(response, str):
-        summary = response
-    summary = (summary or "").strip()
+    summary = _extract_sync_content(ctx, response).strip()
     return summary or None
 
 
@@ -1449,6 +1481,119 @@ def summarize_tool_results(messages, ctx, query_handler):
         ctx.stamp_tokens(m)
 
     return messages
+
+
+# LLM-assisted conversation summarization (opus6 item 2 / `/compact llm`).
+LLM_COMPACT_TRANSCRIPT_CHARS = 6000  # Cap the excerpt sent to the model
+LLM_COMPACT_SUMMARY_MARKER = "[CONVERSATION SUMMARY (LLM)]"
+
+
+def _render_conversation_transcript(middle: list,
+                                    max_chars: int = LLM_COMPACT_TRANSCRIPT_CHARS) -> str:
+    """Render a compact text transcript of older turns for the LLM summarizer.
+
+    Tool results reduce to a status line (they are handled separately by
+    `summarize_tool_results` / the excerpt summary); user/assistant text is kept
+    near-verbatim so the model can follow the actual conversation.
+    """
+    lines = []
+    for msg in middle:
+        role = msg.get('role', 'unknown')
+        content = msg.get('content', '')
+        if role == 'tool':
+            name = msg.get('name', 'unknown')
+            ok = 'OK' if 'ERROR' not in content[:100] else 'FAILED'
+            lines.append(f"[tool {name}: {ok}]")
+            continue
+        if not isinstance(content, str):
+            content = str(content)
+        if role == 'user' and (content.startswith("Tool result:") or content.startswith("<tool_result")):
+            first = content.split('\n')[0][:80]
+            lines.append(f"[tool observation: {first}]")
+            continue
+        text = content.replace('\n', ' ')
+        if len(text) > 300:
+            text = text[:300] + "..."
+        lines.append(f"{role}: {text}")
+    transcript = "\n".join(lines)
+    if len(transcript) > max_chars:
+        transcript = transcript[:max_chars] + "\n[...]"
+    return transcript
+
+
+def _llm_summarize_conversation(ctx, query_handler, middle) -> Optional[str]:
+    """Ask the model for a faithful narrative summary of older conversation turns.
+
+    Returns the summary text, or None on failure/empty response.
+    """
+    transcript = _render_conversation_transcript(middle)
+    if not transcript.strip():
+        return None
+    system = (
+        "You are a context optimizer for a CLI chat session. The conversation is "
+        "approaching the context limit, so the EARLIER turns below must be compacted "
+        "into a short, faithful summary. Retain everything that still matters for the "
+        "rest of the session: the user's requirements and preferences, decisions made, "
+        "file paths, commands run, errors, and open questions. A few sentences are "
+        "enough. Do not narrate the process — only keep information that would be lost "
+        "if the transcript were deleted."
+    )
+    user = f"EARLIER CONVERSATION TO SUMMARIZE:\n\n{transcript}"
+    try:
+        response = query_handler.query_sync(
+            [{'role': 'system', 'content': system},
+             {'role': 'user', 'content': user}],
+            ctx.model,
+            temperature=0.3,
+        )
+    except Exception:
+        return None
+    summary = _extract_sync_content(ctx, response).strip()
+    return summary or None
+
+
+def llm_compact_messages(messages: list, ctx, query_handler,
+                         keep_recent: int = COMPACTION_KEEP_RECENT) -> list:
+    """Compress history with an LLM-generated narrative summary of the older turns.
+
+    Unlike `compact_messages` (excerpt previews), the dropped middle is handed to
+    the model for a faithful summary, preserving facts the excerpt-based approach
+    would drop. On LLM failure (or when there is nothing to compact) falls back to
+    the mechanical `compact_messages`.
+
+    Args:
+        messages: Full message list (not mutated — returns a new list).
+        ctx: CommandContext for token estimation/stamping.
+        query_handler: ModelQuery used for the summarization call.
+        keep_recent: Number of recent messages to always preserve.
+
+    Returns:
+        A new compacted message list.
+    """
+    if len(messages) <= keep_recent + 1:
+        return list(messages)
+
+    system_msg, middle, recent = _split_compaction_window(messages, keep_recent)
+    if not middle:
+        return list(messages)
+
+    summary = _llm_summarize_conversation(ctx, query_handler, middle)
+    if not summary:
+        return compact_messages(messages, ctx, keep_recent=keep_recent)
+
+    summary_text = (
+        LLM_COMPACT_SUMMARY_MARKER + "\n"
+        "Earlier conversation compacted into the summary below:\n"
+        + summary
+    )
+    compacted_msg = {'role': 'user', 'content': summary_text}
+    ctx.stamp_tokens(compacted_msg)
+    result = [system_msg, compacted_msg]
+    if recent and recent[-1].get('role') == 'user':
+        result.append({'role': 'assistant', 'content': '[Context continued...]'})
+    result.extend(recent)
+    sanitize_tool_pairing(result)
+    return result
 
 
 # ============================================================================
@@ -1603,6 +1748,28 @@ AGENTIC_EXAMPLE_SOFT = """## Protocol
 4. **Repeat** if more actions are needed
 5. When you have the final answer, respond in plain text with markdown formatting"""
 
+# Native tools API format: for models that receive tool schemas via the OpenAI
+# `tools` parameter (send_tools_api=True). opencode-style — the system prompt
+# never describes JSON tool-call syntax; the model emits native `tool_calls`
+# from its own training. Telling such models to write bare JSON into the message
+# (AGENTIC_FORMAT_STRICT) causes hybrid/XML-garbage output (e.g. Qwen3.6 mixing
+# `{"tool": ...}` with `</function></tool_call>`).
+AGENTIC_FORMAT_NATIVE = """## Tool use
+You have access to tools defined through the function-calling interface. When you need to perform an action, call the appropriate function. After a tool runs, you will receive the result as an observation — use it to decide the next step.
+
+## CRITICAL rules
+- Do NOT write tool calls as JSON text or XML in your reply. Issue them as proper function calls through the tool interface, then continue once the result is returned.
+- Do NOT chain multiple commands with `&&`, `|`, `;` etc. Each tool call runs in isolation.
+- You may make multiple tool calls sequentially — each result feeds back in.
+- Format your final answer with markdown for terminal readability (code blocks, lists, headings)."""
+
+AGENTIC_EXAMPLE_NATIVE = """## ReAct protocol (Think → Act → Observe → Answer)
+1. **Think** about what the user needs and which tool can help
+2. **Act** by calling the appropriate function through the tool interface
+3. **Observe** the tool result (it will be shown to you)
+4. **Repeat** if more actions are needed
+5. When you have the answer, respond in plain text (no tool calls) — that is your final answer"""
+
 # Shared rules block — common to all models.
 AGENTIC_RULES_BLOCK = """## General rules
 - Be precise with file paths. If you create a file in a subdirectory, use the same path when compiling or reading it later.
@@ -1674,19 +1841,29 @@ def get_prompt_style(model_name: str) -> str:
 def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
                        include_tool_defs: bool = True) -> str:
     """Assemble the agentic system prompt from composable blocks.
-    
+
     Args:
-        model_name: Used to select format style from registry.
+        model_name: Used to select format style and tool-delivery strategy.
         tool_defs_block: Tool definitions block (from ToolRegistry.get_system_prompt_block()).
             Inserted after the role block so models see available tools before format instructions.
         include_tool_defs: If False, skip tool_defs_block (for models using native tools API).
+
+    Format selection:
+        - openai tool format (native tools API): AGENTIC_FORMAT_NATIVE — never
+          describes JSON tool-call syntax (opencode-style).
+        - otherwise: the style-registry format (strict/soft) with inline JSON.
     """
+    tool_format = get_tool_format(model_name)
     style = get_prompt_style(model_name)
     blocks = [AGENTIC_ROLE_BLOCK]
     if include_tool_defs and tool_defs_block:
         blocks.append(tool_defs_block)
-    blocks.append(AGENTIC_FORMAT_REGISTRY[style])
-    blocks.append(AGENTIC_EXAMPLE_REGISTRY[style])
+    if tool_format == "openai":
+        blocks.append(AGENTIC_FORMAT_NATIVE)
+        blocks.append(AGENTIC_EXAMPLE_NATIVE)
+    else:
+        blocks.append(AGENTIC_FORMAT_REGISTRY[style])
+        blocks.append(AGENTIC_EXAMPLE_REGISTRY[style])
     blocks.append(AGENTIC_RULES_BLOCK)
     return "\n\n".join(blocks)
 
@@ -1729,6 +1906,23 @@ MODEL_INFERENCE_PARAMS_REGISTRY = {
         "temperature": 0.7,
         "top_p": 1.0,
         "min_p": 0.01,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+    "qwen3.6": {
+        # https://huggingface.co/Qwen/Qwen3.6-35B-A3B#best-practices
+        # HF thinking-mode sampling for PRECISE CODING / agentic tool use:
+        #   temp=0.6, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0,
+        #   repeat_penalty=1.0 (general tasks use temp=1.0 / presence=1.5;
+        #   instruct mode uses temp=0.7 / top_p=0.80).
+        # MUST be matched before the generic "qwen3" key (substring collision —
+        # "qwen3" is contained in "qwen3.6"). The qwen3-8B values (0.5/0.9)
+        # over-constrain sampling and correlate with degenerate/XML-hybrid
+        # tool-call output.
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
     },
@@ -2661,11 +2855,13 @@ AGENTIC_TOOL_DEFS = {
         }
     },
     "read_file": {
-        "description": "Read a file from disk (text, max 100KB). Path relative to CWD. Reading outside CWD (e.g. /proc, /sys, /etc, home dotfiles) may prompt the user for approval — if denied, use run_command instead or ask the user to allow it via /agentic acl.",
+        "description": "Read a text file, optionally paging through large files by 1-based line offset. Files over 100KB auto-page. A paged result reports the served line range and the `next` offset to continue from (read_file(file_path=..., offset=...)). Lines over 2000 chars are truncated. Path relative to CWD. Reading outside CWD (e.g. /proc, /sys, /etc, home dotfiles) may prompt the user for approval — if denied, use run_command instead or ask the user to allow it via /agentic acl.",
         "parameters": {
             "type": "object",
             "properties": {
-                "file_path": {"type": "string", "description": "File path relative to CWD; absolute paths outside CWD may require approval"}
+                "file_path": {"type": "string", "description": "File path relative to CWD; absolute paths outside CWD may require approval"},
+                "offset": {"type": "integer", "description": "Optional 1-based line number to start reading from (default 1). Use the `next` offset from a previous paged result to continue."},
+                "limit": {"type": "integer", "description": "Optional maximum number of lines to read (default 2000, capped at 2000)"}
             },
             "required": ["file_path"]
         }
@@ -3092,6 +3288,18 @@ def _tool_handle_read_file(self, args):
     if not os.path.isfile(filepath):
         return {"success": False, "output": "", "error": "File not found"}
     try:
+        try:
+            offset = int(args["offset"]) if args.get("offset") is not None else None
+        except (TypeError, ValueError):
+            offset = None
+        try:
+            limit = int(args["limit"]) if args.get("limit") is not None else None
+        except (TypeError, ValueError):
+            limit = None
+        size = os.path.getsize(filepath)
+        # Paged mode kicks in for large files or an explicit offset/limit.
+        if size > MAX_READ_FILE_SIZE or offset is not None or limit is not None:
+            return _read_file_page(filepath, raw, offset, limit)
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             content = f.read(MAX_READ_FILE_SIZE + 1)
         truncated = len(content) > MAX_READ_FILE_SIZE
@@ -3101,6 +3309,63 @@ def _tool_handle_read_file(self, args):
         return {"success": True, "output": content, "error": None}
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
+
+def _read_file_page(filepath, raw, offset, limit):
+    """Read a paged window of lines from a (possibly large) text file.
+
+    Mirrors opencode's paged `read`: returns at most `limit` lines (capped at
+    MAX_READ_LINES) and at most MAX_READ_FILE_SIZE bytes, truncating any line
+    longer than MAX_READ_LINE_LENGTH. A leading header reports the served line
+    range and, when more content follows, the exact `next` 1-based offset so
+    the model can chain `read_file` calls.
+
+    Args:
+        filepath: Resolved absolute path of the file.
+        raw: The path string as the model passed it (echoed in the header).
+        offset: 1-based starting line (None → 1).
+        limit: Max lines to return (None → MAX_READ_LINES).
+
+    Returns:
+        {"success": True, "output": <paged text>}.
+    """
+    start = offset if offset is not None and offset >= 1 else 1
+    cap = min(limit, MAX_READ_LINES) if limit is not None and limit >= 1 else MAX_READ_LINES
+
+    collected = []
+    seen = 0
+    bytes_used = 0
+    more = False
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            seen += 1
+            if seen < start:
+                continue
+            if len(collected) >= cap:
+                more = True
+                break
+            text = line.rstrip("\r\n")
+            if len(text) > MAX_READ_LINE_LENGTH:
+                text = text[:MAX_READ_LINE_LENGTH] + f" ... (line truncated to {MAX_READ_LINE_LENGTH} chars)"
+            size_bytes = len(text.encode("utf-8", "replace")) + (1 if collected else 0)
+            if bytes_used + size_bytes > MAX_READ_FILE_SIZE:
+                more = True
+                break
+            collected.append(text)
+            bytes_used += size_bytes
+
+    if not collected:
+        return {"success": True,
+                "output": f"[read_file {raw}: no lines at offset {start} (end of file).]",
+                "error": None}
+
+    end = start + len(collected) - 1
+    body = "\n".join(collected)
+    if more:
+        header = (f"[read_file {raw}: lines {start}-{end}, more available — "
+                  f"use read_file(file_path=\"{raw}\", offset={end + 1}) to read the next page.]")
+    else:
+        header = f"[read_file {raw}: lines {start}-{end} (end of file).]"
+    return {"success": True, "output": header + "\n" + body, "error": None}
 
 
 def _tool_handle_write_file(self, args):
@@ -3409,38 +3674,67 @@ def _parse_unified_hunks(body):
             i += 1
             continue
 
-        # Parse hunk header: @@ -start,count +start,count @@
-        m = re.match(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', line)
-        if m:
-            start = int(m.group(1))
-            old_count = int(m.group(2) or 1)
-            new_count = int(m.group(4) or 1)
-            i += 1
-
-            old_lines = []
-            new_lines = []
-            old_collected = 0
-            new_collected = 0
-            while i < n and (old_collected < old_count or new_collected < new_count):
-                cl = lines[i]
-                if cl.strip() == "" and not cl.startswith(("+", "-")):
-                    new_lines.append(cl[1:] if cl.startswith(" ") else cl)
-                    old_lines.append(cl[1:] if cl.startswith(" ") else cl)
-                    new_collected += 1
-                    old_collected += 1
-                    i += 1
-                    continue
-                if cl.startswith("+") or cl.startswith(" "):
-                    new_lines.append(cl[1:] if cl.startswith("+") else cl[1:])
-                    new_collected += 1
-                if cl.startswith("-") or cl.startswith(" "):
-                    old_lines.append(cl[1:] if cl.startswith("-") else cl[1:])
-                    old_collected += 1
-                if not (cl.startswith(("+", "-", " ")) or cl.startswith("\\ ")):
-                    break
+        # Parse hunk header: @@ -start,count +start,count @@. A bare `@@` (no
+        # line numbers) is the opencode "match anywhere" form and is stored with
+        # start=-1 so the applier knows to search rather than use a line number.
+        if line.startswith('@@'):
+            m = re.match(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', line)
+            if m:
+                start = int(m.group(1))
+                old_count = int(m.group(2) or 1)
+                new_count = int(m.group(4) or 1)
                 i += 1
 
-            hunks.append({"start": start, "old_count": old_count, "old_lines": old_lines, "new_lines": new_lines})
+                old_lines = []
+                new_lines = []
+                old_collected = 0
+                new_collected = 0
+                while i < n and (old_collected < old_count or new_collected < new_count):
+                    cl = lines[i]
+                    if cl.strip() == "" and not cl.startswith(("+", "-")):
+                        new_lines.append(cl[1:] if cl.startswith(" ") else cl)
+                        old_lines.append(cl[1:] if cl.startswith(" ") else cl)
+                        new_collected += 1
+                        old_collected += 1
+                        i += 1
+                        continue
+                    if cl.startswith("+") or cl.startswith(" "):
+                        new_lines.append(cl[1:] if cl.startswith("+") else cl[1:])
+                        new_collected += 1
+                    if cl.startswith("-") or cl.startswith(" "):
+                        old_lines.append(cl[1:] if cl.startswith("-") else cl[1:])
+                        old_collected += 1
+                    if not (cl.startswith(("+", "-", " ")) or cl.startswith("\\ ")):
+                        break
+                    i += 1
+
+                hunks.append({"start": start, "old_count": old_count, "old_lines": old_lines, "new_lines": new_lines})
+                continue
+
+            # Bare @@: collect lines until the next hunk/header as a match-anywhere hunk.
+            i += 1
+            old_lines = []
+            new_lines = []
+            while i < n:
+                cl = lines[i]
+                if cl.startswith('@@') or cl.startswith('*** '):
+                    break
+                if cl.startswith('--- ') and i + 1 < n and lines[i + 1].startswith('+++ '):
+                    break
+                if cl.startswith('+'):
+                    new_lines.append(cl[1:])
+                elif cl.startswith('-'):
+                    old_lines.append(cl[1:])
+                elif cl.startswith(' ') or cl.strip() == '':
+                    context = cl[1:] if cl.startswith(' ') else cl
+                    old_lines.append(context)
+                    new_lines.append(context)
+                elif cl.startswith('\\ '):
+                    pass  # "\ No newline at end of file"
+                else:
+                    break
+                i += 1
+            hunks.append({"start": -1, "old_count": len(old_lines), "old_lines": old_lines, "new_lines": new_lines})
             continue
 
         i += 1
@@ -3495,13 +3789,33 @@ def _apply_unified_diff(patch_text):
             return {"success": False, "output": "", "error": f"File not found: {path}"}
 
         # Apply hunks in reverse order to preserve line numbers
+        applied_hunks = 0
         for hunk in sorted(sec["hunks"], key=lambda h: h["start"], reverse=True):
             start_idx = hunk["start"] - 1
             old_count = hunk["old_count"]
             new_lines = hunk["new_lines"]
 
             if start_idx < 0:
-                start_idx = 0
+                # Bare @@ hunk: match the removed/context lines anywhere in the file.
+                expected_clean = [line.rstrip('\r\n') for line in hunk.get("old_lines", [])]
+                if not expected_clean:
+                    # Pure addition with no anchor: append at the end of the file.
+                    content.extend(new_lines)
+                    applied_hunks += 1
+                    continue
+                found = -1
+                window_len = len(expected_clean)
+                for k in range(len(content) - window_len + 1):
+                    window = [line.rstrip('\r\n') for line in content[k:k + window_len]]
+                    if window == expected_clean:
+                        found = k
+                        break
+                if found < 0:
+                    applied.append(f"SKIPPED {path} hunk (no match for removed lines)")
+                    continue
+                start_idx = found
+                old_count = window_len
+
             if start_idx + old_count > len(content):
                 old_count = len(content) - start_idx
             if old_count < 0:
@@ -3516,6 +3830,13 @@ def _apply_unified_diff(patch_text):
                 continue
 
             content[start_idx:start_idx + old_count] = new_lines
+            applied_hunks += 1
+
+        if applied_hunks == 0 and sec["hunks"]:
+            # Nothing matched — report failure so the model can retry instead of
+            # silently "succeeding" without changing the file.
+            return {"success": False, "output": "\n".join(applied),
+                    "error": f"No hunks matched {path}; patch not applied"}
 
         os.makedirs(os.path.dirname(abspath), exist_ok=True)
         with open(abspath, "w") as f:
@@ -3542,7 +3863,9 @@ def _tool_handle_apply_patch(self, args):
 # ============================================================================
 
 TOOL_ARG_ALIASES = {
-    "read_file": {"file_path": ["file", "path", "filename", "filepath"]},
+    "read_file": {"file_path": ["file", "path", "filename", "filepath"],
+                          "offset": ["start", "start_line", "line"],
+                          "limit": ["max_lines", "lines", "count"]},
     "write_file": {"file_path": ["file", "path", "filename", "filepath"], "content": ["file_content"]},
     "run_python": {"file_path": ["file", "path", "filename", "filepath"]},
     "run_command": {"command": ["cmd", "shell"]},
@@ -6197,23 +6520,31 @@ class ChatLoop:
     def _make_agentic_step_feedback(self):
         """Build live feedback callbacks for an agentic ReAct step.
 
-        Returns (on_chunk, finalize). `on_chunk(thought, content, is_final)` streams
-        model thinking to stderr in real time when `agentic_show_thinking` is enabled;
-        otherwise it emits a heartbeat dot (~1/s) so the user sees the model is still
-        generating. `finalize()` closes any open `<thinking>` block and stops the
-        lingering worker thread (on timeout) from writing further feedback.
+        Returns (on_chunk, finalize, buffer). `on_chunk(thought, content, is_final)`
+        streams model thinking to stderr in real time when `agentic_show_thinking`
+        is enabled; otherwise it emits a heartbeat dot (~1/s) so the user sees the
+        model is still generating. `buffer` is a dict with accumulated
+        `content`/`thought` — used after a timeout to decide abort-vs-continue.
+        `finalize()` closes any open `<thinking>` block and stops the lingering
+        worker thread (on timeout) from writing further feedback.
         """
         state = {
             "thinking_open": False,
             "last_heartbeat": time.time(),
             "cancelled": False,
             "heartbeat_shown": False,
+            "content": "",
+            "thought": "",
         }
         show_thinking = self.ctx.agentic_show_thinking
 
         def on_chunk(thought, content, is_final):
             if state["cancelled"]:
                 return
+            if thought:
+                state["thought"] += thought
+            if content:
+                state["content"] += content
             if show_thinking:
                 if thought:
                     if not state["thinking_open"]:
@@ -6244,20 +6575,104 @@ class ChatLoop:
                 state["heartbeat_shown"] = False
             state["cancelled"] = True
 
-        return on_chunk, finalize
+        return on_chunk, finalize, state
 
-    def _handle_agentic_timeout(self, iteration: int, step_timeout: int, messages: list):
+    def _partial_tool_call_pending(self, partial_text: str) -> bool:
+        """Check whether a timed-out generation contains a parseable tool call.
+
+        Distinguishes "model was narrating prose (safe to retry)" from "model was
+        about to emit a tool call that a retry could re-execute".
+        """
+        if not partial_text or not partial_text.strip():
+            return False
+        try:
+            calls = self.parse_tool_calls(partial_text)
+            if not calls:
+                single = self.parse_tool_call(partial_text)
+                if single:
+                    calls = [single]
+        except Exception:
+            return False
+        return bool(calls)
+
+    @staticmethod
+    def _looks_like_truncated_tool_call(text: str) -> bool:
+        """Detect an in-flight (unbalanced) tool-call JSON opening in partial text.
+
+        `_partial_tool_call_pending` only sees *parseable* tool calls. A model cut
+        off mid-emission leaves an unbalanced `{"tool": ...` opening that would
+        parse as nothing — but echoing that prefix back invites the model to
+        continue the JSON from the middle and emit a malformed call. This catches
+        the unbalanced opening so the nudge can omit partial content.
+        """
+        if not text or not text.strip():
+            return False
+        try:
+            idx = ChatLoop._find_tool_call_brace(text)
+            if idx == -1:
+                return False
+            return ChatLoop._extract_json_balanced(None, text, idx) is None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _timeout_nudge(partial_content: str, partial_thought: str, pending_tool: bool) -> str:
+        """Build the timeout-continuation nudge message for the model.
+
+        Feeds the model's partial reasoning/content back so it continues from
+        where it left off instead of restarting its analysis from scratch
+        (re-thinking the same problem burns a full generation budget). Partial
+        *content* is omitted when a tool call was pending — feeding a cut-off
+        JSON prefix back invites a malformed JSON continuation. The reasoning is
+        always included; it is the model's internal monologue, not the output
+        channel, so echoing it is safe and preserves the in-flight train of
+        thought.
+
+        Args:
+            partial_content: Partial text content from the step buffer.
+            partial_thought: Partial reasoning (`reasoning_content`) from the step buffer.
+            pending_tool: True if the partial content contained a parseable tool call.
+
+        Returns:
+            str: The nudge message to append as a user turn.
+        """
+        lines = []
+        thought = partial_thought.strip()
+        if thought:
+            lines.append("Your reasoning before the interruption:\n" + thought[:4000])
+        if not pending_tool:
+            content = partial_content.strip()
+            if content:
+                lines.append("Your response before the interruption:\n" + content[:4000])
+        base = ("You were interrupted by a timeout while generating your response. "
+                "Please continue your previous response.")
+        if lines:
+            return base + "\n\n" + "\n\n".join(lines)
+        return base
+
+    def _handle_agentic_timeout(self, iteration: int, step_timeout: int, messages: list,
+                                partial_text: str = "", partial_thought: str = ""):
         """Handle a step timeout in the ReAct loop.
 
         Applies the escalation policy based on model state:
-          State C — last tool was destructive → abort immediately.
+          State C — last tool was destructive → abort ONLY if a tool call was
+                    pending in the timed-out generation (a retry could re-execute
+                    it). If the model was mid-narration with no tool call pending,
+                    the destructive tool already completed, so continue with backoff.
           State A — no tool executed yet       → retry once, abort after two.
           State B — a tool already ran         → exponential backoff up to max.
+
+        On any continue, the nudge message includes the model's partial reasoning
+        (and partial content when no tool call was pending) so it resumes rather
+        than regenerating the same analysis — long-thinking models that time out
+        mid-thought would otherwise restart from scratch and hit the same wall.
 
         Args:
             iteration: Current ReAct iteration number.
             step_timeout: The timeout (seconds) that just expired.
             messages: The conversation list (a nudge message is appended on continue).
+            partial_text: Content generated before the timeout (from the step buffer).
+            partial_thought: Reasoning generated before the timeout (from the step buffer).
 
         Returns:
             (should_break: bool, new_step_timeout: int)
@@ -6265,16 +6680,26 @@ class ChatLoop:
         self.ctx.agentic_consecutive_timeouts += 1
         last_tool = self.ctx.agentic_last_tool_name
         expired = step_timeout
+        pending_tool = self._partial_tool_call_pending(partial_text)
+        content_is_tool = pending_tool or self._looks_like_truncated_tool_call(partial_text)
 
         if last_tool in AGENTIC_TIMEOUT_ABORT_TOOLS:
-            # State C: destructive last tool — don't risk re-execution.
+            if pending_tool:
+                # State C: destructive last tool AND a tool call was in flight —
+                # retrying risks re-executing it.
+                print(colorize(
+                    f"\n[Agentic] Step {iteration} timed out after {expired}s. "
+                    f"Last tool was '{last_tool}' (destructive) and a tool call was "
+                    "pending. Aborting to avoid re-execution.",
+                    'error'), file=sys.stderr)
+                return True, step_timeout
+            # Destructive tool already completed; the model was only narrating.
             print(colorize(
                 f"\n[Agentic] Step {iteration} timed out after {expired}s. "
-                f"Last tool was '{last_tool}' (destructive). Aborting.",
-                'error'), file=sys.stderr)
-            return True, step_timeout
-
-        if not self.ctx.agentic_has_executed_tool:
+                f"Last tool was '{last_tool}' (destructive) but no tool call was "
+                "pending — continuing with backoff.",
+                'warning'), file=sys.stderr)
+        elif not self.ctx.agentic_has_executed_tool:
             # State A: no tool executed yet — conservative; abort after two timeouts.
             if self.ctx.agentic_consecutive_timeouts >= 2:
                 print(colorize(
@@ -6285,23 +6710,25 @@ class ChatLoop:
                 f"\n[Agentic] Step {iteration} timed out after {expired}s. "
                 "Model may be thinking — retrying.",
                 'warning'), file=sys.stderr)
-        else:
-            # State B: a tool already ran — escalate with exponential backoff.
-            if step_timeout >= self.ctx.agentic_timeout_max:
-                print(colorize(
-                    f"\n[Agentic] Max timeout ({self.ctx.agentic_timeout_max}s) reached. Aborting agentic query.",
-                    'error'), file=sys.stderr)
-                return True, step_timeout
-            step_timeout = min(step_timeout * 2, self.ctx.agentic_timeout_max)
-            print(colorize(
-                f"\n[Agentic] Step {iteration} timed out after {expired}s. "
-                f"Model was executing tools — extending to {step_timeout}s.",
-                'warning'), file=sys.stderr)
+            messages.append({'role': 'user', 'content': self._timeout_nudge(
+                partial_text, partial_thought, content_is_tool)})
+            return False, step_timeout
 
-        messages.append({'role': 'user', 'content': (
-            "You were interrupted by a timeout while generating your response. "
-            "Please continue your previous response."
-        )})
+        # State B: a tool already ran (or a completed destructive tool) — escalate
+        # with exponential backoff.
+        if step_timeout >= self.ctx.agentic_timeout_max:
+            print(colorize(
+                f"\n[Agentic] Max timeout ({self.ctx.agentic_timeout_max}s) reached. Aborting agentic query.",
+                'error'), file=sys.stderr)
+            return True, step_timeout
+        step_timeout = min(step_timeout * 2, self.ctx.agentic_timeout_max)
+        print(colorize(
+            f"\n[Agentic] Step {iteration} timed out after {expired}s. "
+            f"Model was executing tools — extending to {step_timeout}s.",
+            'warning'), file=sys.stderr)
+
+        messages.append({'role': 'user', 'content': self._timeout_nudge(
+            partial_text, partial_thought, content_is_tool)})
         return False, step_timeout
 
     def _init_agentic_query(self, final_content):
@@ -6341,6 +6768,22 @@ class ChatLoop:
             })
 
         return messages, logger, openai_tools, send_tools_api
+
+    @staticmethod
+    def _cap_tool_observation(tool_name: str, observation: str, cap: int = 4000) -> str:
+        """Truncate a tool observation to fit the context, read_file pages excepted.
+
+        `read_file` already bounds and paginates its own output and its header
+        carries the `next` offset, so a blanket cap would silently drop the
+        continuation pointer and defeat chunked reads of large files.
+        """
+        if tool_name == "read_file":
+            return observation
+        if not observation:
+            return observation
+        if len(observation) > cap:
+            return observation[:cap] + f"\n... [truncated to {cap} chars]"
+        return observation
 
     def _execute_tool_calls(self, tool_calls, last_tool_call, iteration, logger, messages, response_text, api_tool_calls):
         """Execute a list of tool calls, collecting observations.
@@ -6387,7 +6830,9 @@ class ChatLoop:
             if not observation:
                 observation = "[Tool returned no output]"
 
-            # Progressive observation truncation based on context usage
+            # Progressive observation truncation based on context usage.
+            # read_file pages are exempt — they self-bound and carry a `next`
+            # offset that a blanket cap would silently drop.
             max_obs_chars = 4000
             usage_ratio = 0.0
             if self.ctx.context_window_size > 0:
@@ -6397,8 +6842,7 @@ class ChatLoop:
                     max_obs_chars = 2000
                 elif usage_ratio > 0.5:
                     max_obs_chars = 3000
-            if len(observation) > max_obs_chars:
-                observation = observation[:max_obs_chars] + f"\n... [truncated to {max_obs_chars} chars]"
+            observation = self._cap_tool_observation(tool_name, observation, max_obs_chars)
 
             timed_observation = json.dumps({"tool": tool_name, "duration_s": round(elapsed, 1), "success": result["success"], "output": observation})
             if self.ctx.agentic_trace:
@@ -6430,16 +6874,7 @@ class ChatLoop:
 
         pending_tool = self.parse_tool_call(final_answer)
         if pending_tool:
-            tool_name = pending_tool["tool"]
-            tool_args = pending_tool.get("arguments", {})
-            args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-            print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr)
-            result = self.tool_registry.execute(tool_name, tool_args)
-            observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
-            if not observation:
-                observation = "[Tool returned no output]"
-            if len(observation) > 4000:
-                observation = observation[:4000] + "\n... [truncated]"
+            observation = self._finalize_pending_tool(pending_tool)
             print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
             self.messages.append({'role': 'assistant', 'content': final_answer})
             print()
@@ -6468,100 +6903,150 @@ class ChatLoop:
                 **stream_kwargs
             )
             if response or stream_tool_calls_out:
-                stream_tool_calls = []
-                if stream_tool_calls_out:
-                    for tc in stream_tool_calls_out:
-                        func = tc.get("function", {})
-                        name = func.get("name", "")
-                        args_raw = func.get("arguments", "{}")
-                        try:
-                            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                        except json.JSONDecodeError:
-                            args = {"raw": args_raw}
-                        stream_tool_calls.append({"tool": name, "arguments": args})
-                if not stream_tool_calls and response:
-                    stream_tool_calls = self.parse_tool_calls(response)
-                    if not stream_tool_calls:
-                        single = self.parse_tool_call(response)
-                        if single:
-                            stream_tool_calls = [single]
+                stream_tool_calls = self._collect_stream_tool_calls(stream_tool_calls_out, response)
                 if stream_tool_calls:
-                    stream_observations = []
-                    for stream_tc in stream_tool_calls:
-                        tool_name = stream_tc["tool"]
-                        tool_args = stream_tc.get("arguments", {})
-                        args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-                        print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
-                        sys.stderr.flush()
-                        t_start = time.time()
-                        result = self.tool_registry.execute(tool_name, tool_args)
-                        if not result["success"] and "Cancelled" in (result.get("error") or ""):
-                            print(colorize("[Agentic] Streaming tool sequence cancelled by user, aborting.", 'warning'), file=sys.stderr)
-                            break
-                        elapsed = time.time() - t_start
-                        status = "OK" if result["success"] else "ERROR"
-                        print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
-                        observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
-                        if not observation:
-                            observation = "[Tool returned no output]"
-                        if len(observation) > 4000:
-                            observation = observation[:4000] + "\n... [truncated]"
-                        print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
-                        stream_observations.append(f"[{tool_name}] {observation}")
-                    if stream_observations:
-                        stream_tool_used = True
-                    if stream_tool_calls_out:
-                        stream_content = response or ""
-                        if not stream_content:
-                            inline_parts = []
-                            for stc in stream_tool_calls_out:
-                                fn = stc.get("function", {})
-                                args_raw = fn.get("arguments", "{}")
-                                try:
-                                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                                except json.JSONDecodeError:
-                                    args = {"raw": args_raw}
-                                inline_parts.append(json.dumps({
-                                    "tool": fn.get("name", ""),
-                                    "arguments": args
-                                }))
-                            stream_content = "\n".join(inline_parts)
-                        assistant_msg = {'role': 'assistant', 'content': stream_content}
-                        assistant_msg['tool_calls'] = stream_tool_calls_out
-                        self.messages.append(assistant_msg)
-                    else:
-                        self.messages.append({'role': 'assistant', 'content': response})
-                    if stream_observations:
-                        if send_tools_api and stream_tool_calls_out:
-                            for idx, tc in enumerate(stream_tool_calls_out):
-                                obs = stream_observations[idx] if idx < len(stream_observations) else "ERROR: Tool execution declined by the user."
-                                clean_obs = obs.split("] ", 1)[1] if "] " in obs else obs
-                                self.messages.append({
-                                    'role': 'tool',
-                                    'tool_call_id': tc.get('id', ''),
-                                    'name': tc.get('function', {}).get('name', ''),
-                                    'content': clean_obs
-                                })
-                        else:
-                            self.messages.append({'role': 'user', 'content': "Tool result:\n" + "\n---\n".join(stream_observations)})
-                    elif send_tools_api and stream_tool_calls_out:
-                        for tc in stream_tool_calls_out:
-                            self.messages.append({
-                                'role': 'tool',
-                                'tool_call_id': tc.get('id', ''),
-                                'name': tc.get('function', {}).get('name', ''),
-                                'content': "ERROR: Tool execution declined by the user."
-                            })
-                    print()
+                    stream_tool_used = self._execute_stream_tool_calls(
+                        stream_tool_calls, stream_tool_calls_out, response, send_tools_api)
                 else:
                     self.messages.append({'role': 'assistant', 'content': response})
                     print()
             else:
                 print(colorize(f"\n{final_answer}", 'success'), file=sys.stdout)
+
+        stream_tool_used = self._agentic_streaming_reentry(stream_tool_used, send_tools_api, openai_tools)
+
+    def _finalize_pending_tool(self, pending_tool: dict) -> str:
+        """Execute a single pending tool call found in the final answer.
+
+        Returns the (possibly truncated) observation text.
+        """
+        tool_name = pending_tool["tool"]
+        tool_args = pending_tool.get("arguments", {})
+        args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+        print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr)
+        result = self.tool_registry.execute(tool_name, tool_args)
+        observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
+        if not observation:
+            observation = "[Tool returned no output]"
+        observation = self._cap_tool_observation(tool_name, observation)
+        return observation
+
+    def _collect_stream_tool_calls(self, stream_tool_calls_out, response) -> list:
+        """Normalize tool calls from the final streaming response.
+
+        Prefers native `tool_calls` out-params; falls back to parsing the text
+        response for inline JSON tool calls.
+        """
+        stream_tool_calls = []
+        if stream_tool_calls_out:
+            for tc in stream_tool_calls_out:
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                args_raw = func.get("arguments", "{}")
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except json.JSONDecodeError:
+                    args = {"raw": args_raw}
+                stream_tool_calls.append({"tool": name, "arguments": args})
+        if not stream_tool_calls and response:
+            stream_tool_calls = self.parse_tool_calls(response)
+            if not stream_tool_calls:
+                single = self.parse_tool_call(response)
+                if single:
+                    stream_tool_calls = [single]
+        return stream_tool_calls
+
+    def _execute_stream_tool_calls(self, stream_tool_calls, stream_tool_calls_out,
+                                   response, send_tools_api) -> bool:
+        """Execute tools produced by the final streaming answer; record self.messages.
+
+        Runs each tool, prints results, and appends the assistant tool_call and the
+        observations to `self.messages` (OpenAI `tool` role when `send_tools_api`,
+        otherwise a `Tool result:` user note).
+
+        Returns True if any tool ran (so the caller can re-enter the loop).
+        """
+        stream_observations = []
+        for stream_tc in stream_tool_calls:
+            tool_name = stream_tc["tool"]
+            tool_args = stream_tc.get("arguments", {})
+            args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+            print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
+            sys.stderr.flush()
+            t_start = time.time()
+            result = self.tool_registry.execute(tool_name, tool_args)
+            if not result["success"] and "Cancelled" in (result.get("error") or ""):
+                print(colorize("[Agentic] Streaming tool sequence cancelled by user, aborting.", 'warning'), file=sys.stderr)
+                break
+            elapsed = time.time() - t_start
+            status = "OK" if result["success"] else "ERROR"
+            print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
+            observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
+            if not observation:
+                observation = "[Tool returned no output]"
+            observation = self._cap_tool_observation(tool_name, observation)
+            print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
+            stream_observations.append(f"[{tool_name}] {observation}")
+
+        if stream_tool_calls_out:
+            stream_content = response or ""
+            if not stream_content:
+                inline_parts = []
+                for stc in stream_tool_calls_out:
+                    fn = stc.get("function", {})
+                    args_raw = fn.get("arguments", "{}")
+                    try:
+                        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    except json.JSONDecodeError:
+                        args = {"raw": args_raw}
+                    inline_parts.append(json.dumps({
+                        "tool": fn.get("name", ""),
+                        "arguments": args
+                    }))
+                stream_content = "\n".join(inline_parts)
+            assistant_msg = {'role': 'assistant', 'content': stream_content}
+            assistant_msg['tool_calls'] = stream_tool_calls_out
+            self.messages.append(assistant_msg)
+        else:
+            self.messages.append({'role': 'assistant', 'content': response})
+        if stream_observations:
+            if send_tools_api and stream_tool_calls_out:
+                for idx, tc in enumerate(stream_tool_calls_out):
+                    obs = stream_observations[idx] if idx < len(stream_observations) else "ERROR: Tool execution declined by the user."
+                    clean_obs = obs.split("] ", 1)[1] if "] " in obs else obs
+                    self.messages.append({
+                        'role': 'tool',
+                        'tool_call_id': tc.get('id', ''),
+                        'name': tc.get('function', {}).get('name', ''),
+                        'content': clean_obs
+                    })
+            else:
+                self.messages.append({'role': 'user', 'content': "Tool result:\n" + "\n---\n".join(stream_observations)})
+        elif send_tools_api and stream_tool_calls_out:
+            for tc in stream_tool_calls_out:
+                self.messages.append({
+                    'role': 'tool',
+                    'tool_call_id': tc.get('id', ''),
+                    'name': tc.get('function', {}).get('name', ''),
+                    'content': "ERROR: Tool execution declined by the user."
+                })
+        print()
+        return bool(stream_observations)
+
+    def _agentic_streaming_reentry(self, stream_tool_used, send_tools_api, openai_tools) -> bool:
+        """Re-enter the loop if the final streaming answer itself carried a tool call.
+
+        Some models narrate intent in prose then emit the JSON tool call last, so
+        the streamed finalize can still carry a tool call. Run up to 3 bounded
+        rounds: re-query with updated history, parse tool calls, execute them, feed
+        observations back, until the model answers plainly.
+
+        Returns the final `stream_tool_used` value.
+        """
         reentry_round = 0
         while stream_tool_used and reentry_round < 3:
             reentry_round += 1
-            self._agentic_streaming_reentry = getattr(self, '_agentic_streaming_reentry', 0) + 1
+            self._agentic_streaming_reentry_count = getattr(self, '_agentic_streaming_reentry_count', 0) + 1
             tool_format = get_tool_format(self.ctx.model)
             include_tool_defs = tool_format != "openai"
             tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
@@ -6577,14 +7062,7 @@ class ChatLoop:
                 images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
                 **sync_kwargs
             )
-            reentry_text = ""
-            if reentry_response and isinstance(reentry_response, dict):
-                if self.ctx.backend == "ollama":
-                    reentry_text = reentry_response.get('message', {}).get('content', '')
-                else:
-                    choices = reentry_response.get('choices', [])
-                    if choices:
-                        reentry_text = choices[0].get('message', {}).get('content', '')
+            reentry_text = _extract_sync_content(self.ctx, reentry_response)
             if not reentry_text:
                 break
             self.messages.append({'role': 'assistant', 'content': reentry_text})
@@ -6612,8 +7090,7 @@ class ChatLoop:
                 rt_obs = rt_result["output"] if rt_result["success"] else f"ERROR: {rt_result['error']}"
                 if not rt_obs:
                     rt_obs = "[Tool returned no output]"
-                if len(rt_obs) > 4000:
-                    rt_obs = rt_obs[:4000] + "\n... [truncated]"
+                rt_obs = self._cap_tool_observation(rt_name, rt_obs)
                 print(colorize(f"\n{rt_obs}", 'info'), file=sys.stdout)
                 reentry_observations.append(f"[{rt_name}] {rt_obs}")
             if reentry_observations:
@@ -6621,10 +7098,32 @@ class ChatLoop:
                 stream_tool_used = True
             else:
                 stream_tool_used = False
+        return stream_tool_used
+
+    def _maybe_auto_compact_agentic(self, messages: list) -> list:
+        """Auto-compact the ReAct loop's local messages near the context limit.
+
+        Agentic steps can balloon the local `messages` array (tool observations,
+        re-queries). When usage passes 85% of the window, mechanically compact
+        with a wider keep-recent window so the loop keeps working memory.
+
+        Returns the (possibly compacted) message list.
+        """
+        if self.ctx.context_window_size <= 0:
+            return messages
+        msg_tokens = self.ctx.calculate_context_tokens(messages)
+        if msg_tokens <= int(self.ctx.context_window_size * 0.85):
+            return messages
+        before_len = len(messages)
+        messages = compact_messages(messages, self.ctx,
+                                    keep_recent=max(8, COMPACTION_KEEP_RECENT))
+        print(colorize(f"\n[Auto-compact] Agentic context: {before_len} → {len(messages)} msgs",
+                       'warning'), file=sys.stderr)
+        return messages
 
     def run_agentic_query(self, full_input: str) -> None:
         """ReAct loop: query model, parse tool calls, execute tools, stream final answer."""
-        self._agentic_streaming_reentry = 0
+        self._agentic_streaming_reentry_count = 0
         logger = None
         try:
             final_content = process_inline_commands(full_input)
@@ -6652,6 +7151,7 @@ class ChatLoop:
             last_tool_call = None
             step_timeout = self.ctx.agentic_step_timeout
             response_text = ""
+            api_error = ""
 
             # Reset timeout escalation state at the start of each agentic query.
             self.ctx.agentic_consecutive_timeouts = 0
@@ -6666,14 +7166,7 @@ class ChatLoop:
                 sys.stderr.flush()
 
                 # Auto-compact agentic messages if approaching context limit
-                if self.ctx.context_window_size > 0:
-                    msg_tokens = self.ctx.calculate_context_tokens(messages)
-                    if msg_tokens > int(self.ctx.context_window_size * 0.85):
-                        before_len = len(messages)
-                        messages = compact_messages(messages, self.ctx,
-                                                   keep_recent=max(8, COMPACTION_KEEP_RECENT))
-                        print(colorize(f"\n[Auto-compact] Agentic context: {before_len} → {len(messages)} msgs",
-                                       'warning'), file=sys.stderr)
+                messages = self._maybe_auto_compact_agentic(messages)
 
                 # Verbose: show payload token count
                 if self.ctx.agentic_verbose and self.ctx.context_window_size > 0:
@@ -6685,7 +7178,7 @@ class ChatLoop:
                 sync_kwargs = dict(get_inference_params(self.ctx.model))
                 if send_tools_api:
                     sync_kwargs["tools"] = openai_tools
-                on_chunk, finalize_step = self._make_agentic_step_feedback()
+                on_chunk, finalize_step, step_buf = self._make_agentic_step_feedback()
                 response = self._call_with_timeout(
                     self.query_handler.query_sync_stream, step_timeout,
                     messages, self.ctx.model,
@@ -6698,7 +7191,10 @@ class ChatLoop:
                 finalize_step()
 
                 if response is None:
-                    should_break, step_timeout = self._handle_agentic_timeout(iteration, step_timeout, messages)
+                    should_break, step_timeout = self._handle_agentic_timeout(
+                        iteration, step_timeout, messages,
+                        partial_text=step_buf.get("content", ""),
+                        partial_thought=step_buf.get("thought", ""))
                     if should_break:
                         break
                     response_text = ""
@@ -6719,6 +7215,7 @@ class ChatLoop:
                 # Check for API-level errors from query_sync
                 if isinstance(response, dict) and "error" in response and not response.get("choices") and not response.get("message", {}).get("content"):
                     err_msg = response["error"].get("message", "Unknown error") if isinstance(response["error"], dict) else str(response["error"])
+                    api_error = err_msg
                     print(colorize(f"\n[Agentic] API error: {err_msg}", 'error'), file=sys.stderr)
                     break
 
@@ -6760,7 +7257,8 @@ class ChatLoop:
                         print(colorize(f"[Verbose] ({len(response_text)} total chars, showing first 500)", 'muted'), file=sys.stderr)
 
                 if not response_text and not api_tool_calls:
-                    messages.append({'role': 'user', 'content': 'Please provide a tool call or your final answer.'})
+                    messages.append({'role': 'user', 'content': 'Please provide a tool call or your final answer.',
+                                     '_system_nudge': True})
                     continue
 
                 if response_text and self._is_stuck(response_text):
@@ -6827,10 +7325,22 @@ class ChatLoop:
                 else:
                     messages.append({'role': 'user', 'content': f"Tool result:\n{combined}"})
 
-            if iteration >= max_iterations and not final_answer:
-                final_answer = response_text
+            if api_error:
+                # Backend unreachable (connection refused, 5xx, ...). Do NOT re-query
+                # a dead endpoint for a final answer — the finalize path would launch
+                # a second doomed streaming request (another 3 retries) and print a
+                # misleading "[Agentic: no answer produced]". Nothing is merged into
+                # the persistent history beyond the user's own message, so repeated
+                # attempts while the server is down don't pollute the context.
+                print(colorize(
+                    f"\n[Agentic] Backend unreachable ({api_error}). "
+                    "Aborted without a final answer; conversation history untouched.",
+                    'warning'), file=sys.stderr)
+            else:
+                if iteration >= max_iterations and not final_answer:
+                    final_answer = response_text
 
-            self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text)
+                self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text)
 
             # Merge the ReAct loop turns back into self.messages for cross-turn
             # memory. The local `messages` array was seeded as
@@ -6842,7 +7352,14 @@ class ChatLoop:
             # The old insert-before-last approach duplicated history/user
             # messages and placed tool work before the query that triggered it.
             if len(messages) > agentic_seed_len:
-                self.messages[agentic_seed_len:agentic_seed_len] = messages[agentic_seed_len:]
+                # Exclude `_system_nudge` messages (e.g. the empty-response
+                # "Please provide a tool call..." fallback) from the persistent
+                # history — they are loop-internal steering, not real user turns,
+                # and repeated empty responses would otherwise pile them into
+                # context forever.
+                new_turns = [m for m in messages[agentic_seed_len:] if not m.get('_system_nudge')]
+                if new_turns:
+                    self.messages[agentic_seed_len:agentic_seed_len] = new_turns
             sanitize_tool_pairing(self.messages)
 
             # Persist compaction savings: the ReAct loop may have auto-compacted its
@@ -6931,8 +7448,24 @@ class ChatLoop:
                     "[Compact] No eligible tool results to summarize.",
                     'muted'), file=sys.stderr)
 
-        # Phase 1: sliding-window compaction
-        self.messages = compact_messages(self.messages, self.ctx, force=force)
+        # Phase 1: LLM narrative summary (when requested) or sliding-window compaction
+        if use_llm:
+            self.messages = llm_compact_messages(self.messages, self.ctx, self.query_handler)
+            llm_summary_used = (
+                len(self.messages) > 1
+                and isinstance(self.messages[1].get('content', ''), str)
+                and self.messages[1]['content'].startswith(LLM_COMPACT_SUMMARY_MARKER)
+            )
+            if llm_summary_used:
+                print(colorize(
+                    "[Compact] LLM-summarized the older conversation.",
+                    'info'), file=sys.stderr)
+            else:
+                print(colorize(
+                    "[Compact] LLM summarization failed; fell back to mechanical compaction.",
+                    'muted'), file=sys.stderr)
+        else:
+            self.messages = compact_messages(self.messages, self.ctx, force=force)
         after_tokens = self.ctx.calculate_context_tokens(self.messages)
 
         # Phase 2: if still over the target budget (COMPACTION_TARGET) and
@@ -6940,30 +7473,7 @@ class ChatLoop:
         if self.ctx.context_window_size > 0:
             target = int(self.ctx.context_window_size * COMPACTION_TARGET)
             if after_tokens > target and len(self.messages) > 1:
-                largest_idx = -1
-                largest_tokens = 0
-                for i, msg in enumerate(self.messages):
-                    if i == 0:
-                        continue
-                    t = msg.get('_tokens', self.ctx.estimate_tokens(msg.get('content', '')))
-                    if t > largest_tokens:
-                        largest_tokens = t
-                        largest_idx = i
-                if largest_idx > 0 and largest_tokens > target * 0.3:
-                    excess = after_tokens - target
-                    msg = self.messages[largest_idx]
-                    content = msg.get('content', '')
-                    chars_to_cut = int(excess * 4)  # rough tokens→chars
-                    if chars_to_cut > 0 and chars_to_cut < len(content):
-                        role = msg.get('role', 'unknown')
-                        msg['content'] = content[:len(content) - chars_to_cut] + \
-                            f"\n\n[... truncated {chars_to_cut} chars to fit context budget ...]"
-                        msg.pop('_tokens', None)
-                        self.ctx.stamp_tokens(msg)
-                        after_tokens = self.ctx.calculate_context_tokens(self.messages)
-                        print(colorize(
-                            f"[Compact] Truncated large {role} message (index {largest_idx}) to fit budget.",
-                            'warning'), file=sys.stderr)
+                after_tokens = self._compact_truncate_largest(target)
 
         self.ctx.current_context_tokens = after_tokens
         print(colorize(
@@ -6972,6 +7482,47 @@ class ChatLoop:
             f"(saved {before_tokens - after_tokens} tokens)",
             'success'), file=sys.stderr)
         return False
+
+    def _compact_truncate_largest(self, target: int) -> int:
+        """Phase 2: truncate the largest single message to fit the token budget.
+
+        If the total still exceeds `target` and one message is large enough to be
+        worth shrinking, cut roughly `excess * 4` characters from its tail.
+
+        Returns the updated total token count (unchanged if nothing was truncated).
+        """
+        total = self.ctx.calculate_context_tokens(self.messages)
+        if total <= target or len(self.messages) <= 1:
+            return total
+        largest_idx = -1
+        largest_tokens = 0
+        for i, msg in enumerate(self.messages):
+            if i == 0:
+                continue
+            t = msg.get('_tokens', self.ctx.estimate_tokens(msg.get('content', '')))
+            if t > largest_tokens:
+                largest_tokens = t
+                largest_idx = i
+        if largest_idx <= 0 or largest_tokens <= target * 0.3:
+            return total
+        msg = self.messages[largest_idx]
+        content = msg.get('content', '')
+        if not isinstance(content, str):
+            return total
+        excess = total - target
+        chars_to_cut = int(excess * 4)  # rough tokens→chars
+        if chars_to_cut <= 0 or chars_to_cut >= len(content):
+            return total
+        role = msg.get('role', 'unknown')
+        msg['content'] = content[:len(content) - chars_to_cut] + \
+            f"\n\n[... truncated {chars_to_cut} chars to fit context budget ...]"
+        msg.pop('_tokens', None)
+        self.ctx.stamp_tokens(msg)
+        updated = self.ctx.calculate_context_tokens(self.messages)
+        print(colorize(
+            f"[Compact] Truncated large {role} message (index {largest_idx}) to fit budget.",
+            'warning'), file=sys.stderr)
+        return updated
 
     def _compact_list(self) -> bool:
         """List all messages with sizes (like /tokencount)."""

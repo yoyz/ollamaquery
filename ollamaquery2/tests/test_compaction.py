@@ -27,6 +27,8 @@ class FakeContext:
 
     def __init__(self, context_window_size=0):
         self.context_window_size = context_window_size
+        self.backend = 'llamacpp'
+        self.model = 'test-model'
 
     def estimate_tokens(self, text):
         if not text:
@@ -248,6 +250,174 @@ class TestSanitizeToolPairing(unittest.TestCase):
         ]
         m.sanitize_tool_pairing(msgs)
         self.assertEqual(msgs[1]['role'], 'user')
+
+
+class TestSplitCompactionWindow(unittest.TestCase):
+    """The keep-recent window must never start on an orphaned tool message."""
+
+    def test_window_shifts_left_on_tool(self):
+        msgs = [_msg('system', 'sys'), _msg('user', 'q')]
+        msgs += [{'role': 'assistant', 'content': 'call',
+                  'tool_calls': [{'id': 'tc', 'function': {'name': 'x', 'arguments': '{}'}}]},
+                 {'role': 'tool', 'content': 'res', 'tool_call_id': 'tc'},
+                 {'role': 'user', 'content': 'tail'}]
+        system, middle, recent = m._split_compaction_window(msgs, keep_recent=2)
+        self.assertEqual(system['role'], 'system')
+        self.assertEqual(middle, msgs[1:2])
+        # Window starts on the assistant tool_call, not the tool result.
+        self.assertEqual(recent[0]['role'], 'assistant')
+        self.assertEqual(recent[-1], msgs[-1])
+
+    def test_window_keeps_recent_tail(self):
+        msgs = [_msg('system', 'sys')] + [_msg('user', f'q{i}') for i in range(6)]
+        system, middle, recent = m._split_compaction_window(msgs, keep_recent=4)
+        self.assertEqual(len(recent), 4)
+        self.assertEqual(recent, msgs[-4:])
+        self.assertEqual(middle, msgs[1:-4])
+
+
+class TestBuildCompactionSummary(unittest.TestCase):
+    def test_tool_and_user_and_assistant(self):
+        middle = [
+            {'role': 'user', 'content': 'hello world'},
+            {'role': 'assistant', 'content': 'some answer'},
+            {'role': 'tool', 'name': 'read_file', 'content': 'data'},
+            {'role': 'tool', 'name': 'run', 'content': 'ERROR: boom'},
+        ]
+        text = m._build_compaction_summary(middle)
+        self.assertIn('[CONVERSATION HISTORY COMPACTED]', text)
+        self.assertIn('User: hello world', text)
+        self.assertIn('Assistant: some answer', text)
+        self.assertIn('[Tool read_file: OK]', text)
+        self.assertIn('[Tool run: FAILED]', text)
+
+    def test_tool_observation_user(self):
+        middle = [{'role': 'user', 'content': "Tool result:\nfoo\nbar"}]
+        text = m._build_compaction_summary(middle)
+        self.assertIn('[Tool observation:', text)
+
+
+class TestRenderConversationTranscript(unittest.TestCase):
+    def test_tool_reduced_to_status_line(self):
+        middle = [
+            {'role': 'tool', 'name': 'read_file', 'content': 'x' * 5000},
+            {'role': 'user', 'content': 'keep this question'},
+            {'role': 'assistant', 'content': 'short reply'},
+        ]
+        text = m._render_conversation_transcript(middle)
+        self.assertIn('[tool read_file: OK]', text)
+        self.assertIn('user: keep this question', text)
+        self.assertNotIn('xxxxx', text)
+
+    def test_max_chars_truncation(self):
+        middle = [{'role': 'user', 'content': 'a' * 1000}]
+        text = m._render_conversation_transcript(middle, max_chars=200)
+        self.assertLessEqual(len(text), 200 + len("[...]") + 1)
+        self.assertIn('[...]', text)
+
+    def test_tool_observation_collapsed(self):
+        middle = [{'role': 'user', 'content': "Tool result:\nbig output here"}]
+        text = m._render_conversation_transcript(middle)
+        self.assertIn('[tool observation: Tool result:]', text)
+        self.assertNotIn('big output', text)
+
+
+class FakeQueryHandler:
+    """Deterministic stand-in for ModelQuery used by the LLM summarizers."""
+
+    def __init__(self, content='NARRATIVE SUMMARY'):
+        self.content = content
+        self.calls = []
+
+    def query_sync(self, messages, model, **kwargs):
+        self.calls.append((messages, model, kwargs))
+        return {'choices': [{'message': {'content': self.content}}]}
+
+
+class TestExtractSyncContent(unittest.TestCase):
+    def setUp(self):
+        self.ctx = FakeContext()
+        self.ctx.backend = 'llamacpp'
+
+    def test_llamacpp_shape(self):
+        self.assertEqual(
+            m._extract_sync_content(self.ctx, {'choices': [{'message': {'content': 'hi'}}]}),
+            'hi')
+
+    def test_ollama_shape(self):
+        self.ctx.backend = 'ollama'
+        self.assertEqual(
+            m._extract_sync_content(self.ctx, {'message': {'content': 'hi'}}), 'hi')
+
+    def test_string_response(self):
+        self.assertEqual(m._extract_sync_content(self.ctx, 'raw'), 'raw')
+
+    def test_empty_response(self):
+        self.assertEqual(m._extract_sync_content(self.ctx, {}), '')
+        self.assertEqual(m._extract_sync_content(self.ctx, None), '')
+
+
+class TestLlmCompactMessages(unittest.TestCase):
+    def _session(self):
+        msgs = [_msg('system', 'sys')]
+        msgs += [_msg('user', f'q{i}') for i in range(8)]
+        msgs += [_msg('assistant', 'final answer')]
+        return msgs
+
+    def test_llm_summary_structure(self):
+        ctx = FakeContext()
+        handler = FakeQueryHandler(content='user wanted a summary of X.')
+        result = m.llm_compact_messages(self._session(), ctx, handler, keep_recent=2)
+        self.assertEqual(result[0]['role'], 'system')
+        self.assertEqual(result[1]['role'], 'user')
+        self.assertIn(m.LLM_COMPACT_SUMMARY_MARKER, result[1]['content'])
+        self.assertIn('user wanted a summary of X.', result[1]['content'])
+        self.assertIn('_tokens', result[1])
+        self.assertEqual(result[-2:], self._session()[-2:])
+        # The summarizer actually got the older turns.
+        self.assertTrue(handler.calls)
+        sent_user = handler.calls[0][0][1]['content']
+        self.assertIn('q0', sent_user)
+
+    def test_fallback_to_mechanical_when_llm_fails(self):
+        ctx = FakeContext()
+        handler = FakeQueryHandler(content='')
+        result = m.llm_compact_messages(self._session(), ctx, handler, keep_recent=2)
+        self.assertIn('[CONVERSATION HISTORY COMPACTED]', result[1]['content'])
+        self.assertNotIn(m.LLM_COMPACT_SUMMARY_MARKER, result[1]['content'])
+
+    def test_noop_when_too_few_messages(self):
+        ctx = FakeContext()
+        handler = FakeQueryHandler()
+        msgs = [_msg('system', 'sys'), _msg('user', 'hi')]
+        result = m.llm_compact_messages(msgs, ctx, handler, keep_recent=6)
+        self.assertEqual(result, msgs)
+        self.assertEqual(handler.calls, [])
+
+    def test_role_alternation_and_tool_pairing(self):
+        ctx = FakeContext()
+        handler = FakeQueryHandler()
+        session = [_msg('system', 'sys'), _msg('user', 'q0'), _msg('user', 'q1'),
+                   {'role': 'assistant', 'content': 'call',
+                    'tool_calls': [{'id': 'tc', 'function': {'name': 'x', 'arguments': '{}'}}]},
+                   {'role': 'tool', 'content': 'res', 'tool_call_id': 'tc'},
+                   {'role': 'user', 'content': 'tail'}]
+        result = m.llm_compact_messages(session, ctx, handler, keep_recent=3)
+        _assert_no_orphaned_tools(self, result)
+        roles = [msg['role'] for msg in result]
+        for i in range(1, len(roles)):
+            if roles[i] == 'user':
+                self.assertNotEqual(roles[i], roles[i - 1])
+
+    def test_llm_compact_uses_transcript_excerpt(self):
+        ctx = FakeContext()
+        handler = FakeQueryHandler()
+        big = _msg('user', 'z' * 3000)
+        session = [_msg('system', 'sys')] + [big] + [_msg('user', f'q{i}') for i in range(6)]
+        m.llm_compact_messages(session, ctx, handler, keep_recent=1)
+        sent = handler.calls[0][0][1]['content']
+        self.assertLessEqual(len(sent), m.LLM_COMPACT_TRANSCRIPT_CHARS + 64)
+        self.assertIn('user: q3', sent)
 
 
 if __name__ == '__main__':

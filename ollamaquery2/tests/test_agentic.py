@@ -235,10 +235,135 @@ class TestToolRegistry(unittest.TestCase):
                     f.write("x" * (q.MAX_READ_FILE_SIZE + 1000))
                 result = self.reg.execute("read_file", {"file": "big.txt"})
                 self.assertTrue(result["success"])
-                self.assertIn("[truncated", result["output"])
-                self.assertLessEqual(len(result["output"]), q.MAX_READ_FILE_SIZE + 200)
+                self.assertIn("(line truncated to", result["output"])
+                self.assertLessEqual(len(result["output"]), q.MAX_READ_LINE_LENGTH + 200)
             finally:
                 os.chdir(old_cwd)
+
+    def test_read_file_pages_large_file(self):
+        """A file over MAX_READ_FILE_SIZE auto-pages with a `next` offset."""
+        import tempfile
+        import re
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("big.txt", "w") as f:
+                    for i in range(5000):
+                        f.write(f"line {i:04d} " + "padding data " * 6 + "\n")
+                self.assertGreater(os.path.getsize("big.txt"), q.MAX_READ_FILE_SIZE)
+                result = self.reg.execute("read_file", {"file": "big.txt"})
+                self.assertTrue(result["success"], msg=result.get("error"))
+                head = result["output"].split("\n")[0]
+                self.assertIn("more available", head)
+                mh = re.search(r'offset=(\d+)', head)
+                self.assertIsNotNone(mh, f"no next offset in header: {head}")
+                self.assertGreater(int(mh.group(1)), 1)
+                self.assertIn("read_file", head)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_read_file_chained_to_end(self):
+        """Following the returned `next` offsets must reach end-of-file."""
+        import tempfile
+        import re
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("big.txt", "w") as f:
+                    for i in range(3000):
+                        f.write(f"line {i:04d} " + "padding data " * 6 + "\n")
+                result = self.reg.execute("read_file", {"file": "big.txt"})
+                head = result["output"].split("\n")[0]
+                mh = re.search(r'offset=(\d+)', head)
+                off = int(mh.group(1)) if mh else None
+                pages = 1
+                while off:
+                    r = self.reg.execute("read_file", {"file": "big.txt", "offset": off})
+                    self.assertTrue(r["success"], msg=r.get("error"))
+                    h = r["output"].split("\n")[0]
+                    m2 = re.search(r'offset=(\d+)', h)
+                    off = int(m2.group(1)) if m2 else None
+                    pages += 1
+                    self.assertLess(pages, 50)
+                self.assertIn("line 2999", r["output"])
+            finally:
+                os.chdir(old_cwd)
+
+    def test_read_file_offset_window(self):
+        """An explicit offset/limit returns exactly that line range."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("w.txt", "w") as f:
+                    for i in range(100):
+                        f.write(f"row {i}\n")
+                result = self.reg.execute("read_file", {"file": "w.txt", "offset": 10, "limit": 5})
+                self.assertTrue(result["success"], msg=result.get("error"))
+                head = result["output"].split("\n")[0]
+                self.assertIn("lines 10-14", head)
+                self.assertIn("row 9", result["output"])
+                self.assertIn("row 13", result["output"])
+                self.assertNotIn("row 14", result["output"])
+            finally:
+                os.chdir(old_cwd)
+
+    def test_read_file_offset_out_of_range(self):
+        """An offset past the last line reports end-of-file, not an error."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("w.txt", "w") as f:
+                    f.write("a\nb\n")
+                result = self.reg.execute("read_file", {"file": "w.txt", "offset": 50})
+                self.assertTrue(result["success"])
+                self.assertIn("no lines at offset 50", result["output"])
+            finally:
+                os.chdir(old_cwd)
+
+    def test_read_file_small_file_unchanged(self):
+        """Small files read whole with no paging header."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("small.txt", "w") as f:
+                    f.write("line1\nline2\n")
+                result = self.reg.execute("read_file", {"file": "small.txt"})
+                self.assertTrue(result["success"], msg=result.get("error"))
+                self.assertEqual(result["output"], "line1\nline2\n")
+            finally:
+                os.chdir(old_cwd)
+
+    def test_read_file_long_line_truncated(self):
+        """Single lines longer than MAX_READ_LINE_LENGTH are truncated per-line."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("long.txt", "w") as f:
+                    f.write("x" * 5000 + "\n")
+                result = self.reg.execute("read_file", {"file": "long.txt", "limit": 5})
+                self.assertTrue(result["success"], msg=result.get("error"))
+                self.assertIn(f"(line truncated to {q.MAX_READ_LINE_LENGTH} chars)", result["output"])
+                self.assertLessEqual(len(result["output"]), q.MAX_READ_LINE_LENGTH + 200)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_cap_tool_observation_exempts_read_file(self):
+        """read_file observations skip the generic 4000-char context cap."""
+        big = "z" * 9000
+        self.assertEqual(q.ChatLoop._cap_tool_observation("read_file", big), big)
+        capped = q.ChatLoop._cap_tool_observation("run_command", big)
+        self.assertLess(len(capped), 4000 + 100)
+        self.assertIn("[truncated", capped)
 
     def test_list_directory(self):
         result = self.reg.execute("list_directory", {"path": "."})
@@ -852,6 +977,81 @@ class TestReActLoopUnit(unittest.TestCase):
         last = self.loop.messages[-1] if hasattr(self.loop, 'messages') else {"role": "system", "content": ""}
         self.assertEqual(last["role"], "assistant")
 
+    def test_api_error_skips_finalize_and_preserves_history(self):
+        """When the backend is unreachable, the loop must NOT re-query a dead
+        endpoint for a final answer, must NOT print/merge the '[Agentic: no
+        answer produced]' placeholder, and must leave conversation history
+        un-polluted so repeated attempts don't pile failures into context."""
+        self.loop.query_handler.query_sync_stream = MagicMock(
+            return_value={"error": {"message": "Connection refused"}})
+        self.loop.query_handler.query_stream = MagicMock(return_value="")
+
+        self.loop.run_agentic_query("ok update AGENTS.md")
+
+        self.assertFalse(self.loop.query_handler.query_stream.called,
+                         "Finalize must not re-query an unreachable backend")
+        assistant_msgs = [m for m in self.loop.messages if m["role"] == "assistant"]
+        self.assertEqual(len(assistant_msgs), 0,
+                         "No assistant placeholder should be recorded on API error")
+        for m in self.loop.messages:
+            content = m.get("content", "")
+            self.assertNotIn("[Agentic: no answer produced]", content)
+        # The user's own message stays (real input), but nothing artificial was added.
+        self.assertLessEqual(len(self.loop.messages), 2)
+
+    def test_api_error_after_tool_turns_keeps_real_work(self):
+        """If the backend dies partway through a query, the successful tool turns
+        must still be merged into history — only the failed finalize is skipped."""
+        calls = [
+            self._make_sync_response(
+                '{"tool": "write_file", "arguments": {"file": "z.txt", "content": "data"}}'
+            ),
+            {"error": {"message": "HTTP Error 503: Service Unavailable"}},
+        ]
+        call_idx = [0]
+
+        def mock_sync(*args, **kwargs):
+            idx = call_idx[0]
+            call_idx[0] += 1
+            return calls[idx] if idx < len(calls) else self._make_sync_response("done")
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="")
+
+        self.loop.run_agentic_query("fix the server")
+
+        contents = [m.get("content", "") for m in self.loop.messages]
+        self.assertTrue(any("Tool result" in c for c in contents),
+                        "Successful tool turns must persist after an API error")
+        self.assertFalse(self.loop.query_handler.query_stream.called)
+
+    def test_empty_response_nudge_not_persisted(self):
+        """The injected 'Please provide a tool call or your final answer.' nudge
+        is loop-internal steering and must NOT be merged into the persistent
+        conversation history."""
+        calls = [
+            self._make_sync_response(""),                      # empty → nudge injected
+            self._make_sync_response("Done."),                 # real answer
+        ]
+        call_idx = [0]
+
+        def mock_sync(*args, **kwargs):
+            idx = call_idx[0]
+            call_idx[0] += 1
+            return calls[idx] if idx < len(calls) else self._make_sync_response("done")
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="Done.")
+
+        self.loop.run_agentic_query("Say done")
+
+        self.assertFalse(
+            any(m.get("content") == "Please provide a tool call or your final answer."
+                for m in self.loop.messages),
+            "System nudge must not persist in conversation history")
+        self.assertEqual(self.loop.messages[-1]["role"], "assistant")
+        self.assertIn("Done.", self.loop.messages[-1]["content"])
+
 
 class TestStuckDetection(unittest.TestCase):
     """Test the _is_stuck and _call_with_timeout helpers."""
@@ -1160,6 +1360,17 @@ class TestComposableSystemPrompt(unittest.TestCase):
         prompt = q.get_agentic_prompt("test-model")
         self.assertIn("Output ONLY the JSON tool call", prompt)
         self.assertIn("ReAct protocol", prompt)
+
+    def test_get_agentic_prompt_native_format_for_openai_models(self):
+        """Models using the native tools API must NOT get the bare-JSON format
+        block (which caused Qwen3.6 to emit hybrid/XML tool calls)."""
+        for model in ("qwen3.6-35b-a3b", "qwen3:8b", "gpt-oss-20b", "gemini-2.5"):
+            prompt = q.get_agentic_prompt(model)
+            self.assertNotIn("Output ONLY the JSON tool call", prompt,
+                             f"{model} must not receive the strict JSON format")
+            self.assertIn("function-calling interface", prompt,
+                          f"{model} should receive the native-tools format")
+            self.assertNotIn("JSON tool call", prompt)
 
     def test_get_agentic_prompt_soft_format(self):
         prompt = q.get_agentic_prompt("nemotron-cascade")

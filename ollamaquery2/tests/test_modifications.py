@@ -604,6 +604,107 @@ class TestUnifiedDiffHunkParsing(unittest.TestCase):
                 os.chdir(old_cwd)
 
 
+class TestBareAtAtHunk(unittest.TestCase):
+    """Bare `@@` hunks (opencode "match anywhere", no line numbers) must apply.
+
+    Regression: the agent's apply_patch calls used `@@` with no line numbers,
+    which `_parse_unified_hunks` silently dropped → empty hunks → the file was
+    rewritten unchanged but reported "Patched" success, so the model looped.
+    """
+
+    def _apply(self, content, patch):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("test.txt", "w") as f:
+                    f.write(content)
+                result = m._apply_unified_diff(patch)
+                with open("test.txt") as f:
+                    after = f.read()
+                return result, after
+            finally:
+                os.chdir(old_cwd)
+
+    def test_bare_hunk_replaces_anywhere(self):
+        content = ("#define PORT \"8000\"\n"
+                   "void serve(void);\n")
+        patch = ("*** Update File: test.txt\n"
+                 "@@\n"
+                 "-#define PORT \"8000\"\n"
+                 "+#define PORT \"15000\"\n")
+        result, after = self._apply(content, patch)
+        self.assertTrue(result["success"], msg=result.get("error", ""))
+        self.assertIn('#define PORT "15000"', after)
+        self.assertNotIn('#define PORT "8000"', after)
+
+    def test_bare_hunk_mid_file(self):
+        content = "line one\n#define PORT \"8000\"\nline three\n"
+        patch = ("*** Update File: test.txt\n"
+                 "@@\n"
+                 "-#define PORT \"8000\"\n"
+                 "+#define PORT \"9000\"\n")
+        result, after = self._apply(content, patch)
+        self.assertTrue(result["success"], msg=result.get("error", ""))
+        self.assertIn('#define PORT "9000"', after)
+        self.assertEqual(after.splitlines()[0], "line one")
+
+    def test_bare_hunk_context_anchor(self):
+        content = "int main(void) {\n    return 0;\n}\n"
+        patch = ("*** Update File: test.txt\n"
+                 "@@\n"
+                 " int main(void) {\n"
+                 "-    return 0;\n"
+                 "+    return 42;\n"
+                 "}\n")
+        result, after = self._apply(content, patch)
+        self.assertTrue(result["success"], msg=result.get("error", ""))
+        self.assertIn("return 42;", after)
+
+    def test_bare_hunk_pure_addition_appends(self):
+        content = "first\n"
+        patch = ("*** Update File: test.txt\n"
+                 "@@\n"
+                 "+appended line\n")
+        result, after = self._apply(content, patch)
+        self.assertTrue(result["success"], msg=result.get("error", ""))
+        self.assertEqual(after.splitlines()[-1], "appended line")
+        self.assertEqual(after.splitlines()[0], "first")
+
+    def test_bare_hunk_no_match_reports_failure(self):
+        content = "some content\n"
+        patch = ("*** Update File: test.txt\n"
+                 "@@\n"
+                 "-this line is not present\n"
+                 "+replaced\n")
+        result, after = self._apply(content, patch)
+        self.assertFalse(result["success"])
+        self.assertIn("No hunks matched", result.get("error", ""))
+        self.assertNotIn("replaced", after)
+
+    def test_numbered_hunk_still_works(self):
+        content = "old\nkeep\n"
+        patch = ("*** Update File: test.txt\n"
+                 "@@ -1,1 +1,1 @@\n"
+                 "-old\n"
+                 "+new\n")
+        result, after = self._apply(content, patch)
+        self.assertTrue(result["success"], msg=result.get("error", ""))
+        self.assertTrue(after.startswith("new\n"))
+
+    def test_bare_hunk_parsed_by_sections(self):
+        patch = ("*** Update File: test.txt\n"
+                 "@@\n"
+                 "-old\n"
+                 "+new\n")
+        sections = m._parse_patch_sections(patch)
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(len(sections[0]["hunks"]), 1,
+                         "Bare @@ hunk was dropped by _parse_unified_hunks")
+        self.assertEqual(sections[0]["hunks"][0]["start"], -1)
+
+
 class TestParsePatchSections(unittest.TestCase):
     """_parse_patch_sections must correctly parse OpenCode-style markers with --- headers."""
 
@@ -925,6 +1026,33 @@ class TestShellTimeout(unittest.TestCase):
 # ============================================================================
 # 13. AGENTS.md line number consistency
 # ============================================================================
+
+class TestInferenceParamsRegistry(unittest.TestCase):
+    """Model-name matching must pick the most specific registry entry."""
+
+    def test_qwen36_matches_own_entry_not_qwen3(self):
+        params = m.get_inference_params('Qwen3.6-35B-A3B-UD-Q4_K_M.gguf')
+        self.assertEqual(params['temperature'], 0.6)
+        self.assertEqual(params['top_p'], 0.95)
+
+    def test_qwen3_keeps_own_values(self):
+        params = m.get_inference_params('qwen3:8b')
+        self.assertEqual(params['temperature'], 0.5)
+        self.assertEqual(params['top_p'], 0.9)
+
+    def test_qwen35_not_swallowed_by_qwen36(self):
+        params = m.get_inference_params('qwen3.5:9b')
+        self.assertEqual(params['temperature'], 0.5)
+
+    def test_unknown_model_falls_back_to_default(self):
+        params = m.get_inference_params('some-random-model:latest')
+        self.assertEqual(params, m.DEFAULT_INFERENCE_PARAMS)
+
+    def test_registry_order_qwen36_before_qwen3(self):
+        keys = list(m.MODEL_INFERENCE_PARAMS_REGISTRY)
+        self.assertLess(keys.index('qwen3.6'), keys.index('qwen3'),
+                        "qwen3.6 must be matched before generic qwen3")
+
 
 class TestAgentsMdConsistency(unittest.TestCase):
     """Verify AGENTS.md line-number references are still accurate."""

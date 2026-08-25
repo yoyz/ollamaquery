@@ -45,7 +45,11 @@ class FakeCtx:
 
 
 class FakeQueryHandler:
+    def __init__(self):
+        self.called_with_conversation = False
+
     def query_sync(self, messages, model, **kwargs):
+        self.called_with_conversation = 'EARLIER CONVERSATION TO SUMMARIZE' in messages[-1]['content']
         return {'choices': [{'message': {'content': 'SUMMARY'}}]}
 
 
@@ -145,6 +149,79 @@ class TestCompactDispatch(unittest.TestCase):
         before = list(loop.messages)
         loop.run_handle_compact('/compact status')
         self.assertEqual(loop.messages, before)
+
+
+class TestCompactLlm(unittest.TestCase):
+    def _loop(self):
+        loop = _loop()
+        loop.messages += [{'role': 'user', 'content': f'q{i}'} for i in range(8)]
+        loop.messages += [{'role': 'assistant', 'content': 'answer'}]
+        return loop
+
+    def test_llm_compacts_conversation(self):
+        loop = self._loop()
+        loop.run_handle_compact('/compact llm')
+        self.assertIn(m.LLM_COMPACT_SUMMARY_MARKER, loop.messages[1]['content'])
+        self.assertLess(len(loop.messages), 12)
+        self.assertTrue(loop.query_handler.called_with_conversation)
+
+    def test_llm_under_budget_still_summarizes(self):
+        # /compact llm is explicit: even a small conversation gets summarized.
+        loop = self._loop()
+        loop.run_handle_compact('/compact llm')
+        self.assertIn(m.LLM_COMPACT_SUMMARY_MARKER, loop.messages[1]['content'])
+
+
+class _FourToOneCtx(FakeCtx):
+    """More realistic token model: ~4 chars per token, consistent with stamping."""
+
+    def estimate_tokens(self, text):
+        if not text:
+            return 0
+        return max(1, len(text) // 4) + 2
+
+    def stamp_tokens(self, msg):
+        content = msg.get('content', '')
+        if isinstance(content, list):
+            content = "".join(p.get('text', '') for p in content if isinstance(p, dict))
+        msg['_tokens'] = (len(content) // 4) + 2
+        return msg
+
+
+class TestCompactTruncateLargest(unittest.TestCase):
+    def _loop_with_ctx(self, ctx):
+        loop = _loop()
+        loop.ctx = ctx
+        return loop
+
+    def test_truncates_giant_message_to_budget(self):
+        ctx = _FourToOneCtx()
+        loop = self._loop_with_ctx(ctx)
+        loop.messages.append({'role': 'user', 'content': 'x' * 20000})
+        loop.messages.append({'role': 'assistant', 'content': 'small'})
+        total_before = ctx.calculate_context_tokens(loop.messages)
+        target = 3000
+        self.assertGreater(total_before, target)
+        updated = loop._compact_truncate_largest(target)
+        self.assertLess(updated, total_before)
+        self.assertIn('truncated', loop.messages[1]['content'])
+
+    def test_noop_when_under_budget(self):
+        loop = _loop()
+        loop.messages.append({'role': 'user', 'content': 'small'})
+        total = loop.ctx.calculate_context_tokens(loop.messages)
+        updated = loop._compact_truncate_largest(target=1000000)
+        self.assertEqual(updated, total)
+        self.assertNotIn('truncated', loop.messages[1]['content'])
+
+    def test_noop_when_excess_overshoots_content(self):
+        # 1:1 estimate makes excess*4 > content length → guarded no-op.
+        loop = _loop()
+        loop.messages.append({'role': 'user', 'content': 'x' * 20000})
+        total = loop.ctx.calculate_context_tokens(loop.messages)
+        updated = loop._compact_truncate_largest(target=1000)
+        self.assertEqual(updated, total)
+        self.assertNotIn('truncated', loop.messages[1]['content'])
 
 
 if __name__ == '__main__':
