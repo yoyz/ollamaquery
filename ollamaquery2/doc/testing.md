@@ -22,7 +22,7 @@ python3 -m unittest tests.test_features -v
 python3 -m unittest tests.test_features.TestInlineProcessing -v
 
 # Single test
-python3 -m unittest tests.test_features.TestInlineProcessing.test_sanitize_shell_command -v
+python3 -m unittest tests.test_features.TestInlineProcessing.test_shell_command_execution -v
 ```
 
 ### Against a specific backend
@@ -69,7 +69,7 @@ If Ollama is detected, the test suite automatically:
 | **Debug Log** | 3 | Log writes to stderr, suppressed when off, custom prefix |
 | **Image Handling** | 3 | prepare_image_data: nonexistent, empty, valid PNG |
 | **Image Command** | 2 | /image clear, /image no-arg |
-| **Utility Functions** | 8 | is_known_command, format_help_text, sanitize_shell_command, validate_shell_command_safety |
+| **Utility Functions** | 3 | is_known_command, format_help_text_compact, format_help_text_full |
 | **Argument Parser** | 3 | Backend choices, model opt, mutual exclusion |
 | **Error Handling** | 7 | fetch failures, token count with no model, image with bad path |
 | **Format Help** | 3 | Compact and full help text contains categories |

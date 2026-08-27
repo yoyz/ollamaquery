@@ -658,27 +658,6 @@ class TestInlineProcessing(unittest.TestCase):
         result = q.process_inline_commands('!echo hello_shell')
         self.assertIn('hello_shell', result)
 
-    def test_shell_command_validation_rejects_dangerous(self):
-        self.assertFalse(q.validate_shell_command_safety('echo hello; python -c "import os"'))
-
-    def test_sanitize_shell_command(self):
-        result = q.sanitize_shell_command('echo hello')
-        self.assertIsNotNone(result)
-
-    def test_sanitize_dangerous_returns_none(self):
-        self.assertIsNone(q.sanitize_shell_command('hello && touch /tmp/evil'))
-
-    def test_sanitize_blocks_command_substitution(self):
-        """$(...) must be blocked by sanitize_shell_command."""
-        self.assertIsNone(q.sanitize_shell_command('echo $(whoami)'))
-        self.assertIsNone(q.sanitize_shell_command('echo $(touch /tmp/injected)'))
-        self.assertIsNone(q.sanitize_shell_command('cat $(ls /etc)'))
-
-    def test_validate_blocks_dollar_paren(self):
-        """$(...) must be blocked by validate_shell_command_safety."""
-        self.assertFalse(q.validate_shell_command_safety('echo $(whoami)'))
-        self.assertFalse(q.validate_shell_command_safety('nslookup $(hostname)'))
-
     def test_execute_os_command_basic(self):
         result = q.execute_os_command('echo ok', timeout=5)
         self.assertIn('ok', result)
@@ -1242,23 +1221,6 @@ class TestBuildPrompt(unittest.TestCase):
 
 class TestUtilityFunctions(unittest.TestCase):
     """Standalone utility functions."""
-
-    def test_sanitize_shell_command(self):
-        result = q.sanitize_shell_command('ls -la')
-        self.assertEqual(result, 'ls -la')
-
-    def test_validate_shell_command_safety_valid(self):
-        self.assertTrue(q.validate_shell_command_safety('echo hello'))
-
-    def test_validate_shell_command_safety_backtick(self):
-        # Bare backticks are NOT blocked (only escaped ones like \`)
-        self.assertTrue(q.validate_shell_command_safety('echo `ls`'))
-
-    def test_validate_shell_command_safety_escaped_backtick(self):
-        self.assertFalse(q.validate_shell_command_safety('echo \\`ls\\`'))
-
-    def test_validate_shell_command_safety_dangerous_pattern(self):
-        self.assertFalse(q.validate_shell_command_safety('dd if=/dev/zero of=/tmp/evil'))
 
     def test_is_known_command(self):
         self.assertTrue(q.is_known_command('/help'))

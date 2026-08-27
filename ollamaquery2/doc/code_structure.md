@@ -56,8 +56,6 @@ No handler functions are stored in the registry dispatching happens via `ChatLoo
 |----------|---------|
 | `colorize()` / `get_theme()` | ANSI color output with readline-safe wrapping |
 | `_request_with_retry()` | HTTP requests with 3 retries, 1s delay, no-4xx |
-| `sanitize_shell_command()` | Blocks `;`, `|`, `&&`, `` ` ``, `$()` |
-| `validate_shell_command_safety()` | Length limit + dangerous pattern blocklist |
 | `execute_os_command()` | Shell execution with timeout, safety checks |
 | `fetch_and_convert_url()` | URL to text via html2text/pandoc/lynx/fallback |
 | `get_html_bytes()` | Fetch HTML bytes via curl/wget/urllib |

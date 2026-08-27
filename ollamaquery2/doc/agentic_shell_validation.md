@@ -15,7 +15,7 @@ Comparison: `ollamaquery_SHELL_PERMISSION_TODO/comparison_shell_permission.md`
 
 | Call site                        | Entry point                         | Previous gate                          |
 |----------------------------------|-------------------------------------|----------------------------------------|
-| `Executor._run_shell:2471`       | `run_command` / `run_python` tools  | `validate_shell_command_safety:731` + `shell=False` + `shlex.split:2476` |
+| `Executor._run_shell:2471`       | `run_command` / `run_python` tools  | `validate_shell_command_safety` + `shell=False` + `shlex.split` (validators since removed) |
 | `execute_os_command:4331`        | `!` inline shell (`_process_command_lines:4284`) | same gate |
 
 The gate rejected any command containing `|  &&  ||  ;  >  <  ` `$(` `` ` ``
@@ -326,8 +326,8 @@ whole-string detection.
 
 Prior behavior (`AGENTS.md`):
 
-*   `validate_shell_command_safety:731` + `sanitize:705` blocked `| && ; > <`
-    outright — pipes impossible.
+*   `validate_shell_command_safety` + `sanitize` (both since removed) blocked
+    `| && ; > <` outright — pipes impossible.
 *   `Executor._run_shell:2471` `shell=False` + `shlex.split` — single command only.
 *   `run_python` bypassed validation via `python3 -c` special case.
 

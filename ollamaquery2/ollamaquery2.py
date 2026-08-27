@@ -27,7 +27,6 @@ import time
 import traceback
 import glob
 import difflib
-import fnmatch
 import unicodedata
 from datetime import datetime
 
@@ -58,7 +57,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.5"
+__version__ = "0.2.7"
 
 
 # ============================================================================
@@ -161,6 +160,30 @@ DEFAULT_OLLAMA_PORT    =  11434
 DEFAULT_LLAMACPP_PORT  =  8080
 DEFAULT_LMSTUDIO_PORT  =  1234
 
+# Cloud backends share the OpenAI-compatible /v1/models shape but need an API key.
+CLOUD_BACKENDS = {"gemini", "opencodezen", "opencodego", "mistral", "deepseek"}
+CLOUD_API_KEY_ENV = {
+    "gemini": "GEMINI_API_KEY",
+    "opencodezen": "OPENCODEZEN_API_KEY",
+    "opencodego": "OPENCODEGO_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+}
+CLOUD_HOST_ENV = {
+    "gemini": "GEMINI_HOST",
+    "opencodezen": "OPENCODEZEN_HOST",
+    "opencodego": "OPENCODEGO_HOST",
+    "mistral": "MISTRAL_HOST",
+    "deepseek": "DEEPSEEK_HOST",
+}
+CLOUD_DEFAULT_HOST = {
+    "gemini": DEFAULT_GEMINI_HOST,
+    "opencodezen": DEFAULT_OPENCODEZEN_HOST,
+    "opencodego": DEFAULT_OPENCODEGO_HOST,
+    "mistral": DEFAULT_MISTRAL_HOST,
+    "deepseek": DEFAULT_DEEPSEEK_HOST,
+}
+
 
 
 # ============================================================================
@@ -227,7 +250,7 @@ COMMANDS = {
     },
     'quit': {
         'aliases': ['/quit', '/exit', 'quit', 'exit'],
-        'category': 'Core', 
+        'category': 'Core',
         'description': 'Exit the chat session',
         'usage': '/quit',
         'handler': None
@@ -246,7 +269,7 @@ COMMANDS = {
         'usage': '/stats [reset]',
         'handler': None
     },
-    
+
     # === Model Management ===
     'listmodel': {
         'aliases': ['/listmodel'],
@@ -269,7 +292,7 @@ COMMANDS = {
         'usage': '/switchmodel <model_name>',
         'handler': None
     },
-    
+
     # === context management ===
    'dumpcontext': {
         'aliases': ['/dumpcontext'],
@@ -305,7 +328,7 @@ COMMANDS = {
         'category': 'Settings',
         'description': 'Configure per-category debug levels',
         'usage': '/debug <category> <level> | /debug list | /debug status',
-        'handler': 'handle_debug_command'
+        'handler': None
     },
     'agentic': {
         'aliases': ['/agentic'],
@@ -350,7 +373,7 @@ COMMANDS = {
         'usage': '/ls [args]',
         'handler': None
     },
-    
+
     # === Advanced ===
     'spawnshell': {
         'aliases': ['/spawnshell'],
@@ -407,7 +430,7 @@ COMMANDS = {
 COMMAND_CATEGORIES = ['Core', 'Model', 'Settings', 'I/O', 'Advanced']
 
 
-def get_command_aliases():
+def get_command_aliases() -> List[str]:
     """Return flat list of all command aliases for readline completion."""
     aliases = []
     for cmd in COMMANDS.values():
@@ -415,11 +438,19 @@ def get_command_aliases():
     return aliases
 
 
-def get_commands_by_category(category=None):
-    """Return commands grouped by category, or filtered by category."""
+def get_commands_by_category(category: Optional[str] = None) -> Dict:
+    """Return commands grouped by category, or filtered by category.
+
+    Args:
+        category: Optional single category name to filter by.
+
+    Returns:
+        When category is given, a dict of commands in that category; otherwise
+        a dict mapping category names to sorted (name, info) lists.
+    """
     if category:
         return {k: v for k, v in COMMANDS.items() if v['category'] == category}
-    
+
     # Group by category in defined order
     grouped = {}
     for cat in COMMAND_CATEGORIES:
@@ -429,15 +460,20 @@ def get_commands_by_category(category=None):
     return grouped
 
 
-def format_help_text(compact=False):
-    """Generate formatted help text for display."""
+def format_help_text(compact: bool = False) -> str:
+    """Generate formatted help text for display.
+
+    Args:
+        compact: If True, render one-line-per-category alias lists; otherwise
+            the detailed /help layout with descriptions and usage.
+    """
     lines = []
     grouped = get_commands_by_category()
-    
+
     for category in COMMAND_CATEGORIES:
         if category not in grouped:
             continue
-        
+
         if compact:
             # One-liner format for welcome message
             cmds = [info['aliases'][0] for _, info in grouped[category]]
@@ -451,33 +487,28 @@ def format_help_text(compact=False):
                 lines.append(f"  {colorize(f'{aliases:<28}', 'success')} {desc}")
                 if info.get('usage') and info['usage'] != info['aliases'][0]:
                     lines.append(f"    {colorize('Usage: ' + info['usage'], 'muted')}")
-    
+
     return '\n'.join(lines)
 
 
-def is_known_command(text):
-    """Check if text matches any known command or alias."""
-    text_lower = text.lower().strip()
-    for cmd in COMMANDS.values():
-        if text_lower in [a.lower() for a in cmd['aliases']]:
-            return True, cmd
-    return False, None
-
-
 #
-# === Color management 
-# 
+# === Color management
+#
 
 
-def colors_enabled():
+def colors_enabled() -> bool:
     """Check if colors should be used (TTY check + NO_COLOR env var)."""
     if os.environ.get('NO_COLOR'):
         return False
     return sys.stdout.isatty()
 
 
-def load_custom_themes():
-    """Load custom themes from JSON file."""
+def load_custom_themes() -> Dict:
+    """Load custom themes from JSON file.
+
+    Returns:
+        Dict of theme name -> color mapping, or {} if the file is absent/invalid.
+    """
     if not os.path.exists(THEME_FILE):
         return {}
     try:
@@ -490,14 +521,18 @@ def load_custom_themes():
     return {}
 
 
-def get_theme(theme_name: Optional[str] = None):
-    """Get theme color dictionary."""
+def get_theme(theme_name: Optional[str] = None) -> Dict:
+    """Get theme color dictionary.
+
+    Args:
+        theme_name: Optional theme key; falls back to OLLAMAQUERY_THEME env or 'default'.
+    """
     if os.environ.get('NO_COLOR'):
         return BUILTIN_THEMES["minimal"]
-    
+
     if theme_name is None:
         theme_name = os.environ.get('OLLAMAQUERY_THEME', 'default')
-    
+
     custom_themes = load_custom_themes()
     if theme_name in custom_themes:
         theme = custom_themes[theme_name]
@@ -505,26 +540,35 @@ def get_theme(theme_name: Optional[str] = None):
             if key not in theme:
                 theme[key] = BUILTIN_THEMES["default"][key]
         return theme
-    
+
     return BUILTIN_THEMES.get(theme_name, BUILTIN_THEMES["default"])
 
 
-def colorize(text, role, theme=None, force_color=False, is_prompt=False):
-    """Apply color to text using active theme."""
+def colorize(text: str, role: str, theme: Optional[Dict] = None,
+             force_color: bool = False, is_prompt: bool = False) -> str:
+    """Apply color to text using active theme.
+
+    Args:
+        text: The text to colorize.
+        role: Color role key (e.g. 'success', 'warning', 'error').
+        theme: Optional theme dict; defaults to get_theme().
+        force_color: Apply colors even when the terminal is not a TTY.
+        is_prompt: Wrap codes in readline byte markers so they aren't counted.
+    """
     if theme is None:
         theme = get_theme()
-    
+
     if not colors_enabled() and not force_color:
         return text
 
     start_code = theme.get(role, '')
     reset_code = theme['reset']
-    
+
     # Wrap color codes in \x01 and \x02 so readline ignores their length
     if is_prompt and READLINE_AVAILABLE:
         start_code = f"\x01{start_code}\x02" if start_code else ""
         reset_code = f"\x01{reset_code}\x02" if reset_code else ""
-        
+
     return f"{start_code}{text}{reset_code}"
 
 
@@ -532,7 +576,8 @@ def colorize(text, role, theme=None, force_color=False, is_prompt=False):
 # ============= RETRY UTILITY ================================================
 # ============================================================================
 
-def _request_with_retry(req, max_retries=3, delay=1, timeout=120, **kwargs):
+def _request_with_retry(req: Request, max_retries: int = 3, delay: float = 1,
+                        timeout: float = 120, **kwargs: dict) -> object:
     """Open URL with retry on transient network errors.
 
     Retries on URLError, HTTPError (5xx only), ConnectionError, TimeoutError,
@@ -642,8 +687,15 @@ def get_ollama_context_size(base_url: str, model_name: str) -> int:
 
 # update the ctx.context_window_size by querying the LLM server
 # ctx is an object which contain ctx.context_window_size
-def refresh_context_window_size(ctx):
-    """Fetch and update context window size from the backend."""
+def refresh_context_window_size(ctx: 'CommandContext') -> bool:
+    """Fetch and update context window size from the backend.
+
+    Args:
+        ctx: The shared CommandContext (uses backend/base_url/model).
+
+    Returns:
+        True if a positive context size was stored, False otherwise.
+    """
     if ctx.backend == "ollama":
         size = get_ollama_context_size(ctx.base_url, ctx.model)
     elif ctx.backend == "lmstudio":
@@ -658,13 +710,13 @@ def refresh_context_window_size(ctx):
         size = 131072  # DeepSeek: 128K context (deepseek-v4)
     else:
         size = get_llamacpp_context_size(ctx.base_url)
-    
+
     if size > 0:
         ctx.context_window_size = size
         return True
     return False
 
-def refresh_ollama_context_window_size_from_ps(ctx):
+def refresh_ollama_context_window_size_from_ps(ctx: 'CommandContext') -> None:
     """Re-check /api/ps to get the real context window size now that the model is loaded.
 
     Called after a query completes (model is guaranteed to be in /api/ps).
@@ -687,18 +739,18 @@ def context_bar(current: int, maximum: int, width: int = 20) -> str:
     """Render a simple [====    ] NN% bar."""
     if maximum == 0:
         return ""
-    
+
     pct = min(current / maximum, 1.0)
     filled = int(width * pct)
     bar = "█" * filled + "░" * (width - filled)
-    
+
     if pct < 0.6:
         color = 'success'
     elif pct < 0.8:
         color = 'warning'
     else:
         color = 'error'
-    
+
     return colorize(f"[{bar}] {current}/{maximum} ({pct:.0%})", color)
 
 
@@ -706,82 +758,21 @@ def context_bar(current: int, maximum: int, width: int = 20) -> str:
 # ============= UTILITY FUNCTIONS ===========================================
 # ============================================================================
 
-def sanitize_shell_command(command):
-    """
-    Sanitize shell command to prevent injection attacks.
-
-    Args:
-        command (str): User input to sanitize
-
-    Returns:
-        str: Sanitized command or None if unsafe
-    """
-    if not command:
-        return None
-
-    # Remove dangerous characters that enable command chaining
-    dangerous_patterns = [';', '|', '&&', '||', '`', '$(', '>', '<']
-    for pattern in dangerous_patterns:
-        if pattern in command:
-            return None
-
-    # Escape special shell characters
-    command = command.replace('`', '')  # Remove backticks
-    command = re.sub(r'\$\{[^}]+\}', 'SAFE_VAR', command)  # Hide variable expansion
-
-    return command
-
-
-def validate_shell_command_safety(command, max_length=500):
-    """
-    Validate that a shell command is safe to execute.
-
-    Args:
-        command (str): Command to validate
-        max_length (int): Maximum allowed length
-
-    Returns:
-        bool: True if command is safe
-    """
-    if not command:
-        return False
-
-    # Length limit
-    if len(command) > max_length:
-        return False
-
-    # Block dangerous utilities and substitution patterns
-    dangerous = ['rm -rf', 'rm -r -f', 'rm -r /', 'mv / ', 'mkfs', 'dd if=', 'wget ', 'curl ',
-                 'nc -e', 'python -c', 'perl -e', 'bash -c']
-    for pattern in dangerous:
-        if pattern.lower() in command.lower():
-            return False
-
-    # Block command substitution $() (modern shell syntax)
-    if '$(' in command:
-        return False
-
-    # Check for shell escape sequences
-    if '\\"' in command or "\\'" in command or '\\$' in command or '\\`' in command:
-        return False
-
-    # Block command chaining operators — only one command at a time
-    chain_ops = ['&&', '||', ';', '|']
-    for op in chain_ops:
-        if op in command:
-            return False
-
-    return True
-
-
-def strip_ansi(text):
+def strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from text."""
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
 
 
-def prepare_image_data(image_path):
-    """Reads an image file and returns its base64 encoded string."""
+def prepare_image_data(image_path: str) -> Optional[str]:
+    """Reads an image file and returns its base64 encoded string.
+
+    Args:
+        image_path: Path to the image file.
+
+    Returns:
+        Base64-encoded image string, or None if the file is missing/unreadable.
+    """
     if not image_path or not os.path.isfile(image_path):
         return None
 
@@ -793,8 +784,15 @@ def prepare_image_data(image_path):
         return None
 
 
-def guess_image_mime(b64_data):
-    """Guess image MIME type from base64-encoded data prefix."""
+def guess_image_mime(b64_data: str) -> str:
+    """Guess image MIME type from base64-encoded data prefix.
+
+    Args:
+        b64_data: Base64-encoded image data.
+
+    Returns:
+        One of "jpeg"/"png"/"gif"/"webp" (defaults to "jpeg").
+    """
     if b64_data.startswith('/9j/'):
         return "jpeg"
     if b64_data.startswith('iVBOR'):
@@ -806,8 +804,15 @@ def guess_image_mime(b64_data):
     return "jpeg"
 
 
-def fetch_models_ollama(base_url):
-    """Fetch available models from Ollama API."""
+def fetch_models_ollama(base_url: str) -> list:
+    """Fetch available models from Ollama API.
+
+    Args:
+        base_url: Ollama server URL.
+
+    Returns:
+        List of model dicts, or [] on failure.
+    """
     try:
         url = f"{base_url}/api/tags"
         with _request_with_retry(Request(url, headers={'User-Agent': 'Mozilla/5.0'})) as response:
@@ -817,8 +822,16 @@ def fetch_models_ollama(base_url):
         return []
 
 
-def fetch_models_llamacpp(base_url, api_key=None):
-    """Fetch available models from Llama.cpp API (or Gemini OAI-compatible endpoint)."""
+def fetch_models_llamacpp(base_url: str, api_key: Optional[str] = None) -> list:
+    """Fetch available models from Llama.cpp API (or Gemini OAI-compatible endpoint).
+
+    Args:
+        base_url: Server URL.
+        api_key: Optional API key for cloud backends.
+
+    Returns:
+        List of {"name": ...} dicts, or [] on failure.
+    """
     try:
         url = f"{base_url}/v1/models"
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -845,7 +858,7 @@ def get_llamacpp_context_size(base_url: str) -> int:
                 # Return the context size from the first slot
                 return data[0].get('n_ctx', -1)
     except Exception:
-        sys.stderr.write(colorize(f"[WARNING] Failed to get Llama.cpp context size\n", 'warning'))
+        sys.stderr.write(colorize("[WARNING] Failed to get Llama.cpp context size\n", 'warning'))
     return -1
 
 def get_message_token_count_llamacpp(base_url: str, text: str) -> int:
@@ -904,11 +917,11 @@ def get_message_token_count_ollama(base_url: str, text: str, model: str) -> int:
 def is_available_ollama_model(base_url: str, model_name: str) -> bool:
     """
     Check if a model exists on the Ollama server.
-    
+
     Args:
         base_url: Ollama server URL (e.g., 'http://192.168.1.20:11434')
         model_name: Model name to check (e.g., 'qwen3:8b')
-    
+
     Returns:
         True if model exists, False otherwise
     """
@@ -922,12 +935,12 @@ def is_available_ollama_model(base_url: str, model_name: str) -> bool:
 def is_available_llamacpp_model(base_url: str, model_name: str, api_key: str = None) -> bool:
     """
     Check if a model exists on the Llama.cpp (or Gemini) server.
-    
+
     Args:
         base_url: Server URL
         model_name: Model name to check
         api_key: Optional API key for cloud backends
-    
+
     Returns:
         True if model exists, False otherwise
     """
@@ -939,8 +952,15 @@ def is_available_llamacpp_model(base_url: str, model_name: str, api_key: str = N
         return False
 
 
-def parse_size(size_bytes):
-    """Parse size from the API into human-readable format."""
+def parse_size(size_bytes: Optional[int]) -> str:
+    """Parse size from the API into human-readable format.
+
+    Args:
+        size_bytes: Numeric size in bytes (or None/falsy).
+
+    Returns:
+        Human-readable size string, or "N/A" when unparseable.
+    """
     if not size_bytes:
         return "N/A"
     try:
@@ -967,7 +987,7 @@ _OLLAMA_TOKENIZE_SUPPORTED = None
 
 def estimate_token_count(text: str) -> int:
     """Estimate token count from text using regex-based heuristic.
-    
+
     Falls back to a safe overestimate when API tokenization is unavailable.
     Detects code content and uses a higher multiplier for safety.
     """
@@ -981,8 +1001,16 @@ def estimate_token_count(text: str) -> int:
     return max(1, int(tokens * 1.5))
 
 
-def fetch_model_info_ollama(base_url, model_name):
-    """Fetch detailed model information via Ollama /api/show endpoint."""
+def fetch_model_info_ollama(base_url: str, model_name: str) -> Dict:
+    """Fetch detailed model information via Ollama /api/show endpoint.
+
+    Args:
+        base_url: Ollama server URL.
+        model_name: Name of the model to inspect.
+
+    Returns:
+        Raw /api/show JSON dict, or {} on failure.
+    """
     try:
         url = f"{base_url}/api/show"
         payload = json.dumps({"name": model_name}).encode('utf-8')
@@ -995,10 +1023,10 @@ def fetch_model_info_ollama(base_url, model_name):
 
 class CommandContext:
     """Singleton that holds all shared state for the application.
-    
+
     Replaces the scattered self.* attributes across ChatLoop, ModelQuery,
     and other classes with a single centralized state object.
-    
+
     Design rationale: factory methods (create_completer, create_tool_registry,
     etc.) live here as thin convenience wrappers rather than in separate factory
     classes because the codebase is a single file and the indirection would add
@@ -1006,7 +1034,7 @@ class CommandContext:
     because it is context-state-dependent, not a pure text utility.
     All print() calls in business logic are intentional for CLI mode;
     a GUI port would inject a callback/emitter pattern instead.
-    
+
     Call map:
       create_completer() → ChatCompleter
       create_query_handler() → ModelQuery
@@ -1017,34 +1045,36 @@ class CommandContext:
     _instance = None
     _initialized = False
 
-    def __new__(cls):
+    def __new__(cls) -> 'CommandContext':
+        """Return the singleton instance, creating it on first access."""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize the singleton's shared state once (no-op on repeat)."""
         if CommandContext._initialized:
             return
         CommandContext._initialized = True
         self.shell_timeout: int = 5
-        self.debug_manager = DebugManager() 
+        self.debug_manager = DebugManager()
         # Connection info
         self._base_url: str = ""
         self._backend: str = "ollama"
         self._model: str = "llama3"
         self.api_key: str = ""
-        
+
         # Session state
         self.system_prompt: str = DEFAULT_SYSTEM_PROMPT
         self.context_size: Optional[int] = None
         self.current_images: List[str] = []
         self.force_no_thinking: bool = False
         self.models: List[str] = []
-        
+
         # Execution state
         self.debug_mode: bool = False
         self.stream_enabled: bool = True
-        
+
         # Statistics (cumulative)
         self.total_queries: int = 0
         self.total_tokens_generated: int = 0
@@ -1070,7 +1100,7 @@ class CommandContext:
         self.agentic_last_tool_name: str = ""
         self.lazy_tool: bool = True  # Enabled by default: many models embed tool calls after thinking/preamble
         self.supports_vision: Optional[bool] = None  # None = unknown (treated as capable)
-        
+
         # Context window tracking
         self.context_window_size: int = 0  # Will be fetched from server
         self.current_context_tokens: int = 0  # Updated after each query
@@ -1082,30 +1112,36 @@ class CommandContext:
     # === Properties ===
     @property
     def base_url(self) -> str:
+        """The resolved backend API base URL."""
         return self._base_url
-    
+
     @base_url.setter
-    def base_url(self, value: str):
+    def base_url(self, value: str) -> None:
+        """Set the backend API base URL."""
         self._base_url = value
 
     @property
     def backend(self) -> str:
+        """The active backend name (ollama/llamacpp/lmstudio/cloud)."""
         return self._backend
-    
+
     @backend.setter
-    def backend(self, value: str):
+    def backend(self, value: str) -> None:
+        """Set the active backend name."""
         self._backend = value
 
     @property
     def model(self) -> str:
+        """The currently selected model name."""
         return self._model
-    
+
     @model.setter
-    def model(self, value: str):
+    def model(self, value: str) -> None:
+        """Set the currently selected model name."""
         self._model = value
 
     # === Helper Methods ===
-    def reset(self):
+    def reset(self) -> None:
         """Reset session state without changing connection info or user preferences."""
         self.current_images = []
         self.total_queries = 0
@@ -1118,31 +1154,31 @@ class CommandContext:
         self.current_context_tokens = 0
         self.supports_vision = None
 
-    def create_completer(self):
+    def create_completer(self) -> 'ChatCompleter':
         """Create a ChatCompleter using this context's connection info."""
         return ChatCompleter(self.base_url, self.backend, api_key=self.api_key)
-    
-    def create_query_handler(self):
+
+    def create_query_handler(self) -> 'ModelQuery':
         """Create a ModelQuery using this context's connection info."""
         return ModelQuery(self.base_url, self.backend)
 
-    def create_executor(self):
+    def create_executor(self) -> 'Executor':
         """Create an Executor for agentic tool execution."""
         return Executor()
 
-    def create_tool_registry(self):
+    def create_tool_registry(self) -> 'ToolRegistry':
         """Create a ToolRegistry for agentic mode."""
         executor = self.create_executor()
         return ToolRegistry(ctx=self, executor=executor)
 
-    def update_stats(self, tokens: int, prompt_tokens: int, time_spent: float, chars: int):
+    def update_stats(self, tokens: int, prompt_tokens: int, time_spent: float, chars: int) -> None:
         """Update cumulative statistics."""
         self.total_queries += 1
         self.total_tokens_generated += tokens
         self.total_prompt_tokens += prompt_tokens
         self.total_time_spent += time_spent
         self.total_chars_generated += chars
-        
+
         # Rolling history
         entry = {
             "timestamp": time.time(),
@@ -1155,7 +1191,7 @@ class CommandContext:
         if len(self.query_history) > self.max_history:
             self.query_history.pop(0)
 
-    def get_cumulative_stats(self):
+    def get_cumulative_stats(self) -> Dict:
         """Return summary of all tracked usage."""
         return {
             "total_queries": self.total_queries,
@@ -1256,7 +1292,7 @@ COMPACTION_TARGET = 0.50     # Compact down to 50% of context window
 COMPACTION_KEEP_RECENT = 6   # Always keep last 6 messages (3 user/assistant turns)
 
 
-def sanitize_tool_pairing(messages):
+def sanitize_tool_pairing(messages: list) -> list:
     """Repair orphaned tool-role messages so strict chat templates don't 500.
 
     gpt-oss (and similar) chat templates hard-raise when a 'tool' role message
@@ -1350,7 +1386,7 @@ def _build_compaction_summary(middle: list) -> str:
     )
 
 
-def compact_messages(messages: list, ctx, target_tokens: int = 0,
+def compact_messages(messages: list, ctx: 'CommandContext', target_tokens: int = 0,
                      keep_recent: int = COMPACTION_KEEP_RECENT, force: bool = False) -> list:
     """Compact conversation history to fit within token budget.
 
@@ -1413,12 +1449,19 @@ SUMMARIZE_TOOL_MAX = 3           # Cap tool results summarized per invocation
 SUMMARIZE_TOOL_EXCLUDE = {"list_directory", "diff", "patch", "edit_file", "apply_patch"}
 
 
-def _extract_sync_content(ctx, response) -> str:
+def _extract_sync_content(ctx: 'CommandContext', response: dict) -> str:
     """Extract assistant text content from a sync response (backend-aware).
 
     Handles ollama's `message.content`, OpenAI-compatible `choices[0].message
     .content`, and plain-string responses. Multi-modal content lists are joined
     from their `text` parts.
+
+    Args:
+        ctx: CommandContext (uses backend for shape selection).
+        response: Dict or str returned by a query call.
+
+    Returns:
+        Extracted text content (never None).
     """
     content = ""
     if isinstance(response, dict):
@@ -1435,8 +1478,55 @@ def _extract_sync_content(ctx, response) -> str:
     return content or ""
 
 
-def _llm_summarize_tool_result(ctx, query_handler, name, content):
-    """Ask the model to summarize a single tool result. Returns summary text or None."""
+def _extract_sync_tool_calls(ctx: 'CommandContext', response: dict) -> list:
+    """Extract native API tool calls from a sync response (backend-aware).
+
+    Returns the raw `message.tool_calls` (ollama) or `choices[0].message
+    .tool_calls` (OpenAI-compatible) list, or an empty list when absent.
+
+    Args:
+        ctx: CommandContext (uses backend for shape selection).
+        response: Dict or str returned by a query call.
+    """
+    if not isinstance(response, dict):
+        return []
+    if ctx.backend == "ollama":
+        return response.get('message', {}).get('tool_calls', []) or []
+    choices = response.get('choices', [])
+    if choices:
+        return choices[0].get('message', {}).get('tool_calls', []) or []
+    return []
+
+
+def _signal_abort(step_cancel: dict) -> None:
+    """Abort a running agentic step: set the cancel event and close its HTTP response.
+
+    Args:
+        step_cancel: The {"event": threading.Event, "close": callable} dict
+            threaded into `query_sync_stream` as its `cancel` kwarg.
+    """
+    step_cancel["event"].set()
+    close = step_cancel.get("close")
+    if close:
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _llm_summarize_tool_result(ctx: 'CommandContext', query_handler: 'ModelQuery',
+                               name: str, content: str) -> Optional[str]:
+    """Ask the model to summarize a single tool result. Returns summary text or None.
+
+    Args:
+        ctx: CommandContext (uses model for the call).
+        query_handler: ModelQuery for the summarization call.
+        name: Tool name that produced the result.
+        content: Raw tool result content.
+
+    Returns:
+        Summary text, or None on failure/empty response.
+    """
     system = (
         "You are a context optimizer. Summarize the tool result below, keeping only "
         "information relevant to the ongoing task: key findings, file paths, errors, "
@@ -1456,7 +1546,8 @@ def _llm_summarize_tool_result(ctx, query_handler, name, content):
     return summary or None
 
 
-def summarize_tool_results(messages, ctx, query_handler):
+def summarize_tool_results(messages: list, ctx: 'CommandContext',
+                           query_handler: 'ModelQuery') -> list:
     """Summarize large tool results via the LLM to preserve key findings.
 
     Replaces the content of eligible tool-result messages (in place) with a
@@ -1544,10 +1635,17 @@ def _render_conversation_transcript(middle: list,
     return transcript
 
 
-def _llm_summarize_conversation(ctx, query_handler, middle) -> Optional[str]:
+def _llm_summarize_conversation(ctx: 'CommandContext', query_handler: 'ModelQuery',
+                                middle: list) -> Optional[str]:
     """Ask the model for a faithful narrative summary of older conversation turns.
 
-    Returns the summary text, or None on failure/empty response.
+    Args:
+        ctx: CommandContext (uses model for the call).
+        query_handler: ModelQuery for the summarization call.
+        middle: Older message list to summarize.
+
+    Returns:
+        The summary text, or None on failure/empty response.
     """
     transcript = _render_conversation_transcript(middle)
     if not transcript.strip():
@@ -1575,7 +1673,7 @@ def _llm_summarize_conversation(ctx, query_handler, middle) -> Optional[str]:
     return summary or None
 
 
-def llm_compact_messages(messages: list, ctx, query_handler,
+def llm_compact_messages(messages: list, ctx: 'CommandContext', query_handler: 'ModelQuery',
                          keep_recent: int = COMPACTION_KEEP_RECENT) -> list:
     """Compress history with an LLM-generated narrative summary of the older turns.
 
@@ -1631,11 +1729,13 @@ MAX_SESSIONS = 50
 class SessionManager:
     """Manages session persistence: save, list, resume."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Ensure the session directory exists and load the session index."""
         os.makedirs(SESSION_DIR, exist_ok=True)
         self._index = self._load_index()
 
     def _load_index(self) -> list:
+        """Load the saved session index JSON, or [] when missing/invalid."""
         if os.path.exists(SESSION_INDEX):
             try:
                 with open(SESSION_INDEX, 'r') as f:
@@ -1644,11 +1744,12 @@ class SessionManager:
                 pass
         return []
 
-    def _save_index(self):
+    def _save_index(self) -> None:
+        """Persist the current session index JSON to disk."""
         with open(SESSION_INDEX, 'w') as f:
             json.dump(self._index, f, indent=2)
 
-    def save_session(self, messages: list, ctx) -> str:
+    def save_session(self, messages: list, ctx: 'CommandContext') -> str:
         """Save current session to disk. Returns session ID."""
         session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         filepath = os.path.join(SESSION_DIR, f"{session_id}.json")
@@ -2074,8 +2175,16 @@ _VISION_ERROR_KEYWORDS = [
 ]
 
 
-def _extract_error_text(obj, depth=0):
-    """Recursively extract error text from nested structures."""
+def _extract_error_text(obj: object, depth: int = 0) -> str:
+    """Recursively extract error text from nested structures.
+
+    Args:
+        obj: Any nested dict/list/str to walk.
+        depth: Internal recursion guard (stops at depth 5).
+
+    Returns:
+        Flattened error text string.
+    """
     if depth > 5:
         return ""
     if isinstance(obj, str):
@@ -2091,9 +2200,15 @@ def _extract_error_text(obj, depth=0):
     return str(obj)
 
 
-def check_vision_error(response) -> bool:
+def check_vision_error(response: dict) -> bool:
     """Check if an API response dict indicates the model doesn't support vision.
-    
+
+    Args:
+        response: Dict returned by the backend.
+
+    Returns:
+        True when the error text matches vision-unsupported keywords.
+
     Works for Ollama (/api/chat returns {"error": "..."}),
     and OpenAI-compatible APIs (/v1/chat/completions returns {"error": {"message": "..."}}).
     """
@@ -2110,9 +2225,15 @@ _TOOLS_ERROR_KEYWORDS = [
 ]
 
 
-def check_tools_error(response) -> bool:
+def check_tools_error(response: dict) -> bool:
     """Check if an API response dict indicates the model doesn't support native tools.
-    
+
+    Args:
+        response: Dict returned by the backend.
+
+    Returns:
+        True when the error text matches tools-unsupported keywords.
+
     Works for Ollama (/api/chat returns {"error": "..."}),
     and OpenAI-compatible APIs (/v1/chat/completions returns {"error": {"message": "..."}}).
     """
@@ -2195,16 +2316,18 @@ _SHELL_SESSION_APPROVED = []  # list of {"permission":"bash","pattern":..., "act
 
 _ANSI_RE_SHELL = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
-def _shell_strip_ansi(text):
+def _shell_strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from a shell command string."""
     return _ANSI_RE_SHELL.sub("", text)
 
-def _shell_rewrite_home(cmd):
+def _shell_rewrite_home(cmd: str) -> str:
+    """Rewrite an absolute $HOME prefix in a command to the `~` shorthand."""
     home = os.path.expanduser("~")
     if home and home != "~":
         cmd = cmd.replace(home + "/", "~/").replace(home, "~")
     return cmd
 
-def _shell_normalize_for_home(cmd):
+def _shell_normalize_for_home(cmd: str) -> str:
     """Normalization subset from hermes_style_approval.py for home guard."""
     cmd = _shell_strip_ansi(cmd)
     cmd = cmd.replace("\x00", "")
@@ -2217,6 +2340,7 @@ def _shell_normalize_for_home(cmd):
     return cmd
 
 def _shell_escape_regex(pattern: str) -> str:
+    """Escape regex metacharacters in a shell glob pattern."""
     out = []
     for ch in pattern:
         if ch in r".+^${}()|[\]\\":
@@ -2225,6 +2349,7 @@ def _shell_escape_regex(pattern: str) -> str:
     return "".join(out)
 
 def _shell_wildcard_match(input_str: str, pattern: str) -> bool:
+    """Match a shell-style glob (with `*`/`?`) against an input string."""
     normalized = input_str.replace("\\", "/")
     escaped = _shell_escape_regex(pattern.replace("\\", "/"))
     escaped = escaped.replace("*", ".*").replace("?", ".")
@@ -2263,7 +2388,8 @@ _SHELL_ARITY = {
     "yarn": 2, "yarn dlx": 3, "yarn run": 3,
 }
 
-def _shell_arity_prefix(tokens):
+def _shell_arity_prefix(tokens: list) -> list:
+    """Return the command tokens up to the arity of the longest matching command prefix."""
     for length in range(len(tokens), 0, -1):
         prefix = " ".join(tokens[:length])
         arity = _SHELL_ARITY.get(prefix)
@@ -2280,15 +2406,37 @@ _SHELL_REDIR = "redir"
 _SHELL_CTRL = "ctrl"
 
 class _ShellToken:
+    """A shell token with kind, span, and optional nested tokens."""
+
     __slots__ = ("kind", "text", "start", "end", "nested")
-    def __init__(self, kind, text, start, end, nested=None):
+    def __init__(self, kind: str, text: str, start: int, end: int, nested: Optional[list] = None) -> None:
+        """Initialize a shell token.
+
+        Args:
+            kind: One of _SHELL_WORD / _SHELL_REDIR / _SHELL_CTRL.
+            text: The token's raw text.
+            start: Character offset of the token start.
+            end: Character offset of the token end.
+            nested: Optional list of tokens nested inside a $() expansion.
+        """
         self.kind = kind
         self.text = text
         self.start = start
         self.end = end
         self.nested = nested or []
 
-def _shell_find_closing(s, i, open_, close):
+def _shell_find_closing(s: str, i: int, open_: str, close: str) -> int:
+    """Find the index of the matching close character for a `$(` / `)` group.
+
+    Args:
+        s: The command string.
+        i: Index just after the opening `$(`.
+        open_: The open character (e.g. '(').
+        close: The close character (e.g. ')').
+
+    Returns:
+        Index of the matching close char, or len(s) if unbalanced.
+    """
     depth = 1
     n = len(s)
     j = i
@@ -2325,7 +2473,17 @@ def _shell_find_closing(s, i, open_, close):
         j += 1
     return n
 
-def _shell_scan_word(s, i):
+def _shell_scan_word(s: str, i: int) -> tuple:
+    """Scan a shell word starting at index i, honoring quotes and $() nesting.
+
+    Args:
+        s: The command string.
+        i: Starting index of the word.
+
+    Returns:
+        (j, parts, nested) where j is the end index, parts are the raw word
+        segments, and nested is the list of nested tokens.
+    """
     n = len(s)
     j = i
     parts = []
@@ -2392,7 +2550,8 @@ def _shell_scan_word(s, i):
 
 _SHELL_REDIR_OPS = ("&>>", "<<-", "<<<", ">>", ">&", "<&", "<>", ">|", "<<", "&>", ">", "<")
 
-def _shell_tokenize(s):
+def _shell_tokenize(s: str) -> list:
+    """Tokenize a shell command string into _ShellToken objects."""
     tokens = []
     i = 0
     n = len(s)
@@ -2448,13 +2607,30 @@ def _shell_tokenize(s):
     return tokens
 
 class _ShellNode:
+    """A parsed shell command node with source, glob pattern, and arity tokens."""
+
     __slots__ = ("source", "pattern", "tokens")
-    def __init__(self, source, pattern, tokens):
+    def __init__(self, source: str, pattern: str, tokens: list) -> None:
+        """Initialize a shell node.
+
+        Args:
+            source: Original command source text.
+            pattern: Glob pattern used for rule matching.
+            tokens: Arity-reduced token list.
+        """
         self.source = source
         self.pattern = pattern
         self.tokens = tokens
 
-def _shell_arity_tokens(tokens):
+def _shell_arity_tokens(tokens: list) -> list:
+    """Drop redirection operators and their targets from a token list.
+
+    Args:
+        tokens: List of _ShellToken.
+
+    Returns:
+        List of word texts excluding redirect operators/operands.
+    """
     skip = set()
     i = 0
     while i < len(tokens):
@@ -2475,7 +2651,15 @@ def _shell_arity_tokens(tokens):
         out.append(t.text)
     return out
 
-def _shell_breakdown(command):
+def _shell_breakdown(command: str) -> list:
+    """Split a shell command into _ShellNode segments at control operators.
+
+    Args:
+        command: The raw command string.
+
+    Returns:
+        List of _ShellNode, recursively including $()/subshell inner segments.
+    """
     tokens = _shell_tokenize(command)
     segments = []
     current = []
@@ -2505,7 +2689,15 @@ def _shell_breakdown(command):
                         nodes.extend(_shell_breakdown(inner))
     return nodes
 
-def _shell_from_config(permission):
+def _shell_from_config(permission: object) -> list:
+    """Flatten an opencode-style permission config into a rules list.
+
+    Args:
+        permission: str or dict permission spec (e.g. "ask" or {"*": "ask"}).
+
+    Returns:
+        List of {"permission", "pattern", "action"} rule dicts.
+    """
     rules = []
     if isinstance(permission, str):
         permission = {"*": permission}
@@ -2517,7 +2709,15 @@ def _shell_from_config(permission):
                 rules.append({"permission": key, "pattern": pattern, "action": action})
     return rules
 
-def _shell_as_bash_rules(config):
+def _shell_as_bash_rules(config: object) -> list:
+    """Normalize a bash permission config into a rules list.
+
+    Args:
+        config: str, dict, or list of rule dicts.
+
+    Returns:
+        List of {"permission", "pattern", "action"} rule dicts.
+    """
     if isinstance(config, str):
         return _shell_from_config({"bash": {"*": config}})
     if isinstance(config, dict):
@@ -2526,7 +2726,17 @@ def _shell_as_bash_rules(config):
         return _shell_from_config({"bash": config})
     return list(config)
 
-def _shell_evaluate(permission, pattern, *rulesets):
+def _shell_evaluate(permission: str, pattern: str, *rulesets: tuple) -> Optional[dict]:
+    """Evaluate a permission/pattern against rule sets, last match wins.
+
+    Args:
+        permission: The permission string to match.
+        pattern: The command pattern to match.
+        *rulesets: Ordered iterables of rule dicts.
+
+    Returns:
+        The winning rule dict, or None if no rule matched.
+    """
     found = None
     for ruleset in rulesets:
         for rule in ruleset:
@@ -2536,7 +2746,17 @@ def _shell_evaluate(permission, pattern, *rulesets):
         return found
     return {"permission": permission, "pattern": "*", "action": "ask"}
 
-def shell_check_command(command, config, approved=None):
+def shell_check_command(command: str, config: object, approved: Optional[list] = None) -> Dict:
+    """Break a command down and evaluate it against the shell permission rules.
+
+    Args:
+        command: The raw command string.
+        config: Permission config (str/dict/list).
+        approved: Optional list of pre-approved rule dicts.
+
+    Returns:
+        Verdict dict with command, nodes, patterns, always, effect, details.
+    """
     rules = _shell_as_bash_rules(config)
     approved = list(approved) if approved else []
     nodes = _shell_breakdown(command)
@@ -2564,7 +2784,13 @@ def shell_check_command(command, config, approved=None):
     return {"command": command, "nodes": [{"source": n.source, "pattern": n.pattern, "tokens": n.tokens} for n in nodes], "patterns": patterns, "always": always, "effect": effect, "details": details}
 
 # --- CWD leniency helpers ---
-def _shell_path_inside_cwd(path_str, cwd=None):
+def _shell_path_inside_cwd(path_str: str, cwd: Optional[str] = None) -> bool:
+    """Return True if a shell operand resolves inside the given working directory.
+
+    Args:
+        path_str: A command operand (may be quoted or a glob).
+        cwd: Directory to test against (defaults to os.getcwd()).
+    """
     if cwd is None:
         cwd = os.getcwd()
     # Strip quotes
@@ -2593,11 +2819,16 @@ def _shell_path_inside_cwd(path_str, cwd=None):
     except Exception:
         return False
 
-def _shell_all_operands_inside_cwd(nodes, cwd=None):
+def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None) -> bool:
+    """Return True when every non-flag operand of the parsed nodes is inside CWD.
+
+    Args:
+        nodes: List of _ShellNode (or dict nodes) from _shell_breakdown.
+        cwd: Directory to test against (defaults to os.getcwd()).
+    """
     if cwd is None:
         cwd = os.getcwd()
     for n in nodes:
-        src = n.get("source") if isinstance(n, dict) else n.source
         toks = n.get("tokens") if isinstance(n, dict) else n.tokens
         if not toks:
             continue
@@ -2613,7 +2844,12 @@ def _shell_all_operands_inside_cwd(nodes, cwd=None):
     return True
 
 # --- Home/root destructive guard (bypass-immune) ---
-def _shell_is_home_destructive(nodes):
+def _shell_is_home_destructive(nodes: list) -> bool:
+    """Return True if any parsed node is an `rm` targeting ~ or the filesystem root.
+
+    Args:
+        nodes: List of _ShellNode (or dict nodes) from _shell_breakdown.
+    """
     for n in nodes:
         toks = n.get("tokens") if isinstance(n, dict) else n.tokens
         if not toks:
@@ -2650,11 +2886,15 @@ def _shell_is_home_destructive(nodes):
     return False
 
 
-def _shell_operand_realpath(tok):
+def _shell_operand_realpath(tok: str) -> Optional[str]:
     """Best-effort resolve of a shell token to an absolute realpath.
 
-    Returns a realpath string, or None if the token is not a resolvable path
-    (flags, env assignments, bare words, URLs, empty tokens).
+    Args:
+        tok: A command operand string.
+
+    Returns:
+        A realpath string, or None if the token is not a resolvable path
+        (flags, env assignments, bare words, URLs, empty tokens).
     """
     t = tok.strip().strip("'\"")
     t = t.lstrip("<>")  # strip redirection markers (>>/etc/foo)
@@ -2679,14 +2919,20 @@ def _shell_operand_realpath(tok):
         return None
 
 
-def _shell_acl_scan(command, ctx):
+def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[dict]:
     """Scan command operands against PathAcl (run_command path awareness).
 
     Only *explicit* ACL rules trigger here — /proc, /sys, /etc, home dotfiles,
     plus anything the user added. The generic outside-CWD default deny is NOT
     applied (the shell gate already owns that). Sensitive virtual files
-    (/proc/*/mem etc.) are hard-denied. Returns None (no concern) or a dict
-    {"approved": bool, "reason": str|None}.
+    (/proc/*/mem etc.) are hard-denied.
+
+    Args:
+        command: The raw command string.
+        ctx: CommandContext with a path_acl.
+
+    Returns:
+        None (no concern) or a dict {"approved": bool, "reason": str|None}.
     """
     acl = getattr(ctx, "path_acl", None) if ctx is not None else None
     if acl is None:
@@ -2726,49 +2972,38 @@ def _shell_acl_scan(command, ctx):
     return None
 
 
-def check_shell_approval(command, ctx=None, executor_mode="host"):
-    """Gate: home hard-deny → opencode breakdown → CWD leniency → prompt.
+def _shell_hard_block(command: str, verdict: dict) -> Optional[Dict]:
+    """Check home/root destructive and explicit-rule denies (bypass-immune).
 
-    Returns dict: {"approved": bool, "effect": str, "message": str|None, "verdict": dict}
+    Args:
+        command: The raw command string.
+        verdict: The opencode breakdown verdict dict.
+
+    Returns:
+        A deny result dict when hard-blocked, or None to continue the gate.
     """
-    if not command or not command.strip():
-        return {"approved": False, "effect": "deny", "message": "Empty command", "verdict": None}
-    if executor_mode == "container":
-        return {"approved": True, "effect": "allow", "message": None, "verdict": None}
     # Normalize for home check (fold resolved home)
     norm = _shell_normalize_for_home(command)
-    # Build verdict via opencode
-    verdict = shell_check_command(command, DEFAULT_SHELL_PERMISSION, _SHELL_SESSION_APPROVED)
-    nodes = verdict["nodes"]
-    # Also check normalized variant for home destructive via tokens of norm
     norm_verdict = shell_check_command(norm, DEFAULT_SHELL_PERMISSION, _SHELL_SESSION_APPROVED)
     # Home/root guard: either original or normalized hits destructive rm (bypass-immune, contains 'rejected' for test compat)
-    if _shell_is_home_destructive(nodes) or _shell_is_home_destructive(norm_verdict["nodes"]):
+    if _shell_is_home_destructive(verdict["nodes"]) or _shell_is_home_destructive(norm_verdict["nodes"]):
         return {"approved": False, "effect": "deny", "message": "BLOCKED (rejected): recursive delete of home directory (~/ or $HOME) or root filesystem is never allowed", "verdict": verdict}
     # Also catch opencode deny (explicit rules) — include 'rejected' for compat with safety_blocklist test
     if verdict["effect"] == "deny":
         return {"approved": False, "effect": "deny", "message": "BLOCKED (rejected): denied by permission rules (%s)" % ", ".join(d["pattern"] for d in verdict["details"] if d["action"]=="deny"), "verdict": verdict}
+    return None
 
-    # Apply the path ACL on automatic allow paths. Explicit user approval via
-    # the shell prompt below already overrides it (the user said yes to the
-    # exact command), so those returns are left untouched.
-    def _final_allow(**extra):
-        res = _shell_acl_scan(command, ctx)
-        if res is not None and not res["approved"]:
-            return {"approved": False, "effect": "deny", "message": res["reason"], "verdict": verdict}
-        return {"approved": True, "effect": "allow", "message": None, "verdict": verdict, **extra}
 
-    if verdict["effect"] == "allow":
-        return _final_allow()
-    # effect == ask → check CWD leniency
-    if _shell_all_operands_inside_cwd(nodes):
-        return _final_allow(cwd_leniency=True)
-    # Auto-confirm (yolo) respects home deny but allows ask
-    if ctx is not None and getattr(ctx, "auto_confirm", False):
-        return _final_allow(auto=True)
-    # Interactive prompt (TTY required)
-    if not sys.stdin.isatty():
-        return {"approved": False, "effect": "ask", "message": "Approval required but no TTY — denied (use /agentic auto to allow)", "verdict": verdict}
+def _shell_prompt_approval(command: str, verdict: dict) -> Dict:
+    """Interactively ask the user to approve a command (once/session/always/deny).
+
+    Args:
+        command: The raw command string.
+        verdict: The opencode breakdown verdict dict.
+
+    Returns:
+        {"approved", "effect", "message", "verdict"} result dict.
+    """
     # Prompt user: once / session / always / deny
     print(colorize(f"\n[Shell approval] `{command}`", 'warning'), file=sys.stderr)
     for d in verdict["details"]:
@@ -2793,25 +3028,82 @@ def check_shell_approval(command, ctx=None, executor_mode="host"):
         return {"approved": True, "effect": "allow", "message": None, "verdict": verdict}
     return {"approved": False, "effect": "ask", "message": "Denied by user", "verdict": verdict}
 
+
+def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, executor_mode: str = "host") -> Dict:
+    """Gate: home hard-deny → opencode breakdown → CWD leniency → prompt.
+
+    Args:
+        command: The raw command string.
+        ctx: Optional CommandContext (for path ACL + auto_confirm).
+        executor_mode: "host" or "container" (container skips the gate).
+
+    Returns:
+        dict: {"approved": bool, "effect": str, "message": str|None, "verdict": dict}
+    """
+    if not command or not command.strip():
+        return {"approved": False, "effect": "deny", "message": "Empty command", "verdict": None}
+    if executor_mode == "container":
+        return {"approved": True, "effect": "allow", "message": None, "verdict": None}
+
+    # Build verdict via opencode
+    verdict = shell_check_command(command, DEFAULT_SHELL_PERMISSION, _SHELL_SESSION_APPROVED)
+    nodes = verdict["nodes"]
+
+    # Home/root guard + explicit-rule denies (bypass-immune)
+    blocked = _shell_hard_block(command, verdict)
+    if blocked:
+        return blocked
+
+    # Apply the path ACL on automatic allow paths. Explicit user approval via
+    # the shell prompt below already overrides it (the user said yes to the
+    # exact command), so those returns are left untouched.
+    def _final_allow(**extra: dict) -> dict:
+        """Final allow wrapper that applies the path-ACL operand scan."""
+        res = _shell_acl_scan(command, ctx)
+        if res is not None and not res["approved"]:
+            return {"approved": False, "effect": "deny", "message": res["reason"], "verdict": verdict}
+        return {"approved": True, "effect": "allow", "message": None, "verdict": verdict, **extra}
+
+    if verdict["effect"] == "allow":
+        return _final_allow()
+    # effect == ask → check CWD leniency
+    if _shell_all_operands_inside_cwd(nodes):
+        return _final_allow(cwd_leniency=True)
+    # Auto-confirm (yolo) respects home deny but allows ask
+    if ctx is not None and getattr(ctx, "auto_confirm", False):
+        return _final_allow(auto=True)
+    # Interactive prompt (TTY required)
+    if not sys.stdin.isatty():
+        return {"approved": False, "effect": "ask", "message": "Approval required but no TTY — denied (use /agentic auto to allow)", "verdict": verdict}
+    return _shell_prompt_approval(command, verdict)
+
 # ============================================================================
 # ============= EXECUTOR (CONTAINER/HOST)  ===================================
 # ============================================================================
 
 class Executor:
     """Runs shell commands on host or inside a container sandbox.
-    
+
     Call map:
       run() → _run_shell() or _pre_pull_image()
       _run_shell() → subprocess.run / podman|docker exec
     """
 
-    def __init__(self, mode="host", container_runtime=None, container_image=None):
+    def __init__(self, mode: str = "host", container_runtime: Optional[str] = None,
+                 container_image: Optional[str] = None) -> None:
+        """Initialize the executor with host/container mode and runtime settings.
+
+        Args:
+            mode: "host" or "container".
+            container_runtime: podman/docker runtime (defaults to env or podman).
+            container_image: Image for container mode (defaults to python:3.12-alpine).
+        """
         self.mode = mode
         self.runtime = container_runtime or os.environ.get("OLLAMAQUERY_CONTAINER_RT", "podman")
         self.image = container_image or os.environ.get("OLLAMAQUERY_CONTAINER_IMAGE",
                                                        "docker.io/library/python:3.12-alpine")
 
-    def _pre_pull_image(self):
+    def _pre_pull_image(self) -> None:
         """Pull the container image with a separate timeout so pulls don't consume command timeout."""
         try:
             subprocess.run(
@@ -2822,6 +3114,15 @@ class Executor:
             pass
 
     def run(self, command: str, timeout: int = 120) -> dict:
+        """Run a shell command on the host or inside a container.
+
+        Args:
+            command: The command string to run.
+            timeout: Timeout in seconds (default 120).
+
+        Returns:
+            dict with stdout, stderr, returncode.
+        """
         if self.mode == "container":
             self._pre_pull_image()
             cwd_bind = os.getcwd()
@@ -2836,6 +3137,16 @@ class Executor:
         return self._run_shell(command, timeout)
 
     def _run_shell(self, command: str, timeout: int, is_container: bool = False) -> dict:
+        """Execute a command, applying the shell approval gate on host mode.
+
+        Args:
+            command: The command string to run.
+            timeout: Timeout in seconds.
+            is_container: Whether to run via the container runtime (no gate).
+
+        Returns:
+            dict with stdout, stderr, returncode.
+        """
         if not is_container:
             ctx = CommandContext() if CommandContext._initialized else None
             res = check_shell_approval(command, ctx=ctx, executor_mode=self.mode)
@@ -3001,7 +3312,15 @@ AGENTIC_TIMEOUT_ABORT_TOOLS = {"run_command", "patch", "edit_file"}
 # ============= AGENTIC TOOL HANDLERS         ================================
 # ============================================================================
 
-def _tool_handle_fetch_url(self, args):
+def _tool_handle_fetch_url(self, args: dict) -> dict:
+    """Fetch a URL and return its text content.
+
+    Args:
+        args: Tool arguments dict with "url".
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
     url = args["url"]
     text, _tool = fetch_and_convert_url(url)
     return {"success": True, "output": text, "error": None}
@@ -3014,8 +3333,15 @@ SYSTEM_PATH_HINTS = ("proc", "sys")
 SYSTEM_READ_BLOCKED_BASENAMES = {"mem", "environ", "kcore", "pagemap", "maps", "smaps"}
 
 
-def _is_blocked_system_file(abspath):
-    """True for sensitive /proc or /sys virtual files (secrets / huge dumps)."""
+def _is_blocked_system_file(abspath: str) -> bool:
+    """True for sensitive /proc or /sys virtual files (secrets / huge dumps).
+
+    Args:
+        abspath: Absolute path to test.
+
+    Returns:
+        True when the path is a hard-blocked virtual file.
+    """
     base = os.path.basename(abspath)
     if base in SYSTEM_READ_BLOCKED_BASENAMES:
         return True
@@ -3026,13 +3352,18 @@ def _is_blocked_system_file(abspath):
     return False
 
 
-def _resolve_tool_path(raw_path, allow_home=False):
+def _resolve_tool_path(raw_path: str, allow_home: bool = False) -> tuple:
     """Resolve raw_path handling ~, absolute, and symlink.
 
-    Returns (abspath, allowed, error). When allow_home=True, paths
-    explicitly starting with ~ or absolute inside $HOME are allowed
-    even though they are outside CWD (needed for ~/.vimrc etc.).
-    All other paths must be inside CWD via realpath commonpath check.
+    Args:
+        raw_path: The path string from a tool argument.
+        allow_home: Whether explicit `~`/home paths are permitted.
+
+    Returns:
+        (abspath, allowed, error). When allow_home=True, paths
+        explicitly starting with ~ or absolute inside $HOME are allowed
+        even though they are outside CWD (needed for ~/.vimrc etc.).
+        All other paths must be inside CWD via realpath commonpath check.
     """
     expanded = os.path.expanduser(raw_path)
     if os.path.isabs(expanded):
@@ -3059,8 +3390,14 @@ def _resolve_tool_path(raw_path, allow_home=False):
     return abspath, False, "Path traversal denied"
 
 
-def _is_home_dotfile(abspath):
+def _is_home_dotfile(abspath: str) -> bool:
     """True if abspath is inside $HOME (but outside CWD) and any component is dotfile.
+
+    Args:
+        abspath: Absolute path to test.
+
+    Returns:
+        True when the file is a home dotfile outside the current working directory.
 
     Dotfiles inside the current working directory (e.g. ./.gitignore, ./.env)
     are NOT considered home dotfiles even when CWD itself is inside $HOME —
@@ -3088,10 +3425,17 @@ def _is_home_dotfile(abspath):
         return False
 
 
-def _raw_is_home_explicit(raw_path):
+def _raw_is_home_explicit(raw_path: str) -> bool:
     """True if a raw tool path is an explicit home request (`~` prefix or an
     absolute path under $HOME). Relative `../` escapes that happen to land in
-    $HOME are NOT explicit and stay denied."""
+    $HOME are NOT explicit and stay denied.
+
+    Args:
+        raw_path: The original tool argument string.
+
+    Returns:
+        True when the path is an explicit home request.
+    """
     if raw_path is None:
         return False
     if raw_path.startswith("~"):
@@ -3128,12 +3472,14 @@ class PathAcl:
     CWD/$HOME is denied.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize the ACL with an empty log and the default rules."""
         self.rules: list = []
         self.log: list = []
         self._install_defaults()
 
-    def _install_defaults(self):
+    def _install_defaults(self) -> None:
+        """Install the default allow/ask/deny policy (CWD, $HOME, /proc, /sys, /etc)."""
         for root in ("/proc", "/sys", "/etc"):
             self.add("read", "ask", root, source="default")
             self.add("write", "deny", root, source="default")
@@ -3142,8 +3488,15 @@ class PathAcl:
             self.rules.append({"op": op, "action": "ask", "kind": "home_dotfile",
                                "path": home, "source": "default"})
 
-    def add(self, op, action, path, source="session"):
-        """Add/replace a prefix rule for `path` (read|write|any)."""
+    def add(self, op: str, action: str, path: str, source: str = "session") -> None:
+        """Add/replace a prefix rule for `path` (read|write|any).
+
+        Args:
+            op: "read", "write", or "any".
+            action: "allow", "ask", or "deny".
+            path: Real path (or ~-expanded) the rule applies to.
+            source: "session" (user) or "default".
+        """
         rp = os.path.realpath(os.path.expanduser(path))
         self.rules = [r for r in self.rules
                       if not (r["source"] == source and r.get("kind") == "prefix"
@@ -3151,8 +3504,11 @@ class PathAcl:
         self.rules.append({"op": op, "action": action, "kind": "prefix",
                            "path": rp, "source": source})
 
-    def remove(self, path):
+    def remove(self, path: str) -> None:
         """Remove session rules whose path equals `path` (realpath'd).
+
+        Args:
+            path: The path to drop from session rules.
 
         Default rules are preserved — use reset() to restore defaults.
         """
@@ -3161,13 +3517,23 @@ class PathAcl:
                       if not (r["source"] == "session"
                               and r.get("kind") == "prefix" and r["path"] == rp)]
 
-    def reset(self):
+    def reset(self) -> None:
+        """Clear all rules and log, reinstalling the defaults."""
         self.rules = []
         self.log = []
         self._install_defaults()
 
-    def evaluate(self, op, realpath, explicit_only=False):
-        """Resolve a (op, realpath) to (decision, rule|None)."""
+    def evaluate(self, op: str, realpath: str, explicit_only: bool = False) -> tuple:
+        """Resolve a (op, realpath) to (decision, rule|None).
+
+        Args:
+            op: Operation ("read"/"write"/"any").
+            realpath: Realpath of the target file.
+            explicit_only: If True, skip implicit CWD/$HOME defaults.
+
+        Returns:
+            (action, rule|None) tuple.
+        """
         best = None
         best_key = None
         for rule in self.rules:
@@ -3210,7 +3576,15 @@ class PathAcl:
                 pass
         return "deny", None
 
-    def log_event(self, tool, path, decision, rule=None):
+    def log_event(self, tool: str, path: str, decision: str, rule: Optional[dict] = None) -> None:
+        """Record a path ACL decision in the rolling log (capped at 100 entries).
+
+        Args:
+            tool: Tool name (e.g. "read_file", "run_command").
+            path: The realpath being accessed.
+            decision: The resulting decision ("allow"/"ask"/"deny").
+            rule: Optional matching rule dict.
+        """
         self.log.append({
             "tool": tool, "path": path, "decision": decision,
             "rule": (rule["path"] if rule and rule.get("kind") == "prefix"
@@ -3220,9 +3594,20 @@ class PathAcl:
         if len(self.log) > 100:
             self.log = self.log[-100:]
 
-    def prompt(self, op, realpath, rule, tool="file", context=""):
+    def prompt(self, op: str, realpath: str, rule: Optional[dict], tool: str = "file", context: str = "") -> bool:
         """Interactive `ask` gate. Bypass-immune (auto_confirm does not
-        auto-approve). Returns True if the user granted session access."""
+        auto-approve). Returns True if the user granted session access.
+
+        Args:
+            op: Operation ("read"/"write").
+            realpath: The realpath being accessed.
+            rule: The matching rule dict (for display).
+            tool: Tool name for the log.
+            context: Extra context line to show.
+
+        Returns:
+            True when the user granted access (adding a session allow rule).
+        """
         if not sys.stdin.isatty():
             return False
         op_label = "read" if op == "read" else "write"
@@ -3246,8 +3631,19 @@ class PathAcl:
         return False
 
 
-def _path_acl_decision(ctx, op, realpath, tool, context="", raw_path=None):
+def _path_acl_decision(ctx: Optional['CommandContext'], op: str, realpath: str, tool: str, context: str = "", raw_path: Optional[str] = None) -> tuple:
     """Apply PathAcl to an operation. Returns (decision, message|None).
+
+    Args:
+        ctx: CommandContext with a path_acl.
+        op: Operation ("read"/"write").
+        realpath: The realpath being accessed.
+        tool: Tool name for logging.
+        context: Extra context line for the prompt.
+        raw_path: The original tool path (used for home-explicitness gating).
+
+    Returns:
+        (decision, message|None) tuple.
 
     'ask' rules are resolved via the interactive gate (bypass-immune).
     Sensitive virtual files (/proc/*/mem etc.) are hard-denied regardless.
@@ -3290,7 +3686,15 @@ def _path_acl_decision(ctx, op, realpath, tool, context="", raw_path=None):
         return "deny", "Path traversal denied"
     return "allow", None
 
-def _tool_handle_read_file(self, args):
+def _tool_handle_read_file(self, args: dict) -> dict:
+    """Read a file (with ACL gate + optional paging).
+
+    Args:
+        args: Tool arguments with "file_path", optional "offset"/"limit".
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
     raw = args["file_path"]
     filepath, _allowed, _err = _resolve_tool_path(raw, allow_home=True)
     ctx = self._ctx if self._ctx is not None else (CommandContext() if CommandContext._initialized else None)
@@ -3333,7 +3737,7 @@ def _tool_handle_read_file(self, args):
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
 
-def _read_file_page(filepath, raw, offset, limit):
+def _read_file_page(filepath: str, raw: str, offset: Optional[int], limit: Optional[int]) -> dict:
     """Read a paged window of lines from a (possibly large) text file.
 
     Mirrors opencode's paged `read`: returns at most `limit` lines (capped at
@@ -3391,7 +3795,15 @@ def _read_file_page(filepath, raw, offset, limit):
     return {"success": True, "output": header + "\n" + body, "error": None}
 
 
-def _tool_handle_write_file(self, args):
+def _tool_handle_write_file(self, args: dict) -> dict:
+    """Write a file after the path-ACL write gate.
+
+    Args:
+        args: Tool arguments with "file_path" and "content".
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
     # Write policy is enforced by PathAcl: CWD allowed, home dotfiles ask,
     # everything else outside CWD denied (system paths /etc /proc /sys deny).
     filepath, _allowed, _err = _resolve_tool_path(args["file_path"], allow_home=True)
@@ -3412,7 +3824,15 @@ def _tool_handle_write_file(self, args):
         return {"success": False, "output": "", "error": str(e)}
 
 
-def _tool_handle_list_directory(self, args):
+def _tool_handle_list_directory(self, args: dict) -> dict:
+    """List directory entries (ACL-gated), sorted, with dirs suffixed by '/'.
+
+    Args:
+        args: Tool arguments with optional "path" (default ".").
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
     path, _allowed, _err = _resolve_tool_path(args.get("path", "."), allow_home=True)
     ctx = self._ctx if self._ctx is not None else (CommandContext() if CommandContext._initialized else None)
     decision, acl_err = _path_acl_decision(ctx, "read", os.path.realpath(path),
@@ -3431,7 +3851,15 @@ def _tool_handle_list_directory(self, args):
         return {"success": False, "output": "", "error": str(e)}
 
 
-def _tool_handle_glob(self, args):
+def _tool_handle_glob(self, args: dict) -> dict:
+    """Glob for files matching a pattern, restricted to the working directory.
+
+    Args:
+        args: Tool arguments with "pattern".
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
     base_dir = os.path.abspath(os.getcwd())
     try:
         matches = sorted(glob.glob(args["pattern"], recursive=True))
@@ -3445,7 +3873,15 @@ def _tool_handle_glob(self, args):
         return {"success": False, "output": "", "error": str(e)}
 
 
-def _tool_handle_run_python(self, args):
+def _tool_handle_run_python(self, args: dict) -> dict:
+    """Run Python 3 code (inline or from a file) through the executor.
+
+    Args:
+        args: Tool arguments with "code" or "file_path"/"file", optional "timeout".
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
     if "code" in args:
         command = f"python3 -c {shlex.quote(args['code'])}"
     elif "file_path" in args:
@@ -3464,7 +3900,15 @@ def _tool_handle_run_python(self, args):
     return {"success": result["returncode"] == 0, "output": output, "error": result["stderr"] or None}
 
 
-def _tool_handle_run_command(self, args):
+def _tool_handle_run_command(self, args: dict) -> dict:
+    """Run a shell command through the executor (with the approval gate).
+
+    Args:
+        args: Tool arguments with "command", optional "timeout".
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
     command = args["command"]
     # Gate is now in Executor._run_shell (opencode breakdown + home guard + CWD leniency)
     # Pipes/redirections are allowed when per-component rules permit; no operator ban here.
@@ -3478,7 +3922,15 @@ def _tool_handle_run_command(self, args):
     return {"success": result["returncode"] == 0, "output": output, "error": result["stderr"] or None}
 
 
-def _tool_handle_diff(self, args):
+def _tool_handle_diff(self, args: dict) -> dict:
+    """Generate a unified diff between two files (pure Python).
+
+    Args:
+        args: Tool arguments with "file1"/"file2", optional "label1"/"label2".
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
     filepath1, ok1, err1 = _resolve_tool_path(args["file1"], allow_home=False)
     if not ok1:
         return {"success": False, "output": "", "error": err1}
@@ -3499,7 +3951,15 @@ def _tool_handle_diff(self, args):
         return {"success": False, "output": "", "error": str(e)}
 
 
-def _tool_handle_patch(self, args):
+def _tool_handle_patch(self, args: dict) -> dict:
+    """Apply a unified diff to a file via the `patch` command (destructive).
+
+    Args:
+        args: Tool arguments with "diff" and optional "target".
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
     import tempfile
     diff_text = args["diff"]
     diff_path = None
@@ -3532,7 +3992,15 @@ def _tool_handle_patch(self, args):
             os.unlink(diff_path)
 
 
-def _tool_handle_edit_file(self, args):
+def _tool_handle_edit_file(self, args: dict) -> dict:
+    """Replace an exact old_string with new_string in a file (single match).
+
+    Args:
+        args: Tool arguments with "file_path"/"old_string"/"new_string".
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
     filepath, _allowed, _err = _resolve_tool_path(args["file_path"], allow_home=True)
     ctx = self._ctx if self._ctx is not None else (CommandContext() if CommandContext._initialized else None)
     decision, acl_err = _path_acl_decision(ctx, "write", os.path.realpath(filepath),
@@ -3564,12 +4032,88 @@ def _tool_handle_edit_file(self, args):
         return {"success": False, "output": "", "error": str(e)}
 
 
-def _parse_patch_sections(patch_text):
+def _parse_opencode_marker(line: str) -> Optional[tuple]:
+    """Parse an OpenCode-style `*** <Op> to: path` marker line.
+
+    Args:
+        line: A patch line starting with `*** `.
+
+    Returns:
+        (operation, path, destination) tuple where operation is one of
+        "add"/"modify"/"delete"/"move", path is the target file, and
+        destination is set only for "move" operations. Returns None if the
+        line is not a recognized marker.
+    """
+    marker = line[4:].strip()
+    if marker.startswith("Add File:"):
+        return "add", marker[len("Add File:"):].strip(), None
+    if marker.startswith("Update File:"):
+        return "modify", marker[len("Update File:"):].strip(), None
+    if marker.startswith("Delete File:"):
+        return "delete", marker[len("Delete File:"):].strip(), None
+    if marker.startswith("Move to:"):
+        dest = marker[len("Move to:"):].strip()
+        # The marker tells us the destination; the source comes from ---/+++
+        # headers or a path before this.
+        return "move", dest, dest
+    return None
+
+
+def _parse_unified_diff_section(lines: list, i: int) -> Optional[tuple]:
+    """Parse a standard unified diff section starting at a `--- ` line.
+
+    Args:
+        lines: Patch lines (kept with line endings).
+        i: Index of the `--- ` line in `lines`.
+
+    Returns:
+        (path, operation, hunks, next_index) tuple, or None if the lines at
+        index `i` do not form a valid `--- ` / `+++ ` section. `next_index`
+        is the index just past the parsed section's hunks.
+    """
+    n = len(lines)
+    old_path = lines[i][4:].strip()
+    if i + 1 >= n or not lines[i + 1].startswith("+++ "):
+        return None
+    new_path = lines[i + 1][4:].strip()
+    i += 2
+
+    # Strip "a/" and "b/" prefixes commonly used by git
+    src = old_path[2:] if old_path.startswith(("a/", "b/")) else old_path
+    dst = new_path[2:] if new_path.startswith(("a/", "b/")) else new_path
+    path = dst if dst != "/dev/null" else src
+    is_new = old_path == "/dev/null" or old_path.endswith("/dev/null")
+    is_delete = new_path == "/dev/null" or new_path.endswith("/dev/null")
+
+    # Collect hunks
+    body_start = i
+    while i < n:
+        if lines[i].startswith("--- ") and i + 1 < n and lines[i + 1].startswith("+++ "):
+            break
+        i += 1
+    body = "".join(lines[body_start:i])
+    hunks, _, _ = _parse_unified_hunks(body)
+
+    if is_delete:
+        operation = "delete"
+        hunks = []
+    elif is_new:
+        operation = "add"
+    else:
+        operation = "modify"
+    return path, operation, hunks, i
+
+
+def _parse_patch_sections(patch_text: str) -> list:
     """Parse patch text into sections for each file.
-    
-    Returns list of dicts:
-      {"path": str, "operation": "add"|"modify"|"delete"|"move",
-       "destination": str (for move), "hunks": [{"start": int, "old_count": int, "new_lines": [str]}]}
+
+    Args:
+        patch_text: The raw unified-diff / OpenCode-marker patch text.
+
+    Returns:
+        List of dicts:
+          {"path": str, "operation": "add"|"modify"|"delete"|"move",
+           "destination": str (for move), "hunks": [{"start": int, "old_count": int, "new_lines": [str]}]}
     """
     lines = patch_text.splitlines(keepends=True)
     sections = []
@@ -3581,24 +4125,13 @@ def _parse_patch_sections(patch_text):
 
         # OpenCode-style marker: *** Add/Update/Delete/Move to: path
         if line.startswith("*** "):
-            marker = line[4:].strip()
-            if marker.startswith("Add File:"):
-                path = marker[len("Add File:"):].strip()
-                op = "add"
-            elif marker.startswith("Update File:"):
-                path = marker[len("Update File:"):].strip()
-                op = "modify"
-            elif marker.startswith("Delete File:"):
-                path = marker[len("Delete File:"):].strip()
-                sections.append({"path": path, "operation": "delete", "hunks": []})
+            marker = _parse_opencode_marker(line)
+            if marker is None:
                 i += 1
                 continue
-            elif marker.startswith("Move to:"):
-                dest = marker[len("Move to:"):].strip()
-                # The marker line tells us the destination; the source comes from ---/+++ headers or a path before this
-                path = dest  # We'll override if ---/+++ follow
-                op = "move"
-            else:
+            op, path, dest = marker
+            if op == "delete":
+                sections.append({"path": path, "operation": "delete", "hunks": []})
                 i += 1
                 continue
 
@@ -3611,7 +4144,7 @@ def _parse_patch_sections(patch_text):
                 i += 1
             body = "".join(lines[body_start:i])
             hunks, detected_path, is_delete = _parse_unified_hunks(body)
-            if detected_path and not marker.startswith("Move to:"):
+            if detected_path and op != "move":
                 path = detected_path
             if is_delete:
                 sections.append({"path": path, "operation": "delete", "hunks": []})
@@ -3623,44 +4156,98 @@ def _parse_patch_sections(patch_text):
             continue
 
         # Standard unified diff section: starts with "--- "
-        if line.startswith("--- "):
-            old_path = line[4:].strip()
-            if i + 1 < n and lines[i + 1].startswith("+++ "):
-                new_path = lines[i + 1][4:].strip()
-                i += 2
-                # Strip "a/" and "b/" prefixes commonly used by git
-                src = old_path[2:] if old_path.startswith(("a/", "b/")) else old_path
-                dst = new_path[2:] if new_path.startswith(("a/", "b/")) else new_path
-                path = dst if dst != "/dev/null" else src
-                is_new = old_path == "/dev/null" or old_path.endswith("/dev/null")
-                is_delete = new_path == "/dev/null" or new_path.endswith("/dev/null")
-
-                # Collect hunks
-                body_start = i
-                while i < n:
-                    if lines[i].startswith("--- ") and i + 1 < n and lines[i + 1].startswith("+++ "):
-                        break
-                    i += 1
-                body = "".join(lines[body_start:i])
-                hunks, _, _ = _parse_unified_hunks(body)
-
-                if is_delete:
-                    sections.append({"path": path, "operation": "delete", "hunks": []})
-                elif is_new:
-                    sections.append({"path": path, "operation": "add", "hunks": hunks})
-                else:
-                    sections.append({"path": path, "operation": "modify", "hunks": hunks})
-                continue
+        parsed = _parse_unified_diff_section(lines, i)
+        if parsed:
+            path, operation, hunks, next_i = parsed
+            sections.append({"path": path, "operation": operation, "hunks": hunks})
+            i = next_i
+            continue
         i += 1
 
     return sections
 
 
-def _parse_unified_hunks(body):
+def _collect_hunk_lines(lines: list, i: int, n: int, old_count: int, new_count: int) -> tuple:
+    """Collect old/new lines for a numbered @@ hunk.
+
+    Args:
+        lines: Diff body lines (kept with endings).
+        i: Index of the first line after the @@ header.
+        n: Total line count.
+        old_count / new_count: Expected removed/added line counts from the header.
+
+    Returns:
+        (i, old_lines, new_lines) where i is the index just past the hunk.
+    """
+    old_lines = []
+    new_lines = []
+    old_collected = 0
+    new_collected = 0
+    while i < n and (old_collected < old_count or new_collected < new_count):
+        cl = lines[i]
+        if cl.strip() == "" and not cl.startswith(("+", "-")):
+            new_lines.append(cl[1:] if cl.startswith(" ") else cl)
+            old_lines.append(cl[1:] if cl.startswith(" ") else cl)
+            new_collected += 1
+            old_collected += 1
+            i += 1
+            continue
+        if cl.startswith("+") or cl.startswith(" "):
+            new_lines.append(cl[1:] if cl.startswith("+") else cl[1:])
+            new_collected += 1
+        if cl.startswith("-") or cl.startswith(" "):
+            old_lines.append(cl[1:] if cl.startswith("-") else cl[1:])
+            old_collected += 1
+        if not (cl.startswith(("+", "-", " ")) or cl.startswith("\\ ")):
+            break
+        i += 1
+    return i, old_lines, new_lines
+
+
+def _collect_bare_hunk_lines(lines: list, i: int, n: int) -> tuple:
+    """Collect old/new lines for a bare `@@` (match-anywhere) hunk.
+
+    Args:
+        lines: Diff body lines (kept with endings).
+        i: Index of the first line after the bare @@ marker.
+        n: Total line count.
+
+    Returns:
+        (i, old_lines, new_lines) where i is the index just past the hunk.
+    """
+    old_lines = []
+    new_lines = []
+    while i < n:
+        cl = lines[i]
+        if cl.startswith('@@') or cl.startswith('*** '):
+            break
+        if cl.startswith('--- ') and i + 1 < n and lines[i + 1].startswith('+++ '):
+            break
+        if cl.startswith('+'):
+            new_lines.append(cl[1:])
+        elif cl.startswith('-'):
+            old_lines.append(cl[1:])
+        elif cl.startswith(' ') or cl.strip() == '':
+            context = cl[1:] if cl.startswith(' ') else cl
+            old_lines.append(context)
+            new_lines.append(context)
+        elif cl.startswith('\\ '):
+            pass  # "\ No newline at end of file"
+        else:
+            break
+        i += 1
+    return i, old_lines, new_lines
+
+
+def _parse_unified_hunks(body: str) -> tuple:
     """Parse @@ hunks from a unified diff body.
-    
-    Returns (hunks, detected_path, is_delete).
-    Each hunk: {"start": int, "old_count": int, "old_lines": [str], "new_lines": [str]}
+
+    Args:
+        body: The diff body text (---/+++ headers + hunks).
+
+    Returns:
+        (hunks, detected_path, is_delete).
+        Each hunk: {"start": int, "old_count": int, "old_lines": [str], "new_lines": [str]}
     """
     import re
     hunks = []
@@ -3705,58 +4292,16 @@ def _parse_unified_hunks(body):
             if m:
                 start = int(m.group(1))
                 old_count = int(m.group(2) or 1)
-                new_count = int(m.group(4) or 1)
                 i += 1
 
-                old_lines = []
-                new_lines = []
-                old_collected = 0
-                new_collected = 0
-                while i < n and (old_collected < old_count or new_collected < new_count):
-                    cl = lines[i]
-                    if cl.strip() == "" and not cl.startswith(("+", "-")):
-                        new_lines.append(cl[1:] if cl.startswith(" ") else cl)
-                        old_lines.append(cl[1:] if cl.startswith(" ") else cl)
-                        new_collected += 1
-                        old_collected += 1
-                        i += 1
-                        continue
-                    if cl.startswith("+") or cl.startswith(" "):
-                        new_lines.append(cl[1:] if cl.startswith("+") else cl[1:])
-                        new_collected += 1
-                    if cl.startswith("-") or cl.startswith(" "):
-                        old_lines.append(cl[1:] if cl.startswith("-") else cl[1:])
-                        old_collected += 1
-                    if not (cl.startswith(("+", "-", " ")) or cl.startswith("\\ ")):
-                        break
-                    i += 1
+                i, old_lines, new_lines = _collect_hunk_lines(lines, i, n, old_count, int(m.group(4) or 1))
 
                 hunks.append({"start": start, "old_count": old_count, "old_lines": old_lines, "new_lines": new_lines})
                 continue
 
             # Bare @@: collect lines until the next hunk/header as a match-anywhere hunk.
             i += 1
-            old_lines = []
-            new_lines = []
-            while i < n:
-                cl = lines[i]
-                if cl.startswith('@@') or cl.startswith('*** '):
-                    break
-                if cl.startswith('--- ') and i + 1 < n and lines[i + 1].startswith('+++ '):
-                    break
-                if cl.startswith('+'):
-                    new_lines.append(cl[1:])
-                elif cl.startswith('-'):
-                    old_lines.append(cl[1:])
-                elif cl.startswith(' ') or cl.strip() == '':
-                    context = cl[1:] if cl.startswith(' ') else cl
-                    old_lines.append(context)
-                    new_lines.append(context)
-                elif cl.startswith('\\ '):
-                    pass  # "\ No newline at end of file"
-                else:
-                    break
-                i += 1
+            i, old_lines, new_lines = _collect_bare_hunk_lines(lines, i, n)
             hunks.append({"start": -1, "old_count": len(old_lines), "old_lines": old_lines, "new_lines": new_lines})
             continue
 
@@ -3765,9 +4310,81 @@ def _parse_unified_hunks(body):
     return hunks, detected_path, is_delete
 
 
-def _apply_unified_diff(patch_text):
+def _resolve_section_path(base_dir: str, path: str) -> str:
+    """Resolve a patch section path and validate it stays inside the base dir.
+
+    Args:
+        base_dir: Realpath of the working directory.
+        path: The patch's target path.
+
+    Returns:
+        The absolute path, or raises ValueError on traversal.
+    """
+    abspath = os.path.abspath(os.path.join(os.getcwd(), path))
+    if os.path.commonpath([base_dir, os.path.realpath(abspath)]) != base_dir:
+        raise ValueError(f"Path traversal denied: {path}")
+    return abspath
+
+
+def _apply_hunk(content: list, hunk: dict, path: str) -> tuple:
+    """Apply a single hunk to a file's line list.
+
+    Args:
+        content: List of lines (mutated in place).
+        hunk: {"start", "old_count", "old_lines", "new_lines"}.
+        path: Target path (for skip messages).
+
+    Returns:
+        (applied: bool, message: Optional[str]).
+    """
+    start_idx = hunk["start"] - 1
+    old_count = hunk["old_count"]
+    new_lines = hunk["new_lines"]
+
+    if start_idx < 0:
+        # Bare @@ hunk: match the removed/context lines anywhere in the file.
+        expected_clean = [line.rstrip('\r\n') for line in hunk.get("old_lines", [])]
+        if not expected_clean:
+            # Pure addition with no anchor: append at the end of the file.
+            content.extend(new_lines)
+            return True, None
+        found = -1
+        window_len = len(expected_clean)
+        for k in range(len(content) - window_len + 1):
+            window = [line.rstrip('\r\n') for line in content[k:k + window_len]]
+            if window == expected_clean:
+                found = k
+                break
+        if found < 0:
+            return False, f"SKIPPED {path} hunk (no match for removed lines)"
+        start_idx = found
+        old_count = window_len
+
+    if start_idx + old_count > len(content):
+        old_count = len(content) - start_idx
+    if old_count < 0:
+        old_count = 0
+
+    existing = content[start_idx:start_idx + old_count]
+    expected = hunk.get("old_lines", [])
+    existing_clean = [line.rstrip('\r\n') for line in existing]
+    expected_clean = [line.rstrip('\r\n') for line in expected]
+    if expected and existing_clean != expected_clean:
+        return False, f"SKIPPED {path} hunk at line {hunk['start']} (context mismatch)"
+
+    content[start_idx:start_idx + old_count] = new_lines
+    return True, None
+
+
+def _apply_unified_diff(patch_text: str) -> Dict:
     """Apply a unified diff patch to the filesystem. Pure Python.
-    
+
+    Args:
+        patch_text: The diff text to apply.
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+
     Supports standard unified diff (---/+++ headers, @@ hunks)
     and OpenCode-style markers (*** Add/Update/Delete/Move to: path).
     """
@@ -3779,9 +4396,10 @@ def _apply_unified_diff(patch_text):
     base_dir = os.path.realpath(os.getcwd())
     for sec in sections:
         path = sec["path"]
-        abspath = os.path.abspath(os.path.join(os.getcwd(), path))
-        if os.path.commonpath([base_dir, os.path.realpath(abspath)]) != base_dir:
-            return {"success": False, "output": "", "error": f"Path traversal denied: {path}"}
+        try:
+            abspath = _resolve_section_path(base_dir, path)
+        except ValueError as e:
+            return {"success": False, "output": "", "error": str(e)}
 
         op = sec.get("operation", "modify")
 
@@ -3793,9 +4411,10 @@ def _apply_unified_diff(patch_text):
 
         if op == "move":
             dest = sec["destination"]
-            absdest = os.path.abspath(os.path.join(os.getcwd(), dest))
-            if os.path.commonpath([base_dir, os.path.realpath(absdest)]) != base_dir:
-                return {"success": False, "output": "", "error": f"Path traversal denied: {dest}"}
+            try:
+                absdest = _resolve_section_path(base_dir, dest)
+            except ValueError as e:
+                return {"success": False, "output": "", "error": str(e)}
             if os.path.isfile(abspath):
                 os.makedirs(os.path.dirname(absdest), exist_ok=True)
                 os.rename(abspath, absdest)
@@ -3814,46 +4433,11 @@ def _apply_unified_diff(patch_text):
         # Apply hunks in reverse order to preserve line numbers
         applied_hunks = 0
         for hunk in sorted(sec["hunks"], key=lambda h: h["start"], reverse=True):
-            start_idx = hunk["start"] - 1
-            old_count = hunk["old_count"]
-            new_lines = hunk["new_lines"]
-
-            if start_idx < 0:
-                # Bare @@ hunk: match the removed/context lines anywhere in the file.
-                expected_clean = [line.rstrip('\r\n') for line in hunk.get("old_lines", [])]
-                if not expected_clean:
-                    # Pure addition with no anchor: append at the end of the file.
-                    content.extend(new_lines)
-                    applied_hunks += 1
-                    continue
-                found = -1
-                window_len = len(expected_clean)
-                for k in range(len(content) - window_len + 1):
-                    window = [line.rstrip('\r\n') for line in content[k:k + window_len]]
-                    if window == expected_clean:
-                        found = k
-                        break
-                if found < 0:
-                    applied.append(f"SKIPPED {path} hunk (no match for removed lines)")
-                    continue
-                start_idx = found
-                old_count = window_len
-
-            if start_idx + old_count > len(content):
-                old_count = len(content) - start_idx
-            if old_count < 0:
-                old_count = 0
-
-            existing = content[start_idx:start_idx + old_count]
-            expected = hunk.get("old_lines", [])
-            existing_clean = [line.rstrip('\r\n') for line in existing]
-            expected_clean = [line.rstrip('\r\n') for line in expected]
-            if expected and existing_clean != expected_clean:
-                applied.append(f"SKIPPED {path} hunk at line {hunk['start']} (context mismatch)")
-                continue
-
-            content[start_idx:start_idx + old_count] = new_lines
-            applied_hunks += 1
+            ok, message = _apply_hunk(content, hunk, path)
+            if ok:
+                applied_hunks += 1
+            elif message:
+                applied.append(message)
 
         if applied_hunks == 0 and sec["hunks"]:
             # Nothing matched — report failure so the model can retry instead of
@@ -3871,7 +4455,15 @@ def _apply_unified_diff(patch_text):
     return {"success": True, "output": "\n".join(applied), "error": None}
 
 
-def _tool_handle_apply_patch(self, args):
+def _tool_handle_apply_patch(self, args: dict) -> dict:
+    """Apply a unified diff (or OpenCode markers) to the filesystem.
+
+    Args:
+        args: Tool arguments with "patch_text".
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
     patch_text = args["patch_text"]
     if not patch_text.strip():
         return {"success": False, "output": "", "error": "patch_text must not be empty"}
@@ -3899,14 +4491,21 @@ TOOL_ARG_ALIASES = {
 
 class ToolRegistry:
     """Registers and executes agentic tools with confirmation support.
-    
+
     Call map:
       get_system_prompt_block() → AGENTIC_TOOL_DEFS
       execute() → _confirm() then handler
       list_tools_str() → AGENTIC_TOOL_DEFS
     """
 
-    def __init__(self, ctx=None, executor=None):
+    def __init__(self, ctx: Optional['CommandContext'] = None,
+                 executor: Optional[Executor] = None) -> None:
+        """Initialize the tool registry with context and executor.
+
+        Args:
+            ctx: Shared CommandContext (used for auto-confirm + path ACL).
+            executor: Executor for run_python/run_command (defaults to a new one).
+        """
         self._ctx = ctx
         self.executor = executor or Executor()
         self._handlers = {
@@ -3939,6 +4538,7 @@ class ToolRegistry:
         return "\n".join(lines)
 
     def list_tools_str(self) -> str:
+        """Format the tool list for /listtool display."""
         lines = []
         for name, defn in AGENTIC_TOOL_DEFS.items():
             destructive = "! " if name in DESTRUCTIVE_TOOLS else "  "
@@ -3946,6 +4546,15 @@ class ToolRegistry:
         return "\n".join(lines)
 
     def _confirm(self, tool_name: str, args: dict) -> bool:
+        """Ask the user before running a destructive tool (unless auto-confirm).
+
+        Args:
+            tool_name: Name of the tool to run.
+            args: The tool's arguments (shown in the prompt).
+
+        Returns:
+            True if the tool may run.
+        """
         if tool_name not in DESTRUCTIVE_TOOLS:
             return True
         if self._ctx and self._ctx.auto_confirm:
@@ -3959,6 +4568,15 @@ class ToolRegistry:
             return False
 
     def execute(self, tool_name: str, args: dict) -> dict:
+        """Dispatch a tool call to its handler with alias normalization + confirmation.
+
+        Args:
+            tool_name: Name of the tool to execute.
+            args: Tool argument dict.
+
+        Returns:
+            {"success": bool, "output": str, "error": str|None}.
+        """
         if tool_name not in self._handlers:
             return {"success": False, "output": "", "error": f"Unknown tool '{tool_name}'"}
         # Normalize argument name aliases (e.g. "path" -> "file")
@@ -3985,10 +4603,10 @@ class ToolRegistry:
 
 class AgenticLogger:
     """Logs agentic session turns to a structured JSONL file.
-    
+
     Automatically cleans up log files older than AGENTIC_LOG_RETENTION_DAYS
     (default 1) on initialization to prevent unbounded disk growth.
-    
+
     Call map:
       __init__() → _cleanup_old_logs()
       write() → appends JSONL line
@@ -3997,7 +4615,8 @@ class AgenticLogger:
 
     AGENTIC_LOG_RETENTION_DAYS = 1
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Open a fresh timestamped JSONL log after pruning old ones."""
         log_dir = os.path.expanduser("~/.ollamaquery.d/agentic")
         os.makedirs(log_dir, exist_ok=True)
         self._cleanup_old_logs(log_dir)
@@ -4017,12 +4636,18 @@ class AgenticLogger:
         except OSError:
             pass
 
-    def write(self, **data):
+    def write(self, **data: dict) -> None:
+        """Append a JSONL entry with a timestamp.
+
+        Args:
+            **data: Arbitrary fields to log (type, iteration, model_response, ...).
+        """
         data["timestamp"] = datetime.now().isoformat()
         self.file.write(json.dumps(data, default=str) + "\n")
         self.file.flush()
 
-    def close(self):
+    def close(self) -> None:
+        """Flush and close the log file."""
         self.file.close()
 
 
@@ -4032,73 +4657,87 @@ class AgenticLogger:
 
 class DebugManager:
     """Manages per-category debug levels.
-    
+
     Call map:
       set_level() → is_enabled() / should_log()
       get_status() → get_level()
     """
-    
+
     CATEGORIES = {
         'network':    "HTTP requests/responses to LLM server",
         'payload':    "Full JSON payloads sent to server",
         'response':   "Response content and chunks from server",  # ← ADD THIS
-        'stream':     "Streaming chunks received from server", 
+        'stream':     "Streaming chunks received from server",
         'context':    "Token estimation and message context details",
         'thinking':   "Thinking/reasoning block extraction",
         'commands':   "Command processing internals",
         'urlfetch':   "URL fetching and HTML conversion",
         'all':        "Master toggle for everything",
     }
-    
+
 
     VALID_LEVELS = {
-        'off': 0, 
-        'basic': 1, 
-        'verbose': 2, 
+        'off': 0,
+        'basic': 1,
+        'verbose': 2,
         'trace': 3
     }
-    
-    def __init__(self):
+
+    def __init__(self) -> None:
+        """Initialize per-category debug levels to off."""
         # Each category stores its own level
         self._levels: Dict[str, int] = {cat: 0 for cat in self.CATEGORIES}
-    
+
     def is_enabled(self, category: str) -> bool:
         """Quick check if any debugging is active for this category."""
         return self.get_level(category) > 0
 
 
     def set_level(self, category: str, level: str) -> bool:
-        """Set debug level for a category. Returns True if valid."""
+        """Set debug level for a category. Returns True if valid.
+
+        Args:
+            category: Debug category name (or 'all').
+            level: One of off/basic/verbose/trace.
+
+        Returns:
+            True if the level was applied.
+        """
         if category not in self.CATEGORIES:
             return False
         if level.lower() not in self.VALID_LEVELS:
             return False
-        
+
         level_int = self.VALID_LEVELS[level.lower()]
-        
+
         if category == 'all':
             for cat in self.CATEGORIES:
                 self._levels[cat] = level_int
         else:
             self._levels[category] = level_int
         return True
-    
+
     def get_level(self, category: str) -> int:
         """Get current level. All respects the 'all' category master."""
         master = self._levels.get('all', 0)
         specific = self._levels.get(category, 0)
         return max(master, specific)
-    
+
     def should_log(self, category: str, min_level: int = 1) -> bool:
-        """Check if a debug message should be emitted."""
+        """Check if a debug message should be emitted.
+
+        Args:
+            category: Debug category name.
+            min_level: Minimum level required to emit.
+        """
         return self.get_level(category) >= min_level
 
 
     def get_status(self) -> dict:
         """Return current state for status display."""
         return {
-            cat: level 
-            for cat, level in self._levels.items() 
+            cat: level
+            for cat, level in self._levels.items()
             if level > 0 or cat == 'all'
         }
 
@@ -4106,11 +4745,11 @@ class DebugManager:
 
 
 
-def debug_log(debug_mgr, category: str, level: int, message: str, 
-              data=None, prefix: str = "DEBUG"):
+def debug_log(debug_mgr: 'DebugManager', category: str, level: int, message: str,
+              data: object = None, prefix: str = "DEBUG") -> None:
     """
     Central debug logging function.
-    
+
     Args:
         debug_mgr: The DebugManager instance
         category: Which subsystem this belongs to
@@ -4121,12 +4760,12 @@ def debug_log(debug_mgr, category: str, level: int, message: str,
     """
     if not debug_mgr.should_log(category, level):
         return
-    
+
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    
+
     # Build output
     output = f"[{prefix}:{category}:{timestamp}] {message}"
-    
+
     if data is not None and debug_mgr.get_level(category) >= 2:
         if isinstance(data, (dict, list)):
             formatted = json.dumps(data, indent=2, default=str)
@@ -4136,7 +4775,7 @@ def debug_log(debug_mgr, category: str, level: int, message: str,
             output += f"\n{data[:500]!r}"
         else:
             output += f" | {data}"
-    
+
     sys.stderr.write(colorize(f"{output}\n", 'muted'))
 
 
@@ -4146,7 +4785,7 @@ def debug_log(debug_mgr, category: str, level: int, message: str,
 
 class ModelQuery:
     """Unified query handler for both Ollama and Llama.cpp backends.
-    
+
     Call map:
       query_stream() → _build_stream_request() → build_request_payload()
                       → _parse_chunk() → _normalize_llamacpp_usage()
@@ -4158,7 +4797,15 @@ class ModelQuery:
       calculate_stats() → print_stats_display()
     """
 
-    def __init__(self, base_url=None, backend=None, context=None):
+    def __init__(self, base_url: Optional[str] = None, backend: Optional[str] = None,
+                 context: Optional['CommandContext'] = None) -> None:
+        """Initialize the query handler with a context (or legacy connection args).
+
+        Args:
+            base_url: Legacy: backend base URL (when context is None).
+            backend: Legacy: backend name (when context is None).
+            context: Shared CommandContext; preferred over base_url/backend.
+        """
         if context is not None:
             self.ctx = context
         elif base_url is not None:
@@ -4170,16 +4817,16 @@ class ModelQuery:
             # Fallback: use global CommandContext
             self.ctx = CommandContext()
 
-    def _debug_request(self, url: str, payload: dict, headers: dict = None):
+    def _debug_request(self, url: str, payload: dict, headers: dict = None) -> None:
         """Log outgoing request to LLM server."""
         debug_mgr = self.ctx.debug_manager
-        
+
         if not debug_mgr or not payload:
             return
-        
+
         if headers is None:
             headers = {'Content-Type': 'application/json'}
-        
+
         if debug_mgr.should_log('network', 1):
             try:
                 payload_size = len(json.dumps(payload))
@@ -4188,83 +4835,97 @@ class ModelQuery:
                          prefix="HTTP→")
             except Exception:
                 pass  # Silently fail debug logging
-        
+
         if debug_mgr.should_log('payload', 1):
             try:
                 # Create a safe copy for logging (mask large base64 data)
                 safe_payload = self._mask_payload(payload)
                 model_name = payload.get('model', '?') if isinstance(payload, dict) else '?'
                 msg_count = len(payload.get('messages', [])) if isinstance(payload, dict) else 0
-                
+
                 debug_log(debug_mgr, 'payload', 1,
                          f"Sending to model '{model_name}' | {msg_count} messages",
                          safe_payload,
                          prefix="PAYLOAD")
             except Exception:
                 pass  # Silently fail debug logging
- 
-    def _debug_response_chunk(self, chunk: dict, is_first: bool = False, is_final: bool = False, *args, **kwargs):
-        """Log incoming streaming chunk."""
+
+    def _debug_response_chunk(self, chunk: dict, is_first: bool = False, is_final: bool = False, *args: tuple, **kwargs: dict) -> None:
+        """Log incoming streaming chunk.
+
+        Args:
+            chunk: The raw chunk dict.
+            is_first: Whether this is the first chunk of the stream.
+            is_final: Whether this is the final chunk.
+            *args, **kwargs: Ignored (API compatibility).
+        """
         debug_mgr = self.ctx.debug_manager
-        
+
         if not debug_mgr or chunk is None:
             return
-        
+
         try:
             if is_first and debug_mgr.should_log('network', 1):
                 debug_log(debug_mgr, 'network', 1, "Stream started", prefix="HTTP←")
-            
+
             if debug_mgr.should_log('stream', 1) and is_final:
                 debug_log(debug_mgr, 'stream', 1, "Stream completed", prefix="HTTP←")
-            
+
             # --- ADD: Response content debugging ---
             if debug_mgr.should_log('response', 1):
                 message = chunk.get('message', {}) if isinstance(chunk, dict) else {}
                 content = message.get('content', '') if isinstance(message, dict) else ''
                 thought = message.get('thought', '') or message.get('thinking', '') if isinstance(message, dict) else ''
-                
+
                 if content or thought:
                     debug_log(debug_mgr, 'response', 1,
                              f"Content: '{content[:50]}...' " if content else "Thinking block",
                              prefix="RESP")
             # --------------------------------------
-            
+
             if debug_mgr.should_log('stream', 2) and not is_final:
                 # Show chunk structure without flooding the terminal
                 message = chunk.get('message', {}) if isinstance(chunk, dict) else {}
                 content = message.get('content', '') if isinstance(message, dict) else ''
-                
+
                 if content and isinstance(content, str):
                     preview = content[:100] + ('...' if len(content) > 100 else '')
-                    debug_log(debug_mgr, 'stream', 2, 
+                    debug_log(debug_mgr, 'stream', 2,
                              f"Content chunk: '{preview}'", prefix="CHUNK")
         except Exception:
             pass  # Silently fail debug logging
-       
-    def _debug_final_stats(self, usage_stats: dict):
+
+    def _debug_final_stats(self, usage_stats: dict) -> None:
         """Log final usage statistics from server."""
         debug_mgr = self.ctx.debug_manager
-        
+
         if not debug_mgr or usage_stats is None:
             return
-        
+
         try:
             if debug_mgr.should_log('network', 1):
-                debug_log(debug_mgr, 'network', 1, 
-                         "Response complete with usage stats", 
+                debug_log(debug_mgr, 'network', 1,
+                         "Response complete with usage stats",
                          usage_stats, prefix="HTTP←")
         except Exception:
             pass  # Silently fail debug logging
-    
+
     def _mask_payload(self, payload: dict) -> dict:
-        """Replace large binary data with size indicators for logging."""
+        """Replace large binary data with size indicators for logging.
+
+        Args:
+            payload: The request payload to sanitize.
+
+        Returns:
+            A deep copy of the payload with images replaced by size indicators.
+        """
         if payload is None:
             return {}
-        
+
         try:
             # Deep copy to avoid modifying the original
             safe = json.loads(json.dumps(payload))
-            
+
             if isinstance(safe, dict):
                 for msg in safe.get('messages', []):
                     if isinstance(msg, dict) and 'images' in msg and msg['images']:
@@ -4272,56 +4933,72 @@ class ModelQuery:
                             f"<base64_image: {len(img)} bytes>" if isinstance(img, str) else "<binary_image>"
                             for img in msg['images']
                         ]
-            
+
             return safe
         except Exception:
             return {"error": "Could not mask payload for logging"}
-    
-    
-   
+
+
+
 
     @property
-    def base_url(self):
+    def base_url(self) -> str:
+        """The backend base URL from the shared context."""
         return self.ctx.base_url
-    
+
     @property
-    def backend(self):
+    def backend(self) -> str:
+        """The active backend name from the shared context."""
         return self.ctx.backend
 
-    def _get_headers(self):
-        """Build request headers, injecting API key for cloud backends."""
+    def _get_headers(self) -> dict:
+        """Build request headers, injecting API key for cloud backends.
+
+        Returns:
+            Dict of HTTP headers for the request.
+        """
         headers = {'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'}
         if self.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek") and self.ctx.api_key:
             headers['Authorization'] = f'Bearer {self.ctx.api_key}'
         return headers
 
-    def estimate_tokens(self, text):
+    def estimate_tokens(self, text: str) -> int:
         """Estimate token count. Delegates to CommandContext."""
         return self.ctx.estimate_tokens(text)
 
-    def calculate_context_tokens(self, messages):
+    def calculate_context_tokens(self, messages: list) -> int:
         """Calculate estimated total tokens in conversation context. Delegates to CommandContext."""
         return self.ctx.calculate_context_tokens(messages)
 
-    def calculate_stats(self, total_time, content, usage=None, messages=None):
-        """Calculate stats for current query AND update cumulative totals in context."""
+    def calculate_stats(self, total_time: float, content: str, usage: Optional[dict] = None, messages: Optional[list] = None) -> dict:
+        """Calculate stats for current query AND update cumulative totals in context.
+
+        Args:
+            total_time: Wall-clock seconds for the query.
+            content: The response text.
+            usage: Optional server usage dict.
+            messages: Optional message list for context-token fallback.
+
+        Returns:
+            dict of eval_count/prompt_eval_count/total_context_tokens/total_time/tps/content_length.
+        """
         eval_count = 0
         prompt_tokens = 0
         total_context_tokens = 0
-        
+
         if usage:
             eval_count = usage.get("completion_tokens", 0) or usage.get("eval_count", 0)
             prompt_tokens = usage.get("prompt_tokens", 0) or usage.get("prompt_eval_count", 0)
             total_context_tokens = usage.get("total_tokens", 0) or (prompt_tokens + eval_count)
-        
+
         if not total_context_tokens and messages:
             total_context_tokens = self.calculate_context_tokens(messages)
 
         if not eval_count and content:
             eval_count = len(content.split())
-    
+
         tps = eval_count / total_time if eval_count > 0 and total_time > 0 else 0.0
-        
+
         current_stats = {
             "eval_count": eval_count,
             "prompt_eval_count": prompt_tokens,
@@ -4332,15 +5009,19 @@ class ModelQuery:
         }
 
         return current_stats
-    
 
-    def print_stats_display(self, stats):
-        """Print formatted stats to stderr."""
+
+    def print_stats_display(self, stats: dict) -> None:
+        """Print formatted stats to stderr.
+
+        Args:
+            stats: Stats dict from calculate_stats().
+        """
         if not stats:
             return
-            
+
         parts = [f"{stats['total_time']:.2f}s total"]
-        
+
         if stats.get("eval_count", 0) > 0:
             parts.append(f"{stats['tps']:.2f} t/s")
             ctx = self.ctx.current_context_tokens
@@ -4351,13 +5032,18 @@ class ModelQuery:
             parts.append(f"Context: {ctx} tokens")
         else:
             parts.append(f"Content: {stats.get('content_length', 0)} chars")
-        
+
         sys.stderr.write(colorize(f"\n--- Stats: {' | '.join(parts)} ---\n", 'muted'))
- 
+
 
     @staticmethod
-    def _inject_images_into_messages(messages, images, backend):
+    def _inject_images_into_messages(messages: list, images: Optional[list], backend: str) -> None:
         """Inject image data into the last user message, mutating in-place.
+
+        Args:
+            messages: Message list (mutated in place).
+            images: List of base64 image strings.
+            backend: Backend name for shape selection.
 
         Ollama backend: sets messages[-1]["images"] = images list.
         OpenAI-compatible backends (llamacpp, lmstudio): embeds images as
@@ -4375,56 +5061,97 @@ class ModelQuery:
                 content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img}"}})
             messages[-1]["content"] = content_parts
 
-    def build_request_payload(self, messages, model, stream_enabled=False, **kwargs):
-        """Build request payload for the backend."""
+    @staticmethod
+    def _apply_backend_inference_params(payload: dict, backend: str, kwargs: dict) -> None:
+        """Copy the backend-supported inference params from kwargs into the payload.
+
+        Args:
+            payload: The payload dict (mutated in place).
+            backend: Backend name (controls which params are supported).
+            kwargs: The kwargs dict (images/tools/params/etc.).
+        """
+        if backend == "llamacpp":
+            params = ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]
+        elif backend == "lmstudio":
+            params = ["temperature", "top_p", "presence_penalty", "repeat_penalty"]
+        elif backend in ("gemini", "opencodezen", "opencodego"):
+            params = ["temperature", "top_p", "top_k"]
+        elif backend in ("mistral", "deepseek"):
+            params = ["temperature", "top_p"]
+        else:
+            params = []
+        for param in params:
+            if param in kwargs:
+                payload[param] = kwargs[param]
+
+    def _apply_size_options(self, payload: dict, backend: str, kwargs: dict) -> None:
+        """Apply warmup/context-size options to the payload.
+
+        Args:
+            payload: The payload dict (mutated in place).
+            backend: Backend name.
+            kwargs: The kwargs dict.
+        """
+        if kwargs.get('is_warmup'):
+            if backend == "ollama":
+                payload["options"] = {"num_predict": 1}
+            elif backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+                payload["max_tokens"] = 1
+        elif context_size := kwargs.get('context_size'):
+            if backend == "ollama":
+                payload["options"] = {"num_ctx": context_size}
+            elif backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+                payload["max_tokens"] = context_size
+
+    def build_request_payload(self, messages: list, model: str, stream_enabled: bool = False, **kwargs: dict) -> dict:
+        """Build request payload for the backend.
+
+        Args:
+            messages: Message list to send.
+            model: Model name.
+            stream_enabled: Whether to request streaming.
+            **kwargs: images, tools, context_size, is_warmup, inference params.
+
+        Returns:
+            The JSON payload dict.
+        """
         self._inject_images_into_messages(messages, kwargs.get('images'), self.backend)
-        
+
         payload = {
             "model": model,
             "messages": messages,
             "stream": stream_enabled
         }
-        
-        if kwargs.get('is_warmup'):
-            if self.backend == "ollama":
-                payload["options"] = {"num_predict": 1}
-            elif self.backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-                payload["max_tokens"] = 1
-        elif context_size := kwargs.get('context_size'):
-            if self.backend == "ollama":
-                payload["options"] = {"num_ctx": context_size}
-            elif self.backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-                payload["max_tokens"] = context_size
-        
+
+        self._apply_size_options(payload, self.backend, kwargs)
+
         if tools := kwargs.get('tools'):
             payload["tools"] = tools
-        
-        # Pass inference params for backend
-        if self.backend == "llamacpp":
-            for param in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]:
-                if param in kwargs:
-                    payload[param] = kwargs[param]
-        elif self.backend == "lmstudio":
-            for param in ["temperature", "top_p", "presence_penalty", "repeat_penalty"]:
-                if param in kwargs:
-                    payload[param] = kwargs[param]
-        elif self.backend in ("gemini", "opencodezen", "opencodego"):
-            for param in ["temperature", "top_p", "top_k"]:
-                if param in kwargs:
-                    payload[param] = kwargs[param]
-        elif self.backend in ("mistral", "deepseek"):
-            for param in ["temperature", "top_p"]:
-                if param in kwargs:
-                    payload[param] = kwargs[param]
+
+        self._apply_backend_inference_params(payload, self.backend, kwargs)
 
         return payload
 
-    def _get_chat_url(self, backend):
-        """Return the chat API URL for the given backend."""
+    def _get_chat_url(self, backend: str) -> str:
+        """Return the chat API URL for the given backend.
+
+        Args:
+            backend: Backend name ("ollama" uses /api/chat, others use /v1/chat/completions).
+        """
         return f"{self.base_url}/api/chat" if backend == "ollama" else f"{self.base_url}/v1/chat/completions"
 
-    def query_sync(self, messages, model, stream_enabled=False, **kwargs):
-        """Non-streaming sync query wrapper."""
+    def query_sync(self, messages: list, model: str, stream_enabled: bool = False, **kwargs: dict) -> dict:
+        """Non-streaming sync query wrapper.
+
+        Args:
+            messages: Message list to send.
+            model: Model name.
+            stream_enabled: Unused (always False for sync).
+            **kwargs: Passed to build_request_payload.
+
+        Returns:
+            Parsed JSON response dict.
+        """
         payload = self.build_request_payload(messages, model, stream_enabled=False, **kwargs)
 
         try:
@@ -4448,8 +5175,13 @@ class ModelQuery:
             return {"error": {"message": str(e), "type": type(e).__name__}}
 
     @staticmethod
-    def _accumulate_stream_tool_calls(tool_calls, tool_call_index, new_calls):
+    def _accumulate_stream_tool_calls(tool_calls: list, tool_call_index: dict, new_calls: list) -> None:
         """Merge incremental tool-call chunks into `tool_calls` and `tool_call_index`.
+
+        Args:
+            tool_calls: List to append full-object tool calls to.
+            tool_call_index: Dict mapping index → partial tool call dict.
+            new_calls: The new tool calls from a chunk.
 
         Handles both OpenAI-compatible deltas (arguments accumulate as strings, keyed by
         `index`) and Ollama full-object tool calls (no `index`, arguments already a dict).
@@ -4485,8 +5217,17 @@ class ModelQuery:
                 if "arguments" in fn_delta and fn_delta["arguments"]:
                     existing["function"]["arguments"] += fn_delta["arguments"]
 
-    def _synthesize_sync_response(self, content, thinking, tool_calls, usage):
+    def _synthesize_sync_response(self, content: str, thinking: str, tool_calls: list, usage: dict) -> dict:
         """Build a non-streaming-shaped response dict from aggregated stream chunks.
+
+        Args:
+            content: Aggregated assistant text.
+            thinking: Aggregated reasoning/thinking text.
+            tool_calls: Accumulated native tool calls.
+            usage: Aggregated usage dict.
+
+        Returns:
+            A sync-shaped response dict for the current backend.
 
         Mirrors the shape returned by `query_sync` for the current backend so callers
         (e.g. the ReAct loop) can parse it identically.
@@ -4525,7 +5266,60 @@ class ModelQuery:
             }
         return resp
 
-    def query_sync_stream(self, messages, model, stream_enabled=True, **kwargs):
+    def _aggregate_sync_stream(self, req: Request, backend: str, socket_timeout: float,
+                               on_chunk: object, cancel: Optional[dict] = None) -> tuple:
+        """Read a streaming response and aggregate content/thinking/tools/usage.
+
+        Args:
+            req: The prepared urllib Request.
+            backend: Backend name.
+            socket_timeout: Socket timeout for the request.
+            on_chunk: Optional per-chunk callback (thought, content, is_final).
+            cancel: Optional {"event", "close"} cancel token dict.
+
+        Returns:
+            (full_content, full_thinking, tool_calls, tool_call_index, usage),
+            or None when the request was cancelled.
+        """
+        full_content = ""
+        full_thinking = ""
+        tool_calls = []          # ordered, deduped accumulated tool calls
+        tool_call_index = {}     # index -> partial tool call dict
+        usage = {}
+        try:
+            with _request_with_retry(req, timeout=socket_timeout) as response:
+                if cancel is not None and hasattr(response, 'close'):
+                    # Expose a close callback so a ^C (or timeout retry) on the
+                    # calling thread can abort this blocked stream read promptly.
+                    cancel["close"] = response.close
+                for raw_line in self._iter_stream_lines(response, backend):
+                    if cancel is not None and cancel["event"].is_set():
+                        return None
+                    try:
+                        chunk = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    thought, content, is_final, u, tcs = self._parse_chunk(chunk, backend)
+                    if thought:
+                        full_thinking += thought
+                    if content:
+                        full_content += content
+                    if tcs:
+                        self._accumulate_stream_tool_calls(tool_calls, tool_call_index, tcs)
+                    if u:
+                        usage.update(u)
+                    if on_chunk:
+                        on_chunk(thought, content, is_final)
+        except Exception as e:
+            if cancel is not None and cancel["event"].is_set():
+                # User aborted (^C) or a timeout retry superseded this request —
+                # return quietly instead of spamming an error line.
+                return None
+            sys.stderr.write(colorize(f"[ERROR] {backend} sync stream failed: {e}\n", 'error'))
+            return {"error": {"message": str(e), "type": type(e).__name__}}
+        return full_content, full_thinking, tool_calls, tool_call_index, usage
+
+    def query_sync_stream(self, messages: list, model: str, stream_enabled: bool = True, **kwargs: dict) -> dict:
         """Streaming variant of `query_sync` that aggregates chunks into a single dict.
 
         Performs a streaming request and synthesizes a non-streaming-shaped response
@@ -4550,12 +5344,6 @@ class ModelQuery:
         cancel = kwargs.pop("cancel", None)
         backend = self.backend
 
-        full_content = ""
-        full_thinking = ""
-        tool_calls = []          # ordered, deduped accumulated tool calls
-        tool_call_index = {}     # index -> partial tool call dict
-        usage = {}
-
         if images and messages and messages[-1].get("role") == "user":
             messages[-1] = dict(messages[-1])
             self._inject_images_into_messages(messages, images, backend)
@@ -4567,37 +5355,12 @@ class ModelQuery:
         req = Request(api_url, data=data, headers=headers)
         self._debug_request(api_url, payload)
 
-        try:
-            with _request_with_retry(req, timeout=socket_timeout) as response:
-                if cancel is not None and hasattr(response, 'close'):
-                    # Expose a close callback so a ^C (or timeout retry) on the
-                    # calling thread can abort this blocked stream read promptly.
-                    cancel["close"] = response.close
-                for raw_line in self._iter_stream_lines(response, backend):
-                    if cancel is not None and cancel["event"].is_set():
-                        break
-                    try:
-                        chunk = json.loads(raw_line)
-                    except json.JSONDecodeError:
-                        continue
-                    thought, content, is_final, u, tcs = self._parse_chunk(chunk, backend)
-                    if thought:
-                        full_thinking += thought
-                    if content:
-                        full_content += content
-                    if tcs:
-                        self._accumulate_stream_tool_calls(tool_calls, tool_call_index, tcs)
-                    if u:
-                        usage.update(u)
-                    if on_chunk:
-                        on_chunk(thought, content, is_final)
-        except Exception as e:
-            if cancel is not None and cancel["event"].is_set():
-                # User aborted (^C) or a timeout retry superseded this request —
-                # return quietly instead of spamming an error line.
-                return {"error": {"message": "cancelled", "type": "KeyboardInterrupt"}}
-            sys.stderr.write(colorize(f"[ERROR] {backend} sync stream failed: {e}\n", 'error'))
-            return {"error": {"message": str(e), "type": type(e).__name__}}
+        result = self._aggregate_sync_stream(req, backend, socket_timeout, on_chunk, cancel)
+        if isinstance(result, dict):  # error dict
+            return result
+        if result is None:  # cancelled
+            return {"error": {"message": "cancelled", "type": "KeyboardInterrupt"}}
+        full_content, full_thinking, tool_calls, tool_call_index, usage = result
 
         for idx in sorted(tool_call_index):
             tc = tool_call_index[idx]
@@ -4619,38 +5382,59 @@ class ModelQuery:
         Returns dict with standardized keys: total_tokens, prompt_tokens, completion_tokens
         """
         usage = {}
-        
+
         # Format 1: Standard OpenAI-style usage block
         if "usage" in chunk and chunk["usage"]:
             u = chunk["usage"]
             usage["prompt_tokens"] = u.get("prompt_tokens", 0)
             usage["completion_tokens"] = u.get("completion_tokens", 0)
-            usage["total_tokens"] = u.get("total_tokens", 
+            usage["total_tokens"] = u.get("total_tokens",
                                            usage["prompt_tokens"] + usage["completion_tokens"])
-        
+
         # Format 2: Llama.cpp timings block (your server uses this)
         if "timings" in chunk:
             t = chunk["timings"]
             usage["prompt_tokens"] = t.get("prompt_n", 0)
             usage["completion_tokens"] = t.get("predicted_n", 0)
             usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-        
+
         # Format 3: Root-level fields (some versions)
         if "prompt_eval_count" in chunk:
             usage["prompt_tokens"] = usage.get("prompt_tokens", 0) or chunk.get("prompt_eval_count", 0)
         if "eval_count" in chunk:
             usage["completion_tokens"] = usage.get("completion_tokens", 0) or chunk.get("eval_count", 0)
             usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-        
+
         return usage if usage else None
 
-    def _build_stream_request(self, backend, messages, model, stream_enabled, context_size, **kwargs):
-        """Build URL, payload and headers for the backend."""
+    def _build_stream_request(self, backend: str, messages: list, model: str,
+                              stream_enabled: bool, context_size: Optional[int], **kwargs: dict) -> tuple:
+        """Build URL, payload and headers for the backend.
+
+        Args:
+            backend: Backend name.
+            messages: Message list to send.
+            model: Model name.
+            stream_enabled: Whether streaming was requested.
+            context_size: Context window size (or None).
+            **kwargs: Extra payload args.
+
+        Returns:
+            (api_url, payload, headers) tuple.
+        """
         payload = self.build_request_payload(messages, model, stream_enabled=stream_enabled, context_size=context_size, **kwargs)
         return self._get_chat_url(backend), payload, self._get_headers()
 
-    def _parse_chunk(self, chunk, backend):
-        """Extract (thought, content, is_final, usage, tool_calls) from a chunk for any backend."""
+    def _parse_chunk(self, chunk: dict, backend: str) -> tuple:
+        """Extract (thought, content, is_final, usage, tool_calls) from a chunk for any backend.
+
+        Args:
+            chunk: A parsed JSON chunk dict.
+            backend: Backend name for shape selection.
+
+        Returns:
+            (thought, content, is_final, usage, tool_calls) tuple.
+        """
         if backend == "ollama":
             thought = (chunk.get("message", {}).get("thought") or
                        chunk.get("message", {}).get("thinking")) or ""
@@ -4688,8 +5472,13 @@ class ModelQuery:
         else:
             raise ValueError(f"Unknown backend: {backend}")
 
-    def _iter_stream_lines(self, response, backend):
-        """Yield decoded JSON lines from streaming response, stripping SSE prefixes."""
+    def _iter_stream_lines(self, response: object, backend: str) -> tuple:
+        """Yield decoded JSON lines from streaming response, stripping SSE prefixes.
+
+        Args:
+            response: The streaming HTTP response object.
+            backend: Backend name (SSE stripping applies to non-ollama backends).
+        """
         for line in response:
             decoded = line.decode('utf-8').strip()
             if not decoded:
@@ -4701,8 +5490,14 @@ class ModelQuery:
                 continue
             yield decoded
 
-    def _update_context_tokens(self, backend, aggregated_usage, messages):
-        """Update context token tracking after stream completes."""
+    def _update_context_tokens(self, backend: str, aggregated_usage: dict, messages: list) -> None:
+        """Update context token tracking after stream completes.
+
+        Args:
+            backend: Backend name.
+            aggregated_usage: Accumulated usage dict from chunks.
+            messages: The message list (for recalc on KV-cache backends).
+        """
         if backend == "ollama":
             total_tokens = (aggregated_usage.get("total_tokens", 0) or
                            aggregated_usage.get("prompt_eval_count", 0) + aggregated_usage.get("eval_count", 0))
@@ -4719,17 +5514,113 @@ class ModelQuery:
             if messages:
                 self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(messages)
 
+    def _finalize_stream_tool_calls(self, stream_tool_call_index: dict) -> list:
+        """Consolidate incremental tool-call fragments into a list of complete calls.
+
+        Args:
+            stream_tool_call_index: Maps tool-call index -> partial tool call dict.
+
+        Returns:
+            list of {"id", "type", "function": {"name", "arguments"}} dicts.
+        """
+        stream_tool_calls = []
+        for idx in sorted(stream_tool_call_index):
+            tc = stream_tool_call_index[idx]
+            stream_tool_calls.append({
+                "id": tc["id"],
+                "type": tc["type"],
+                "function": {
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"]["arguments"],
+                }
+            })
+        return stream_tool_calls
+
+    @staticmethod
+    def _close_thinking_block(start_thinking: bool, started_content: bool) -> bool:
+        """Close an open `<thinking>` block, returning whether it was closed."""
+        if start_thinking and not started_content:
+            sys.stderr.write("\n</thinking>\n")
+            return True
+        return False
+
+    def _stream_error_detail(self, e: Exception, backend: str, model: str) -> str:
+        """Build a user-facing error message for a failed stream.
+
+        Adds backend-specific authentication hints for 403 responses.
+        """
+        msg = f"\n[ERROR] {backend} streaming failed: {e}"
+        if isinstance(e, HTTPError) and e.code == 403:
+            if backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+                env_hint = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+                msg += f"\n[HINT] {backend} authentication failed. Check your --api-key or {env_hint.get(backend, 'API_KEY')} env var."
+            elif ":cloud" in model:
+                msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
+        return msg
+
+    def _render_stream_chunk(self, chunk: dict, thought: str, content: str, is_final: bool,
+                             debug: bool, show_thinking: bool, display_state: dict) -> str:
+        """Render a parsed streaming chunk to the terminal (thinking + content).
+
+        Args:
+            chunk: The raw parsed chunk (for debug output).
+            thought: Reasoning text for this chunk.
+            content: Assistant text for this chunk.
+            is_final: Whether this is the final chunk.
+            debug: Print raw final JSON to stderr.
+            show_thinking: Display the thinking/reasoning block.
+            display_state: Mutable dict tracking start_thinking/started_content.
+
+        Returns:
+            The content text appended to the accumulator (may be "").
+        """
+        if debug and is_final:
+            formatted_json = json.dumps(chunk, indent=4)
+            sys.stderr.write(colorize(f"\n[DEBUG] Final JSON chunk from server:\n{formatted_json}\n", 'muted'))
+
+        # Thinking display
+        if thought and show_thinking:
+            if not display_state["start_thinking"]:
+                display_state["start_thinking"] = True
+                sys.stderr.write("\n<thinking>\n")
+            sys.stderr.write(thought)
+            sys.stderr.flush()
+
+        # Content display
+        if content:
+            if display_state["start_thinking"] and not display_state["started_content"]:
+                sys.stderr.write("\n</thinking>\n")
+
+            if not display_state["started_content"]:
+                print("\n[--- Response ---]", file=sys.stdout)
+                display_state["started_content"] = True
+
+            sys.stdout.write(content)
+            sys.stdout.flush()
+        return content
+
     def query_stream(
         self,
-        messages, model, stream_enabled=True, debug=False,
-        show_thinking=True, context_size=None, images=None,
-        tool_calls_out=None, **kwargs
-    ):
+        messages: list, model: str, stream_enabled: bool = True, debug: bool = False,
+        show_thinking: bool = True, context_size: Optional[int] = None, images: Optional[list] = None,
+        tool_calls_out: Optional[list] = None, **kwargs: dict
+    ) -> str:
         """Stream response from any backend. Dispatches to backend-specific chunk parsing.
-        
+
         Args:
+            messages: Message list to send.
+            model: Model name.
+            stream_enabled: Whether to request streaming.
+            debug: Print raw JSON chunks to stderr.
+            show_thinking: Display the thinking/reasoning block.
+            context_size: Optional context window size.
+            images: Optional list of base64 images.
             tool_calls_out: Optional list to populate with accumulated tool_calls from streaming.
                 For OpenAI-compatible streaming, incremental tool_calls are merged by index.
+            **kwargs: Extra payload args.
+
+        Returns:
+            The accumulated full response content.
         """
         full_content = ""
         start_time = time.time()
@@ -4746,8 +5637,7 @@ class ModelQuery:
         req = Request(api_url, data=data, headers=headers)
         self._debug_request(api_url, payload)
 
-        start_thinking = False
-        started_content = False
+        display_state = {"start_thinking": False, "started_content": False}
         first_chunk = True
         aggregated_usage = {}
         stream_tool_calls = []  # Accumulated tool calls from streaming (merged by index)
@@ -4773,51 +5663,19 @@ class ModelQuery:
                         if usage:
                             aggregated_usage.update(usage)
 
-                        if debug and is_final:
-                            formatted_json = json.dumps(chunk, indent=4)
-                            sys.stderr.write(colorize(f"\n[DEBUG] Final JSON chunk from server:\n{formatted_json}\n", 'muted'))
-
-                        # Thinking display
-                        if thought and show_thinking:
-                            if not start_thinking:
-                                start_thinking = True
-                                sys.stderr.write("\n<thinking>\n")
-                            sys.stderr.write(thought)
-                            sys.stderr.flush()
-
-                        # Content display
-                        if content:
-                            if start_thinking and not started_content:
-                                sys.stderr.write("\n</thinking>\n")
-
-                            if not started_content:
-                                print("\n[--- Response ---]", file=sys.stdout)
-                                started_content = True
-
-                            sys.stdout.write(content)
-                            sys.stdout.flush()
-                            full_content += content
+                        full_content += self._render_stream_chunk(
+                            chunk, thought, content, is_final, debug, show_thinking, display_state)
 
                     except json.JSONDecodeError:
                         continue
 
             # Finalize accumulated tool_calls
             if stream_tool_call_index:
-                for idx in sorted(stream_tool_call_index):
-                    tc = stream_tool_call_index[idx]
-                    stream_tool_calls.append({
-                        "id": tc["id"],
-                        "type": tc["type"],
-                        "function": {
-                            "name": tc["function"]["name"],
-                            "arguments": tc["function"]["arguments"],
-                        }
-                    })
+                stream_tool_calls = self._finalize_stream_tool_calls(stream_tool_call_index)
             if tool_calls_out is not None and stream_tool_calls:
                 tool_calls_out.extend(stream_tool_calls)
 
-            if start_thinking and not started_content:
-                sys.stderr.write("\n</thinking>\n")
+            self._close_thinking_block(display_state["start_thinking"], display_state["started_content"])
 
             total_time = time.time() - start_time
             self._update_context_tokens(backend, aggregated_usage, messages)
@@ -4828,14 +5686,7 @@ class ModelQuery:
             return full_content
 
         except Exception as e:
-            msg = f"\n[ERROR] {backend} streaming failed: {e}"
-            if isinstance(e, HTTPError) and e.code == 403:
-                if self.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-                    env_hint = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
-                    msg += f"\n[HINT] {self.backend} authentication failed. Check your --api-key or {env_hint.get(self.backend, 'API_KEY')} env var."
-                elif ":cloud" in model:
-                    msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
-            sys.stderr.write(colorize(f"{msg}\n", 'error'))
+            sys.stderr.write(colorize(f"{self._stream_error_detail(e, backend, model)}\n", 'error'))
             return full_content
 
 
@@ -4851,20 +5702,27 @@ class ChatCompleter:
     - Commands (/listmodel, /switchmodel, etc.)
     - Paths (for /cwd, /ls)
     - Model names
-    
+
     Call map:
       complete() → fetch_models() → fetch_models_ollama / fetch_models_llamacpp
                  → get_command_aliases() for command completion
     """
 
-    def __init__(self, base_url, backend, api_key=None):
+    def __init__(self, base_url: str, backend: str, api_key: Optional[str] = None) -> None:
+        """Initialize the completer with connection info and command aliases.
+
+        Args:
+            base_url: Backend API base URL.
+            backend: Backend name.
+            api_key: Optional API key for cloud backends.
+        """
         self.base_url = base_url
         self.backend = backend
         self.api_key = api_key
         self.commands = get_command_aliases()
         self.models = []
 
-    def fetch_models(self):
+    def fetch_models(self) -> None:
         """Fetch available models from the backend."""
         if self.backend == "llamacpp":
             self.models = [m['name'] for m in fetch_models_llamacpp(self.base_url)]
@@ -4874,8 +5732,16 @@ class ChatCompleter:
             self.models = [m['name'] for m in fetch_models_ollama(self.base_url)]
 
 
-    def complete(self, text, state):
-        """The core readline autocompletion hook."""
+    def complete(self, text: str, state: int) -> Optional[str]:
+        """The core readline autocompletion hook.
+
+        Args:
+            text: The token being completed.
+            state: Readline completion state (0-based).
+
+        Returns:
+            The completion candidate, or None when exhausted.
+        """
         buffer = readline.get_line_buffer()
 
         # 1. Model Autocompletion
@@ -4894,7 +5760,8 @@ class ChatCompleter:
             path = os.path.expanduser(path_input)
             dirname = os.path.dirname(path)
             basename = os.path.basename(path)
-            if not dirname: dirname = '.'
+            if not dirname:
+                dirname = '.'
 
             matches = []
             try:
@@ -4918,7 +5785,7 @@ class ChatCompleter:
         # 3. Command Autocompletion
         elif not text or text.startswith('/') or text in ['e', 'ex', 'exi', 'q', 'qu', 'qui']:
             matches = [c for c in self.commands if c.startswith(text)]
-            
+
         else:
             matches = []
 
@@ -4930,25 +5797,79 @@ class ChatCompleter:
 # ============================================================================
 
 
-def gather_user_input(prompt_prefix, show_multiline=True):
+def _make_input_prompts(prompt_prefix: str) -> tuple:
+    """Build (prompt, continuation) prompt strings for the current TTY style.
+
+    readline-aware terminals get a `> ` prompt; plain terminals a `: ` prompt.
+    """
+    if READLINE_AVAILABLE:
+        return (colorize(f"{prompt_prefix} > ", 'warning', is_prompt=True),
+                colorize("... > ", 'warning', is_prompt=True))
+    return (colorize(f"{prompt_prefix}: ", 'warning'),
+            colorize("... : ", 'warning'))
+
+
+def _remove_last_history_item() -> None:
+    """Drop the just-read line from readline history (used during multiline entry)."""
+    if READLINE_AVAILABLE:
+        try:
+            readline.remove_history_item(readline.get_current_history_length() - 1)
+        except Exception:
+            pass
+
+
+def _add_history(text: str) -> None:
+    """Add a completed multiline entry to readline history (skips empty text)."""
+    if READLINE_AVAILABLE and text:
+        readline.add_history(text)
+
+
+def _read_multiline_lines(cont_prompt: str, is_terminator: object, transform: object = lambda ln: ln,
+                          include_terminator: bool = False) -> Optional[list]:
+    """Read continuation lines until the terminator predicate fires.
+
+    Args:
+        cont_prompt: Prompt string shown for each continuation line.
+        is_terminator: Callable(line) -> bool; stops reading when True.
+        transform: Applied to each appended line (e.g. strip a trailing backslash).
+        include_terminator: If True, the terminating line is appended (transformed).
+
+    Returns:
+        list of str, or None if the user pressed Ctrl+C (cancelled).
+    """
+    lines = []
+    while True:
+        try:
+            m_line = input(cont_prompt)
+            _remove_last_history_item()
+            if is_terminator(m_line):
+                if include_terminator:
+                    lines.append(transform(m_line))
+                return lines
+            lines.append(transform(m_line))
+        except KeyboardInterrupt:
+            print(colorize("\n[Multiline entry cancelled]", 'warning'), file=sys.stderr)
+            return None
+
+
+def gather_user_input(prompt_prefix: str, show_multiline: bool = True) -> Optional[str]:
     """
     Gather user input with multiline support.
-    it support three double quote
-    it support backslash
+
+    Supports triple-quote (`\"\"\"`) block entry and backslash (`\\`) line
+    continuation. Returns the entered text, or None if the user cancelled
+    (double Ctrl+C) or closed input (double Ctrl+D / EOF).
+
+    Args:
+        prompt_prefix: String shown before the input prompt.
+        show_multiline: Whether to honor `\"\"\"` / `\\` multiline entry.
     """
     ctrl_c_count = 0
     ctrl_d_count = 0
 
     while True:
         try:
-            # Setup prompts
-            if READLINE_AVAILABLE:
-                prompt_str = colorize(f"{prompt_prefix} > ", 'warning',is_prompt=True)
-                cont_prompt_str = colorize(f"... > ", 'warning', is_prompt=True)
-            else:
-                prompt_str = colorize(f"{prompt_prefix}: ", 'warning')
-                cont_prompt_str = colorize(f"... : ", 'warning')
-
+            prompt_str, cont_prompt_str = _make_input_prompts(prompt_prefix)
             line = input(prompt_str)
             ctrl_c_count = 0
 
@@ -4957,48 +5878,26 @@ def gather_user_input(prompt_prefix, show_multiline=True):
 
             # 1. Handle """ Block Multiline
             if show_multiline and line.strip() == '"""':
-                lines = []
-                while True:
-                    try:
-                        m_line = input(cont_prompt_str)
-                        if READLINE_AVAILABLE:
-                            try:
-                                readline.remove_history_item(readline.get_current_history_length() - 1)
-                            except Exception:
-                                pass
-                        if m_line.strip() == '"""':
-                            break
-                        lines.append(m_line)
-                    except KeyboardInterrupt:
-                        print(colorize("\n[Multiline entry cancelled]", 'warning'), file=sys.stderr)
-                        return None # Escape out of multiline without quitting
+                lines = _read_multiline_lines(cont_prompt_str,
+                                              lambda ln: ln.strip() == '"""')
+                if lines is None:
+                    return None  # Escape out of multiline without quitting
                 result = "\n".join(lines)
-                if READLINE_AVAILABLE and result:
-                    readline.add_history(result)
+                _add_history(result)
                 return result
 
             # 2. Handle \ Line Continuation
             if line.endswith('\\'):
                 lines = [line[:-1]]  # Strip the trailing backslash
-                while True:
-                    try:
-                        m_line = input(cont_prompt_str)
-                        if READLINE_AVAILABLE:
-                            try:
-                                readline.remove_history_item(readline.get_current_history_length() - 1)
-                            except Exception:
-                                pass
-                        if m_line.endswith('\\'):
-                            lines.append(m_line[:-1])
-                        else:
-                            lines.append(m_line)
-                            break
-                    except KeyboardInterrupt:
-                        print(colorize("\n[Multiline entry cancelled]", 'warning'), file=sys.stderr)
-                        return None
-                result = "\n".join(lines)
-                if READLINE_AVAILABLE:
-                    readline.add_history(result)
+                tail = _read_multiline_lines(
+                    cont_prompt_str,
+                    lambda ln: not ln.endswith('\\'),
+                    transform=lambda ln: ln[:-1] if ln.endswith('\\') else ln,
+                    include_terminator=True)
+                if tail is None:
+                    return None
+                result = "\n".join(lines + tail)
+                _add_history(result)
                 return result
 
             # 3. Standard Single Line
@@ -5007,19 +5906,96 @@ def gather_user_input(prompt_prefix, show_multiline=True):
         except KeyboardInterrupt:
             ctrl_c_count += 1
             if ctrl_c_count >= 2:
-                print(f"\n[Cancelled]", file=sys.stderr)
+                print("\n[Cancelled]", file=sys.stderr)
                 return None
-            print(f"\n(Press Ctrl+C again to exit)", file=sys.stderr)
+            print("\n(Press Ctrl+C again to exit)", file=sys.stderr)
 
         except EOFError:
-            print(f"\n[EOF received, one more and it exits]", file=sys.stderr)
+            print("\n[EOF received, one more and it exits]", file=sys.stderr)
             ctrl_d_count += 1
             if ctrl_d_count >= 2:
-                print(f"\n[Exiting]", file=sys.stderr)
+                print("\n[Exiting]", file=sys.stderr)
                 sys.exit(1)
 
-def _process_file_inclusions(text):
-    """Scan text for @filepath mentions and load referenced files."""
+def _confirm_sensitive_inclusion(filepath: str) -> bool:
+    """Ask the user before including a sensitive file (sensitive path check + confirm).
+
+    Args:
+        filepath: The file path being included.
+
+    Returns:
+        True when the user confirmed inclusion.
+    """
+    print(colorize(f"[WARNING] Attempting to load sensitive file: {filepath}", 'warning'), file=sys.stderr)
+    print(colorize("  This could leak private data (keys, tokens, passwords) to the LLM.", 'warning'), file=sys.stderr)
+    try:
+        confirm = input(colorize("  Confirm file inclusion? [y/N] ", 'warning', is_prompt=True)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        confirm = 'n'
+    if confirm != 'y':
+        print(colorize(f"[Skipped: {filepath}]", 'warning'), file=sys.stderr)
+        return False
+    return True
+
+
+def _load_file_inclusion(expanded_path: str, filepath: str) -> Optional[str]:
+    """Read a file and return its inclusion block (with token-count info).
+
+    Args:
+        expanded_path: ~-expanded absolute path to read.
+        filepath: Display path (from the user's @ mention).
+
+    Returns:
+        The formatted inclusion text, an error message, or None when skipped.
+    """
+    print(colorize(f"[--- Loading file: {filepath} ---]", 'muted'), file=sys.stderr)
+    try:
+        with open(expanded_path, 'r', encoding='utf-8') as f:
+            file_content = f.read()
+
+        lines_count = len(file_content.splitlines())
+        char_count = len(file_content)
+        word_count = len(file_content.split())
+
+        token_count = 0
+        token_method = "api"
+        if CommandContext._initialized:
+            ctx = CommandContext()
+            if ctx.base_url and ctx.model:
+                if ctx.backend == "ollama":
+                    token_count = get_message_token_count_ollama(ctx.base_url, file_content, ctx.model)
+                elif ctx.backend == "llamacpp":
+                    token_count = get_message_token_count_llamacpp(ctx.base_url, file_content)
+
+        if token_count == 0:
+            token_count = estimate_token_count(file_content)
+            token_method = "est"
+
+        if token_method == "api":
+            print(colorize(f"Successfully loaded {lines_count} lines ({char_count} chars, {word_count} words, ~{token_count} tokens).", 'info'), file=sys.stderr)
+        else:
+            print(colorize(f"Successfully loaded {lines_count} lines ({char_count} chars, {word_count} words, ~{token_count} tokens est).", 'warning'), file=sys.stderr)
+
+        return f"\n[Content of local file `{filepath}`]:\n```text\n{file_content}\n```\n"
+    except UnicodeDecodeError:
+        err_msg = f"[Failed to load `{filepath}`: Appears to be a binary or non-UTF-8 file]"
+        print(colorize(err_msg, 'error'), file=sys.stderr)
+        return err_msg + "\n"
+    except Exception as e:
+        err_msg = f"[Failed to load `{filepath}`: {e}]"
+        print(colorize(err_msg, 'error'), file=sys.stderr)
+        return err_msg + "\n"
+
+
+def _process_file_inclusions(text: str) -> str:
+    """Scan text for @filepath mentions and load referenced files.
+
+    Args:
+        text: The input line to scan for @-inclusions.
+
+    Returns:
+        The text with file contents appended after the @ mentions.
+    """
     inclusions = []
     words = text.split()
     i = 0
@@ -5047,52 +6023,11 @@ def _process_file_inclusions(text):
                     print(colorize(err_msg, 'error'), file=sys.stderr)
                     continue
                 if expanded_path.startswith('/etc/') or '/.' in expanded_path:
-                    print(colorize(f"[WARNING] Attempting to load sensitive file: {filepath}", 'warning'), file=sys.stderr)
-                    print(colorize(f"  This could leak private data (keys, tokens, passwords) to the LLM.", 'warning'), file=sys.stderr)
-                    try:
-                        confirm = input(colorize(f"  Confirm file inclusion? [y/N] ", 'warning', is_prompt=True)).strip().lower()
-                    except (EOFError, KeyboardInterrupt):
-                        confirm = 'n'
-                    if confirm != 'y':
-                        print(colorize(f"[Skipped: {filepath}]", 'warning'), file=sys.stderr)
+                    if not _confirm_sensitive_inclusion(filepath):
                         continue
-                print(colorize(f"[--- Loading file: {filepath} ---]", 'muted'), file=sys.stderr)
-                try:
-                    with open(expanded_path, 'r', encoding='utf-8') as f:
-                        file_content = f.read()
-
-                    lines_count = len(file_content.splitlines())
-                    char_count = len(file_content)
-                    word_count = len(file_content.split())
-
-                    token_count = 0
-                    token_method = "api"
-                    if CommandContext._initialized:
-                        ctx = CommandContext()
-                        if ctx.base_url and ctx.model:
-                            if ctx.backend == "ollama":
-                                token_count = get_message_token_count_ollama(ctx.base_url, file_content, ctx.model)
-                            elif ctx.backend == "llamacpp":
-                                token_count = get_message_token_count_llamacpp(ctx.base_url, file_content)
-
-                    if token_count == 0:
-                        token_count = estimate_token_count(file_content)
-                        token_method = "est"
-
-                    if token_method == "api":
-                        print(colorize(f"Successfully loaded {lines_count} lines ({char_count} chars, {word_count} words, ~{token_count} tokens).", 'info'), file=sys.stderr)
-                    else:
-                        print(colorize(f"Successfully loaded {lines_count} lines ({char_count} chars, {word_count} words, ~{token_count} tokens est).", 'warning'), file=sys.stderr)
-
-                    inclusions.append(f"\n[Content of local file `{filepath}`]:\n```text\n{file_content}\n```\n")
-                except UnicodeDecodeError:
-                    err_msg = f"[Failed to load `{filepath}`: Appears to be a binary or non-UTF-8 file]"
-                    print(colorize(err_msg, 'error'), file=sys.stderr)
-                    inclusions.append(err_msg + "\n")
-                except Exception as e:
-                    err_msg = f"[Failed to load `{filepath}`: {e}]"
-                    print(colorize(err_msg, 'error'), file=sys.stderr)
-                    inclusions.append(err_msg + "\n")
+                inclusion = _load_file_inclusion(expanded_path, filepath)
+                if inclusion:
+                    inclusions.append(inclusion)
                 continue
             i += 1
         else:
@@ -5100,8 +6035,15 @@ def _process_file_inclusions(text):
     return inclusions
 
 
-def _process_command_lines(text):
-    """Process lines starting with ! (shell) or /curl (URL fetch)."""
+def _process_command_lines(text: str) -> list:
+    """Process lines starting with ! (shell) or /curl (URL fetch).
+
+    Args:
+        text: The input text (may contain multiple lines).
+
+    Returns:
+        List of processed lines (shell output / fetched content substituted).
+    """
     processed = []
     in_literal_block = False
     for line in text.split('\n'):
@@ -5148,8 +6090,15 @@ def _process_command_lines(text):
     return processed
 
 
-def process_inline_commands(full_input):
-    """Process inline commands (!, /curl, @) within user input."""
+def process_inline_commands(full_input: str) -> str:
+    """Process inline commands (!, /curl, @) within user input.
+
+    Args:
+        full_input: The raw user input line.
+
+    Returns:
+        The input with shell outputs, fetched content, and @-file content appended.
+    """
     file_inclusions = _process_file_inclusions(full_input)
     processed_lines = _process_command_lines(full_input)
     final_output = "\n".join(processed_lines)
@@ -5159,7 +6108,7 @@ def process_inline_commands(full_input):
 
 
 
-def execute_os_command(command, timeout=None):
+def execute_os_command(command: str, timeout: Optional[int] = None) -> str:
     """
     Execute OS command with safety checks and timeout.
 
@@ -5188,7 +6137,6 @@ def execute_os_command(command, timeout=None):
         return f"[Command rejected: {msg}]"
 
     print(f"[--- Executing (max {timeout}s): {command} ---]", file=sys.stderr)
-    output_lines = []
 
     try:
         process = subprocess.run(
@@ -5202,7 +6150,7 @@ def execute_os_command(command, timeout=None):
         )
 
         raw_output = process.stdout if process.stdout else ""
-        
+
         # --- THE FIX: Print the output to the user's terminal! ---
         if raw_output.strip():
             print(colorize(raw_output, 'info'))
@@ -5210,7 +6158,7 @@ def execute_os_command(command, timeout=None):
             print(colorize("[Command executed successfully with no output]", 'muted'))
         # ---------------------------------------------------------
 
-        
+
         output = raw_output or "[Command executed successfully with no output]"
 
     except subprocess.TimeoutExpired:
@@ -5224,8 +6172,15 @@ def execute_os_command(command, timeout=None):
     return f"\n[Command executed: `{command}`]\n```text\n{output.strip()}\n```\n"
 
 
-def fetch_and_convert_url(url):
-    """Fetch URL and extract clean text using core standard libraries only."""
+def fetch_and_convert_url(url: str) -> tuple:
+    """Fetch URL and extract clean text using core standard libraries only.
+
+    Args:
+        url: The URL to fetch.
+
+    Returns:
+        (text, tool) tuple where tool is "htmlstrip" or "None".
+    """
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
         req = Request(url, headers=headers)
@@ -5246,33 +6201,51 @@ class CoreHTMLStripper(HTMLParser):
 
     Tracks skip-depth instead of a single tag name, so nested or sequential
     skipped tags (script, style, etc.) properly resume text capture.
-    
+
     Call map:
       feed(text) → handle_starttag / handle_endtag / handle_data
       get_text() → returns accumulated text
     """
     skip_tags = {'script', 'style', 'head', 'meta', 'noscript', 'link', 'title'}
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize the stripper with empty text parts and skip depth 0."""
         super().__init__()
         self.text_parts = []
         self.skip_depth = 0
 
-    def handle_starttag(self, tag, attrs):
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        """Increment skip depth for excluded block tags.
+
+        Args:
+            tag: The start tag name.
+            attrs: Tag attributes (ignored).
+        """
         if tag.lower() in self.skip_tags:
             self.skip_depth += 1
 
-    def handle_endtag(self, tag):
+    def handle_endtag(self, tag: str) -> None:
+        """Decrement skip depth for excluded block tags.
+
+        Args:
+            tag: The end tag name.
+        """
         if tag.lower() in self.skip_tags:
             self.skip_depth = max(0, self.skip_depth - 1)
 
-    def handle_data(self, data):
+    def handle_data(self, data: str) -> None:
+        """Capture non-skipped text, trimmed of surrounding whitespace.
+
+        Args:
+            data: Raw text content between tags.
+        """
         if self.skip_depth == 0:
             cleaned = data.strip()
             if cleaned:
                 self.text_parts.append(cleaned)
 
-    def get_text(self):
+    def get_text(self) -> str:
+        """Return the accumulated text joined by newlines."""
         return '\n'.join(self.text_parts)
 
 
@@ -5286,65 +6259,40 @@ HTMLStripper = CoreHTMLStripper  # Backward-compat alias for tests
 class ChatLoop:
     """
     Unified chat loop that handles both Ollama and Llama.cpp backends.
-    
+
     State is managed through a shared CommandContext singleton instead of
     individual self.* attributes.
-    
+
     Call map:
       run() → run_init_session() → run_update_ollama_context()
             → dispatches to run_handle_*() by command
             → run_process_query() on non-command input
-      
+
       run_process_query() → query_handler.query_stream()
       run_agentic_query() → _init_agentic_query()
                           → query_handler.query_sync() (ReAct loop)
                           → parse_tool_call() / parse_tool_calls()
                           → _execute_tool_calls() → tool_registry.execute()
                           → _finalize_agentic_query() → query_handler.query_stream()
-      
+
       parse_tool_call() → _normalize_tool_json() / _extract_json_balanced()
       parse_tool_calls() → _find_tool_call_brace() / _extract_json_balanced()
       _execute_tool_calls() → tool_registry.execute()
       _finalize_agentic_query() → parse_tool_call() / parse_tool_calls()
     """
 
-    def __init__(self, context: CommandContext):
-        """Initialize chat loop with shared context, completer, and query handler."""
+    def __init__(self, context: CommandContext) -> None:
+        """Initialize chat loop with shared context, completer, and query handler.
+
+        Args:
+            context: The shared CommandContext singleton.
+        """
         self.ctx = context
         self.completer = context.create_completer()
         self.query_handler = context.create_query_handler()
         self.executor = context.create_executor()
         self.tool_registry = context.create_tool_registry()
         self.commands = get_command_aliases()
-
-    def handle_debug_command(self, args: str) -> None:
-        """Process /debug commands."""
-        parts = args.strip().split()
-    
-        if not parts or parts[0] == 'status':
-            self._print_debug_status()
-            return
-    
-        if parts[0] == 'list':
-            self._print_debug_categories()
-            return
-    
-        if len(parts) == 2:
-            category, level = parts
-            if self.ctx.debug_manager.set_level(category, level):
-                print(colorize(f"Debug: {category} → {level}", 'success'), 
-                    file=sys.stderr)
-            else:
-                print(colorize(f"Invalid category or level. Use '/debug list'", 
-                              'error'), file=sys.stderr)
-            return
-    
-    # Legacy fallback for old /debug on|off
-        if len(parts) == 1 and parts[0] in ('on', 'off'):
-            level = 'verbose' if parts[0] == 'on' else 'off'
-            self.ctx.debug_manager.set_level('all', level)
-            print(colorize(f"Debug: {parts[0]} (all categories)", 'success'), 
-                file=sys.stderr)
 
     def dump_context_to_file(self, filepath: str) -> None:
         """Dump current conversation history to a JSON file for browsing."""
@@ -5363,7 +6311,7 @@ class ChatLoop:
 
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(history, f, indent=2, ensure_ascii=False)
- 
+
 
     def fetch_models(self) -> None:
         """Fetch available models from the backend."""
@@ -5373,7 +6321,7 @@ class ChatLoop:
             self.ctx.models = [m['name'] for m in fetch_models_llamacpp(self.ctx.base_url, api_key=self.ctx.api_key)]
         else:
             self.ctx.models = [m['name'] for m in fetch_models_ollama(self.ctx.base_url)]
-        
+
         # Only auto-select if a model WAS explicitly set but not found on server
         # Don't auto-select if model is empty (user must pick manually)
         if self.ctx.model and self.ctx.models and self.ctx.model not in self.ctx.models:
@@ -5401,105 +6349,21 @@ class ChatLoop:
                     print(colorize("\n[ERROR] No model selected. Use /listmodel to see available models, then /switchmodel <name> to select one.", 'error'), file=sys.stderr)
                     continue
 
-                result = self.run_handle_exit(full_input)
-                if result is True:
+                dispatched = self._dispatch_command(full_input)
+                if dispatched is True:
                     break
-                if result is False:
-                    continue
-
-                result = self.run_handle_help(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_stats(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_listmodel(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_context_size(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_clear(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_image(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_dumpcontext(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_debug(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_thinking(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_cwd(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_ls(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_switchmodel(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_spawnshell(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_agentic(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_listtool(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_compact(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_drop(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_tokencount(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_sessions(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_resume(full_input)
-                if result is False:
-                    continue
-
-                result = self.run_handle_save(full_input)
-                if result is False:
+                if dispatched is False:
                     continue
 
                 self.run_process_query(full_input)
 
             except KeyboardInterrupt:
-                print(f"\n[Interrupted]", file=sys.stderr)
+                print("\n[Interrupted]", file=sys.stderr)
                 continue
 
             except Exception as e:
                 if isinstance(e, EOFError):
-                    print(f"[EOF - Goodbye!]", file=sys.stderr)
+                    print("[EOF - Goodbye!]", file=sys.stderr)
                     break
                 else:
                     print(colorize(f"[ERROR] ChatLoop->run {e}", 'error'), file=sys.stderr)
@@ -5507,6 +6371,48 @@ class ChatLoop:
                         traceback.print_exc(file=sys.stderr)
 
         return
+
+    def _dispatch_command(self, full_input: str) -> Optional[bool]:
+        """Route a line to the matching /command handler.
+
+        Args:
+            full_input: The raw input line from the user.
+
+        Returns:
+            True if the loop should break (exit requested), False when a
+            handler consumed the line (continue), or None if it is a plain
+            query to be processed normally.
+        """
+        if self.run_handle_exit(full_input) is True:
+            return True
+
+        handlers = (
+            self.run_handle_help,
+            self.run_handle_stats,
+            self.run_handle_listmodel,
+            self.run_handle_context_size,
+            self.run_handle_clear,
+            self.run_handle_image,
+            self.run_handle_dumpcontext,
+            self.run_handle_debug,
+            self.run_handle_thinking,
+            self.run_handle_cwd,
+            self.run_handle_ls,
+            self.run_handle_switchmodel,
+            self.run_handle_spawnshell,
+            self.run_handle_agentic,
+            self.run_handle_listtool,
+            self.run_handle_compact,
+            self.run_handle_drop,
+            self.run_handle_tokencount,
+            self.run_handle_sessions,
+            self.run_handle_resume,
+            self.run_handle_save,
+        )
+        for handler in handlers:
+            if handler(full_input) is False:
+                return False
+        return None
 
     def list_models(self, filter_arg: Optional[str] = None) -> None:
         """List available models from the backend, with optional name filter."""
@@ -5562,7 +6468,15 @@ class ChatLoop:
             shell_cmd = os.environ.get('SHELL', '/bin/bash')
             output_lines = []
 
-            def read_output(fd):
+            def read_output(fd: int) -> bytes:
+                """Read up to 4096 bytes from the pty fd, capturing decoded text.
+
+                Args:
+                    fd: The pty file descriptor.
+
+                Returns:
+                    The raw bytes read (b'' on OSError).
+                """
                 try:
                     data = os.read(fd, 4096)
                     if data:
@@ -5578,20 +6492,41 @@ class ChatLoop:
 
         return "".join(output_lines).strip()
 
-    def _parse_shell_into_blocks(self, text):
-        """Split shell session into command blocks by detecting prompt lines."""
+    def _parse_shell_into_blocks(self, text: str) -> list:
+        """Split shell session into command blocks by detecting prompt lines.
+
+        Args:
+            text: The captured shell session text.
+
+        Returns:
+            List of non-empty command block strings.
+        """
         text = strip_ansi(text)
         import re
         parts = re.split(r'(?m)^.*[\$#] ', text)
         return [p.strip() for p in parts if p.strip()]
 
-    def _filter_smart_blocks(self, blocks):
-        """Filter out trivial commands (cd, ls, pwd, clear, echo, exit)."""
+    def _filter_smart_blocks(self, blocks: list) -> list:
+        """Filter out trivial commands (cd, ls, pwd, clear, echo, exit).
+
+        Args:
+            blocks: List of parsed command blocks.
+
+        Returns:
+            Subset of blocks worth sending (non-trivial, >20 chars).
+        """
         boring_commands = {'cd', 'ls', 'pwd', 'clear', 'exit', 'echo'}
         return [b for b in blocks if b.split('\n')[0].strip().split()[0] not in boring_commands if b.split() and len(b.strip()) > 20]
 
-    def _edit_session(self, content):
-        """Open content in editor (VISUAL > EDITOR > vim) and return the edited result."""
+    def _edit_session(self, content: str) -> Optional[str]:
+        """Open content in editor (VISUAL > EDITOR > vim) and return the edited result.
+
+        Args:
+            content: The text to open in the editor.
+
+        Returns:
+            Edited text, or None if the edit was cancelled.
+        """
         import tempfile
         editor = os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vim'
         tmpfile = None
@@ -5612,8 +6547,12 @@ class ChatLoop:
                 except OSError:
                     pass
 
-    def _handle_shell_session(self, session_output):
-        """Parse captured shell session and let user choose what to send."""
+    def _handle_shell_session(self, session_output: str) -> None:
+        """Parse captured shell session and let user choose what to send.
+
+        Args:
+            session_output: The raw shell session text.
+        """
         clean = strip_ansi(session_output)
         if len(clean) > MAX_WRITE_FILE_SIZE:
             print(colorize(f"\n[Shell session output too large ({len(clean)} bytes), discarding — will not be sent to LLM]", 'error'), file=sys.stderr)
@@ -5662,8 +6601,16 @@ class ChatLoop:
                 print(colorize("[Shell session discarded]", 'muted'), file=sys.stderr)
 
     @staticmethod
-    def _parse_number_ranges(text, max_val):
-        """Parse '1,3-5,7' into [1, 3, 4, 5, 7]. Returns None on invalid input."""
+    def _parse_number_ranges(text: str, max_val: int) -> Optional[list]:
+        """Parse '1,3-5,7' into [1, 3, 4, 5, 7]. Returns None on invalid input.
+
+        Args:
+            text: The selection string.
+            max_val: Maximum valid index (1-based).
+
+        Returns:
+            Sorted list of unique 1-based indices, or None when invalid/out of range.
+        """
         valid_chars = set('0123456789,- ')
         if not text or not all(c in valid_chars for c in text):
             return None
@@ -5729,7 +6676,8 @@ class ChatLoop:
 
                 readline.set_history_length(1000)
 
-                def save_history():
+                def save_history() -> None:
+                    """Persist the readline history to disk at exit."""
                     if READLINE_AVAILABLE:
                         try:
                             readline.write_history_file(histfile)
@@ -5805,7 +6753,7 @@ class ChatLoop:
         """Handle /stats and /usage commands."""
         if full_input.lower() in ['/stats', '/usage']:
             cum = self.ctx.get_cumulative_stats()
-            print(colorize(f"\n[Usage Summary]", 'info'), file=sys.stderr)
+            print(colorize("\n[Usage Summary]", 'info'), file=sys.stderr)
             print(f"  Queries: {cum['total_queries']}", file=sys.stderr)
             print(f"  Tokens (completion): {cum['total_completion_tokens']:,}", file=sys.stderr)
             print(f"  Tokens (prompt): {cum['total_prompt_tokens']:,}", file=sys.stderr)
@@ -5900,70 +6848,91 @@ class ChatLoop:
             return False
         return None
 
+    def _debug_level_name(self, level: int) -> str:
+        """Map a numeric debug level to its name.
+
+        Args:
+            level: 0-3 debug level.
+
+        Returns:
+            "off"/"basic"/"verbose"/"trace" (or the raw number).
+        """
+        return {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(level, str(level))
+
+    def _debug_show_categories(self) -> None:
+        """Print all debug categories with their current levels."""
+        print(colorize("\n[Debug Categories - Use /debug <category> <level>]", 'info'), file=sys.stderr)
+        print("  Levels: off (0), basic (1), verbose (2), trace (3)", file=sys.stderr)
+        print()
+        for cat, desc in DebugManager.CATEGORIES.items():
+            current_level = self.ctx.debug_manager.get_level(cat)
+            level_name = self._debug_level_name(current_level)
+            marker = '>' if current_level > 0 else ' '
+            print(f"  {marker} {cat:<12} [{level_name:<7}] {desc}", file=sys.stderr)
+        print()
+
+    def _debug_handle_single(self, arg: str) -> None:
+        """Handle a single /debug argument (list/status/on/off/level/category).
+
+        Args:
+            arg: The first argument after /debug.
+        """
+        if arg == 'list':
+            print(colorize("\n[Debug Categories]", 'info'), file=sys.stderr)
+            for cat, desc in DebugManager.CATEGORIES.items():
+                current_level = self.ctx.debug_manager.get_level(cat)
+                level_name = self._debug_level_name(current_level)
+                marker = '>' if current_level > 0 else ' '
+                print(f"  {marker} {cat:<12} [{level_name}]", file=sys.stderr)
+            print()
+
+        elif arg == 'status':
+            status = self.ctx.debug_manager.get_status()
+            if any(level > 0 for level in status.values() if isinstance(level, int)):
+                print(colorize("\n[Active Debug Categories]", 'info'), file=sys.stderr)
+                for cat, level in status.items():
+                    if isinstance(level, int) and level > 0:
+                        level_name = self._debug_level_name(level)
+                        print(f"  > {cat}: {level_name}", file=sys.stderr)
+                print()
+            else:
+                print(colorize("\n[Debug: No categories active]\n", 'muted'), file=sys.stderr)
+
+        elif arg in ('on', 'off', '0', '1', '2', '3'):
+            if arg == 'on':
+                level = 'verbose'
+            elif arg == 'off':
+                level = 'off'
+            elif arg in ('0', '1', '2', '3'):
+                level_map = {'0': 'off', '1': 'basic', '2': 'verbose', '3': 'trace'}
+                level = level_map[arg]
+            else:
+                level = arg
+
+            self.ctx.debug_manager.set_level('all', level)
+            print(colorize(f"\n[Debug: ALL categories -> {level}]\n", 'success'), file=sys.stderr)
+
+        else:
+            if arg in DebugManager.CATEGORIES:
+                current = self.ctx.debug_manager.get_level(arg)
+                level_name = self._debug_level_name(current)
+                desc = DebugManager.CATEGORIES[arg]
+                print(colorize(f"\n[Debug: {arg} = {level_name}] - {desc}", 'info'), file=sys.stderr)
+                print("Usage: /debug {} [off|basic|verbose|trace]\n".format(arg), file=sys.stderr)
+            else:
+                print(colorize(f"\n[Unknown category: '{arg}']", 'error'), file=sys.stderr)
+                print(colorize("Use '/debug' to see available categories\n", 'muted'), file=sys.stderr)
+
     def run_handle_debug(self, full_input: str) -> Optional[bool]:
         """Handle /debug command."""
         if full_input.startswith('/debug'):
             parts = full_input.split(maxsplit=2)
 
             if len(parts) == 1 or (len(parts) == 2 and not parts[1].strip()):
-                print(colorize("\n[Debug Categories - Use /debug <category> <level>]", 'info'), file=sys.stderr)
-                print("  Levels: off (0), basic (1), verbose (2), trace (3)", file=sys.stderr)
-                print()
-                for cat, desc in DebugManager.CATEGORIES.items():
-                    current_level = self.ctx.debug_manager.get_level(cat)
-                    level_name = {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(current_level, str(current_level))
-                    marker = '>' if current_level > 0 else ' '
-                    print(f"  {marker} {cat:<12} [{level_name:<7}] {desc}", file=sys.stderr)
-                print()
+                self._debug_show_categories()
 
             elif len(parts) == 2:
-                arg = parts[1].lower()
-
-                if arg == 'list':
-                    print(colorize("\n[Debug Categories]", 'info'), file=sys.stderr)
-                    for cat, desc in DebugManager.CATEGORIES.items():
-                        current_level = self.ctx.debug_manager.get_level(cat)
-                        level_name = {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(current_level, str(current_level))
-                        marker = '>' if current_level > 0 else ' '
-                        print(f"  {marker} {cat:<12} [{level_name}]", file=sys.stderr)
-                    print()
-
-                elif arg == 'status':
-                    status = self.ctx.debug_manager.get_status()
-                    if any(level > 0 for level in status.values() if isinstance(level, int)):
-                        print(colorize("\n[Active Debug Categories]", 'info'), file=sys.stderr)
-                        for cat, level in status.items():
-                            if isinstance(level, int) and level > 0:
-                                level_name = {1: 'basic', 2: 'verbose', 3: 'trace'}.get(level, str(level))
-                                print(f"  > {cat}: {level_name}", file=sys.stderr)
-                        print()
-                    else:
-                        print(colorize("\n[Debug: No categories active]\n", 'muted'), file=sys.stderr)
-
-                elif arg in ('on', 'off', '0', '1', '2', '3'):
-                    if arg == 'on':
-                        level = 'verbose'
-                    elif arg == 'off':
-                        level = 'off'
-                    elif arg in ('0', '1', '2', '3'):
-                        level_map = {'0': 'off', '1': 'basic', '2': 'verbose', '3': 'trace'}
-                        level = level_map[arg]
-                    else:
-                        level = arg
-
-                    self.ctx.debug_manager.set_level('all', level)
-                    print(colorize(f"\n[Debug: ALL categories -> {level}]\n", 'success'), file=sys.stderr)
-
-                else:
-                    if arg in DebugManager.CATEGORIES:
-                        current = self.ctx.debug_manager.get_level(arg)
-                        level_name = {0: 'off', 1: 'basic', 2: 'verbose', 3: 'trace'}.get(current, str(current))
-                        desc = DebugManager.CATEGORIES[arg]
-                        print(colorize(f"\n[Debug: {arg} = {level_name}] - {desc}", 'info'), file=sys.stderr)
-                        print("Usage: /debug {} [off|basic|verbose|trace]\n".format(arg), file=sys.stderr)
-                    else:
-                        print(colorize(f"\n[Unknown category: '{arg}']", 'error'), file=sys.stderr)
-                        print(colorize("Use '/debug' to see available categories\n", 'muted'), file=sys.stderr)
+                self._debug_handle_single(parts[1].lower())
 
             elif len(parts) == 3:
                 category, level = parts[1].lower(), parts[2].lower()
@@ -6095,80 +7064,94 @@ class ChatLoop:
 
         subcmd = parts[1]
 
-        # on/off -> explicit toggle
         if subcmd in ("on", "off"):
-            target = subcmd == "on"
-            if self.ctx.agentic_mode == target:
-                print(colorize(f"[Agentic mode already {'ON' if target else 'OFF'}]", 'muted'), file=sys.stderr)
-                return False
-            self.ctx.agentic_mode = target
-            state = "ON" if self.ctx.agentic_mode else "OFF"
-            if self.ctx.agentic_mode:
-                self.ctx._saved_system_prompt = self.ctx.system_prompt
-                self.ctx.system_prompt = get_agentic_prompt(self.ctx.model)
-            else:
-                if hasattr(self.ctx, '_saved_system_prompt'):
-                    self.ctx.system_prompt = self.ctx._saved_system_prompt
-            print(colorize(f"[Agentic mode: {state}]", 'success' if self.ctx.agentic_mode else 'warning'), file=sys.stderr)
-            return False
-
-        # full -> enable everything
+            return self._agentic_toggle_on_off(subcmd == "on")
         if subcmd == "full":
-            self.ctx._saved_system_prompt = self.ctx.system_prompt
-            self.ctx.system_prompt = get_agentic_prompt(self.ctx.model)
-            self.ctx.agentic_mode = True
-            self.ctx.agentic_verbose = True
-            self.ctx.agentic_show_thinking = True
-            self.ctx.agentic_trace = True
-            self.ctx.auto_confirm = True
-            self.ctx.lazy_tool = True
-            print(colorize("[Agentic mode: ON]", 'success'), file=sys.stderr)
-            print(colorize("[System prompt switched to agentic mode]", 'muted'), file=sys.stderr)
-            print(colorize("[Verbose: ON]", 'info'), file=sys.stderr)
-            print(colorize("[Show thinking: ON]", 'info'), file=sys.stderr)
-            print(colorize("[Trace: ON]", 'info'), file=sys.stderr)
-            print(colorize("[Auto-confirm: ON]", 'info'), file=sys.stderr)
-            print(colorize("[Lazy tool extraction: ON]", 'info'), file=sys.stderr)
-            return False
-
-        # Named toggles (always toggle between on/off)
-        toggle_map = {
-            "auto":     ("auto_confirm",        "Auto-confirm"),
-            "verbose":  ("agentic_verbose",     "Verbose"),
-            "thinking": ("agentic_show_thinking", "Show thinking"),
-            "trace":    ("agentic_trace",        "Trace"),
-            "log":      ("agentic_logging",      "Logging"),
-            "lazytool": ("lazy_tool",            "Lazy tool extraction"),
-        }
-
+            return self._agentic_set_full()
         if subcmd == "sandbox":
-            new_mode = "container" if self.executor.mode != "container" else "host"
-            self.executor.mode = new_mode
-            self.tool_registry.executor.mode = new_mode
-            print(colorize(f"[Executor mode: {self.executor.mode}]", 'info'), file=sys.stderr)
-
-        elif subcmd in ("iterations", "timeout"):
-            if len(parts) < 3 or not parts[2].isdigit():
-                print(colorize(f"[Usage: /agentic {subcmd} <number>]", 'warning'), file=sys.stderr)
-                return False
-            val = int(parts[2])
-            attr = "agentic_max_iterations" if subcmd == "iterations" else "agentic_step_timeout"
-            setattr(self.ctx, attr, val)
-            label = "Max iterations" if subcmd == "iterations" else "Step timeout"
-            print(colorize(f"[{label}: {val}]", 'info'), file=sys.stderr)
-
-        elif subcmd in toggle_map:
-            attr, label = toggle_map[subcmd]
-            new_val = not getattr(self.ctx, attr)
-            setattr(self.ctx, attr, new_val)
-            state = "ON" if new_val else "OFF"
-            print(colorize(f"[{label}: {state}]", 'info'), file=sys.stderr)
-
-        elif subcmd == "acl":
+            return self._agentic_toggle_sandbox()
+        if subcmd in ("iterations", "timeout"):
+            return self._agentic_set_number(subcmd, parts)
+        if subcmd in self._AGENTIC_TOGGLE_MAP:
+            return self._agentic_toggle_named(subcmd)
+        if subcmd == "acl":
             return self._handle_agentic_acl(parts)
 
+        print(colorize("[Usage: /agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|lazytool|acl|iterations <N>|timeout <N>|status]]", 'warning'), file=sys.stderr)
+        return False
+
+    # Named toggles (always toggle between on/off)
+    _AGENTIC_TOGGLE_MAP = {
+        "auto":     ("auto_confirm",        "Auto-confirm"),
+        "verbose":  ("agentic_verbose",     "Verbose"),
+        "thinking": ("agentic_show_thinking", "Show thinking"),
+        "trace":    ("agentic_trace",        "Trace"),
+        "log":      ("agentic_logging",      "Logging"),
+        "lazytool": ("lazy_tool",            "Lazy tool extraction"),
+    }
+
+    def _agentic_toggle_on_off(self, target: bool) -> bool:
+        """Turn agentic mode explicitly on or off, swapping the system prompt."""
+        if self.ctx.agentic_mode == target:
+            print(colorize(f"[Agentic mode already {'ON' if target else 'OFF'}]", 'muted'), file=sys.stderr)
+            return False
+        self.ctx.agentic_mode = target
+        state = "ON" if self.ctx.agentic_mode else "OFF"
+        if self.ctx.agentic_mode:
+            self.ctx._saved_system_prompt = self.ctx.system_prompt
+            self.ctx.system_prompt = get_agentic_prompt(self.ctx.model)
         else:
-            print(colorize("[Usage: /agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|lazytool|acl|iterations <N>|timeout <N>|status]]", 'warning'), file=sys.stderr)
+            if hasattr(self.ctx, '_saved_system_prompt'):
+                self.ctx.system_prompt = self.ctx._saved_system_prompt
+        print(colorize(f"[Agentic mode: {state}]", 'success' if self.ctx.agentic_mode else 'warning'), file=sys.stderr)
+        return False
+
+    def _agentic_set_full(self) -> bool:
+        """Enable everything: agentic mode, verbose, thinking, trace, auto-confirm, lazy."""
+        self.ctx._saved_system_prompt = self.ctx.system_prompt
+        self.ctx.system_prompt = get_agentic_prompt(self.ctx.model)
+        self.ctx.agentic_mode = True
+        self.ctx.agentic_verbose = True
+        self.ctx.agentic_show_thinking = True
+        self.ctx.agentic_trace = True
+        self.ctx.auto_confirm = True
+        self.ctx.lazy_tool = True
+        print(colorize("[Agentic mode: ON]", 'success'), file=sys.stderr)
+        print(colorize("[System prompt switched to agentic mode]", 'muted'), file=sys.stderr)
+        print(colorize("[Verbose: ON]", 'info'), file=sys.stderr)
+        print(colorize("[Show thinking: ON]", 'info'), file=sys.stderr)
+        print(colorize("[Trace: ON]", 'info'), file=sys.stderr)
+        print(colorize("[Auto-confirm: ON]", 'info'), file=sys.stderr)
+        print(colorize("[Lazy tool extraction: ON]", 'info'), file=sys.stderr)
+        return False
+
+    def _agentic_toggle_sandbox(self) -> bool:
+        """Toggle the executor between container and host mode."""
+        new_mode = "container" if self.executor.mode != "container" else "host"
+        self.executor.mode = new_mode
+        self.tool_registry.executor.mode = new_mode
+        print(colorize(f"[Executor mode: {self.executor.mode}]", 'info'), file=sys.stderr)
+        return False
+
+    def _agentic_set_number(self, subcmd: str, parts: list) -> bool:
+        """Set a numeric agentic setting (iterations or step timeout)."""
+        if len(parts) < 3 or not parts[2].isdigit():
+            print(colorize(f"[Usage: /agentic {subcmd} <number>]", 'warning'), file=sys.stderr)
+            return False
+        val = int(parts[2])
+        attr = "agentic_max_iterations" if subcmd == "iterations" else "agentic_step_timeout"
+        setattr(self.ctx, attr, val)
+        label = "Max iterations" if subcmd == "iterations" else "Step timeout"
+        print(colorize(f"[{label}: {val}]", 'info'), file=sys.stderr)
+        return False
+
+    def _agentic_toggle_named(self, subcmd: str) -> bool:
+        """Toggle one of the named boolean agentic settings."""
+        attr, label = self._AGENTIC_TOGGLE_MAP[subcmd]
+        new_val = not getattr(self.ctx, attr)
+        setattr(self.ctx, attr, new_val)
+        state = "ON" if new_val else "OFF"
+        print(colorize(f"[{label}: {state}]", 'info'), file=sys.stderr)
         return False
 
     def _handle_agentic_acl(self, parts: list) -> bool:
@@ -6210,7 +7193,12 @@ class ChatLoop:
         print(colorize("[Usage: /agentic acl [list|status|log|allow|ask|deny <path> [read|write|any]|remove <path>|reset]]", 'warning'), file=sys.stderr)
         return False
 
-    def _print_acl(self, acl):
+    def _print_acl(self, acl: 'PathAcl') -> None:
+        """Print the current path ACL rules table.
+
+        Args:
+            acl: The PathAcl instance to display.
+        """
         print(colorize("\n[Path ACL - Use /agentic acl <allow|ask|deny|remove|reset|log>]", 'info'), file=sys.stderr)
         print("  Defaults: CWD always allowed; reads inside ~ allowed.", file=sys.stderr)
         print("  Everything else outside CWD/~ is denied unless a rule matches.", file=sys.stderr)
@@ -6225,7 +7213,12 @@ class ChatLoop:
         print("  Recent access decisions: /agentic acl log", file=sys.stderr)
         print(file=sys.stderr)
 
-    def _print_acl_log(self, acl):
+    def _print_acl_log(self, acl: 'PathAcl') -> None:
+        """Print recent path ACL access decisions.
+
+        Args:
+            acl: The PathAcl instance whose log to display.
+        """
         if not acl.log:
             print(colorize("[Path ACL] No access decisions recorded yet.", 'muted'), file=sys.stderr)
             return
@@ -6234,7 +7227,7 @@ class ChatLoop:
             print(f"  {entry['ts']} {entry['decision']:<6} {entry['tool']:<14} {entry['path']}  ({entry['rule'] or 'default'})", file=sys.stderr)
         print(file=sys.stderr)
 
-    def _print_agentic_status(self):
+    def _print_agentic_status(self) -> None:
         """Display current agentic settings like /debug output."""
         c = self.ctx
         print(colorize("\n[Agentic Settings - Use /agentic <option> [value]]", 'info'), file=sys.stderr)
@@ -6273,7 +7266,7 @@ class ChatLoop:
     @staticmethod
     def _normalize_tool_json(json_text: str) -> Optional[dict]:
         """Parse JSON and normalize any tool call format to {"tool": ..., "arguments": ...}.
-        
+
         Supports:
         - Internal:  {"tool": "name", "arguments": {...}}
         - OpenAI:    {"type": "function", "function": {"name": "name", "arguments": {...}}}
@@ -6318,8 +7311,16 @@ class ChatLoop:
         return None
 
     @staticmethod
-    def _find_tool_call_brace(text, pos=0):
-        """Find the next { that introduces a tool call JSON (with tool/function/type key)."""
+    def _find_tool_call_brace(text: str, pos: int = 0) -> int:
+        """Find the next { that introduces a tool call JSON (with tool/function/type key).
+
+        Args:
+            text: The response text to search.
+            pos: Starting offset.
+
+        Returns:
+            Index of the opening brace, or -1 if none found.
+        """
         idx = text.find('{', pos)
         while idx != -1:
             rest = text[idx+1:].lstrip()
@@ -6329,8 +7330,15 @@ class ChatLoop:
         return -1
 
     @staticmethod
-    def _rfind_tool_call_brace(text):
-        """Find the last { that introduces a tool call JSON, scanning right-to-left."""
+    def _rfind_tool_call_brace(text: str) -> int:
+        """Find the last { that introduces a tool call JSON, scanning right-to-left.
+
+        Args:
+            text: The response text to search.
+
+        Returns:
+            Index of the last tool-call opening brace, or -1 if none found.
+        """
         idx = text.rfind('{')
         while idx != -1:
             rest = text[idx+1:].lstrip()
@@ -6341,9 +7349,16 @@ class ChatLoop:
             idx = text.rfind('{', 0, idx)
         return -1
 
-    def _extract_json_balanced(self, text, start):
+    def _extract_json_balanced(self, text: str, start: int) -> Optional[str]:
         """Extract balanced JSON from text starting at an opening brace.
-        
+
+        Args:
+            text: The response text.
+            start: Index of the opening brace.
+
+        Returns:
+            The balanced JSON substring, or None if unbalanced.
+
         Handles braces inside JSON string values correctly by tracking
         string boundaries and escape sequences.
         """
@@ -6369,15 +7384,31 @@ class ChatLoop:
                         return text[start:i + 1]
         return None
 
-    def parse_tool_call(self, text: str) -> Optional[dict]:
-        """Extract tool call JSON from LLM response. Returns {"tool": ..., "arguments": ...} or None."""
-        lazy = getattr(self.ctx, 'lazy_tool', False)
-        text = text.strip()
-        # Pass 1: full JSON parse
-        result = self._normalize_tool_json(text)
-        if result:
-            return result
-        # Pass 2: fenced JSON code block
+    @staticmethod
+    def _tool_call_json_acceptable(result: Optional[dict]) -> bool:
+        """Reject tool-call JSON that looks like an XML/HTML hybrid fragment.
+
+        Args:
+            result: Normalized tool call dict (or None).
+
+        Returns:
+            True when the result should be accepted.
+        """
+        if not result:
+            return False
+        args_str = json.dumps(result.get("arguments", {}))
+        return not ('<' in args_str and '>' in args_str)
+
+    def _parse_fenced_tool_call(self, text: str, lazy: bool) -> Optional[dict]:
+        """Pass 2: extract a tool call from a fenced ```json code block.
+
+        Args:
+            text: The response text.
+            lazy: Whether lazy extraction is enabled.
+
+        Returns:
+            A normalized tool call dict, or None.
+        """
         parts = text.split("```")
         for i in range(1, len(parts), 2):
             block = parts[i].strip()
@@ -6396,21 +7427,28 @@ class ChatLoop:
                     json_str = self._extract_json_balanced(block, brace_idx)
                     if json_str:
                         result = self._normalize_tool_json(json_str)
-                        if result:
-                            args_str = json.dumps(result.get("arguments", {}))
-                            if not ('<' in args_str and '>' in args_str):
-                                return result
-        # Pass 3: bare JSON object with "tool" key
+                        if self._tool_call_json_acceptable(result):
+                            return result
+        return None
+
+    def _parse_bare_tool_call(self, text: str, lazy: bool) -> Optional[dict]:
+        """Pass 3: extract a bare JSON tool call (anywhere in lazy mode).
+
+        Args:
+            text: The response text.
+            lazy: Whether lazy extraction is enabled.
+
+        Returns:
+            A normalized tool call dict, or None.
+        """
         if lazy:
             brace_idx = ChatLoop._find_tool_call_brace(text)
             if brace_idx != -1:
                 json_str = self._extract_json_balanced(text, brace_idx)
                 if json_str:
                     result = self._normalize_tool_json(json_str)
-                    if result:
-                        args_str = json.dumps(result.get("arguments", {}))
-                        if not ('<' in args_str and '>' in args_str):
-                            return result
+                    if self._tool_call_json_acceptable(result):
+                        return result
         else:
             # Strict mode: only at START of the text
             stripped = text.lstrip()
@@ -6432,27 +7470,110 @@ class ChatLoop:
                     end = idx + len(json_str)
                     if not text[end:].strip():
                         result = self._normalize_tool_json(json_str)
-                        if result:
-                            args_str = json.dumps(result.get("arguments", {}))
-                            if not ('<' in args_str and '>' in args_str):
-                                return result
+                        if self._tool_call_json_acceptable(result):
+                            return result
         return None
+
+    def parse_tool_call(self, text: str) -> Optional[dict]:
+        """Extract tool call JSON from LLM response. Returns {"tool": ..., "arguments": ...} or None.
+
+        Args:
+            text: The response text to parse.
+        """
+        lazy = getattr(self.ctx, 'lazy_tool', False)
+        text = text.strip()
+        # Pass 1: full JSON parse
+        result = self._normalize_tool_json(text)
+        if result:
+            return result
+        # Pass 2: fenced JSON code block
+        result = self._parse_fenced_tool_call(text, lazy)
+        if result:
+            return result
+        # Pass 3: bare JSON object with "tool" key
+        return self._parse_bare_tool_call(text, lazy)
+
+    def _extract_tool_calls_lazy(self, text: str) -> list:
+        """Lazy mode: find ALL tool call JSONs anywhere in the text (deduped).
+
+        Args:
+            text: The response text.
+
+        Returns:
+            List of normalized tool call dicts.
+        """
+        results = []
+        seen_keys = set()
+        pos = 0
+        while pos < len(text):
+            idx = ChatLoop._find_tool_call_brace(text, pos)
+            if idx == -1:
+                break
+            json_str = self._extract_json_balanced(text, idx)
+            if not json_str:
+                pos = idx + 1
+                continue
+            result = self._normalize_tool_json(json_str)
+            if result:
+                key = (result["tool"], json.dumps(result.get("arguments", {}), sort_keys=True))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    results.append(result)
+            pos = idx + len(json_str) if json_str else idx + 1
+        return results
+
+    def _extract_tool_calls_strict(self, text: str) -> list:
+        """Strict mode: only consecutive tool calls from the start.
+
+        Args:
+            text: The response text.
+
+        Returns:
+            List of normalized tool call dicts (empty when the text has preamble).
+        """
+        results = []
+        # Strict mode: only consecutive tool calls from the start
+        stripped = text.lstrip()
+        if not (stripped.startswith('{') and stripped[1:].lstrip().startswith(('"tool"', '"function"', '"type"'))):
+            return []
+        pos = 0
+        while pos < len(text):
+            # Skip whitespace between consecutive tool calls
+            while pos < len(text) and text[pos] in (' ', '\t', '\n', '\r'):
+                pos += 1
+            if pos >= len(text):
+                break
+            # Check if next non-whitespace is a tool call
+            if not (text[pos] == '{' and text[pos+1:].lstrip().startswith(('"tool"', '"function"', '"type"'))):
+                break
+            json_str = self._extract_json_balanced(text, pos)
+            if not json_str:
+                break
+            result = self._normalize_tool_json(json_str)
+            if result:
+                results.append(result)
+            else:
+                break
+            pos += len(json_str)
+        return results
 
     def parse_tool_calls(self, text: str) -> list[dict]:
         """Extract ALL tool call JSONs from the response.
-        
+
         First tries direct JSON parse (works for clean tool calls at start of text).
         Falls back to strict/lazy extraction for embedded or malformed JSON.
-        
+
         In strict mode (default): only matches consecutive tool calls starting
         from the beginning of the response (no preamble).
         In lazy mode (/agentic lazytool): finds tool calls anywhere in the text.
         Returns list of {"tool": ..., "arguments": ...} dicts.
+
+        Args:
+            text: The response text to parse.
         """
         lazy = getattr(self.ctx, 'lazy_tool', False)
         text = text.strip()
-        results = []
-        
+
         # Pass 0: Quick check — if text starts with '{', try direct JSON parse.
         # A proper JSON parser handles braces inside string values correctly,
         # unlike brace-counting approaches.
@@ -6463,56 +7584,15 @@ class ChatLoop:
                     return [obj]
             except (json.JSONDecodeError, ValueError):
                 pass
-        
+
         if lazy:
-            # Lazy mode: find ALL tool call JSONs anywhere in the text
-            seen_keys = set()
-            pos = 0
-            while pos < len(text):
-                idx = ChatLoop._find_tool_call_brace(text, pos)
-                if idx == -1:
-                    break
-                json_str = self._extract_json_balanced(text, idx)
-                if not json_str:
-                    pos = idx + 1
-                    continue
-                result = self._normalize_tool_json(json_str)
-                if result:
-                    key = (result["tool"], json.dumps(result.get("arguments", {}), sort_keys=True))
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        results.append(result)
-                pos = idx + len(json_str) if json_str else idx + 1
-        else:
-            # Strict mode: only consecutive tool calls from the start
-            stripped = text.lstrip()
-            if not (stripped.startswith('{') and stripped[1:].lstrip().startswith(('"tool"', '"function"', '"type"'))):
-                return []
-            pos = 0
-            while pos < len(text):
-                # Skip whitespace between consecutive tool calls
-                while pos < len(text) and text[pos] in (' ', '\t', '\n', '\r'):
-                    pos += 1
-                if pos >= len(text):
-                    break
-                # Check if next non-whitespace is a tool call
-                if not (text[pos] == '{' and text[pos+1:].lstrip().startswith(('"tool"', '"function"', '"type"'))):
-                    break
-                json_str = self._extract_json_balanced(text, pos)
-                if not json_str:
-                    break
-                result = self._normalize_tool_json(json_str)
-                if result:
-                    results.append(result)
-                else:
-                    break
-                pos += len(json_str)
-        return results
+            return self._extract_tool_calls_lazy(text)
+        return self._extract_tool_calls_strict(text)
 
     @staticmethod
     def _is_stuck(text: str, threshold: float = 0.8) -> bool:
         """Detect if the model is repeating itself using sliding-window frequency check.
-        
+
         Checks if the last ~400 chars contain a phrase that appears 3+ times.
         Uses multiple window sizes to catch variable-length repetition periods.
         """
@@ -6531,12 +7611,22 @@ class ChatLoop:
         return False
 
     @staticmethod
-    def _call_with_timeout(func, timeout_sec: int, *args, **kwargs):
-        """Call a function with a wall-clock timeout using a daemon thread."""
+    def _call_with_timeout(func: object, timeout_sec: int, *args: tuple, **kwargs: dict) -> object:
+        """Call a function with a wall-clock timeout using a daemon thread.
+
+        Args:
+            func: The callable to invoke.
+            timeout_sec: Timeout in seconds.
+            *args, **kwargs: Passed to func.
+
+        Returns:
+            The function's return value, or None on timeout.
+        """
         result = [None]
         exception = [None]
 
-        def worker():
+        def worker() -> None:
+            """Run the target function in the daemon thread, capturing result/exception."""
             try:
                 result[0] = func(*args, **kwargs)
             except Exception as e:
@@ -6551,7 +7641,61 @@ class ChatLoop:
             raise exception[0]
         return result[0]
 
-    def _make_agentic_step_feedback(self):
+    def _accumulate_step_feedback(self, state: dict, thought: str, content: str) -> None:
+        """Accumulate thought/content into the step buffer with F5 cap tracking.
+
+        Args:
+            state: The step feedback buffer dict (mutated in place).
+            thought: Reasoning text for this chunk.
+            content: Assistant text for this chunk.
+        """
+        if thought:
+            state["thought"] += thought
+            state["last_activity"] = time.time()
+            # F5: track an estimate of total thinking tokens so a single step
+            # can't silently burn the whole budget on reasoning undetected.
+            # Detection + flag only — we keep accumulating (F4 tail-caps the
+            # nudge) and keep streaming live thinking; the flag is surfaced to
+            # the timeout nudge so a verbose thinker is told to be concise.
+            cap = int(getattr(self.ctx, 'agentic_max_thinking_tokens', 0) or 0)
+            if cap > 0:
+                state["thinking_tokens"] += max(1, len(thought) // 4)
+                if state["thinking_tokens"] >= cap:
+                    state["thinking_capped"] = True
+        if content:
+            state["content"] += content
+            state["last_activity"] = time.time()
+
+    def _render_step_feedback(self, state: dict, thought: str, content: str,
+                              show_thinking: bool) -> None:
+        """Render live feedback for a chunk (thinking stream or heartbeat dot).
+
+        Args:
+            state: The step feedback buffer dict (mutated in place).
+            thought: Reasoning text for this chunk.
+            content: Assistant text for this chunk.
+            show_thinking: Whether to stream the reasoning live.
+        """
+        if show_thinking:
+            if thought:
+                if not state["thinking_open"]:
+                    state["thinking_open"] = True
+                    sys.stderr.write("\n<thinking>\n")
+                sys.stderr.write(thought)
+                sys.stderr.flush()
+            if content and state["thinking_open"]:
+                sys.stderr.write("\n</thinking>\n")
+                sys.stderr.flush()
+                state["thinking_open"] = False
+        else:
+            now = time.time()
+            if now - state["last_heartbeat"] >= 1.0:
+                state["last_heartbeat"] = now
+                state["heartbeat_shown"] = True
+                sys.stderr.write(".")
+                sys.stderr.flush()
+
+    def _make_agentic_step_feedback(self) -> tuple:
         """Build live feedback callbacks for an agentic ReAct step.
 
         Returns (on_chunk, finalize, buffer). `on_chunk(thought, content, is_final)`
@@ -6561,6 +7705,9 @@ class ChatLoop:
         `content`/`thought` — used after a timeout to decide abort-vs-continue.
         `finalize()` closes any open `<thinking>` block and stops the lingering
         worker thread (on timeout) from writing further feedback.
+
+        Returns:
+            (on_chunk, finalize, buffer) tuple of callables + state dict.
         """
         state = {
             "thinking_open": False,
@@ -6575,45 +7722,21 @@ class ChatLoop:
         }
         show_thinking = self.ctx.agentic_show_thinking
 
-        def on_chunk(thought, content, is_final):
+        def on_chunk(thought: str, content: str, is_final: bool) -> None:
+            """Handle a parsed stream chunk: accumulate + render feedback.
+
+            Args:
+                thought: Reasoning text for this chunk.
+                content: Assistant text for this chunk.
+                is_final: Whether this is the final chunk.
+            """
             if state["cancelled"]:
                 return
-            if thought:
-                state["thought"] += thought
-                state["last_activity"] = time.time()
-                # F5: track an estimate of total thinking tokens so a single step
-                # can't silently burn the whole budget on reasoning undetected.
-                # Detection + flag only — we keep accumulating (F4 tail-caps the
-                # nudge) and keep streaming live thinking; the flag is surfaced to
-                # the timeout nudge so a verbose thinker is told to be concise.
-                cap = int(getattr(self.ctx, 'agentic_max_thinking_tokens', 0) or 0)
-                if cap > 0:
-                    state["thinking_tokens"] += max(1, len(thought) // 4)
-                    if state["thinking_tokens"] >= cap:
-                        state["thinking_capped"] = True
-            if content:
-                state["content"] += content
-                state["last_activity"] = time.time()
-            if show_thinking:
-                if thought:
-                    if not state["thinking_open"]:
-                        state["thinking_open"] = True
-                        sys.stderr.write("\n<thinking>\n")
-                    sys.stderr.write(thought)
-                    sys.stderr.flush()
-                if content and state["thinking_open"]:
-                    sys.stderr.write("\n</thinking>\n")
-                    sys.stderr.flush()
-                    state["thinking_open"] = False
-            else:
-                now = time.time()
-                if now - state["last_heartbeat"] >= 1.0:
-                    state["last_heartbeat"] = now
-                    state["heartbeat_shown"] = True
-                    sys.stderr.write(".")
-                    sys.stderr.flush()
+            self._accumulate_step_feedback(state, thought, content)
+            self._render_step_feedback(state, thought, content, show_thinking)
 
-        def finalize():
+        def finalize() -> None:
+            """Close any open thinking block and stop further feedback output."""
             if state["thinking_open"]:
                 sys.stderr.write("\n</thinking>\n")
                 sys.stderr.flush()
@@ -6697,6 +7820,7 @@ class ChatLoop:
             str: The nudge message to append as a user turn.
         """
         def _cap_tail(text: str, cap: int = 4000) -> str:
+            """Cap text from the tail, marking omitted leading content."""
             text = text.strip()
             if len(text) <= cap:
                 return text
@@ -6737,12 +7861,134 @@ class ChatLoop:
             return base + "\n\n" + "\n\n".join(lines)
         return base
 
+    def _agentic_timeout_state_c(self, iteration: int, expired: int, last_tool: str,
+                                 pending_tool: bool, step_timeout: int, messages: list,
+                                 partial_text: str, partial_thought: str,
+                                 content_is_tool: bool, _nudge_metrics: object) -> tuple:
+        """State C policy: last tool was destructive.
+
+        Args:
+            iteration: Current iteration.
+            expired: The timeout that just expired (seconds).
+            last_tool: Name of the last executed tool.
+            pending_tool: Whether a tool call was in flight in the partial output.
+            step_timeout: The current step budget.
+            messages: Conversation list (nudge appended on continue).
+            partial_text / partial_thought / content_is_tool: Nudge inputs.
+            _nudge_metrics: Callable building the metrics dict for the nudge.
+
+        Returns:
+            (should_break, step_timeout).
+        """
+        if pending_tool:
+            # State C: destructive last tool AND a tool call was in flight —
+            # retrying risks re-executing it.
+            print(colorize(
+                f"\n[Agentic] Step {iteration} timed out after {expired}s. "
+                f"Last tool was '{last_tool}' (destructive) and a tool call was "
+                "pending. Aborting to avoid re-execution.",
+                'error'), file=sys.stderr)
+            return True, step_timeout
+        # Destructive tool already completed; the model was only narrating.
+        # Continue with State B backoff.
+        print(colorize(
+            f"\n[Agentic] Step {iteration} timed out after {expired}s. "
+            f"Last tool was '{last_tool}' (destructive) but no tool call was "
+            "pending — continuing with backoff.",
+            'warning'), file=sys.stderr)
+        return self._agentic_timeout_state_b(
+            iteration, expired, messages, step_timeout,
+            partial_text, partial_thought, content_is_tool, _nudge_metrics)
+
+    def _agentic_timeout_state_a(self, iteration: int, expired: int, messages: list,
+                                 step_timeout: int, making_progress: bool, tok_per_sec: float,
+                                 partial_text: str, partial_thought: str,
+                                 content_is_tool: bool, _nudge_metrics: object) -> tuple:
+        """State A policy: no tool executed yet.
+
+        Extends the budget while the model is actively generating (F3);
+        otherwise retries once and aborts after two consecutive timeouts.
+
+        Args:
+            iteration: Current iteration.
+            expired: The timeout that just expired.
+            messages: Conversation list (nudge appended on continue).
+            step_timeout: The current step budget.
+            making_progress: Whether tokens were still flowing when the timer fired.
+            tok_per_sec: Estimated generation speed.
+            partial_text / partial_thought / content_is_tool: Nudge inputs.
+            _nudge_metrics: Callable building the metrics dict for the nudge.
+
+        Returns:
+            (should_break, step_timeout).
+        """
+        if making_progress and step_timeout < self.ctx.agentic_timeout_max:
+            # F3: model is actively generating (tokens flowing) — extend the
+            # budget instead of retrying at the same (insufficient) timeout,
+            # which would just fail again. Only thinking-only steps benefit
+            # from this; a stalled step falls through to the retry/abort.
+            step_timeout = min(step_timeout * 2, self.ctx.agentic_timeout_max)
+            print(colorize(
+                f"\n[Agentic] Step {iteration} timed out after {expired}s but still "
+                f"generating ({tok_per_sec:.1f} tok/s) — extending to {step_timeout}s.",
+                'warning'), file=sys.stderr)
+            messages.append({'role': 'user', 'content': self._timeout_nudge(
+                partial_text, partial_thought, content_is_tool,
+                metrics=_nudge_metrics(step_timeout))})
+            return False, step_timeout
+        # No recent progress → conservative; abort after two timeouts.
+        if self.ctx.agentic_consecutive_timeouts >= 2:
+            print(colorize(
+                f"\n[Agentic] Step {iteration} timed out twice. Model may be stuck. Aborting.",
+                'error'), file=sys.stderr)
+            return True, step_timeout
+        print(colorize(
+            f"\n[Agentic] Step {iteration} timed out after {expired}s. "
+            "Model may be thinking — retrying.",
+            'warning'), file=sys.stderr)
+        messages.append({'role': 'user', 'content': self._timeout_nudge(
+            partial_text, partial_thought, content_is_tool,
+            metrics=_nudge_metrics(step_timeout))})
+        return False, step_timeout
+
+    def _agentic_timeout_state_b(self, iteration: int, expired: int, messages: list,
+                                 step_timeout: int, partial_text: str, partial_thought: str,
+                                 content_is_tool: bool, _nudge_metrics: object) -> tuple:
+        """State B policy: a tool already ran — exponential backoff up to max.
+
+        Args:
+            iteration: Current iteration.
+            expired: The timeout that just expired.
+            messages: Conversation list (nudge appended on continue).
+            step_timeout: The current step budget.
+            partial_text / partial_thought / content_is_tool: Nudge inputs.
+            _nudge_metrics: Callable building the metrics dict for the nudge.
+
+        Returns:
+            (should_break, step_timeout).
+        """
+        if step_timeout >= self.ctx.agentic_timeout_max:
+            print(colorize(
+                f"\n[Agentic] Max timeout ({self.ctx.agentic_timeout_max}s) reached. Aborting agentic query.",
+                'error'), file=sys.stderr)
+            return True, step_timeout
+        step_timeout = min(step_timeout * 2, self.ctx.agentic_timeout_max)
+        print(colorize(
+            f"\n[Agentic] Step {iteration} timed out after {expired}s. "
+            f"Model was executing tools — extending to {step_timeout}s.",
+            'warning'), file=sys.stderr)
+
+        messages.append({'role': 'user', 'content': self._timeout_nudge(
+            partial_text, partial_thought, content_is_tool,
+            metrics=_nudge_metrics(step_timeout))})
+        return False, step_timeout
+
     def _handle_agentic_timeout(self, iteration: int, step_timeout: int, messages: list,
                                 partial_text: str = "", partial_thought: str = "",
                                 elapsed_sec: Optional[float] = None,
                                 partial_tokens: Optional[int] = None,
                                 idle_sec: Optional[float] = None,
-                                thinking_capped: bool = False):
+                                thinking_capped: bool = False) -> tuple:
         """Handle a step timeout in the ReAct loop.
 
         Applies the escalation policy based on model state:
@@ -6786,7 +8032,12 @@ class ChatLoop:
         grace = max(0, int(getattr(self.ctx, 'agentic_progress_grace', 15)))
         making_progress = (idle_sec is not None and idle_sec <= grace and tok_per_sec > 0)
 
-        def _nudge_metrics(budget_sec):
+        def _nudge_metrics(budget_sec: int) -> dict:
+            """Build the metrics dict for the timeout nudge message.
+
+            Args:
+                budget_sec: The new extended step budget in seconds.
+            """
             m = {"tok_per_sec": tok_per_sec, "expired_sec": expired, "budget_sec": budget_sec}
             if thinking_capped:
                 m["thinking_capped"] = True
@@ -6794,74 +8045,25 @@ class ChatLoop:
             return m
 
         if last_tool in AGENTIC_TIMEOUT_ABORT_TOOLS:
-            if pending_tool:
-                # State C: destructive last tool AND a tool call was in flight —
-                # retrying risks re-executing it.
-                print(colorize(
-                    f"\n[Agentic] Step {iteration} timed out after {expired}s. "
-                    f"Last tool was '{last_tool}' (destructive) and a tool call was "
-                    "pending. Aborting to avoid re-execution.",
-                    'error'), file=sys.stderr)
-                return True, step_timeout
-            # Destructive tool already completed; the model was only narrating.
-            print(colorize(
-                f"\n[Agentic] Step {iteration} timed out after {expired}s. "
-                f"Last tool was '{last_tool}' (destructive) but no tool call was "
-                "pending — continuing with backoff.",
-                'warning'), file=sys.stderr)
-        elif not self.ctx.agentic_has_executed_tool:
-            # State A: no tool executed yet.
-            if making_progress and step_timeout < self.ctx.agentic_timeout_max:
-                # F3: model is actively generating (tokens flowing) — extend the
-                # budget instead of retrying at the same (insufficient) timeout,
-                # which would just fail again. Only thinking-only steps benefit
-                # from this; a stalled step falls through to the retry/abort.
-                step_timeout = min(step_timeout * 2, self.ctx.agentic_timeout_max)
-                print(colorize(
-                    f"\n[Agentic] Step {iteration} timed out after {expired}s but still "
-                    f"generating ({tok_per_sec:.1f} tok/s) — extending to {step_timeout}s.",
-                    'warning'), file=sys.stderr)
-                messages.append({'role': 'user', 'content': self._timeout_nudge(
-                    partial_text, partial_thought, content_is_tool,
-                    metrics=_nudge_metrics(step_timeout))})
-                return False, step_timeout
-            # No recent progress → conservative; abort after two timeouts.
-            if self.ctx.agentic_consecutive_timeouts >= 2:
-                print(colorize(
-                    f"\n[Agentic] Step {iteration} timed out twice. Model may be stuck. Aborting.",
-                    'error'), file=sys.stderr)
-                return True, step_timeout
-            print(colorize(
-                f"\n[Agentic] Step {iteration} timed out after {expired}s. "
-                "Model may be thinking — retrying.",
-                'warning'), file=sys.stderr)
-            messages.append({'role': 'user', 'content': self._timeout_nudge(
-                partial_text, partial_thought, content_is_tool,
-                metrics=_nudge_metrics(step_timeout))})
-            return False, step_timeout
+            return self._agentic_timeout_state_c(
+                iteration, expired, last_tool, pending_tool, step_timeout, messages,
+                partial_text, partial_thought, content_is_tool, _nudge_metrics)
+        if not self.ctx.agentic_has_executed_tool:
+            return self._agentic_timeout_state_a(
+                iteration, expired, messages, step_timeout, making_progress, tok_per_sec,
+                partial_text, partial_thought, content_is_tool, _nudge_metrics)
+        return self._agentic_timeout_state_b(
+            iteration, expired, messages, step_timeout,
+            partial_text, partial_thought, content_is_tool, _nudge_metrics)
 
-        # State B: a tool already ran (or a completed destructive tool) — escalate
-        # with exponential backoff.
-        if step_timeout >= self.ctx.agentic_timeout_max:
-            print(colorize(
-                f"\n[Agentic] Max timeout ({self.ctx.agentic_timeout_max}s) reached. Aborting agentic query.",
-                'error'), file=sys.stderr)
-            return True, step_timeout
-        step_timeout = min(step_timeout * 2, self.ctx.agentic_timeout_max)
-        print(colorize(
-            f"\n[Agentic] Step {iteration} timed out after {expired}s. "
-            f"Model was executing tools — extending to {step_timeout}s.",
-            'warning'), file=sys.stderr)
-
-        messages.append({'role': 'user', 'content': self._timeout_nudge(
-            partial_text, partial_thought, content_is_tool,
-            metrics=_nudge_metrics(step_timeout))})
-        return False, step_timeout
-
-    def _init_agentic_query(self, final_content):
+    def _init_agentic_query(self, final_content: str) -> Optional[tuple]:
         """Initialize messages, logger, and tool format for an agentic query.
 
-        Returns (messages, logger, openai_tools, send_tools_api) or None on early exit.
+        Args:
+            final_content: The processed user query text.
+
+        Returns:
+            (messages, logger, openai_tools, send_tools_api) or None on early exit.
         """
         if not getattr(self, 'messages', None):
             self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
@@ -6912,10 +8114,95 @@ class ChatLoop:
             return observation[:cap] + f"\n... [truncated to {cap} chars]"
         return observation
 
-    def _execute_tool_calls(self, tool_calls, last_tool_call, iteration, logger, messages, response_text, api_tool_calls):
+    def _observation_char_cap(self, messages: list) -> int:
+        """Progressive observation truncation cap based on context usage.
+
+        Args:
+            messages: The conversation list (for context-usage measurement).
+
+        Returns:
+            Max observation length in chars (4000/3000/2000 by usage).
+        """
+        if self.ctx.context_window_size <= 0:
+            return 4000
+        msg_tokens = self.ctx.calculate_context_tokens(messages)
+        usage_ratio = msg_tokens / self.ctx.context_window_size
+        if usage_ratio > 0.7:
+            return 2000
+        if usage_ratio > 0.5:
+            return 3000
+        return 4000
+
+    def _execute_single_tool(self, tool_name: str, tool_args: dict, iteration: int,
+                             logger: Optional['AgenticLogger'], messages: list) -> dict:
+        """Run one tool, returning a normalized observation dict.
+
+        Args:
+            tool_name: Tool to execute.
+            tool_args: Tool arguments.
+            iteration: Current iteration.
+            logger: Optional AgenticLogger.
+            messages: The conversation list (for truncation measurement).
+
+        Returns:
+            {"observation": str, "raw": str, "success": bool, "cancelled": bool}.
+        """
+        args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+        print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
+        sys.stderr.flush()
+
+        if self.ctx.agentic_trace:
+            print(colorize(f"\n[Trace] Full args: {json.dumps(tool_args, default=str)[:2000]}", 'muted'), file=sys.stderr)
+
+        t_start = time.time()
+        result = self.tool_registry.execute(tool_name, tool_args)
+        elapsed = time.time() - t_start
+        status = "OK" if result["success"] else "ERROR"
+        print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
+
+        if result["success"]:
+            observation = result["output"]
+        else:
+            full = result["output"] or ""
+            lines = full.split("\n")[:4]
+            context = "\n".join(lines).strip()
+            error_msg = result.get("error", "") or ""
+            observation = f"{context}\nERROR: {error_msg}" if context else f"ERROR: {error_msg}"
+        if not observation:
+            observation = "[Tool returned no output]"
+
+        # read_file pages are exempt — they self-bound and carry a `next`
+        # offset that a blanket cap would silently drop.
+        max_obs_chars = self._observation_char_cap(messages)
+        observation = self._cap_tool_observation(tool_name, observation, max_obs_chars)
+
+        timed_observation = json.dumps({"tool": tool_name, "duration_s": round(elapsed, 1), "success": result["success"], "output": observation})
+        if self.ctx.agentic_trace:
+            trace_out = result["output"] if len(result["output"]) < 2000 else result["output"][:2000] + "..."
+            print(colorize(f"[Trace] Result: {json.dumps({'success': result['success'], 'output': trace_out, 'error': result['error']}, default=str)}", 'muted'), file=sys.stderr)
+
+        if self.ctx.agentic_logging and logger:
+            logger.write(type="result", iteration=iteration, tool_name=tool_name, tool_args=tool_args, result=result)
+
+        cancelled = (not result["success"]) and "Cancelled" in (result.get("error") or "")
+        return {"observation": f"[{tool_name}] {timed_observation}", "raw": observation,
+                "success": result["success"], "cancelled": cancelled}
+
+    def _execute_tool_calls(self, tool_calls: list, last_tool_call: Optional[dict], iteration: int, logger: Optional['AgenticLogger'],
+                            messages: list, response_text: str, api_tool_calls: list) -> tuple:
         """Execute a list of tool calls, collecting observations.
 
-        Returns (observations, abort_loop, last_tool_call, final_answer).
+        Args:
+            tool_calls: Normalized tool call list.
+            last_tool_call: Previous tool call (for same-tool-loop detection).
+            iteration: Current ReAct iteration.
+            logger: Optional AgenticLogger.
+            messages: The conversation list.
+            response_text: The assistant's text for this step.
+            api_tool_calls: Native tool calls from the response.
+
+        Returns:
+            (observations, raw_observations, abort_loop, last_tool_call, final_answer).
         """
         observations = []
         raw_observations = []
@@ -6924,12 +8211,6 @@ class ChatLoop:
         for i, tool_call in enumerate(tool_calls):
             tool_name = tool_call["tool"]
             tool_args = tool_call.get("arguments", {})
-            args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-            print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
-            sys.stderr.flush()
-
-            if self.ctx.agentic_trace:
-                print(colorize(f"\n[Trace] Full args: {json.dumps(tool_args, default=str)[:2000]}", 'muted'), file=sys.stderr)
 
             current_call = (tool_name, json.dumps(tool_args, sort_keys=True))
             if i == 0 and current_call == last_tool_call:
@@ -6940,57 +8221,22 @@ class ChatLoop:
             if i == 0:
                 last_tool_call = current_call
 
-            t_start = time.time()
-            result = self.tool_registry.execute(tool_name, tool_args)
-            elapsed = time.time() - t_start
-            status = "OK" if result["success"] else "ERROR"
-            print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
-
-            if result["success"]:
-                observation = result["output"]
-            else:
-                full = result["output"] or ""
-                lines = full.split("\n")[:4]
-                context = "\n".join(lines).strip()
-                error_msg = result.get("error", "") or ""
-                observation = f"{context}\nERROR: {error_msg}" if context else f"ERROR: {error_msg}"
-            if not observation:
-                observation = "[Tool returned no output]"
-
-            # Progressive observation truncation based on context usage.
-            # read_file pages are exempt — they self-bound and carry a `next`
-            # offset that a blanket cap would silently drop.
-            max_obs_chars = 4000
-            usage_ratio = 0.0
-            if self.ctx.context_window_size > 0:
-                msg_tokens = self.ctx.calculate_context_tokens(messages)
-                usage_ratio = msg_tokens / self.ctx.context_window_size
-                if usage_ratio > 0.7:
-                    max_obs_chars = 2000
-                elif usage_ratio > 0.5:
-                    max_obs_chars = 3000
-            observation = self._cap_tool_observation(tool_name, observation, max_obs_chars)
-
-            timed_observation = json.dumps({"tool": tool_name, "duration_s": round(elapsed, 1), "success": result["success"], "output": observation})
-            if self.ctx.agentic_trace:
-                trace_out = result["output"] if len(result["output"]) < 2000 else result["output"][:2000] + "..."
-                print(colorize(f"[Trace] Result: {json.dumps({'success': result['success'], 'output': trace_out, 'error': result['error']}, default=str)}", 'muted'), file=sys.stderr)
-
-            if self.ctx.agentic_logging and logger:
-                logger.write(type="result", iteration=iteration, tool_name=tool_name, tool_args=tool_args, result=result)
-
-            if not result["success"] and "Cancelled" in (result.get("error") or ""):
+            exec = self._execute_single_tool(tool_name, tool_args, iteration, logger, messages)
+            if exec["cancelled"]:
                 print(colorize("[Agentic] Tool cancelled by user, aborting.", 'warning'), file=sys.stderr)
                 final_answer = "[Agentic query cancelled]"
                 abort_loop = True
                 break
 
-            observations.append(f"[{tool_name}] {timed_observation}")
-            raw_observations.append(observation)
+            observations.append(exec["observation"])
+            raw_observations.append(exec["raw"])
 
         return observations, raw_observations, abort_loop, last_tool_call, final_answer
 
-    def _finalize_agentic_query(self, messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text):
+    def _finalize_agentic_query(self, messages: list, final_answer: str, final_content: str,
+                                send_tools_api: bool, openai_tools: list,
+                                logger: Optional['AgenticLogger'],
+                                iteration: int, response_text: str) -> None:
         """Stream final answer or execute pending tool call, then update self.messages."""
         stream_tool_used = False
         if not final_answer:
@@ -7058,8 +8304,15 @@ class ChatLoop:
         observation = self._cap_tool_observation(tool_name, observation)
         return observation
 
-    def _collect_stream_tool_calls(self, stream_tool_calls_out, response) -> list:
+    def _collect_stream_tool_calls(self, stream_tool_calls_out: list, response: str) -> list:
         """Normalize tool calls from the final streaming response.
+
+        Args:
+            stream_tool_calls_out: Accumulated native tool calls from the stream.
+            response: The streamed response text.
+
+        Returns:
+            List of {"tool", "arguments"} dicts.
 
         Prefers native `tool_calls` out-params; falls back to parsing the text
         response for inline JSON tool calls.
@@ -7083,38 +8336,16 @@ class ChatLoop:
                     stream_tool_calls = [single]
         return stream_tool_calls
 
-    def _execute_stream_tool_calls(self, stream_tool_calls, stream_tool_calls_out,
-                                   response, send_tools_api) -> bool:
-        """Execute tools produced by the final streaming answer; record self.messages.
+    def _append_stream_observations(self, response: str, stream_tool_calls_out: list,
+                                    stream_observations: list, send_tools_api: bool) -> None:
+        """Record assistant tool_call + tool results into self.messages.
 
-        Runs each tool, prints results, and appends the assistant tool_call and the
-        observations to `self.messages` (OpenAI `tool` role when `send_tools_api`,
-        otherwise a `Tool result:` user note).
-
-        Returns True if any tool ran (so the caller can re-enter the loop).
+        Args:
+            response: The streamed response text.
+            stream_tool_calls_out: Native tool calls from the stream.
+            stream_observations: Per-tool observation strings.
+            send_tools_api: Whether to use OpenAI `tool` role messages.
         """
-        stream_observations = []
-        for stream_tc in stream_tool_calls:
-            tool_name = stream_tc["tool"]
-            tool_args = stream_tc.get("arguments", {})
-            args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-            print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
-            sys.stderr.flush()
-            t_start = time.time()
-            result = self.tool_registry.execute(tool_name, tool_args)
-            if not result["success"] and "Cancelled" in (result.get("error") or ""):
-                print(colorize("[Agentic] Streaming tool sequence cancelled by user, aborting.", 'warning'), file=sys.stderr)
-                break
-            elapsed = time.time() - t_start
-            status = "OK" if result["success"] else "ERROR"
-            print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
-            observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
-            if not observation:
-                observation = "[Tool returned no output]"
-            observation = self._cap_tool_observation(tool_name, observation)
-            print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
-            stream_observations.append(f"[{tool_name}] {observation}")
-
         if stream_tool_calls_out:
             stream_content = response or ""
             if not stream_content:
@@ -7157,18 +8388,65 @@ class ChatLoop:
                     'name': tc.get('function', {}).get('name', ''),
                     'content': "ERROR: Tool execution declined by the user."
                 })
+
+    def _execute_stream_tool_calls(self, stream_tool_calls: list, stream_tool_calls_out: list,
+                                   response: str, send_tools_api: bool) -> bool:
+        """Execute tools produced by the final streaming answer; record self.messages.
+
+        Args:
+            stream_tool_calls: Normalized tool call list.
+            stream_tool_calls_out: Native tool calls from the stream.
+            response: The streamed response text.
+            send_tools_api: Whether to use OpenAI `tool` role messages.
+
+        Returns:
+            True if any tool ran (so the caller can re-enter the loop).
+
+        Runs each tool, prints results, and appends the assistant tool_call and the
+        observations to `self.messages` (OpenAI `tool` role when `send_tools_api`,
+        otherwise a `Tool result:` user note).
+        """
+        stream_observations = []
+        for stream_tc in stream_tool_calls:
+            tool_name = stream_tc["tool"]
+            tool_args = stream_tc.get("arguments", {})
+            args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+            print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
+            sys.stderr.flush()
+            t_start = time.time()
+            result = self.tool_registry.execute(tool_name, tool_args)
+            if not result["success"] and "Cancelled" in (result.get("error") or ""):
+                print(colorize("[Agentic] Streaming tool sequence cancelled by user, aborting.", 'warning'), file=sys.stderr)
+                break
+            elapsed = time.time() - t_start
+            status = "OK" if result["success"] else "ERROR"
+            print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
+            observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
+            if not observation:
+                observation = "[Tool returned no output]"
+            observation = self._cap_tool_observation(tool_name, observation)
+            print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
+            stream_observations.append(f"[{tool_name}] {observation}")
+
+        self._append_stream_observations(response, stream_tool_calls_out, stream_observations, send_tools_api)
         print()
         return bool(stream_observations)
 
-    def _agentic_streaming_reentry(self, stream_tool_used, send_tools_api, openai_tools) -> bool:
+    def _agentic_streaming_reentry(self, stream_tool_used: bool, send_tools_api: bool, openai_tools: list) -> bool:
         """Re-enter the loop if the final streaming answer itself carried a tool call.
+
+        Args:
+            stream_tool_used: Whether the final stream emitted a tool call.
+            send_tools_api: Whether native tools are in use.
+            openai_tools: Native tool definitions (for the tools API).
+
+        Returns:
+            The final `stream_tool_used` value.
 
         Some models narrate intent in prose then emit the JSON tool call last, so
         the streamed finalize can still carry a tool call. Run up to 3 bounded
         rounds: re-query with updated history, parse tool calls, execute them, feed
         observations back, until the model answers plainly.
-
-        Returns the final `stream_tool_used` value.
         """
         reentry_round = 0
         while stream_tool_used and reentry_round < 3:
@@ -7293,6 +8571,274 @@ class ChatLoop:
         # Recalculate context tokens after merging agentic history
         self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
 
+    def _parse_agentic_tool_calls(self, response_text: str, api_tool_calls: list) -> list:
+        """Build normalized tool calls from either native API calls or inline JSON text.
+
+        Args:
+            response_text: Assistant text content (may embed JSON tool calls).
+            api_tool_calls: Native `tool_calls` from the response (already
+                backend-normalized), or an empty list.
+
+        Returns:
+            list of {"tool": name, "arguments": args} dicts (may be empty).
+        """
+        tool_calls = []
+        if api_tool_calls:
+            for tc in api_tool_calls:
+                func = tc.get('function', {})
+                name = func.get('name', '')
+                args_raw = func.get('arguments', {})
+                if isinstance(args_raw, str):
+                    try:
+                        args = json.loads(args_raw)
+                    except json.JSONDecodeError:
+                        args = {}
+                else:
+                    args = args_raw
+                tool_calls.append({"tool": name, "arguments": args})
+        elif response_text:
+            tool_calls = self.parse_tool_calls(response_text)
+            if not tool_calls:
+                single = self.parse_tool_call(response_text)
+                if single:
+                    tool_calls = [single]
+        return tool_calls
+
+    def _append_tool_messages(self, messages: list, response_text: str, api_tool_calls: list,
+                              tool_calls: list, observations: list, raw_observations: list,
+                              send_tools_api: bool) -> None:
+        """Append the assistant turn and tool-result messages after executing tools.
+
+        Native-tools backends get `tool`-role messages keyed by `tool_call_id`;
+        inline-mode backends get a plain `Tool result:` user note.
+        """
+        combined = "\n---\n".join(observations) if observations else "[No tool output]"
+        assistant_content = response_text
+        if api_tool_calls and not response_text and tool_calls:
+            tool_json = json.dumps(tool_calls[0])
+            assistant_content = tool_json
+        assistant_msg = {'role': 'assistant', 'content': assistant_content}
+        if api_tool_calls:
+            assistant_msg['tool_calls'] = api_tool_calls
+        messages.append(assistant_msg)
+        if send_tools_api and api_tool_calls and observations:
+            for idx, tc in enumerate(api_tool_calls):
+                obs = raw_observations[idx] if idx < len(raw_observations) else "ERROR: Cancelled or skipped due to preceding tool sequence abort."
+                tool_msg = {'role': 'tool', 'tool_call_id': tc.get('id', ''), 'content': obs}
+                tool_msg['name'] = tc.get('function', {}).get('name', '')
+                messages.append(tool_msg)
+        else:
+            messages.append({'role': 'user', 'content': f"Tool result:\n{combined}"})
+
+    def _agentic_step_header(self, iteration: int, max_iterations: int, logger: Optional['AgenticLogger'], messages: list) -> list:
+        """Print the ReAct step header and auto-compact messages if needed.
+
+        Args:
+            iteration: Current loop iteration (1-based).
+            max_iterations: Loop ceiling.
+            logger: Optional AgenticLogger.
+            messages: The conversation list (returned compacted).
+
+        Returns:
+            The (possibly compacted) message list.
+        """
+        if logger:
+            logger.write(type="iteration", iteration=iteration)
+        print(colorize(f"\r[Agentic] Step {iteration}/{max_iterations}…", 'muted'), file=sys.stderr, end="")
+        sys.stderr.flush()
+
+        messages = self._maybe_auto_compact_agentic(messages)
+
+        # Verbose: show payload token count
+        if self.ctx.agentic_verbose and self.ctx.context_window_size > 0:
+            payload_tokens = self.ctx.calculate_context_tokens(messages)
+            pct = payload_tokens / self.ctx.context_window_size
+            print(colorize(f" [{payload_tokens} tokens, {pct:.0%} of ctx]", 'muted'), file=sys.stderr, end="")
+        return messages
+
+    def _agentic_call_step(self, messages: list, step_timeout: int, images_to_send: list,
+                           sync_kwargs: dict, on_chunk: object, finalize_step: object, step_cancel: dict) -> tuple:
+        """Run one ReAct model call under a wall-clock timeout.
+
+        Args:
+            messages: The conversation list to send.
+            step_timeout: Timeout in seconds.
+            images_to_send: Images for the request (empty when vision unsupported).
+            sync_kwargs: Inference params / tools kwargs for the call.
+            on_chunk: Feedback callback from _make_agentic_step_feedback.
+            finalize_step: Closes feedback output on completion/interrupt.
+            step_cancel: Cancel token dict for aborting the request.
+
+        Returns:
+            (response, step_start) where response is the sync-shaped dict, or
+            None on timeout. Raises KeyboardInterrupt after aborting the
+            in-flight request (so the [Interrupted] handler persists turns).
+        """
+        step_start = time.time()
+        try:
+            response = self._call_with_timeout(
+                self.query_handler.query_sync_stream, step_timeout,
+                messages, self.ctx.model,
+                context_size=self.ctx.context_size,
+                images=images_to_send,
+                on_chunk=on_chunk,
+                timeout=step_timeout + 30,
+                cancel=step_cancel,
+                **sync_kwargs
+            )
+        except KeyboardInterrupt:
+            # F1: stop the zombie generation from streaming to the terminal AND
+            # abort the request, then let the [Interrupted] handler take over
+            # (F2 persists completed turns).
+            _signal_abort(step_cancel)
+            finalize_step()
+            raise
+        finalize_step()
+        return response, step_start
+
+    def _agentic_timeout_continue(self, step_buf: dict, step_cancel: dict, step_start: float,
+                                  iteration: int, step_timeout: int, messages: list) -> tuple:
+        """Handle a timed-out step: abort the request and escalate the budget.
+
+        Args:
+            step_buf: The step feedback buffer (accumulated thought/content).
+            step_cancel: Cancel token dict for the in-flight request.
+            step_start: Wall-clock timestamp when the step began.
+            iteration: Current iteration.
+            step_timeout: Timeout that just expired.
+            messages: The conversation list (may receive a nudge message).
+
+        Returns:
+            (should_break, new_step_timeout).
+        """
+        # Abort the still-running request so the daemon thread dies promptly
+        # and the server slot frees for a retry.
+        _signal_abort(step_cancel)
+        # F3: pass generation timing/rate so the timeout policy can distinguish
+        # "still generating" (extend budget) from "stalled" (conservative
+        # retry / abort), and so the nudge can report the model its speed and
+        # remaining token budget.
+        elapsed = time.time() - step_start
+        partial_tokens = self.ctx.estimate_tokens(
+            (step_buf.get("thought", "") + " " + step_buf.get("content", "")).strip())
+        last_activity = step_buf.get("last_activity")
+        idle_sec = (time.time() - last_activity) if last_activity else None
+        return self._handle_agentic_timeout(
+            iteration, step_timeout, messages,
+            partial_text=step_buf.get("content", ""),
+            partial_thought=step_buf.get("thought", ""),
+            elapsed_sec=elapsed, partial_tokens=partial_tokens, idle_sec=idle_sec,
+            thinking_capped=step_buf.get("thinking_capped", False))
+
+    def _agentic_handle_response_flags(self, response: object, images_to_send: list,
+                                       send_tools_api: bool, messages: list) -> tuple:
+        """Track tokens and handle API/vision/tools errors for a step response.
+
+        Args:
+            response: The sync-shaped response dict.
+            images_to_send: Images included in the request.
+            send_tools_api: Whether native tools are currently enabled.
+            messages: The conversation list (mutated on tools fallback).
+
+        Returns:
+            (status, api_error, send_tools_api) where status is one of
+            "ok" / "api_error" / "vision" / "tools".
+        """
+        # Track tokens from sync response to keep context bar accurate
+        if isinstance(response, dict):
+            if self.ctx.backend == "ollama":
+                _pt = response.get("prompt_eval_count", 0)
+                _et = response.get("eval_count", 0)
+                if _pt > 0:
+                    self.ctx.current_context_tokens = _pt + _et
+            else:
+                # llama.cpp KV cache makes prompt_tokens unreliable;
+                # recalculate from actual messages for accuracy
+                self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(messages)
+
+        # Check for API-level errors from query_sync
+        if isinstance(response, dict) and "error" in response and not response.get("choices") and not response.get("message", {}).get("content"):
+            err_msg = response["error"].get("message", "Unknown error") if isinstance(response["error"], dict) else str(response["error"])
+            print(colorize(f"\n[Agentic] API error: {err_msg}", 'error'), file=sys.stderr)
+            return "api_error", err_msg, send_tools_api
+
+        if images_to_send and self.ctx.supports_vision is not False:
+            if check_vision_error(response):
+                self.ctx.supports_vision = False
+                print(colorize("\n[WARNING] Model does not support vision. Stripping images for subsequent queries.", 'warning'), file=sys.stderr)
+                return "vision", "", send_tools_api
+
+        if send_tools_api and check_tools_error(response):
+            send_tools_api = False
+            tool_defs_block = self.tool_registry.get_system_prompt_block()
+            messages[0] = {'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs_block, include_tool_defs=True)}
+            print(colorize("\n[WARNING] Model does not support native tools API. Falling back to inline tool definitions.", 'warning'), file=sys.stderr)
+            return "tools", "", send_tools_api
+        return "ok", "", send_tools_api
+
+    def _agentic_step_content(self, response: object) -> tuple:
+        """Extract response text + native tool calls from a step response.
+
+        Args:
+            response: The sync-shaped response dict.
+
+        Returns:
+            (response_text, api_tool_calls) tuple (verbose display printed here).
+        """
+        response_text = _extract_sync_content(self.ctx, response)
+        api_tool_calls = _extract_sync_tool_calls(self.ctx, response)
+
+        if self.ctx.agentic_verbose and response_text:
+            truncated = len(response_text) > 500
+            display = response_text[:500] + ("..." if truncated else "")
+            print(colorize(f"\n[Verbose] {display}", 'muted'), file=sys.stderr)
+            if truncated:
+                print(colorize(f"[Verbose] ({len(response_text)} total chars, showing first 500)", 'muted'), file=sys.stderr)
+        return response_text, api_tool_calls
+
+    def _agentic_finish_query(self, messages: list, final_answer: str, final_content: str,
+                              send_tools_api: bool, openai_tools: list, logger: Optional['AgenticLogger'],
+                              iteration: int, max_iterations: int, response_text: str,
+                              api_error: str, agentic_seed_len: int) -> None:
+        """Post-loop finalize: print the API-error banner or stream the final answer.
+
+        Args:
+            messages: The loop's message list.
+            final_answer: The answer produced by the loop (may be "").
+            final_content: The user's processed query text.
+            send_tools_api: Whether native tools are in use.
+            openai_tools: Native tool definitions.
+            logger: Optional AgenticLogger.
+            iteration: Final iteration count.
+            max_iterations: Loop ceiling.
+            response_text: The last response text.
+            api_error: Set when the loop aborted on an API error.
+            agentic_seed_len: Seed boundary for history persistence.
+        """
+        if api_error:
+            # Backend unreachable (connection refused, 5xx, ...). Do NOT re-query
+            # a dead endpoint for a final answer — the finalize path would launch
+            # a second doomed streaming request (another 3 retries) and print a
+            # misleading "[Agentic: no answer produced]". Nothing is merged into
+            # the persistent history beyond the user's own message, so repeated
+            # attempts while the server is down don't pollute the context.
+            print(colorize(
+                f"\n[Agentic] Backend unreachable ({api_error}). "
+                "Aborted without a final answer; conversation history untouched.",
+                'warning'), file=sys.stderr)
+        else:
+            if iteration >= max_iterations and not final_answer:
+                final_answer = response_text
+
+            self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text)
+
+        # Merge the ReAct loop turns back into self.messages for cross-turn
+        # memory (see `_persist_agentic_history` for ordering/nudge handling).
+        self._persist_agentic_history(messages, agentic_seed_len, compact=True)
+
+        if logger:
+            logger.write(type="end", total_iterations=iteration)
+
     def run_agentic_query(self, full_input: str) -> None:
         """ReAct loop: query model, parse tool calls, execute tools, stream final answer."""
         self._agentic_streaming_reentry_count = 0
@@ -7332,19 +8878,7 @@ class ChatLoop:
 
             while iteration < max_iterations:
                 iteration += 1
-                if logger:
-                    logger.write(type="iteration", iteration=iteration)
-                print(colorize(f"\r[Agentic] Step {iteration}/{max_iterations}…", 'muted'), file=sys.stderr, end="")
-                sys.stderr.flush()
-
-                # Auto-compact agentic messages if approaching context limit
-                messages = self._maybe_auto_compact_agentic(messages)
-
-                # Verbose: show payload token count
-                if self.ctx.agentic_verbose and self.ctx.context_window_size > 0:
-                    payload_tokens = self.ctx.calculate_context_tokens(messages)
-                    pct = payload_tokens / self.ctx.context_window_size
-                    print(colorize(f" [{payload_tokens} tokens, {pct:.0%} of ctx]", 'muted'), file=sys.stderr, end="")
+                messages = self._agentic_step_header(iteration, max_iterations, logger, messages)
 
                 images_to_send = [] if self.ctx.supports_vision is False else self.ctx.current_images
                 sync_kwargs = dict(get_inference_params(self.ctx.model))
@@ -7352,119 +8886,28 @@ class ChatLoop:
                     sync_kwargs["tools"] = openai_tools
                 on_chunk, finalize_step, step_buf = self._make_agentic_step_feedback()
                 step_cancel = {"event": threading.Event(), "close": None}
-                step_start = time.time()
 
-                def _abort_step():
-                    # Signal the worker thread and close the HTTP response so a
-                    # blocked stream read terminates promptly (stops the server
-                    # generating + frees the request slot).
-                    step_cancel["event"].set()
-                    close = step_cancel.get("close")
-                    if close:
-                        try:
-                            close()
-                        except Exception:
-                            pass
-
-                try:
-                    response = self._call_with_timeout(
-                        self.query_handler.query_sync_stream, step_timeout,
-                        messages, self.ctx.model,
-                        context_size=self.ctx.context_size,
-                        images=images_to_send,
-                        on_chunk=on_chunk,
-                        timeout=step_timeout + 30,
-                        cancel=step_cancel,
-                        **sync_kwargs
-                    )
-                except KeyboardInterrupt:
-                    # F1: stop the zombie generation from streaming to the
-                    # terminal AND abort the request, then let the [Interrupted]
-                    # handler take over (F2 persists completed turns).
-                    _abort_step()
-                    finalize_step()
-                    raise
-                finalize_step()
+                response, step_start = self._agentic_call_step(
+                    messages, step_timeout, images_to_send, sync_kwargs,
+                    on_chunk, finalize_step, step_cancel)
 
                 if response is None:
-                    # Timed out — abort the still-running request so the daemon
-                    # thread dies promptly and the server slot frees for a retry.
-                    _abort_step()
-                    # F3: pass generation timing/rate so the timeout policy can
-                    # distinguish "still generating" (extend budget) from "stalled"
-                    # (conservative retry / abort), and so the nudge can report the
-                    # model its speed and remaining token budget.
-                    elapsed = time.time() - step_start
-                    partial_tokens = self.ctx.estimate_tokens(
-                        (step_buf.get("thought", "") + " " + step_buf.get("content", "")).strip())
-                    last_activity = step_buf.get("last_activity")
-                    idle_sec = (time.time() - last_activity) if last_activity else None
-                    should_break, step_timeout = self._handle_agentic_timeout(
-                        iteration, step_timeout, messages,
-                        partial_text=step_buf.get("content", ""),
-                        partial_thought=step_buf.get("thought", ""),
-                        elapsed_sec=elapsed, partial_tokens=partial_tokens, idle_sec=idle_sec,
-                        thinking_capped=step_buf.get("thinking_capped", False))
+                    # Timed out — escalate (extend while generating, else retry/abort).
+                    should_break, step_timeout = self._agentic_timeout_continue(
+                        step_buf, step_cancel, step_start, iteration, step_timeout, messages)
                     if should_break:
                         break
                     response_text = ""
                     continue
 
-                # Track tokens from sync response to keep context bar accurate
-                if isinstance(response, dict):
-                    if self.ctx.backend == "ollama":
-                        _pt = response.get("prompt_eval_count", 0)
-                        _et = response.get("eval_count", 0)
-                        if _pt > 0:
-                            self.ctx.current_context_tokens = _pt + _et
-                    else:
-                        # llama.cpp KV cache makes prompt_tokens unreliable;
-                        # recalculate from actual messages for accuracy
-                        self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(messages)
-
-                # Check for API-level errors from query_sync
-                if isinstance(response, dict) and "error" in response and not response.get("choices") and not response.get("message", {}).get("content"):
-                    err_msg = response["error"].get("message", "Unknown error") if isinstance(response["error"], dict) else str(response["error"])
-                    api_error = err_msg
-                    print(colorize(f"\n[Agentic] API error: {err_msg}", 'error'), file=sys.stderr)
+                status, api_error, send_tools_api = self._agentic_handle_response_flags(
+                    response, images_to_send, send_tools_api, messages)
+                if status == "api_error":
                     break
-
-                if images_to_send and self.ctx.supports_vision is not False:
-                    if check_vision_error(response):
-                        self.ctx.supports_vision = False
-                        print(colorize("\n[WARNING] Model does not support vision. Stripping images for subsequent queries.", 'warning'), file=sys.stderr)
-                        continue
-
-                if send_tools_api and check_tools_error(response):
-                    send_tools_api = False
-                    include_tool_defs = True
-                    tool_defs_block = self.tool_registry.get_system_prompt_block()
-                    messages[0] = {'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs_block, include_tool_defs=True)}
-                    print(colorize("\n[WARNING] Model does not support native tools API. Falling back to inline tool definitions.", 'warning'), file=sys.stderr)
+                if status in ("vision", "tools"):
                     continue
 
-                response_text = ""
-                api_tool_calls = []
-                if isinstance(response, dict):
-                    if self.ctx.backend == "ollama":
-                        msg = response.get('message', {})
-                        response_text = msg.get('content', '')
-                        api_tool_calls = msg.get('tool_calls', [])
-                    else:
-                        choices = response.get('choices', [])
-                        if choices:
-                            msg = choices[0].get('message', {})
-                            response_text = msg.get('content', '') or ''
-                            api_tool_calls = msg.get('tool_calls', [])
-                elif isinstance(response, str):
-                    response_text = response
-
-                if self.ctx.agentic_verbose and response_text:
-                    truncated = len(response_text) > 500
-                    display = response_text[:500] + ("..." if truncated else "")
-                    print(colorize(f"\n[Verbose] {display}", 'muted'), file=sys.stderr)
-                    if truncated:
-                        print(colorize(f"[Verbose] ({len(response_text)} total chars, showing first 500)", 'muted'), file=sys.stderr)
+                response_text, api_tool_calls = self._agentic_step_content(response)
 
                 if not response_text and not api_tool_calls:
                     messages.append({'role': 'user', 'content': 'Please provide a tool call or your final answer.',
@@ -7475,26 +8918,7 @@ class ChatLoop:
                     print(colorize("\n[Agentic] Model appears stuck (repetitive output), aborting.", 'warning'), file=sys.stderr)
                     break
 
-                tool_calls = []
-                if api_tool_calls:
-                    for tc in api_tool_calls:
-                        func = tc.get('function', {})
-                        name = func.get('name', '')
-                        args_raw = func.get('arguments', {})
-                        if isinstance(args_raw, str):
-                            try:
-                                args = json.loads(args_raw)
-                            except json.JSONDecodeError:
-                                args = {}
-                        else:
-                            args = args_raw
-                        tool_calls.append({"tool": name, "arguments": args})
-                elif response_text:
-                    tool_calls = self.parse_tool_calls(response_text)
-                    if not tool_calls:
-                        single = self.parse_tool_call(response_text)
-                        if single:
-                            tool_calls = [single]
+                tool_calls = self._parse_agentic_tool_calls(response_text, api_tool_calls)
 
                 if logger:
                     first_call = tool_calls[0] if tool_calls else None
@@ -7517,47 +8941,14 @@ class ChatLoop:
                 if abort_loop:
                     break
 
-                combined = "\n---\n".join(observations) if observations else "[No tool output]"
-                assistant_content = response_text
-                if api_tool_calls and not response_text and tool_calls:
-                    tool_json = json.dumps(tool_calls[0])
-                    assistant_content = tool_json
-                assistant_msg = {'role': 'assistant', 'content': assistant_content}
-                if api_tool_calls:
-                    assistant_msg['tool_calls'] = api_tool_calls
-                messages.append(assistant_msg)
-                if send_tools_api and api_tool_calls and observations:
-                    for idx, tc in enumerate(api_tool_calls):
-                        obs = raw_observations[idx] if idx < len(raw_observations) else "ERROR: Cancelled or skipped due to preceding tool sequence abort."
-                        tool_msg = {'role': 'tool', 'tool_call_id': tc.get('id', ''), 'content': obs}
-                        tool_msg['name'] = tc.get('function', {}).get('name', '')
-                        messages.append(tool_msg)
-                else:
-                    messages.append({'role': 'user', 'content': f"Tool result:\n{combined}"})
+                self._append_tool_messages(
+                    messages, response_text, api_tool_calls, tool_calls,
+                    observations, raw_observations, send_tools_api)
 
-            if api_error:
-                # Backend unreachable (connection refused, 5xx, ...). Do NOT re-query
-                # a dead endpoint for a final answer — the finalize path would launch
-                # a second doomed streaming request (another 3 retries) and print a
-                # misleading "[Agentic: no answer produced]". Nothing is merged into
-                # the persistent history beyond the user's own message, so repeated
-                # attempts while the server is down don't pollute the context.
-                print(colorize(
-                    f"\n[Agentic] Backend unreachable ({api_error}). "
-                    "Aborted without a final answer; conversation history untouched.",
-                    'warning'), file=sys.stderr)
-            else:
-                if iteration >= max_iterations and not final_answer:
-                    final_answer = response_text
+            self._agentic_finish_query(
+                messages, final_answer, final_content, send_tools_api, openai_tools,
+                logger, iteration, max_iterations, response_text, api_error, agentic_seed_len)
 
-                self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text)
-
-            # Merge the ReAct loop turns back into self.messages for cross-turn
-            # memory (see `_persist_agentic_history` for ordering/nudge handling).
-            self._persist_agentic_history(messages, agentic_seed_len, compact=True)
-
-            if logger:
-                logger.write(type="end", total_iterations=iteration)
         except KeyboardInterrupt:
             # F2: a ^C aborts the current step but must NOT erase the completed
             # tool work. Persist the finished turns before handing control back;
@@ -7768,8 +9159,12 @@ class ChatLoop:
         print(file=sys.stderr)
         return False
 
-    def _compact_threshold(self, parts) -> bool:
-        """Set the auto-compaction trigger threshold."""
+    def _compact_threshold(self, parts: list) -> bool:
+        """Set the auto-compaction trigger threshold.
+
+        Args:
+            parts: Split /compact args (parts[2] is the threshold value).
+        """
         if len(parts) < 3:
             print(colorize("[Usage: /compact threshold <value>]  (e.g. 0.6 or 60)", 'warning'), file=sys.stderr)
             return False
@@ -8028,28 +9423,20 @@ class ChatLoop:
 # ============= MAIN ENTRY POINT ===========================================
 # ============================================================================
 
-def get_base_url(args, backend):
-    """Get base URL for the specified backend."""
-    if args.host:
-        base_url = args.host
-    else:
-        default = {"llamacpp": DEFAULT_LLAMACPP_HOST, "lmstudio": DEFAULT_LMSTUDIO_HOST, "gemini": DEFAULT_GEMINI_HOST, "opencodezen": DEFAULT_OPENCODEZEN_HOST, "opencodego": DEFAULT_OPENCODEGO_HOST, "mistral": DEFAULT_MISTRAL_HOST, "deepseek": DEFAULT_DEEPSEEK_HOST}.get(backend, DEFAULT_OLLAMA_HOST)
-        env_var = f'{backend.upper()}_HOST'
-        base_url = os.environ.get(env_var, default)
 
-    # Ensure URL prefix
-    if not base_url.startswith(('http://', 'https://')):
-        base_url = f"http://{base_url}"
+def list_models_llamacpp(base_url: str, filter_arg: Optional[str] = None,
+                         api_key: Optional[str] = None) -> None:
+    """List Llama.cpp / Gemini models.
 
-    return base_url
-
-
-def list_models_llamacpp(base_url, filter_arg=None, api_key=None):
-    """List Llama.cpp / Gemini models."""
+    Args:
+        base_url: Server URL.
+        filter_arg: Optional name filter string.
+        api_key: Optional API key for cloud backends.
+    """
     models = fetch_models_llamacpp(base_url, api_key=api_key)
 
     if not models:
-        print(f"\n[No models found via llamacpp API]", file=sys.stderr)
+        print("\n[No models found via llamacpp API]", file=sys.stderr)
         return
 
     search_term = None
@@ -8074,16 +9461,17 @@ def list_models_llamacpp(base_url, filter_arg=None, api_key=None):
     print()
 
 
-def list_models_ollama(base_url, filter_arg=None, include_capabilities=False, file=None):
-    if file is None:
-        file = sys.stdout
+def _normalize_models_for_display(models: list, filter_arg: Optional[str], sort_by: str) -> tuple:
+    """Filter, sort, and normalize model size fields for display.
 
-    models = fetch_models_ollama(base_url)
-    if not models:
-        print(colorize(f"\nNo models found via Ollama API at {base_url}. Check if the server is running.\n", 'warning'), file=file)
-        return
+    Args:
+        models: Raw model list from the API.
+        filter_arg: Optional name/size filter string.
+        sort_by: 'name' or 'size'.
 
-    sort_by = 'name'
+    Returns:
+        (models, search_term) — normalized + sorted list and the applied term.
+    """
     search_term = None
 
     if filter_arg:
@@ -8099,9 +9487,6 @@ def list_models_ollama(base_url, filter_arg=None, include_capabilities=False, fi
 
     if search_term:
         models = [m for m in models if search_term in m['name'].lower()]
-        if not models:
-            print(colorize(f"\nNo models found matching '{search_term}'.\n", 'warning'), file=file)
-            return
 
     for m in models:
         # Handle different possible size fields from the API
@@ -8116,6 +9501,77 @@ def list_models_ollama(base_url, filter_arg=None, include_capabilities=False, fi
     else:
         models.sort(key=lambda x: x.get('name', ''))
 
+    return models, search_term
+
+
+def _print_models_table(models: list, file: object) -> None:
+    """Print the NAME/SIZE/MODIFIED model table.
+
+    Args:
+        models: Normalized model list.
+        file: Output stream.
+    """
+    header = f"{'NAME':<40} | {'SIZE':<12} | {'MODIFIED'}"
+    print(colorize(header, 'muted'), file=file)
+    print(colorize("-" * len(header), 'muted'), file=file)
+    for m in models:
+        size_str = parse_size(m.get('size') or m.get('size_bytes') or m.get('model_size') or 0)
+        modified = m.get('modified_at', 'Unknown')[:10]
+        print(f"{m['name']:<40} | {size_str:<12} | {modified}", file=file)
+    print(file=file)
+
+
+def _print_models_with_capabilities(base_url: str, models: list, file: object) -> None:
+    """Fetch and print the model table including per-model capabilities.
+
+    Args:
+        base_url: Ollama server URL.
+        models: Normalized model list.
+        file: Output stream.
+    """
+    # Retrieve capabilities for each model (extra API calls)
+    for m in models:
+        try:
+            info = fetch_model_info_ollama(base_url, m['name'])
+            m['capabilities'] = ",".join(info.get('capabilities', []))
+        except Exception:
+            m['capabilities'] = ''
+    header = f"{'NAME':<40} | {'SIZE':<12} | {'MODIFIED':<12} | {'CAPABILITIES'}"
+    print(colorize(header, 'muted'), file=file)
+    print(colorize("-" * len(header), 'muted'), file=file)
+    for m in models:
+        size_str = parse_size(m.get('size') or m.get('size_bytes') or m.get('model_size') or 0)
+        modified = m.get('modified_at', 'Unknown')[:10]
+        caps = m.get('capabilities', '')
+        print(f"{m['name']:<40} | {size_str:<12} | {modified} | {caps}", file=file)
+    print(file=file)
+
+
+def list_models_ollama(base_url: str, filter_arg: Optional[str] = None,
+                       include_capabilities: bool = False, file: object = None) -> None:
+    """List models from an Ollama server, optionally with capabilities.
+
+    Args:
+        base_url: Ollama server URL.
+        filter_arg: Optional name/size filter string.
+        include_capabilities: Whether to fetch and show per-model capabilities.
+        file: Output stream (defaults to sys.stdout).
+    """
+    if file is None:
+        file = sys.stdout
+
+    models = fetch_models_ollama(base_url)
+    if not models:
+        print(colorize(f"\nNo models found via Ollama API at {base_url}. Check if the server is running.\n", 'warning'), file=file)
+        return
+
+    sort_by = 'name'
+    models, search_term = _normalize_models_for_display(models, filter_arg, sort_by)
+
+    if search_term and not models:
+        print(colorize(f"\nNo models found matching '{search_term}'.\n", 'warning'), file=file)
+        return
+
     largest = max(models, key=lambda x: x['size_bytes']) if models else None
     if largest and largest['size_bytes'] > 0:
         l_size_gb = largest['size_bytes'] / (1024**3)
@@ -8124,35 +9580,20 @@ def list_models_ollama(base_url, filter_arg=None, include_capabilities=False, fi
         print(file=file)
 
     if include_capabilities:
-        # Retrieve capabilities for each model (extra API calls)
-        for m in models:
-            try:
-                info = fetch_model_info_ollama(base_url, m['name'])
-                m['capabilities'] = ",".join(info.get('capabilities', []))
-            except Exception:
-                m['capabilities'] = ''
-        header = f"{'NAME':<40} | {'SIZE':<12} | {'MODIFIED':<12} | {'CAPABILITIES'}"
-        print(colorize(header, 'muted'), file=file)
-        print(colorize("-" * len(header), 'muted'), file=file)
-        for m in models:
-            size_str = parse_size(m.get('size') or m.get('size_bytes') or m.get('model_size') or 0)
-            modified = m.get('modified_at', 'Unknown')[:10]
-            caps = m.get('capabilities', '')
-            print(f"{m['name']:<40} | {size_str:<12} | {modified} | {caps}", file=file)
+        _print_models_with_capabilities(base_url, models, file)
     else:
-        header = f"{'NAME':<40} | {'SIZE':<12} | {'MODIFIED'}"
-        print(colorize(header, 'muted'), file=file)
-        print(colorize("-" * len(header), 'muted'), file=file)
-        for m in models:
-            size_str = parse_size(m.get('size') or m.get('size_bytes') or m.get('model_size') or 0)
-            modified = m.get('modified_at', 'Unknown')[:10]
-            print(f"{m['name']:<40} | {size_str:<12} | {modified}", file=file)
-    print(file=file)
+        _print_models_table(models, file)
     print()
 
 
-def show_model_info(base_url, model, args):
-    """Display model information."""
+def show_model_info(base_url: str, model: str, args: argparse.Namespace) -> None:
+    """Display model information.
+
+    Args:
+        base_url: Ollama server URL.
+        model: Model name.
+        args: Parsed CLI arguments (uses output_format).
+    """
     info = fetch_model_info_ollama(base_url, model)
 
     if not info:
@@ -8173,8 +9614,14 @@ def show_model_info(base_url, model, args):
     sys.exit(0)
 
 
-def show_model_details(base_url, model, args):
-    """Display full model details."""
+def show_model_details(base_url: str, model: str, args: argparse.Namespace) -> None:
+    """Display full model details.
+
+    Args:
+        base_url: Ollama server URL.
+        model: Model name.
+        args: Parsed CLI arguments (uses output_format).
+    """
     info = fetch_model_info_ollama(base_url, model)
 
     if not info:
@@ -8189,8 +9636,15 @@ def show_model_details(base_url, model, args):
     sys.exit(0)
 
 
-def fetch_loaded_models_ollama(base_url):
-    """Fetch models currently loaded in memory via Ollama /api/ps."""
+def fetch_loaded_models_ollama(base_url: str) -> list:
+    """Fetch models currently loaded in memory via Ollama /api/ps.
+
+    Args:
+        base_url: Ollama server URL.
+
+    Returns:
+        List of model dicts, or [] on failure.
+    """
     try:
         url = f"{base_url}/api/ps"
         with _request_with_retry(Request(url, headers={'User-Agent': 'Mozilla/5.0'})) as response:
@@ -8227,8 +9681,14 @@ def fetch_loaded_models_context_ollama(base_url: str) -> list[tuple[str, int]]:
         return []
 
 
-def check_backend_with_head(url, server_marker, timeout=1):
-    """Attempt HEAD request to URL and check for server header."""
+def check_backend_with_head(url: str, server_marker: str, timeout: float = 1) -> bool:
+    """Attempt HEAD request to URL and check for server header.
+
+    Args:
+        url: URL to probe.
+        server_marker: Marker to look for in the Server header.
+        timeout: Socket timeout in seconds.
+    """
     try:
         request = Request(url, method='HEAD')
         with urlopen(request, timeout=timeout) as response:  # startup-probe
@@ -8243,8 +9703,14 @@ def check_backend_with_head(url, server_marker, timeout=1):
         return False
 
 
-def check_backend_with_get(url, server_marker, timeout=1):
-    """Attempt GET request to URL and check for server marker."""
+def check_backend_with_get(url: str, server_marker: str, timeout: float = 1) -> bool:
+    """Attempt GET request to URL and check for server marker.
+
+    Args:
+        url: URL to probe.
+        server_marker: Marker to look for in the response body.
+        timeout: Socket timeout in seconds.
+    """
     try:
         request = Request(url, method='GET')
         with urlopen(request, timeout=timeout) as response:  # startup-probe
@@ -8257,8 +9723,13 @@ def check_backend_with_get(url, server_marker, timeout=1):
 
 
 
-def check_lmstudio(url, timeout=2):
-    """Check if LM Studio is running by querying /v1/models."""
+def check_lmstudio(url: str, timeout: float = 2) -> bool:
+    """Check if LM Studio is running by querying /v1/models.
+
+    Args:
+        url: Base URL of the LM Studio server.
+        timeout: Socket timeout in seconds.
+    """
     try:
         request = Request(f"{url}/v1/models", method='GET')
         with urlopen(request, timeout=timeout) as response:  # startup-probe
@@ -8269,8 +9740,14 @@ def check_lmstudio(url, timeout=2):
         return False
 
 
-def check_gemini(url, api_key=None, timeout=2):
-    """Check if Gemini API is reachable by querying /v1/models."""
+def check_gemini(url: str, api_key: Optional[str] = None, timeout: float = 2) -> bool:
+    """Check if Gemini API is reachable by querying /v1/models.
+
+    Args:
+        url: Gemini OpenAI-compatible endpoint URL.
+        api_key: API key (required; returns False without it).
+        timeout: Socket timeout in seconds.
+    """
     if not api_key:
         return False
     try:
@@ -8284,18 +9761,18 @@ def check_gemini(url, api_key=None, timeout=2):
         return False
 
 
-def auto_detect_backend():
+def auto_detect_backend() -> tuple:
     """Auto-detect backend based on default ports using HEAD request.
-    
+
     Checks sequentiall for:
     - 127.0.0.1:8080 for llama.cpp
     - 127.0.0.1:11434 for ollama
     - 127.0.0.1:1234 for lm studio
-    
+
     Returns:
         tuple: (found, backend_name, url) or (None, '', '')
     """
-   
+
     # Default URLs
     llama_cpp_url = DEFAULT_LLAMACPP_HOST
     ollama_url =    DEFAULT_OLLAMA_HOST
@@ -8303,63 +9780,67 @@ def auto_detect_backend():
 
     # Check which backend is running
 
-    sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + llama_cpp_url + " ", 'info'))
+    sys.stderr.write(colorize("[INFO] AutoDetecting on : " + llama_cpp_url + " ", 'info'))
     if check_backend_with_head(llama_cpp_url, 'llama.cpp'):
-        sys.stderr.write(colorize(f"Success\n", 'info'))
+        sys.stderr.write(colorize("Success\n", 'info'))
         return True,'llamacpp',llama_cpp_url
     else:
-        sys.stderr.write(colorize(f"Fail\n", 'info'))
+        sys.stderr.write(colorize("Fail\n", 'info'))
 
-    sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + ollama_url    + " ", 'info'))
+    sys.stderr.write(colorize("[INFO] AutoDetecting on : " + ollama_url    + " ", 'info'))
     if check_backend_with_get(ollama_url,     'ollama'):
-        sys.stderr.write(colorize(f"Success\n", 'info'))
+        sys.stderr.write(colorize("Success\n", 'info'))
         return True,'ollama',ollama_url
     else:
-        sys.stderr.write(colorize(f"Fail\n", 'info'))
+        sys.stderr.write(colorize("Fail\n", 'info'))
 
-    sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + lmstudio_url + " ", 'info'))
+    sys.stderr.write(colorize("[INFO] AutoDetecting on : " + lmstudio_url + " ", 'info'))
     if check_lmstudio(lmstudio_url):
-        sys.stderr.write(colorize(f"Success\n", 'info'))
+        sys.stderr.write(colorize("Success\n", 'info'))
         return True,'lmstudio',lmstudio_url
     else:
-        sys.stderr.write(colorize(f"Fail\n", 'info'))
+        sys.stderr.write(colorize("Fail\n", 'info'))
 
 
-    # grab the ip of the host 
+    # grab the ip of the host
     try:
         list_of_ip = socket.gethostbyname_ex(socket.gethostname())[-1]
     except socket.error:
         list_of_ip = []
     for ip in list_of_ip:
-        
+
         url="http://"+ip + ":" + str(DEFAULT_LLAMACPP_PORT)
-        sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + url    + " ", 'info'))
+        sys.stderr.write(colorize("[INFO] AutoDetecting on : " + url    + " ", 'info'))
         if check_backend_with_head(url, 'llama.cpp', timeout=0.2):
-            sys.stderr.write(colorize(f"Success\n", 'info'))
+            sys.stderr.write(colorize("Success\n", 'info'))
             return True,'llamacpp',url
         else:
-            sys.stderr.write(colorize(f"Fail\n", 'info'))
+            sys.stderr.write(colorize("Fail\n", 'info'))
 
         url="http://"+ip + ":" + str(DEFAULT_OLLAMA_PORT)
-        sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + url    + " ", 'info'))
+        sys.stderr.write(colorize("[INFO] AutoDetecting on : " + url    + " ", 'info'))
         if check_backend_with_get("http://"+ip + ":" +  str(DEFAULT_OLLAMA_PORT),   'ollama', timeout=0.2):
-            sys.stderr.write(colorize(f"Success\n", 'info'))
+            sys.stderr.write(colorize("Success\n", 'info'))
             return True,'ollama',url
         else:
-            sys.stderr.write(colorize(f"Fail\n", 'info'))
+            sys.stderr.write(colorize("Fail\n", 'info'))
 
         url="http://"+ip + ":" + str(DEFAULT_LMSTUDIO_PORT)
-        sys.stderr.write(colorize(f"[INFO] AutoDetecting on : " + url    + " ", 'info'))
+        sys.stderr.write(colorize("[INFO] AutoDetecting on : " + url    + " ", 'info'))
         if check_lmstudio(url, timeout=0.2):
-            sys.stderr.write(colorize(f"Success\n", 'info'))
+            sys.stderr.write(colorize("Success\n", 'info'))
             return True,'lmstudio',url
         else:
-            sys.stderr.write(colorize(f"Fail\n", 'info'))
+            sys.stderr.write(colorize("Fail\n", 'info'))
 
     return None,'',''
 
-def load_saved_backends():
-    """Load the list of previously successful backend configurations."""
+def load_saved_backends() -> list:
+    """Load the list of previously successful backend configurations.
+
+    Returns:
+        List of {"backend", "host"} dicts, or [] when absent/invalid.
+    """
     config_file = os.path.expanduser("~/.ollamaquery.d/backends.json")
     if os.path.exists(config_file):
         try:
@@ -8371,104 +9852,167 @@ def load_saved_backends():
             sys.stderr.write(colorize("[WARNING] Failed to load saved backend config\n", 'warning'))
     return []
 
-def save_backend_config(backend, host):
-    """Save a successful connection to the top of the history list."""
+def save_backend_config(backend: str, host: str) -> None:
+    """Save a successful connection to the top of the history list.
+
+    Args:
+        backend: Backend name.
+        host: Backend base URL.
+    """
     config_file = os.path.expanduser("~/.ollamaquery.d/backends.json")
     try:
         os.makedirs(os.path.dirname(config_file), exist_ok=True)
         history = load_saved_backends()
-        
+
         new_entry = {"backend": backend, "host": host}
-        
+
         # Remove it if it already exists so we can bump it to the top
         history = [entry for entry in history if entry != new_entry]
         history.insert(0, new_entry)
-        
+
         # Keep only the last 10 known servers to avoid bloat
         history = history[:10]
-        
+
         with open(config_file, 'w') as f:
             json.dump(history, f, indent=2)
     except Exception as e:
         sys.stderr.write(colorize(f"[WARNING] Failed to save config: {e}\n", 'warning'))
 
-def resolve_connection(args):
+def _probe_backend(backend: str, host: str, api_key: Optional[str] = None) -> bool:
+    """Probe whether a backend is reachable at a given host URL.
+
+    Args:
+        backend: Backend name (ollama / llamacpp / lmstudio / cloud backends).
+        host: Base URL of the server.
+        api_key: Optional API key for cloud backends.
+
+    Returns:
+        bool: True if the server responded as expected.
+    """
+    if backend == "llamacpp":
+        return check_backend_with_head(host, 'llama.cpp')
+    if backend == "ollama":
+        return check_backend_with_get(host, 'ollama')
+    if backend == "lmstudio":
+        return check_lmstudio(host)
+    if backend in CLOUD_BACKENDS:
+        key = api_key or os.environ.get(CLOUD_API_KEY_ENV.get(backend, ''), '')
+        return check_gemini(host, key)
+    return False
+
+
+def _resolve_host_override(args: argparse.Namespace) -> tuple:
+    """Resolve backend/host when the user passed an explicit -H host.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        (backend, base_url) tuple.
+
+    Infers the backend from the port when -b is omitted; defaults to ollama.
+    """
+    base_url = args.host if args.host.startswith(('http://', 'https://')) else f"http://{args.host}"
+    selected_backend = args.backend
+    if not selected_backend:
+        # Infer backend from known ports
+        port_match = re.search(r':(\d+)(/|$)', base_url)
+        if port_match:
+            port = int(port_match.group(1))
+            if port == DEFAULT_OLLAMA_PORT:
+                selected_backend = "ollama"
+            elif port == DEFAULT_LLAMACPP_PORT:
+                selected_backend = "llamacpp"
+            elif port == DEFAULT_LMSTUDIO_PORT:
+                selected_backend = "lmstudio"
+        if not selected_backend:
+            selected_backend = "ollama"
+    elif selected_backend == "gemini" and not base_url.startswith(('http://', 'https://')):
+        # Treat bare host as gemini API URL, ensure https
+        base_url = f"https://{base_url}" if not base_url.startswith('http') else base_url
+    return selected_backend, base_url
+
+
+def _probe_saved_backends(args: argparse.Namespace, saved_backends: list) -> Optional[tuple]:
+    """Try each saved backend config (MRU first), returning the first reachable one.
+
+    Args:
+        args: Parsed CLI arguments.
+        saved_backends: List of {"backend", "host"} config dicts.
+
+    Returns:
+        (backend, host) tuple, or None if none responded.
+    """
+    for config in saved_backends:
+        s_backend = config.get('backend')
+        s_host = config.get('host')
+
+        # If user explicitly passed `-b`, skip history entries that don't match
+        if args.backend and args.backend != s_backend:
+            continue
+
+        sys.stderr.write(colorize(f"[INFO] Testing known server: {s_backend} @ {s_host} ... ", 'muted'))
+
+        is_valid = _probe_backend(s_backend, s_host, getattr(args, 'api_key', None))
+
+        if is_valid:
+            sys.stderr.write(colorize("Success\n", 'success'))
+            save_backend_config(s_backend, s_host)  # Bump to top of list
+            return s_backend, s_host
+        sys.stderr.write(colorize("Offline\n", 'warning'))
+    return None
+
+
+def _resolve_fallback(args: argparse.Namespace) -> tuple:
+    """Return the ultimate fallback (backend, host) when all probes failed.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
+    fallback_backend = args.backend or "ollama"
+    if fallback_backend in CLOUD_BACKENDS:
+        env_var = CLOUD_HOST_ENV[fallback_backend]
+        fallback_host = os.environ.get(env_var, CLOUD_DEFAULT_HOST[fallback_backend])
+    elif fallback_backend == "llamacpp":
+        fallback_host = os.environ.get('LLAMACPP_HOST', DEFAULT_LLAMACPP_HOST)
+    elif fallback_backend == "lmstudio":
+        fallback_host = os.environ.get('LMSTUDIO_HOST', DEFAULT_LMSTUDIO_HOST)
+    else:
+        fallback_host = os.environ.get('OLLAMA_HOST', DEFAULT_OLLAMA_HOST)
+    return fallback_backend, fallback_host
+
+
+def resolve_connection(args: argparse.Namespace) -> tuple:
     """
     Determines the correct backend and host by prioritizing:
     1. Explicit CLI overrides (-H and -b)
     2. Previously working configurations (tried Most Recently Used first)
     3. Network Auto-discovery
     4. Hardcoded defaults
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        (backend, base_url) tuple.
     """
     # 1. Explicit user override (-H)
     if args.host:
-        base_url = args.host if args.host.startswith(('http://', 'https://')) else f"http://{args.host}"
-        selected_backend = args.backend
-        if not selected_backend:
-            # Infer backend from known ports
-            port_match = re.search(r':(\d+)(/|$)', base_url)
-            if port_match:
-                port = int(port_match.group(1))
-                if port == DEFAULT_OLLAMA_PORT:
-                    selected_backend = "ollama"
-                elif port == DEFAULT_LLAMACPP_PORT:
-                    selected_backend = "llamacpp"
-                elif port == DEFAULT_LMSTUDIO_PORT:
-                    selected_backend = "lmstudio"
-            if not selected_backend:
-                selected_backend = "ollama"
-        elif selected_backend == "gemini" and not base_url.startswith(('http://', 'https://')):
-            # Treat bare host as gemini API URL, ensure https
-            base_url = f"https://{base_url}" if not base_url.startswith('http') else base_url
-        return selected_backend, base_url
+        return _resolve_host_override(args)
 
     # Cloud services with fixed URLs — skip local probes
-    cloud_hosts = {
-        "gemini": ("GEMINI_HOST", DEFAULT_GEMINI_HOST),
-        "opencodezen": ("OPENCODEZEN_HOST", DEFAULT_OPENCODEZEN_HOST),
-        "opencodego": ("OPENCODEGO_HOST", DEFAULT_OPENCODEGO_HOST),
-        "mistral": ("MISTRAL_HOST", DEFAULT_MISTRAL_HOST),
-        "deepseek": ("DEEPSEEK_HOST", DEFAULT_DEEPSEEK_HOST),
-    }
-    if args.backend in cloud_hosts:
-        env_var, default = cloud_hosts[args.backend]
-        return args.backend, os.environ.get(env_var, default)
+    if args.backend in CLOUD_BACKENDS:
+        return args.backend, os.environ.get(CLOUD_HOST_ENV[args.backend], CLOUD_DEFAULT_HOST[args.backend])
 
     saved_backends = load_saved_backends()
-    
+
     # 2. Iterate through history
-    for config in saved_backends:
-        s_backend = config.get('backend')
-        s_host = config.get('host')
-        
-        # If user explicitly passed `-b`, skip history entries that don't match
-        if args.backend and args.backend != s_backend:
-            continue
-
-        sys.stderr.write(colorize(f"[INFO] Testing known server: {s_backend} @ {s_host} ... ", 'muted'))
-        
-        is_valid = False
-        if s_backend == 'llamacpp':
-            is_valid = check_backend_with_head(s_host, 'llama.cpp')
-        elif s_backend == 'ollama':
-            is_valid = check_backend_with_get(s_host, 'ollama')
-        elif s_backend == 'lmstudio':
-            is_valid = check_lmstudio(s_host)
-        elif s_backend == 'gemini':
-            is_valid = check_gemini(s_host, args.api_key or os.environ.get('GEMINI_API_KEY', ''))
-        elif s_backend in ('opencodezen', 'opencodego', 'mistral', 'deepseek'):
-            env_keys = {'opencodezen': 'OPENCODEZEN_API_KEY', 'opencodego': 'OPENCODEGO_API_KEY', 'mistral': 'MISTRAL_API_KEY', 'deepseek': 'DEEPSEEK_API_KEY'}
-            is_valid = check_gemini(s_host, args.api_key or os.environ.get(env_keys.get(s_backend, ''), ''))
-
-        if is_valid:
-            sys.stderr.write(colorize("Success\n", 'success'))
-            save_backend_config(s_backend, s_host) # Bump to top of list
-            return s_backend, s_host
-        else:
-            sys.stderr.write(colorize("Offline\n", 'warning'))
+    resolved = _probe_saved_backends(args, saved_backends)
+    if resolved:
+        return resolved
 
     # 3. If history failed or is empty, trigger Auto-Discovery
-    sys.stderr.write(colorize(f"\n[INFO] Known servers offline. Initiating auto-discovery...\n", 'info'))
+    sys.stderr.write(colorize("\n[INFO] Known servers offline. Initiating auto-discovery...\n", 'info'))
     autodetected, d_backend, d_url = auto_detect_backend()
     if autodetected:
         # If user explicitly passed `-b`, ensure the autodetected backend matches
@@ -8477,26 +10021,15 @@ def resolve_connection(args):
             return d_backend, d_url
 
     # 4. Ultimate Fallback
-    sys.stderr.write(colorize(f"[WARNING] Auto-discovery failed. Falling back to defaults.\n", 'error'))
-    fallback_backend = args.backend or "ollama"
-    if fallback_backend in cloud_hosts:
-        env_var, default = cloud_hosts[fallback_backend]
-        fallback_host = os.environ.get(env_var, default)
-    elif fallback_backend == "llamacpp":
-        fallback_host = os.environ.get('LLAMACPP_HOST', DEFAULT_LLAMACPP_HOST)
-    elif fallback_backend == "lmstudio":
-        fallback_host = os.environ.get('LMSTUDIO_HOST', DEFAULT_LMSTUDIO_HOST)
-    else:
-        fallback_host = os.environ.get('OLLAMA_HOST', DEFAULT_OLLAMA_HOST)
-
-    return fallback_backend, fallback_host
+    sys.stderr.write(colorize("[WARNING] Auto-discovery failed. Falling back to defaults.\n", 'error'))
+    return _resolve_fallback(args)
 
 
 # ============================================================================
 # ============= ARGUMENT PARSER ==============================================
 # ============================================================================
 
-def _build_parser():
+def _build_parser() -> argparse.ArgumentParser:
     """Build and return the argument parser with all options."""
     parser = argparse.ArgumentParser(
         description="Unified LLM Query Interface for Ollama, Llama.cpp & LM Studio"
@@ -8543,70 +10076,89 @@ def _build_parser():
     return parser
 
 
-def _verify_server(backend, base_url, args):
+def _try_known_port(backend: str, base_url: str, args: argparse.Namespace) -> Optional[tuple]:
+    """Probe the backend's default port when -b was given but the bare host failed.
+
+    Args:
+        backend: Backend name.
+        base_url: Bare host URL (no port).
+        args: Parsed CLI arguments.
+
+    Returns:
+        (backend, url_with_port) on success, or None.
+    """
+    port_map = {"ollama": DEFAULT_OLLAMA_PORT, "llamacpp": DEFAULT_LLAMACPP_PORT, "lmstudio": DEFAULT_LMSTUDIO_PORT}
+    port = port_map.get(backend, DEFAULT_OLLAMA_PORT)
+    fallback = f"{base_url}:{port}"
+    sys.stderr.write(colorize(f"[INFO] Checking {fallback}... ", 'muted'))
+    ok = check_lmstudio(fallback) if backend == "lmstudio" else \
+         check_backend_with_head(fallback, 'llama.cpp') if backend == "llamacpp" else \
+         check_backend_with_get(fallback, 'ollama')
+    if ok:
+        sys.stderr.write(colorize(f"found {backend}\n", 'success'))
+        return backend, fallback
+    sys.stderr.write(colorize("no\n", 'warning'))
+    return None
+
+
+def _probe_all_default_ports(base_url: str) -> Optional[tuple]:
+    """Probe each backend's default port when no -b was given.
+
+    Args:
+        base_url: Bare host URL (no port).
+
+    Returns:
+        (backend, url_with_port) on success, or None.
+    """
+    probes = [
+        ("ollama", f"{base_url}:{DEFAULT_OLLAMA_PORT}", check_backend_with_get, 'ollama'),
+        ("llamacpp", f"{base_url}:{DEFAULT_LLAMACPP_PORT}", check_backend_with_head, 'llama.cpp'),
+        ("lmstudio", f"{base_url}:{DEFAULT_LMSTUDIO_PORT}", check_lmstudio, None),
+    ]
+    for probe_backend, probe_url, probe_fn, probe_marker in probes:
+        sys.stderr.write(colorize(f"[INFO] Checking {probe_url}... ", 'muted'))
+        try:
+            ok = probe_fn(probe_url) if probe_marker is None else probe_fn(probe_url, probe_marker)
+            if ok:
+                sys.stderr.write(colorize(f"found {probe_backend}\n", 'success'))
+                return probe_backend, probe_url
+            sys.stderr.write(colorize("no\n", 'warning'))
+        except Exception:
+            sys.stderr.write(colorize("no\n", 'warning'))
+            continue
+    return None
+
+
+def _verify_server(backend: str, base_url: str, args: argparse.Namespace) -> tuple:
     """Probe the server to confirm it's reachable, trying default ports if needed.
 
-    Returns (backend, base_url) — may fall back to a different backend/port
-    if the initial guess was wrong. Exits with code 1 if unreachable.
-    """
-    CLOUD_BACKENDS = {"gemini", "opencodezen", "opencodego", "mistral", "deepseek"}
-    CLOUD_ENV_VARS = {
-        "gemini": "GEMINI_API_KEY",
-        "opencodezen": "OPENCODEZEN_API_KEY",
-        "opencodego": "OPENCODEGO_API_KEY",
-        "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
-        "deepseek": "DEEPSEEK_API_KEY",
-    }
+    Args:
+        backend: Backend name.
+        base_url: Base URL to probe.
+        args: Parsed CLI arguments.
 
+    Returns:
+        (backend, base_url) — may fall back to a different backend/port
+        if the initial guess was wrong. Exits with code 1 if unreachable.
+    """
     server_reachable = False
-    if backend == "ollama":
-        server_reachable = check_backend_with_get(base_url, 'ollama')
-    elif backend == "llamacpp":
-        server_reachable = check_backend_with_head(base_url, 'llama.cpp')
-    elif backend == "lmstudio":
-        server_reachable = check_lmstudio(base_url)
-    elif backend in CLOUD_BACKENDS:
-        api_key = args.api_key or os.environ.get(CLOUD_ENV_VARS.get(backend, ''), '')
+    if backend in CLOUD_BACKENDS:
+        api_key = args.api_key or os.environ.get(CLOUD_API_KEY_ENV.get(backend, ''), '')
         if not api_key:
-            sys.stderr.write(colorize(f"[ERROR] {backend} requires an API key. Set --api-key, {CLOUD_ENV_VARS.get(backend, '')} env var, or save to config.\n", 'error'))
+            sys.stderr.write(colorize(f"[ERROR] {backend} requires an API key. Set --api-key, {CLOUD_API_KEY_ENV.get(backend, '')} env var, or save to config.\n", 'error'))
             sys.exit(1)
         server_reachable = check_gemini(base_url, api_key)
+    else:
+        server_reachable = _probe_backend(backend, base_url, args.api_key)
 
     if not server_reachable and not re.search(r':\d{2,5}(/|$)', base_url) and backend not in CLOUD_BACKENDS:
-        port_map = {"ollama": DEFAULT_OLLAMA_PORT, "llamacpp": DEFAULT_LLAMACPP_PORT, "lmstudio": DEFAULT_LMSTUDIO_PORT}
-
         if args.backend:
-            port = port_map.get(backend, DEFAULT_OLLAMA_PORT)
-            fallback = f"{base_url}:{port}"
-            sys.stderr.write(colorize(f"[INFO] Checking {fallback}... ", 'muted'))
-            ok = check_lmstudio(fallback) if backend == "lmstudio" else \
-                 check_backend_with_head(fallback, 'llama.cpp') if backend == "llamacpp" else \
-                 check_backend_with_get(fallback, 'ollama')
-            if ok:
-                sys.stderr.write(colorize(f"found {backend}\n", 'success'))
-                backend, base_url = backend, fallback
-                server_reachable = True
-            else:
-                sys.stderr.write(colorize("no\n", 'warning'))
+            result = _try_known_port(backend, base_url, args)
         else:
-            probes = [
-                ("ollama", f"{base_url}:{DEFAULT_OLLAMA_PORT}", check_backend_with_get, 'ollama'),
-                ("llamacpp", f"{base_url}:{DEFAULT_LLAMACPP_PORT}", check_backend_with_head, 'llama.cpp'),
-                ("lmstudio", f"{base_url}:{DEFAULT_LMSTUDIO_PORT}", check_lmstudio, None),
-            ]
-            for probe_backend, probe_url, probe_fn, probe_marker in probes:
-                sys.stderr.write(colorize(f"[INFO] Checking {probe_url}... ", 'muted'))
-                try:
-                    ok = probe_fn(probe_url) if probe_marker is None else probe_fn(probe_url, probe_marker)
-                    if ok:
-                        sys.stderr.write(colorize(f"found {probe_backend}\n", 'success'))
-                        backend, base_url = probe_backend, probe_url
-                        server_reachable = True
-                        break
-                    sys.stderr.write(colorize("no\n", 'warning'))
-                except Exception:
-                    sys.stderr.write(colorize("no\n", 'warning'))
-                    continue
+            result = _probe_all_default_ports(base_url)
+        if result:
+            backend, base_url = result
+            server_reachable = True
 
     if not server_reachable:
         hint = ""
@@ -8625,10 +10177,16 @@ def _verify_server(backend, base_url, args):
     return backend, base_url
 
 
-def _select_model(backend, base_url, args):
+def _select_model(backend: str, base_url: str, args: argparse.Namespace) -> str:
     """Select the target model, auto-detecting from server if -m not given.
 
-    Returns model name or empty string if none available.
+    Args:
+        backend: Backend name.
+        base_url: Backend base URL.
+        args: Parsed CLI arguments.
+
+    Returns:
+        Model name or empty string if none available.
     """
     if args.model:
         return args.model
@@ -8646,17 +10204,9 @@ def _select_model(backend, base_url, args):
         sys.stderr.write(colorize("[WARNING] No models available on Ollama server.\n", 'warning'))
         return ""
 
-    CLOUD_ENV_VARS = {
-        "gemini": "GEMINI_API_KEY",
-        "opencodezen": "OPENCODEZEN_API_KEY",
-        "opencodego": "OPENCODEGO_API_KEY",
-        "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
-        "deepseek": "DEEPSEEK_API_KEY",
-    }
-    CLOUD_BACKENDS = {"gemini", "opencodezen", "opencodego", "mistral", "deepseek"}
     LABELS = {"lmstudio": "LM Studio", "gemini": "Gemini", "opencodezen": "OpenCode Zen", "opencodego": "OpenCode Go", "mistral": "Mistral", "deepseek": "DeepSeek"}
 
-    api_key = args.api_key or os.environ.get(CLOUD_ENV_VARS.get(backend, ''), '')
+    api_key = args.api_key or os.environ.get(CLOUD_API_KEY_ENV.get(backend, ''), '')
     available = fetch_models_llamacpp(base_url, api_key=api_key if backend in CLOUD_BACKENDS else None)
     if available:
         model = available[0]['name']
@@ -8679,7 +10229,287 @@ def _select_model(backend, base_url, args):
     return ""
 
 
-def main():
+def _cloud_api_key(backend: str, api_key: Optional[str] = None) -> str:
+    """Resolve the API key for a cloud backend from --api-key or the env.
+
+    Args:
+        backend: Backend name.
+        api_key: Explicit --api-key value (may be None).
+
+    Returns:
+        str: The resolved key, or "" if neither is available.
+    """
+    return api_key or os.environ.get(CLOUD_API_KEY_ENV.get(backend, ''), '')
+
+
+def _resolve_active_prompt(args: argparse.Namespace) -> str:
+    """Resolve the system prompt from --prompt, --profile, or the default.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
+    if args.prompt:
+        return args.prompt
+    if args.profile:
+        return BUILTIN_PROMPTS[args.profile]
+    return DEFAULT_SYSTEM_PROMPT
+
+
+def _prepare_images_list(args: argparse.Namespace) -> Optional[list]:
+    """Prepare image data list from --image args, or None when absent.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
+    if not args.image:
+        return None
+    return [prepare_image_data(p) for p in args.image if p and prepare_image_data(p)]
+
+
+def _make_query_handler(backend: str, base_url: str, args: argparse.Namespace) -> 'ModelQuery':
+    """Build a ModelQuery handler configured with the resolved connection.
+
+    Args:
+        backend: Backend name.
+        base_url: Backend base URL.
+        args: Parsed CLI arguments.
+    """
+    qh = ModelQuery(context=CommandContext())
+    qh.ctx.base_url = base_url
+    qh.ctx.backend = backend
+    qh.ctx.shell_timeout = args.shell_timeout
+    qh.ctx.api_key = _cloud_api_key(backend, args.api_key)
+    return qh
+
+
+def _run_listing(backend: str, base_url: str, args: argparse.Namespace) -> None:
+    """Handle -l / -la model listing, then exit.
+
+    Args:
+        backend: Backend name.
+        base_url: Backend base URL.
+        args: Parsed CLI arguments.
+    """
+    if backend in CLOUD_BACKENDS:
+        list_models_llamacpp(base_url, filter_arg=args.model,
+                             api_key=_cloud_api_key(backend, args.api_key))
+    elif backend in ("llamacpp", "lmstudio"):
+        list_models_llamacpp(base_url, filter_arg=args.model)
+    elif args.list_all:
+        list_models_ollama(base_url, filter_arg=args.model, include_capabilities=True)
+    else:
+        list_models_ollama(base_url, filter_arg=args.model, include_capabilities=False)
+    sys.exit(0)
+
+
+def _run_model_info(base_url: str, target_model: str, args: argparse.Namespace) -> None:
+    """Handle --show / --show-details model info.
+
+    Args:
+        base_url: Backend base URL.
+        target_model: Model name.
+        args: Parsed CLI arguments.
+    """
+    if args.show:
+        show_model_info(base_url, target_model, args)
+    elif args.show_details:
+        show_model_details(base_url, target_model, args)
+
+
+def _run_chat(backend: str, base_url: str, target_model: str, args: argparse.Namespace) -> None:
+    """Run the interactive chat loop and exit.
+
+    Args:
+        backend: Backend name.
+        base_url: Backend base URL.
+        target_model: Model name.
+        args: Parsed CLI arguments.
+    """
+    ctx = CommandContext()
+    ctx.base_url = base_url
+    ctx.backend = backend
+    ctx.model = target_model
+    ctx.system_prompt = args.prompt
+    ctx.shell_timeout = args.shell_timeout
+    ctx.api_key = _cloud_api_key(backend, args.api_key)
+
+    images_list = _prepare_images_list(args)
+    if images_list:
+        ctx.current_images = images_list
+
+    should_stream = not args.no_stream and sys.stdout.isatty()
+    loop = ChatLoop(ctx)
+    loop.run(stream_enabled=should_stream, debug=args.debug, images=images_list)
+    sys.exit(0)
+
+
+def _sync_response_text(response: object, backend: str) -> str:
+    """Extract printable text from a query_sync response (dict or string).
+
+    Args:
+        response: Dict or str returned by query_sync.
+        backend: Backend name for shape selection.
+
+    Returns:
+        Printable text (including API error rendering).
+
+    Handles API error dicts, ollama `message.content`, and OpenAI-compatible
+    `choices[0].message.content` shapes. Returns the raw string for strings.
+    """
+    if not isinstance(response, dict):
+        return str(response)
+    if "error" in response:
+        err = response["error"]
+        return f"[API ERROR] {err.get('message', err) if isinstance(err, dict) else err}"
+    if backend == "ollama":
+        return response.get('message', {}).get('content', '')
+    choices = response.get('choices', [])
+    if choices:
+        return choices[0].get('message', {}).get('content', '')
+    return response.get('message', {}).get('content', '')
+
+
+def _response_content(response: object) -> str:
+    """Extract only the content from a sync response for --output file writes.
+
+    Args:
+        response: Dict or str returned by query_sync.
+    """
+    if not isinstance(response, dict):
+        return str(response)
+    content = response.get('message', {}).get('content', '')
+    if not content:
+        choices = response.get('choices', [])
+        if choices:
+            content = choices[0].get('message', {}).get('content', '')
+    return content
+
+
+def _print_single_response(response: object, backend: str) -> None:
+    """Print a single-query response to stdout, with reasoning to stderr.
+
+    Args:
+        response: Dict or str returned by query_sync.
+        backend: Backend name for shape selection.
+    """
+    content = ""
+    thinking = ""
+    if isinstance(response, dict):
+        if "error" in response:
+            err = response["error"]
+            content = f"[API ERROR] {err.get('message', err) if isinstance(err, dict) else err}"
+        else:
+            msg = response.get('message', {}) if backend == "ollama" else \
+                (response.get('choices', [{}])[0].get('message', {}) if response.get('choices') else {})
+            content = msg.get('content', '')
+            if not content:
+                content = response.get('message', {}).get('content', '')
+            thinking = msg.get('reasoning_content', '') or msg.get('thought', '') or msg.get('thinking', '')
+    else:
+        content = str(response)
+    if thinking:
+        sys.stderr.write(f"\n<thinking>\n{thinking}\n</thinking>\n")
+    print(content)
+
+
+def _run_batch(backend: str, base_url: str, target_model: str, args: argparse.Namespace) -> None:
+    """Process --input-dir of files, writing one `.output` per file, then exit.
+
+    Args:
+        backend: Backend name.
+        base_url: Backend base URL.
+        target_model: Model name.
+        args: Parsed CLI arguments.
+    """
+    if not args.output_dir:
+        print("[ERROR] --output-dir required for --input-dir", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir, exist_ok=True)
+    images_list = _prepare_images_list(args)
+    for filename in sorted(os.listdir(args.input_dir)):
+        input_path = os.path.join(args.input_dir, filename)
+        if not os.path.isfile(input_path):
+            continue
+        print(f"[Processing: {filename}...]")
+        with open(input_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        messages = [
+            {'role': 'system', 'content': args.prompt},
+            {'role': 'user', 'content': content}
+        ]
+        qh = _make_query_handler(backend, base_url, args)
+        response = qh.query_sync(messages, target_model, context_size=None,
+                                 show_thinking=True, debug=args.debug, images=images_list)
+        output_text = _sync_response_text(response, backend)
+        with open(os.path.join(args.output_dir, filename + '.output'), 'w', encoding='utf-8') as f:
+            f.write(output_text)
+    sys.exit(0)
+
+
+def _run_single(backend: str, base_url: str, target_model: str, args: argparse.Namespace) -> None:
+    """Handle a single -I / -i query (optionally writing to --output).
+
+    Args:
+        backend: Backend name.
+        base_url: Backend base URL.
+        target_model: Model name.
+        args: Parsed CLI arguments.
+    """
+    images_list = _prepare_images_list(args)
+    messages = [{'role': 'system', 'content': args.prompt}]
+    if args.input_text:
+        messages.append({'role': 'user', 'content': args.input_text})
+    elif args.input_file and os.path.isfile(args.input_file):
+        with open(args.input_file, 'r', encoding='utf-8') as f:
+            messages.append({'role': 'user', 'content': f.read()})
+
+    qh = _make_query_handler(backend, base_url, args)
+    response = qh.query_sync(messages, target_model, context_size=None,
+                             show_thinking=True, debug=args.debug, images=images_list)
+
+    if args.output:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            f.write(_response_content(response))
+        print(f"[Success: Output saved to {args.output}]", file=sys.stderr)
+    elif response:
+        _print_single_response(response, backend)
+
+
+def _print_no_action_help(args: argparse.Namespace) -> None:
+    """Print the "no action specified" banner and exit.
+
+    Args:
+        args: Parsed CLI arguments.
+    """
+    print(colorize(f"ollamaquery2 v{__version__} - LLM Query Interface", 'info'))
+    if args.backend or args.host:
+        print(f"  Backend configured ({args.backend or 'auto'} @ {args.host or 'auto'}), but no action specified.")
+    print("  Start chat:  -c")
+    print("  Single query: -I \"your prompt\"")
+    print("  List models: -l")
+    print("  Help:        --help")
+    sys.exit(2)
+
+
+def _exit_if_no_model(backend: str, base_url: str, args: argparse.Namespace) -> None:
+    """Exit when no model is available/selected for the requested operation.
+
+    Args:
+        backend: Backend name.
+        base_url: Backend base URL.
+        args: Parsed CLI arguments.
+    """
+    sys.stderr.write(colorize(f"[INFO] Connected to {backend} at {base_url}\n", 'success'))
+    if args.show or args.show_details:
+        sys.stderr.write(colorize("[ERROR] No model selected. Use -m or --list to browse models.\n", 'error'))
+        sys.exit(1)
+    if args.input_text or args.input_file or args.input_dir:
+        sys.stderr.write(colorize("[ERROR] No model selected. Use -m to specify a model.\n", 'error'))
+        sys.exit(1)
+
+
+def main() -> None:
     """Main entry point."""
     parser = _build_parser()
     args = parser.parse_args()
@@ -8693,24 +10523,11 @@ def main():
     elif args.theme is not None:
         os.environ['OLLAMAQUERY_THEME'] = args.theme
 
-    if args.prompt:
-        active_prompt = args.prompt
-    elif args.profile:
-        active_prompt = BUILTIN_PROMPTS[args.profile]
-    else:
-        active_prompt = DEFAULT_SYSTEM_PROMPT
-    args.prompt = active_prompt
+    args.prompt = _resolve_active_prompt(args)
 
     if not (args.chat or args.input_text or args.input_file or
              args.input_dir or args.list or args.show or args.show_details):
-        print(colorize(f"ollamaquery2 v{__version__} - LLM Query Interface", 'info'))
-        if args.backend or args.host:
-            print(f"  Backend configured ({args.backend or 'auto'} @ {args.host or 'auto'}), but no action specified.")
-        print(f"  Start chat:  -c")
-        print(f"  Single query: -I \"your prompt\"")
-        print(f"  List models: -l")
-        print(f"  Help:        --help")
-        sys.exit(2)
+        _print_no_action_help(args)
 
     backend, base_url = resolve_connection(args)
     backend, base_url = _verify_server(backend, base_url, args)
@@ -8718,148 +10535,26 @@ def main():
     target_model = _select_model(backend, base_url, args)
 
     if not target_model:
-        sys.stderr.write(colorize(f"[INFO] Connected to {backend} at {base_url}\n", 'success'))
-        if args.show or args.show_details:
-            sys.stderr.write(colorize("[ERROR] No model selected. Use -m or --list to browse models.\n", 'error'))
-            sys.exit(1)
-        if args.input_text or args.input_file or args.input_dir:
-            sys.stderr.write(colorize("[ERROR] No model selected. Use -m to specify a model.\n", 'error'))
-            sys.exit(1)
+        _exit_if_no_model(backend, base_url, args)
 
     # Listing operations
     if args.list or args.list_all:
-        if backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-            env_keys = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
-            list_models_llamacpp(base_url, filter_arg=args.model, api_key=args.api_key or os.environ.get(env_keys.get(backend, ''), ''))
-        elif backend in ("llamacpp", "lmstudio"):
-            list_models_llamacpp(base_url, filter_arg=args.model)
-        elif args.list_all:
-            list_models_ollama(base_url, filter_arg=args.model, include_capabilities=True)
-        else:
-            list_models_ollama(base_url, filter_arg=args.model, include_capabilities=False)
-        sys.exit(0)
+        _run_listing(backend, base_url, args)
 
     # Model info operations
-    if args.show:
-        show_model_info(base_url, target_model, args)
-    elif args.show_details:
-        show_model_details(base_url, target_model, args)
+    if args.show or args.show_details:
+        _run_model_info(base_url, target_model, args)
 
     # Interactive chat mode
     if args.chat:
-        ctx = CommandContext()
-        ctx.base_url = base_url
-        ctx.backend = backend
-        ctx.model = target_model
-        ctx.system_prompt = args.prompt
-        ctx.shell_timeout = args.shell_timeout
-        env_keys = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
-        ctx.api_key = args.api_key or os.environ.get(env_keys.get(backend, ''), '')
-
-        images_list = None
-        if args.image:
-            images_list = [prepare_image_data(p) for p in args.image if p and prepare_image_data(p)]
-            if images_list:
-                ctx.current_images = images_list
-
-        should_stream = not args.no_stream and sys.stdout.isatty()
-        loop = ChatLoop(ctx)
-        loop.run(stream_enabled=should_stream, debug=args.debug, images=images_list)
-        sys.exit(0)
+        _run_chat(backend, base_url, target_model, args)
 
     # Batch / single query processing
     if args.input_dir:
-        if not args.output_dir:
-            print("[ERROR] --output-dir required for --input-dir", file=sys.stderr)
-            sys.exit(1)
-        if not os.path.exists(args.output_dir):
-            os.makedirs(args.output_dir, exist_ok=True)
-        for filename in sorted(os.listdir(args.input_dir)):
-            input_path = os.path.join(args.input_dir, filename)
-            if not os.path.isfile(input_path):
-                continue
-            print(f"[Processing: {filename}...]")
-            with open(input_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            messages = [
-                {'role': 'system', 'content': args.prompt},
-                {'role': 'user', 'content': content}
-            ]
-            images_list = [prepare_image_data(p) for p in args.image if p and prepare_image_data(p)] if args.image else None
-            qh = ModelQuery(context=CommandContext())
-            qh.ctx.base_url = base_url
-            qh.ctx.backend = backend
-            qh.ctx.shell_timeout = args.shell_timeout
-            env_keys = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
-            qh.ctx.api_key = args.api_key or os.environ.get(env_keys.get(backend, ''), '')
-            response = qh.query_sync(messages, target_model, context_size=None, show_thinking=True, debug=args.debug, images=images_list)
-            output_text = ""
-            if isinstance(response, dict):
-                if "error" in response:
-                    err = response["error"]
-                    output_text = f"[API ERROR] {err.get('message', err) if isinstance(err, dict) else err}"
-                else:
-                    output_text = response.get('message', {}).get('content', '')
-                    if not output_text:
-                        choices = response.get('choices', [])
-                        if choices:
-                            output_text = choices[0].get('message', {}).get('content', '')
-            else:
-                output_text = str(response)
-            with open(os.path.join(args.output_dir, filename + '.output'), 'w', encoding='utf-8') as f:
-                f.write(output_text)
-        sys.exit(0)
+        _run_batch(backend, base_url, target_model, args)
 
     if args.input_text or args.input_file:
-        images_list = [prepare_image_data(p) for p in args.image if p and prepare_image_data(p)] if args.image else None
-        messages = [{'role': 'system', 'content': args.prompt}]
-        if args.input_text:
-            messages.append({'role': 'user', 'content': args.input_text})
-        elif args.input_file and os.path.isfile(args.input_file):
-            with open(args.input_file, 'r', encoding='utf-8') as f:
-                messages.append({'role': 'user', 'content': f.read()})
-
-        qh = ModelQuery(context=CommandContext())
-        qh.ctx.base_url = base_url
-        qh.ctx.backend = backend
-        qh.ctx.shell_timeout = args.shell_timeout
-        env_keys = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
-        qh.ctx.api_key = args.api_key or os.environ.get(env_keys.get(backend, ''), '')
-        should_stream = not args.no_stream and sys.stdout.isatty()
-
-        response = qh.query_sync(messages, target_model, context_size=None, show_thinking=True, debug=args.debug, images=images_list)
-
-        if args.output:
-            content = ""
-            if isinstance(response, dict):
-                content = response.get('message', {}).get('content', '')
-                if not content:
-                    choices = response.get('choices', [])
-                    if choices:
-                        content = choices[0].get('message', {}).get('content', '')
-            else:
-                content = str(response)
-            with open(args.output, 'w', encoding='utf-8') as f:
-                f.write(content)
-            print(f"[Success: Output saved to {args.output}]", file=sys.stderr)
-        elif response:
-            content = ""
-            thinking = ""
-            if isinstance(response, dict):
-                if "error" in response:
-                    err = response["error"]
-                    content = f"[API ERROR] {err.get('message', err) if isinstance(err, dict) else err}"
-                else:
-                    msg = response.get('message', {}) if backend == "ollama" else (response.get('choices', [{}])[0].get('message', {}) if response.get('choices') else {})
-                    content = msg.get('content', '')
-                    if not content:
-                        content = response.get('message', {}).get('content', '')
-                    thinking = msg.get('reasoning_content', '') or msg.get('thought', '') or msg.get('thinking', '')
-            else:
-                content = str(response)
-            if thinking:
-                sys.stderr.write(f"\n<thinking>\n{thinking}\n</thinking>\n")
-            print(content)
+        _run_single(backend, base_url, target_model, args)
 
 
 if __name__ == "__main__":
