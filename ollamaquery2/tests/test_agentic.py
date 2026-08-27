@@ -7,6 +7,7 @@ import re
 import sys
 import json
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -1051,6 +1052,69 @@ class TestReActLoopUnit(unittest.TestCase):
             "System nudge must not persist in conversation history")
         self.assertEqual(self.loop.messages[-1]["role"], "assistant")
         self.assertIn("Done.", self.loop.messages[-1]["content"])
+
+    def test_interrupt_persists_completed_turns(self):
+        """F2/T1(a): a ^C mid-loop must persist completed tool turns into
+        self.messages before control returns, so the next query continues from
+        the full history instead of re-exploring."""
+        # Seed a prior turn so agentic_seed_len > 1 and ordering is meaningful.
+        self.loop.messages = [
+            {'role': 'system', 'content': 'sys'},
+            {'role': 'user', 'content': 'read this project'},
+        ]
+        tool_resp = self._make_sync_response(
+            '{"tool": "write_file", "arguments": {"file": "x.txt", "content": "data"}}')
+        call_idx = [0]
+
+        def fake_timeout(*args, **kwargs):
+            idx = call_idx[0]
+            call_idx[0] += 1
+            if idx == 0:
+                return tool_resp          # step 1 produces a tool call → executed
+            raise KeyboardInterrupt()     # step 2 interrupted by ^C
+
+        with patch.object(self.loop, '_call_with_timeout', side_effect=fake_timeout):
+            with self.assertRaises(KeyboardInterrupt):
+                self.loop.run_agentic_query("read this project")
+
+        roles = [m['role'] for m in self.loop.messages]
+        self.assertIn('assistant', roles, "completed assistant turn must be persisted")
+        self.assertTrue(
+            any('Tool result' in (m.get('content') or '') for m in self.loop.messages),
+            "completed tool result must be persisted")
+
+    def test_query_sync_stream_cancel_quiet(self):
+        """T1(e): query_sync_stream returns the 'cancelled' marker quietly (no
+        [ERROR] spam) when the cancel event is set, so an aborted read on ^C or
+        timeout doesn't error the terminal."""
+        mq = self.loop.query_handler
+        ctx = self.ctx
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def close(self):
+                pass
+
+            def __iter__(self):
+                raise OSError("connection closed by cancel")
+
+        cancel = {"event": threading.Event(), "close": None}
+        cancel["event"].set()  # simulate an already-aborted step
+
+        with patch.object(mq, '_build_stream_request', return_value=("http://x", {}, {})), \
+             patch('ollamaquery2._request_with_retry', return_value=FakeResp()):
+            stderr = io.StringIO()
+            with patch('sys.stderr', stderr):
+                resp = mq.query_sync_stream(
+                    [{'role': 'user', 'content': 'hi'}], "m", cancel=cancel, timeout=5)
+
+        self.assertEqual(resp.get("error", {}).get("message"), "cancelled")
+        self.assertNotIn("[ERROR]", stderr.getvalue())
 
 
 class TestStuckDetection(unittest.TestCase):

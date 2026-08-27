@@ -866,9 +866,16 @@ def get_message_token_count_llamacpp(base_url: str, text: str) -> int:
 
 
 def get_message_token_count_ollama(base_url: str, text: str, model: str) -> int:
-    """Get exact token count using the /api/tokenize endpoint (no GPU overhead)."""
-    global _TOKEN_COUNT_WARNED
+    """Get exact token count using the /api/tokenize endpoint (no GPU overhead).
+
+    Falls back to a heuristic estimate when the endpoint is unavailable. The
+    "unsupported" determination (404) is cached so subsequent messages don't
+    re-probe the endpoint on every token count.
+    """
+    global _TOKEN_COUNT_WARNED, _OLLAMA_TOKENIZE_SUPPORTED
     if not model:
+        return estimate_token_count(text)
+    if _OLLAMA_TOKENIZE_SUPPORTED is False:
         return estimate_token_count(text)
     try:
         url = f"{base_url}/api/tokenize"
@@ -876,11 +883,21 @@ def get_message_token_count_ollama(base_url: str, text: str, model: str) -> int:
         req = Request(url, data=payload, headers={'Content-Type': 'application/json'})
         with _request_with_retry(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
+            _OLLAMA_TOKENIZE_SUPPORTED = True
             return len(data.get('tokens', []))
     except Exception as e:
-        if not _TOKEN_COUNT_WARNED:
-            sys.stderr.write(colorize(f"[WARNING] Token counting failed (ollama): {e}\n", 'warning'))
-            _TOKEN_COUNT_WARNED = True
+        if isinstance(e, HTTPError) and e.code == 404:
+            # Stock Ollama has no /api/tokenize — don't re-probe on every message.
+            _OLLAMA_TOKENIZE_SUPPORTED = False
+            if not _TOKEN_COUNT_WARNED:
+                sys.stderr.write(colorize(
+                    "[WARNING] Exact token counting unsupported on this Ollama build "
+                    "(no /api/tokenize). Using estimates.", 'warning') + "\n")
+                _TOKEN_COUNT_WARNED = True
+        else:
+            if not _TOKEN_COUNT_WARNED:
+                sys.stderr.write(colorize(f"[WARNING] Token counting failed (ollama): {e}\n", 'warning'))
+                _TOKEN_COUNT_WARNED = True
         return estimate_token_count(text)
 
 
@@ -942,6 +959,10 @@ def parse_size(size_bytes):
 
 
 _TOKEN_COUNT_WARNED = False
+# Ollama's stock build does NOT ship /api/tokenize (never merged upstream), so
+# probing it on every message wastes an HTTP round-trip and a 404. Cache the
+# determination: None=unknown, True=supported, False=unsupported (use estimates).
+_OLLAMA_TOKENIZE_SUPPORTED = None
 
 
 def estimate_token_count(text: str) -> int:
@@ -1042,6 +1063,8 @@ class CommandContext:
         self.agentic_max_iterations: int = 50
         self.agentic_step_timeout: int = 120
         self.agentic_timeout_max: int = 480
+        self.agentic_progress_grace: int = 15
+        self.agentic_max_thinking_tokens: int = 2048
         self.agentic_consecutive_timeouts: int = 0
         self.agentic_has_executed_tool: bool = False
         self.agentic_last_tool_name: str = ""
@@ -4524,6 +4547,7 @@ class ModelQuery:
         images = kwargs.pop("images", None)
         context_size = kwargs.pop("context_size", None)
         socket_timeout = kwargs.pop("timeout", 120)
+        cancel = kwargs.pop("cancel", None)
         backend = self.backend
 
         full_content = ""
@@ -4545,7 +4569,13 @@ class ModelQuery:
 
         try:
             with _request_with_retry(req, timeout=socket_timeout) as response:
+                if cancel is not None and hasattr(response, 'close'):
+                    # Expose a close callback so a ^C (or timeout retry) on the
+                    # calling thread can abort this blocked stream read promptly.
+                    cancel["close"] = response.close
                 for raw_line in self._iter_stream_lines(response, backend):
+                    if cancel is not None and cancel["event"].is_set():
+                        break
                     try:
                         chunk = json.loads(raw_line)
                     except json.JSONDecodeError:
@@ -4562,6 +4592,10 @@ class ModelQuery:
                     if on_chunk:
                         on_chunk(thought, content, is_final)
         except Exception as e:
+            if cancel is not None and cancel["event"].is_set():
+                # User aborted (^C) or a timeout retry superseded this request —
+                # return quietly instead of spamming an error line.
+                return {"error": {"message": "cancelled", "type": "KeyboardInterrupt"}}
             sys.stderr.write(colorize(f"[ERROR] {backend} sync stream failed: {e}\n", 'error'))
             return {"error": {"message": str(e), "type": type(e).__name__}}
 
@@ -6531,10 +6565,13 @@ class ChatLoop:
         state = {
             "thinking_open": False,
             "last_heartbeat": time.time(),
+            "last_activity": time.time(),
             "cancelled": False,
             "heartbeat_shown": False,
             "content": "",
             "thought": "",
+            "thinking_tokens": 0,
+            "thinking_capped": False,
         }
         show_thinking = self.ctx.agentic_show_thinking
 
@@ -6543,8 +6580,20 @@ class ChatLoop:
                 return
             if thought:
                 state["thought"] += thought
+                state["last_activity"] = time.time()
+                # F5: track an estimate of total thinking tokens so a single step
+                # can't silently burn the whole budget on reasoning undetected.
+                # Detection + flag only — we keep accumulating (F4 tail-caps the
+                # nudge) and keep streaming live thinking; the flag is surfaced to
+                # the timeout nudge so a verbose thinker is told to be concise.
+                cap = int(getattr(self.ctx, 'agentic_max_thinking_tokens', 0) or 0)
+                if cap > 0:
+                    state["thinking_tokens"] += max(1, len(thought) // 4)
+                    if state["thinking_tokens"] >= cap:
+                        state["thinking_capped"] = True
             if content:
                 state["content"] += content
+                state["last_activity"] = time.time()
             if show_thinking:
                 if thought:
                     if not state["thinking_open"]:
@@ -6616,7 +6665,8 @@ class ChatLoop:
             return False
 
     @staticmethod
-    def _timeout_nudge(partial_content: str, partial_thought: str, pending_tool: bool) -> str:
+    def _timeout_nudge(partial_content: str, partial_thought: str, pending_tool: bool,
+                       metrics: Optional[dict] = None) -> str:
         """Build the timeout-continuation nudge message for the model.
 
         Feeds the model's partial reasoning/content back so it continues from
@@ -6628,30 +6678,71 @@ class ChatLoop:
         channel, so echoing it is safe and preserves the in-flight train of
         thought.
 
+        Two refinements:
+          - F4: the echoed reasoning is capped from the **tail** (`[-4000:]`,
+            where the model was cut off) rather than the head, so a resumed step
+            continues instead of re-deriving the earlier analysis.
+          - F3: an optional `metrics` dict (`tok_per_sec`, `expired_sec`,
+            `budget_sec`) tells the model its actual generation speed, the timeout
+            it hit, and the new budget in seconds/tokens so it can self-throttle
+            and finish within budget instead of getting killed again.
+
         Args:
             partial_content: Partial text content from the step buffer.
             partial_thought: Partial reasoning (`reasoning_content`) from the step buffer.
             pending_tool: True if the partial content contained a parseable tool call.
+            metrics: Optional dict with tok_per_sec / expired_sec / budget_sec.
 
         Returns:
             str: The nudge message to append as a user turn.
         """
+        def _cap_tail(text: str, cap: int = 4000) -> str:
+            text = text.strip()
+            if len(text) <= cap:
+                return text
+            return "…[earlier reasoning omitted]\n" + text[-cap:]
+
         lines = []
         thought = partial_thought.strip()
         if thought:
-            lines.append("Your reasoning before the interruption:\n" + thought[:4000])
+            lines.append("Your reasoning before the interruption:\n" + _cap_tail(thought))
         if not pending_tool:
             content = partial_content.strip()
             if content:
-                lines.append("Your response before the interruption:\n" + content[:4000])
+                lines.append("Your response before the interruption:\n" + _cap_tail(content))
         base = ("You were interrupted by a timeout while generating your response. "
                 "Please continue your previous response.")
+
+        if metrics and metrics.get("budget_sec"):
+            tps = metrics.get("tok_per_sec", 0.0) or 0.0
+            expired = metrics.get("expired_sec", 0) or 0
+            budget = metrics.get("budget_sec", 0) or 0
+            est_tokens = int(budget * tps)
+            base += ("\n\nGeneration metrics:\n"
+                     f"- ~{tps:.1f} tokens/second\n"
+                     f"- cut off after {expired}s (step timeout)\n"
+                     f"- new budget: {budget}s (~{est_tokens} tokens at your current speed)\n")
+            if metrics.get("thinking_capped"):
+                cap = metrics.get("thinking_cap") or 0
+                if cap:
+                    base += (f"- note: your reasoning exceeded the {cap}-token cap — be more "
+                             "concise and move to a tool call or final answer\n")
+                else:
+                    base += ("- note: your reasoning is very long — be more concise and move to "
+                             "a tool call or final answer\n")
+            base += ("Keep your total thinking + output within that budget — finish as soon "
+                     "as you have enough to act, and prefer a tool call or final answer over "
+                     "re-deriving your full analysis.")
         if lines:
             return base + "\n\n" + "\n\n".join(lines)
         return base
 
     def _handle_agentic_timeout(self, iteration: int, step_timeout: int, messages: list,
-                                partial_text: str = "", partial_thought: str = ""):
+                                partial_text: str = "", partial_thought: str = "",
+                                elapsed_sec: Optional[float] = None,
+                                partial_tokens: Optional[int] = None,
+                                idle_sec: Optional[float] = None,
+                                thinking_capped: bool = False):
         """Handle a step timeout in the ReAct loop.
 
         Applies the escalation policy based on model state:
@@ -6659,13 +6750,15 @@ class ChatLoop:
                     pending in the timed-out generation (a retry could re-execute
                     it). If the model was mid-narration with no tool call pending,
                     the destructive tool already completed, so continue with backoff.
-          State A — no tool executed yet       → retry once, abort after two.
+          State A — no tool executed yet       → extend if generating, else retry once / abort after two.
           State B — a tool already ran         → exponential backoff up to max.
 
         On any continue, the nudge message includes the model's partial reasoning
         (and partial content when no tool call was pending) so it resumes rather
         than regenerating the same analysis — long-thinking models that time out
         mid-thought would otherwise restart from scratch and hit the same wall.
+        It also reports the model's generation speed and the new budget (F3
+        budget-awareness) so it can self-throttle within the extended timeout.
 
         Args:
             iteration: Current ReAct iteration number.
@@ -6673,6 +6766,9 @@ class ChatLoop:
             messages: The conversation list (a nudge message is appended on continue).
             partial_text: Content generated before the timeout (from the step buffer).
             partial_thought: Reasoning generated before the timeout (from the step buffer).
+            elapsed_sec: Wall-clock seconds the step actually ran (for tok/s).
+            partial_tokens: Estimated tokens generated before the timeout (for tok/s).
+            idle_sec: Seconds since the last chunk arrived (progress/stall signal).
 
         Returns:
             (should_break: bool, new_step_timeout: int)
@@ -6682,6 +6778,20 @@ class ChatLoop:
         expired = step_timeout
         pending_tool = self._partial_tool_call_pending(partial_text)
         content_is_tool = pending_tool or self._looks_like_truncated_tool_call(partial_text)
+
+        # F3: generation-rate + progress signal from the step buffer.
+        tok_per_sec = 0.0
+        if elapsed_sec and elapsed_sec > 0 and partial_tokens and partial_tokens > 0:
+            tok_per_sec = partial_tokens / elapsed_sec
+        grace = max(0, int(getattr(self.ctx, 'agentic_progress_grace', 15)))
+        making_progress = (idle_sec is not None and idle_sec <= grace and tok_per_sec > 0)
+
+        def _nudge_metrics(budget_sec):
+            m = {"tok_per_sec": tok_per_sec, "expired_sec": expired, "budget_sec": budget_sec}
+            if thinking_capped:
+                m["thinking_capped"] = True
+                m["thinking_cap"] = int(getattr(self.ctx, 'agentic_max_thinking_tokens', 0) or 0)
+            return m
 
         if last_tool in AGENTIC_TIMEOUT_ABORT_TOOLS:
             if pending_tool:
@@ -6700,7 +6810,22 @@ class ChatLoop:
                 "pending — continuing with backoff.",
                 'warning'), file=sys.stderr)
         elif not self.ctx.agentic_has_executed_tool:
-            # State A: no tool executed yet — conservative; abort after two timeouts.
+            # State A: no tool executed yet.
+            if making_progress and step_timeout < self.ctx.agentic_timeout_max:
+                # F3: model is actively generating (tokens flowing) — extend the
+                # budget instead of retrying at the same (insufficient) timeout,
+                # which would just fail again. Only thinking-only steps benefit
+                # from this; a stalled step falls through to the retry/abort.
+                step_timeout = min(step_timeout * 2, self.ctx.agentic_timeout_max)
+                print(colorize(
+                    f"\n[Agentic] Step {iteration} timed out after {expired}s but still "
+                    f"generating ({tok_per_sec:.1f} tok/s) — extending to {step_timeout}s.",
+                    'warning'), file=sys.stderr)
+                messages.append({'role': 'user', 'content': self._timeout_nudge(
+                    partial_text, partial_thought, content_is_tool,
+                    metrics=_nudge_metrics(step_timeout))})
+                return False, step_timeout
+            # No recent progress → conservative; abort after two timeouts.
             if self.ctx.agentic_consecutive_timeouts >= 2:
                 print(colorize(
                     f"\n[Agentic] Step {iteration} timed out twice. Model may be stuck. Aborting.",
@@ -6711,7 +6836,8 @@ class ChatLoop:
                 "Model may be thinking — retrying.",
                 'warning'), file=sys.stderr)
             messages.append({'role': 'user', 'content': self._timeout_nudge(
-                partial_text, partial_thought, content_is_tool)})
+                partial_text, partial_thought, content_is_tool,
+                metrics=_nudge_metrics(step_timeout))})
             return False, step_timeout
 
         # State B: a tool already ran (or a completed destructive tool) — escalate
@@ -6728,7 +6854,8 @@ class ChatLoop:
             'warning'), file=sys.stderr)
 
         messages.append({'role': 'user', 'content': self._timeout_nudge(
-            partial_text, partial_thought, content_is_tool)})
+            partial_text, partial_thought, content_is_tool,
+            metrics=_nudge_metrics(step_timeout))})
         return False, step_timeout
 
     def _init_agentic_query(self, final_content):
@@ -7121,6 +7248,51 @@ class ChatLoop:
                        'warning'), file=sys.stderr)
         return messages
 
+    def _persist_agentic_history(self, messages: list, agentic_seed_len: int, compact: bool = False) -> None:
+        """Merge the ReAct loop's local turns back into `self.messages`.
+
+        The local `messages` array is seeded as [agentic system] + self.messages[1:],
+        so the genuinely new turns begin at index `agentic_seed_len`. They are
+        inserted at that boundary — right after the current user query and BEFORE
+        any messages the streaming finalize appended — so the conversation stays
+        chronologically ordered (user query → tool work → final answer).
+
+        `_system_nudge` messages (loop-internal steering, e.g. the empty-response
+        "Please provide a tool call..." fallback) are excluded from persistent
+        history so repeated empty responses don't pile into context forever.
+
+        Also called from the `except KeyboardInterrupt` path so a ^C that aborts a
+        step still preserves every completed tool turn instead of erasing the
+        conversation (the interrupted step's partial output is never in `messages`
+        yet, so it is correctly not persisted).
+
+        Args:
+            messages: The local ReAct message list.
+            agentic_seed_len: Index in `self.messages` where new turns begin.
+            compact: Whether to auto-compact the merged history if over threshold.
+        """
+        if len(messages) > agentic_seed_len:
+            new_turns = [m for m in messages[agentic_seed_len:] if not m.get('_system_nudge')]
+            if new_turns:
+                self.messages[agentic_seed_len:agentic_seed_len] = new_turns
+        sanitize_tool_pairing(self.messages)
+
+        # Persist compaction savings: the ReAct loop may have auto-compacted its
+        # local `messages`, but that compaction is discarded by the merge above.
+        # Re-check the merged history and compact if it exceeds the threshold.
+        if compact and self.ctx.context_window_size > 0:
+            msg_tokens = self.ctx.calculate_context_tokens(self.messages)
+            threshold = int(self.ctx.context_window_size * self.ctx.compaction_threshold)
+            if msg_tokens > threshold:
+                before_len = len(self.messages)
+                self.messages = compact_messages(self.messages, self.ctx)
+                print(colorize(
+                    f"[Auto-compact] Agentic history persisted: {before_len} → {len(self.messages)} msgs",
+                    'warning'), file=sys.stderr)
+
+        # Recalculate context tokens after merging agentic history
+        self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
+
     def run_agentic_query(self, full_input: str) -> None:
         """ReAct loop: query model, parse tool calls, execute tools, stream final answer."""
         self._agentic_streaming_reentry_count = 0
@@ -7179,22 +7351,60 @@ class ChatLoop:
                 if send_tools_api:
                     sync_kwargs["tools"] = openai_tools
                 on_chunk, finalize_step, step_buf = self._make_agentic_step_feedback()
-                response = self._call_with_timeout(
-                    self.query_handler.query_sync_stream, step_timeout,
-                    messages, self.ctx.model,
-                    context_size=self.ctx.context_size,
-                    images=images_to_send,
-                    on_chunk=on_chunk,
-                    timeout=step_timeout + 30,
-                    **sync_kwargs
-                )
+                step_cancel = {"event": threading.Event(), "close": None}
+                step_start = time.time()
+
+                def _abort_step():
+                    # Signal the worker thread and close the HTTP response so a
+                    # blocked stream read terminates promptly (stops the server
+                    # generating + frees the request slot).
+                    step_cancel["event"].set()
+                    close = step_cancel.get("close")
+                    if close:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                try:
+                    response = self._call_with_timeout(
+                        self.query_handler.query_sync_stream, step_timeout,
+                        messages, self.ctx.model,
+                        context_size=self.ctx.context_size,
+                        images=images_to_send,
+                        on_chunk=on_chunk,
+                        timeout=step_timeout + 30,
+                        cancel=step_cancel,
+                        **sync_kwargs
+                    )
+                except KeyboardInterrupt:
+                    # F1: stop the zombie generation from streaming to the
+                    # terminal AND abort the request, then let the [Interrupted]
+                    # handler take over (F2 persists completed turns).
+                    _abort_step()
+                    finalize_step()
+                    raise
                 finalize_step()
 
                 if response is None:
+                    # Timed out — abort the still-running request so the daemon
+                    # thread dies promptly and the server slot frees for a retry.
+                    _abort_step()
+                    # F3: pass generation timing/rate so the timeout policy can
+                    # distinguish "still generating" (extend budget) from "stalled"
+                    # (conservative retry / abort), and so the nudge can report the
+                    # model its speed and remaining token budget.
+                    elapsed = time.time() - step_start
+                    partial_tokens = self.ctx.estimate_tokens(
+                        (step_buf.get("thought", "") + " " + step_buf.get("content", "")).strip())
+                    last_activity = step_buf.get("last_activity")
+                    idle_sec = (time.time() - last_activity) if last_activity else None
                     should_break, step_timeout = self._handle_agentic_timeout(
                         iteration, step_timeout, messages,
                         partial_text=step_buf.get("content", ""),
-                        partial_thought=step_buf.get("thought", ""))
+                        partial_thought=step_buf.get("thought", ""),
+                        elapsed_sec=elapsed, partial_tokens=partial_tokens, idle_sec=idle_sec,
+                        thinking_capped=step_buf.get("thinking_capped", False))
                     if should_break:
                         break
                     response_text = ""
@@ -7343,43 +7553,18 @@ class ChatLoop:
                 self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text)
 
             # Merge the ReAct loop turns back into self.messages for cross-turn
-            # memory. The local `messages` array was seeded as
-            # [agentic system] + self.messages[1:], so the genuinely new turns
-            # begin at index `agentic_seed_len`. Insert them at that boundary —
-            # right after the current user query and BEFORE any messages the
-            # streaming finalize appended — so the conversation stays
-            # chronologically ordered (user query → tool work → final answer).
-            # The old insert-before-last approach duplicated history/user
-            # messages and placed tool work before the query that triggered it.
-            if len(messages) > agentic_seed_len:
-                # Exclude `_system_nudge` messages (e.g. the empty-response
-                # "Please provide a tool call..." fallback) from the persistent
-                # history — they are loop-internal steering, not real user turns,
-                # and repeated empty responses would otherwise pile them into
-                # context forever.
-                new_turns = [m for m in messages[agentic_seed_len:] if not m.get('_system_nudge')]
-                if new_turns:
-                    self.messages[agentic_seed_len:agentic_seed_len] = new_turns
-            sanitize_tool_pairing(self.messages)
-
-            # Persist compaction savings: the ReAct loop may have auto-compacted its
-            # local `messages`, but that compaction is discarded by the merge above.
-            # Re-check the merged history and compact if it exceeds the threshold.
-            if self.ctx.context_window_size > 0:
-                msg_tokens = self.ctx.calculate_context_tokens(self.messages)
-                threshold = int(self.ctx.context_window_size * self.ctx.compaction_threshold)
-                if msg_tokens > threshold:
-                    before_len = len(self.messages)
-                    self.messages = compact_messages(self.messages, self.ctx)
-                    print(colorize(
-                        f"[Auto-compact] Agentic history persisted: {before_len} → {len(self.messages)} msgs",
-                        'warning'), file=sys.stderr)
-
-            # Recalculate context tokens after merging agentic history
-            self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
+            # memory (see `_persist_agentic_history` for ordering/nudge handling).
+            self._persist_agentic_history(messages, agentic_seed_len, compact=True)
 
             if logger:
                 logger.write(type="end", total_iterations=iteration)
+        except KeyboardInterrupt:
+            # F2: a ^C aborts the current step but must NOT erase the completed
+            # tool work. Persist the finished turns before handing control back;
+            # ChatLoop.run prints the [Interrupted] banner and resumes the prompt.
+            if 'messages' in locals() and 'agentic_seed_len' in locals():
+                self._persist_agentic_history(messages, agentic_seed_len)
+            raise
         except Exception as e:
             print(colorize(f"\n[Agentic] Internal error: {e}", 'error'), file=sys.stderr)
             traceback.print_exc(file=sys.stderr)

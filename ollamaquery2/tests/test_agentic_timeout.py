@@ -26,6 +26,9 @@ class FakeCtx:
     def __init__(self):
         self.agentic_step_timeout = 120
         self.agentic_timeout_max = 480
+        self.agentic_progress_grace = 15
+        self.agentic_max_thinking_tokens = 2048
+        self.agentic_show_thinking = False
         self.agentic_consecutive_timeouts = 0
         self.agentic_has_executed_tool = False
         self.agentic_last_tool_name = ""
@@ -45,11 +48,13 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
     def tearDown(self):
         self._patched.stop()
 
-    def _call(self, iteration=1, step_timeout=120, partial_text="", partial_thought=""):
+    def _call(self, iteration=1, step_timeout=120, partial_text="", partial_thought="",
+              elapsed_sec=None, partial_tokens=None, idle_sec=None):
         messages = []
         should_break, new_timeout = self.loop._handle_agentic_timeout(
             iteration, step_timeout, messages, partial_text=partial_text,
-            partial_thought=partial_thought)
+            partial_thought=partial_thought, elapsed_sec=elapsed_sec,
+            partial_tokens=partial_tokens, idle_sec=idle_sec)
         return should_break, new_timeout, messages
 
     # --- State C: destructive last tool -------------------------------------
@@ -208,6 +213,90 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
         nudge = self.loop._timeout_nudge('{"tool": "x"}', "thought here", True)
         self.assertNotIn('{"tool": "x"}', nudge)
         self.assertIn('thought here', nudge)
+
+    # --- F3: progress-aware State A extension + budget-aware nudge -----------
+
+    def test_state_a_extends_when_generating(self):
+        """F3: State A, but the model was actively generating (idle < grace,
+        tok/s > 0) -> extend the budget instead of the old same-budget retry."""
+        self.ctx.agentic_has_executed_tool = False
+        should_break, new_timeout, messages = self._call(
+            step_timeout=120, partial_thought="x" * 500,
+            elapsed_sec=120, partial_tokens=1000, idle_sec=2)
+        self.assertFalse(should_break)
+        self.assertEqual(new_timeout, 240)
+        self.assertIn('tokens/second', messages[0]['content'])
+
+    def test_state_a_no_progress_still_same_budget(self):
+        """F3: State A with no recent activity (stalled) -> old conservative
+        behavior (same-budget retry)."""
+        self.ctx.agentic_has_executed_tool = False
+        should_break, new_timeout, _ = self._call(
+            step_timeout=120, partial_thought="x" * 500,
+            elapsed_sec=120, partial_tokens=1000, idle_sec=120)
+        self.assertFalse(should_break)
+        self.assertEqual(new_timeout, 120)
+
+    def test_state_a_progress_extends_until_max(self):
+        """F3: progress extension caps at agentic_timeout_max."""
+        self.ctx.agentic_has_executed_tool = False
+        self.ctx.agentic_timeout_max = 480
+        # 120 -> 240 (progress path extends)
+        _, new_timeout, _ = self._call(
+            step_timeout=120, partial_tokens=1000, elapsed_sec=120, idle_sec=1)
+        self.assertEqual(new_timeout, 240)
+        self.ctx.agentic_consecutive_timeouts = 0  # isolate the at-max assertion
+        # at max: progress branch is skipped (not < max) -> same-budget retry
+        should_break, new_timeout, _ = self._call(
+            step_timeout=480, partial_tokens=1000, elapsed_sec=480, idle_sec=1)
+        self.assertFalse(should_break)
+        self.assertEqual(new_timeout, 480)
+
+    def test_nudge_metrics_block(self):
+        """F3: the nudge reports generation speed, the expired timeout, and the
+        new budget in seconds/tokens so the model can self-throttle."""
+        nudge = self.loop._timeout_nudge("", "thought here", False,
+            metrics={"tok_per_sec": 8.3, "expired_sec": 120, "budget_sec": 240})
+        self.assertIn('~8.3 tokens/second', nudge)
+        self.assertIn('cut off after 120s', nudge)
+        self.assertIn('new budget: 240s (~1992 tokens', nudge)
+
+    # --- F4: nudge echoes the TAIL of the reasoning --------------------------
+
+    def test_nudge_tail_caps_thought(self):
+        """F4: echoed reasoning is capped from the TAIL (where the model was cut
+        off), not the head, so a resumed step continues instead of re-deriving."""
+        thought = "H" * 4500 + "TAIL_SENTINEL"
+        nudge = self.loop._timeout_nudge("", thought, False)
+        self.assertIn('TAIL_SENTINEL', nudge)
+        self.assertIn('earlier reasoning omitted', nudge)
+        self.assertNotIn('H' * 4500 + 'TAIL_SENTINEL', nudge)
+
+    # --- F5: thinking-length detection + steer ------------------------------
+
+    def test_nudge_thinking_capped_steer(self):
+        """F5: when thinking exceeded the cap, the nudge tells the model to be
+        more concise and move to a tool call / final answer."""
+        nudge = self.loop._timeout_nudge("", "thought", False,
+            metrics={"tok_per_sec": 8.0, "expired_sec": 120, "budget_sec": 240,
+                     "thinking_capped": True, "thinking_cap": 2048})
+        self.assertIn('2048-token cap', nudge)
+        self.assertIn('be more concise', nudge)
+
+    def test_step_feedback_tracks_thinking_cap(self):
+        """F5: on_chunk accumulates a token estimate and flags thinking_capped
+        once it crosses agentic_max_thinking_tokens."""
+        on_chunk, _, state = self.loop._make_agentic_step_feedback()
+        on_chunk("x" * 9000, "", False)   # ~2250 tokens > 2048 cap
+        self.assertEqual(state["thinking_tokens"], 2250)
+        self.assertTrue(state["thinking_capped"])
+
+    def test_step_feedback_under_cap_not_capped(self):
+        """F5: short thinking stays under the cap."""
+        on_chunk, _, state = self.loop._make_agentic_step_feedback()
+        on_chunk("brief reasoning", "", False)
+        self.assertGreater(state["thinking_tokens"], 0)
+        self.assertFalse(state["thinking_capped"])
 
 
 if __name__ == '__main__':

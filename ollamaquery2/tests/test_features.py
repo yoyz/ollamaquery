@@ -1801,6 +1801,31 @@ class TestErrorHandling(unittest.TestCase):
         count = q.get_message_token_count_ollama(OLLAMA_HOST, 'hello', '')
         self.assertGreaterEqual(count, 1)
 
+    def test_get_message_token_count_ollama_404_cached(self):
+        """A 404 from /api/tokenize (stock Ollama has no such endpoint) falls back
+        to estimates AND is cached so subsequent calls don't re-probe."""
+        def fake_404(req, **kwargs):
+            raise HTTPError(req.full_url, 404, 'Not Found', {}, None)
+
+        calls = [0]
+        def counting_404(req, **kwargs):
+            calls[0] += 1
+            raise HTTPError(req.full_url, 404, 'Not Found', {}, None)
+
+        # Reset the module flag so the test starts from the unknown state.
+        q._OLLAMA_TOKENIZE_SUPPORTED = None
+        try:
+            with patch('ollamaquery2._request_with_retry', side_effect=counting_404):
+                count = q.get_message_token_count_ollama('http://x:11434', 'hello world', 'm')
+            self.assertGreaterEqual(count, 1)
+            self.assertIs(q._OLLAMA_TOKENIZE_SUPPORTED, False)
+            # Second call must short-circuit (no HTTP) thanks to the cached flag.
+            with patch('ollamaquery2._request_with_retry', side_effect=fake_404) as pr:
+                q.get_message_token_count_ollama('http://x:11434', 'again', 'm')
+            pr.assert_not_called()
+        finally:
+            q._OLLAMA_TOKENIZE_SUPPORTED = None
+
     def test_get_ollama_context_size_nonexistent(self):
         size = q.get_ollama_context_size('http://127.0.0.1:1', 'nonexistent')
         self.assertEqual(size, 0)
