@@ -15,6 +15,7 @@ so no backend is required.
 import io
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -28,6 +29,7 @@ class FakeCtx:
         self.agentic_timeout_max = 480
         self.agentic_progress_grace = 15
         self.agentic_max_thinking_tokens = 2048
+        self.agentic_heartbeat_tokens = 10
         self.agentic_show_thinking = False
         self.agentic_consecutive_timeouts = 0
         self.agentic_has_executed_tool = False
@@ -286,17 +288,89 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
     def test_step_feedback_tracks_thinking_cap(self):
         """F5: on_chunk accumulates a token estimate and flags thinking_capped
         once it crosses agentic_max_thinking_tokens."""
-        on_chunk, _, state = self.loop._make_agentic_step_feedback()
+        on_chunk, finalize, state = self.loop._make_agentic_step_feedback()
         on_chunk("x" * 9000, "", False)   # ~2250 tokens > 2048 cap
         self.assertEqual(state["thinking_tokens"], 2250)
         self.assertTrue(state["thinking_capped"])
+        finalize()
 
     def test_step_feedback_under_cap_not_capped(self):
         """F5: short thinking stays under the cap."""
-        on_chunk, _, state = self.loop._make_agentic_step_feedback()
+        on_chunk, finalize, state = self.loop._make_agentic_step_feedback()
         on_chunk("brief reasoning", "", False)
         self.assertGreater(state["thinking_tokens"], 0)
         self.assertFalse(state["thinking_capped"])
+        finalize()
+
+    def _wait_for(self, predicate, timeout=3.0):
+        """Poll `predicate()` until it returns truthy or `timeout` elapses."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_watchdog_liveness_without_chunks(self):
+        """The idle-fallback watchdog emits a liveness dot when no chunks arrive.
+
+        Long tool-call generations (e.g. llama.cpp buffering the response)
+        stream no chunks for tens of seconds; the token-driven heartbeat has no
+        tokens to count, so after ~2s of silence the watchdog ticks ~1/s.
+        """
+        on_chunk, finalize, state = self.loop._make_agentic_step_feedback()
+        self.assertEqual(self._stderr.getvalue(), "")
+        self.assertTrue(self._wait_for(lambda: "." in self._stderr.getvalue(), timeout=5.0))
+        finalize()
+        dots = self._stderr.getvalue().count(".")
+        time.sleep(1.1)
+        self.assertEqual(self._stderr.getvalue().count("."), dots,
+                         "watchdog must stop writing after finalize")
+
+    def test_watchdog_suppressed_while_thinking_streams(self):
+        """No dots while reasoning is being streamed live to the terminal."""
+        self.ctx.agentic_show_thinking = True
+        on_chunk, finalize, state = self.loop._make_agentic_step_feedback()
+        on_chunk("reasoning text", "", False)
+        self.assertFalse(self._wait_for(lambda: "." in self._stderr.getvalue(), timeout=1.5))
+        self.assertIn("<thinking>", self._stderr.getvalue())
+        finalize()
+
+    def test_watchdog_closes_silent_thinking_and_shows_dots(self):
+        """A quiet thinking phase (model switching to a native tool call, whose
+        deltas carry no content) must not suppress the liveness dots: the
+        watchdog closes the `<thinking>` block and resumes ticking."""
+        self.ctx.agentic_show_thinking = True
+        on_chunk, finalize, state = self.loop._make_agentic_step_feedback()
+        on_chunk("reasoning text", "", False)
+        self.assertIn("<thinking>", self._stderr.getvalue())
+        self.assertTrue(self._wait_for(lambda: "." in self._stderr.getvalue(), timeout=5.0))
+        self.assertIn("</thinking>", self._stderr.getvalue())
+        finalize()
+        dots = self._stderr.getvalue().count(".")
+        time.sleep(1.1)
+        self.assertEqual(self._stderr.getvalue().count("."), dots,
+                         "watchdog must stop writing after finalize")
+
+    def test_token_driven_heartbeat(self):
+        """A dot fires per ~agentic_heartbeat_tokens streamed, not per second."""
+        on_chunk, finalize, state = self.loop._make_agentic_step_feedback()
+        self.assertEqual(self._stderr.getvalue(), "")
+        on_chunk("", "x" * 40, False)   # ~10 tokens -> one dot
+        self.assertEqual(self._stderr.getvalue(), ".")
+        on_chunk("", "x" * 40, False)   # another ~10 tokens -> second dot
+        self.assertEqual(self._stderr.getvalue(), "..")
+        on_chunk("", "x" * 16, False)   # ~4 tokens -> under threshold, no dot
+        self.assertEqual(self._stderr.getvalue(), "..")
+        finalize()
+
+    def test_token_driven_heartbeat_respects_threshold(self):
+        """The per-dot token count follows ctx.agentic_heartbeat_tokens."""
+        self.ctx.agentic_heartbeat_tokens = 5
+        on_chunk, finalize, state = self.loop._make_agentic_step_feedback()
+        on_chunk("", "x" * 40, False)   # ~10 tokens / 5 per dot -> two dots
+        self.assertEqual(self._stderr.getvalue(), "..")
+        finalize()
 
 
 if __name__ == '__main__':

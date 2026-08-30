@@ -307,7 +307,16 @@ class TestRenderConversationTranscript(unittest.TestCase):
         text = m._render_conversation_transcript(middle)
         self.assertIn('[tool read_file: OK]', text)
         self.assertIn('user: keep this question', text)
-        self.assertNotIn('xxxxx', text)
+        self.assertNotIn('x' * 200, text, 'huge tool content must be truncated')
+
+    def test_tool_transcript_includes_outcome_excerpt(self):
+        middle = [
+            {'role': 'tool', 'name': 'cat', 'content': 'cat myfile\nmyfile: No such file or directory'},
+            {'role': 'tool', 'name': 'run', 'content': 'ERROR: boom\nstack'},
+        ]
+        text = m._render_conversation_transcript(middle)
+        self.assertIn('[tool cat: OK] cat myfile', text)
+        self.assertIn('[tool run: FAILED] ERROR: boom', text)
 
     def test_max_chars_truncation(self):
         middle = [{'role': 'user', 'content': 'a' * 1000}]
@@ -320,6 +329,63 @@ class TestRenderConversationTranscript(unittest.TestCase):
         text = m._render_conversation_transcript(middle)
         self.assertIn('[tool observation: Tool result:]', text)
         self.assertNotIn('big output', text)
+
+
+class TestRenderTokenBreakdown(unittest.TestCase):
+    def setUp(self):
+        self.ctx = FakeContext()
+
+    def test_roles_tokens_and_tool_ok_ko(self):
+        middle = [
+            {'role': 'user', 'content': 'I want a simple netcat in go', '_tokens': 9},
+            {'role': 'assistant', 'content': 'Let me look at the files.', '_tokens': 7},
+            {'role': 'tool', 'name': 'cat', 'content': 'cat myfile\nNo such file or directory', '_tokens': 5},
+            {'role': 'tool', 'name': 'glob', 'content': 'ERROR: no matches', '_tokens': 3},
+        ]
+        text = m._render_token_breakdown(middle, self.ctx)
+        self.assertIn('[  0] user', text)
+        self.assertIn('[  1] assistant', text)
+        self.assertIn('[OK] cat myfile', text)
+        self.assertIn('[KO] ERROR: no matches', text)
+        self.assertIn('·', text)
+
+    def test_breakdown_truncates_total(self):
+        middle = [{'role': 'user', 'content': 'z' * 500}] * 20
+        text = m._render_token_breakdown(middle, self.ctx, max_chars=300)
+        self.assertLessEqual(len(text), 300 + len("[...]") + 1)
+        self.assertIn('[...]', text)
+
+    def test_breakdown_caps_text_at_80_chars(self):
+        middle = [{'role': 'user', 'content': 'y' * 1000}]
+        text = m._render_token_breakdown(middle, self.ctx)
+        self.assertNotIn('y' * 200, text)
+        self.assertIn('...', text)
+
+    def test_breakdown_exposes_tool_call_command(self):
+        """Tool-call JSON lines keep enough text for the LLM to see the command."""
+        middle = [{'role': 'assistant', '_tokens': 146,
+                   'content': '{"tool": "run_command", "arguments": {"command": "go build -o nc nc.go && go vet nc.go"}}'}]
+        text = m._render_token_breakdown(middle, self.ctx)
+        self.assertIn('run_command', text)
+        self.assertIn('go build -o nc', text)
+
+
+class TestExtractGenTokens(unittest.TestCase):
+    def setUp(self):
+        self.ctx = FakeContext()
+        self.ctx.backend = 'llamacpp'
+
+    def test_llamacpp_usage(self):
+        resp = {'usage': {'completion_tokens': 42}}
+        self.assertEqual(m._extract_gen_tokens(self.ctx, resp), 42)
+
+    def test_ollama_eval_count(self):
+        self.ctx.backend = 'ollama'
+        self.assertEqual(m._extract_gen_tokens(self.ctx, {'eval_count': 7}), 7)
+
+    def test_missing_usage(self):
+        self.assertEqual(m._extract_gen_tokens(self.ctx, {'choices': []}), 0)
+        self.assertEqual(m._extract_gen_tokens(self.ctx, None), 0)
 
 
 class FakeQueryHandler:
@@ -370,14 +436,34 @@ class TestLlmCompactMessages(unittest.TestCase):
         result = m.llm_compact_messages(self._session(), ctx, handler, keep_recent=2)
         self.assertEqual(result[0]['role'], 'system')
         self.assertEqual(result[1]['role'], 'user')
-        self.assertIn(m.LLM_COMPACT_SUMMARY_MARKER, result[1]['content'])
-        self.assertIn('user wanted a summary of X.', result[1]['content'])
+        content = result[1]['content']
+        self.assertIn(m.LLM_COMPACT_SUMMARY_MARKER, content)
+        self.assertIn('user wanted a summary of X.', content)
+        # The compacted message embeds the token breakdown of the compacted turns
+        # plus the before/after context size and the summarization token rate.
+        self.assertIn('Token breakdown of the compacted turns:', content)
+        self.assertIn('[  0] user', content)
+        self.assertIn('Context:', content)
+        self.assertIn('tok/s', content)
         self.assertIn('_tokens', result[1])
         self.assertEqual(result[-2:], self._session()[-2:])
         # The summarizer actually got the older turns.
         self.assertTrue(handler.calls)
         sent_user = handler.calls[0][0][1]['content']
         self.assertIn('q0', sent_user)
+
+    def test_llm_summary_breakdown_marks_tool_results(self):
+        ctx = FakeContext()
+        handler = FakeQueryHandler(content='ok')
+        session = [_msg('system', 'sys'),
+                   {'role': 'user', 'content': 'find the file'},
+                   {'role': 'assistant', 'content': 'calling cat'},
+                   {'role': 'tool', 'name': 'cat', 'content': 'cat myfile\nNo such file', 'tool_call_id': 't1'},
+                   {'role': 'user', 'content': 'tail'}]
+        result = m.llm_compact_messages(session, ctx, handler, keep_recent=1)
+        content = result[1]['content']
+        self.assertIn('[OK] cat myfile', content)
+        self.assertIn('→', content)
 
     def test_fallback_to_mechanical_when_llm_fails(self):
         ctx = FakeContext()
@@ -418,6 +504,39 @@ class TestLlmCompactMessages(unittest.TestCase):
         sent = handler.calls[0][0][1]['content']
         self.assertLessEqual(len(sent), m.LLM_COMPACT_TRANSCRIPT_CHARS + 64)
         self.assertIn('user: q3', sent)
+
+    def test_llm_summary_appends_to_prior_log(self):
+        """A second /compact llm keeps the prior dated entry verbatim and appends
+        a new one instead of re-summarizing the old away."""
+        ctx = FakeContext()
+        first = m.llm_compact_messages(self._session(), ctx,
+                                       FakeQueryHandler(content='SUMMARY ONE.'), keep_recent=2)
+        first_content = first[1]['content']
+        self.assertIn('Compaction log', first_content)
+        self.assertIn('SUMMARY ONE.', first_content)
+
+        # Continue the session: prior summary stays at index 1, then new turns.
+        continued = first[:2] + [_msg('user', 'new question'),
+                                 _msg('assistant', 'new answer')]
+        second = m.llm_compact_messages(continued, ctx,
+                                        FakeQueryHandler(content='SUMMARY TWO.'), keep_recent=1)
+        content = second[1]['content']
+        self.assertIn('SUMMARY ONE.', content, 'prior entry must be preserved verbatim')
+        self.assertIn('SUMMARY TWO.', content)
+        self.assertIn(first_content, content, 'prior entry must survive untruncated')
+        self.assertEqual(content.count('Token breakdown of the compacted turns:'), 2)
+        # Each dated entry carries a [YYYY-MM-DD HH:MM] timestamp.
+        self.assertGreaterEqual(content.count('['), 4)
+
+    def test_extract_compaction_log_strips_header(self):
+        body = m._extract_compaction_log('x')
+        self.assertEqual(body, '')
+        prev = m.llm_compact_messages(self._session(), FakeContext(),
+                                      FakeQueryHandler(content='S.'), keep_recent=2)
+        prev_content = prev[1]['content']
+        extracted = m._extract_compaction_log(prev_content)
+        self.assertNotIn(m.LLM_COMPACT_SUMMARY_MARKER, extracted)
+        self.assertIn('S.', extracted)
 
 
 if __name__ == '__main__':

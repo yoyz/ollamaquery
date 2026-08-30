@@ -1054,6 +1054,58 @@ class TestInferenceParamsRegistry(unittest.TestCase):
                         "qwen3.6 must be matched before generic qwen3")
 
 
+class TestNoThinkingPayload(unittest.TestCase):
+    """Verify /thinkingoff injects the correct per-model reasoning-disabling flag."""
+
+    def _payload(self, backend, model):
+        mq = m.ModelQuery('http://x', backend)
+        return mq.build_request_payload(
+            [{'role': 'user', 'content': 'hi'}], model, no_thinking=True)
+
+    def test_qwen_uses_enable_thinking_kwargs(self):
+        p = self._payload('llamacpp', 'qwen3.8:27b')
+        self.assertEqual(p['chat_template_kwargs']['enable_thinking'], False)
+        self.assertEqual(p['chat_template_kwargs']['thinking'], False)
+
+    def test_gpt_oss_uses_reasoning_effort_low(self):
+        p = self._payload('llamacpp', 'gpt-oss-20b-mxfp4.gguf')
+        self.assertEqual(p['chat_template_kwargs']['reasoning_effort'], 'low')
+        self.assertNotIn('enable_thinking', p['chat_template_kwargs'])
+
+    def test_gpt_oss_underscore_model_matched(self):
+        p = self._payload('llamacpp', '/cache/gpt_oss-20b.gguf')
+        self.assertEqual(p['chat_template_kwargs']['reasoning_effort'], 'low')
+
+    def test_ollama_uses_think_option(self):
+        p = self._payload('ollama', 'gpt-oss-20b')
+        self.assertEqual(p['options']['think'], False)
+
+    def test_no_thinking_flag_absent_by_default(self):
+        mq = m.ModelQuery('http://x', 'llamacpp')
+        p = mq.build_request_payload([{'role': 'user', 'content': 'hi'}], 'qwen3.8:27b')
+        self.assertNotIn('chat_template_kwargs', p)
+
+    def test_reasoning_effort_llamacpp(self):
+        p = self._payload('llamacpp', 'qwen3.8:27b')
+        mq = m.ModelQuery('http://x', 'llamacpp')
+        p = mq.build_request_payload(
+            [{'role': 'user', 'content': 'hi'}], 'qwen3.8:27b', reasoning_effort='high')
+        self.assertEqual(p['chat_template_kwargs']['reasoning_effort'], 'high')
+
+    def test_reasoning_effort_ollama(self):
+        mq = m.ModelQuery('http://x', 'ollama')
+        p = mq.build_request_payload(
+            [{'role': 'user', 'content': 'hi'}], 'qwen3.8:27b', reasoning_effort='medium')
+        self.assertEqual(p['options']['reasoning_effort'], 'medium')
+
+    def test_reasoning_effort_precedes_no_thinking(self):
+        mq = m.ModelQuery('http://x', 'llamacpp')
+        p = mq.build_request_payload(
+            [{'role': 'user', 'content': 'hi'}], 'gpt-oss-20b.gguf',
+            no_thinking=True, reasoning_effort='high')
+        self.assertEqual(p['chat_template_kwargs']['reasoning_effort'], 'high')
+
+
 class TestAgentsMdConsistency(unittest.TestCase):
     """Verify AGENTS.md line-number references are still accurate."""
 

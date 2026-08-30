@@ -723,6 +723,61 @@ class TestCommandHandlers(unittest.TestCase):
         self.assertIs(result, False)
         self.assertTrue(self.ctx.force_no_thinking)
 
+    def test_handle_reasoning_off(self):
+        result = self.loop.run_handle_reasoning('/reasoning off')
+        self.assertIs(result, False)
+        self.assertTrue(self.ctx.force_no_thinking)
+        self.assertIsNone(self.ctx.reasoning_effort)
+
+    def test_handle_reasoning_on(self):
+        result = self.loop.run_handle_reasoning('/reasoning on')
+        self.assertIs(result, False)
+        self.assertFalse(self.ctx.force_no_thinking)
+        self.assertIsNone(self.ctx.reasoning_effort)
+
+    def test_handle_reasoning_effort_levels(self):
+        for level in ('low', 'medium', 'high'):
+            result = self.loop.run_handle_reasoning(f'/reasoning {level}')
+            self.assertIs(result, False)
+            self.assertEqual(self.ctx.reasoning_effort, level)
+            self.assertFalse(self.ctx.force_no_thinking)
+
+    def test_handle_reasoning_status(self):
+        result = self.loop.run_handle_reasoning('/reasoning')
+        self.assertIs(result, False)
+
+    def test_handle_reasoning_bad_value(self):
+        result = self.loop.run_handle_reasoning('/reasoning turbo')
+        self.assertIs(result, False)
+        self.assertIsNone(self.ctx.reasoning_effort)
+
+    def test_handle_reasoning_returns_none_for_other_commands(self):
+        result = self.loop.run_handle_reasoning('/clear')
+        self.assertIsNone(result)
+
+    def test_tokencount_unfolds_message(self):
+        self.loop.messages = [
+            {'role': 'system', 'content': 'You are a capable AI agent with tools.', '_tokens': 364},
+            {'role': 'user', 'content': 'hello world', '_tokens': 156},
+            {'role': 'assistant', 'content': 'reply text', '_tokens': 70},
+        ]
+        buf = io.StringIO()
+        with patch('sys.stderr', buf):
+            result = self.loop.run_handle_tokencount('/tokencount 1')
+        self.assertIs(result, False)
+        out = buf.getvalue()
+        self.assertIn('Full Message [1]', out)
+        self.assertIn('hello world', out)
+        self.assertIn('End Message [1]', out)
+
+    def test_tokencount_out_of_range(self):
+        self.loop.messages = [{'role': 'user', 'content': 'hi', '_tokens': 2}]
+        buf = io.StringIO()
+        with patch('sys.stderr', buf):
+            result = self.loop.run_handle_tokencount('/tokencount 5')
+        self.assertIs(result, False)
+        self.assertIn('out of range', buf.getvalue())
+
     @ollama_only
     def test_handle_listmodel(self):
         result = self.loop.run_handle_listmodel('/listmodel')

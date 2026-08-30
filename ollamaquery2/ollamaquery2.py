@@ -57,7 +57,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.7"
+__version__ = "0.2.8"
 
 
 # ============================================================================
@@ -321,6 +321,13 @@ COMMANDS = {
         'category': 'Settings',
         'description': 'Disable reasoning/thinking output',
         'usage': '/thinkingoff',
+        'handler': None
+    },
+    'reasoning': {
+        'aliases': ['/reasoning'],
+        'category': 'Settings',
+        'description': 'Set model reasoning effort (low/medium/high) or off/on',
+        'usage': '/reasoning [off|on|low|medium|high]',
         'handler': None
     },
     'debug': {
@@ -1069,6 +1076,7 @@ class CommandContext:
         self.context_size: Optional[int] = None
         self.current_images: List[str] = []
         self.force_no_thinking: bool = False
+        self.reasoning_effort: Optional[str] = None  # None | "low" | "medium" | "high"
         self.models: List[str] = []
 
         # Execution state
@@ -1095,6 +1103,7 @@ class CommandContext:
         self.agentic_timeout_max: int = 480
         self.agentic_progress_grace: int = 15
         self.agentic_max_thinking_tokens: int = 2048
+        self.agentic_heartbeat_tokens: int = 10
         self.agentic_consecutive_timeouts: int = 0
         self.agentic_has_executed_tool: bool = False
         self.agentic_last_tool_name: str = ""
@@ -1598,26 +1607,103 @@ def summarize_tool_results(messages: list, ctx: 'CommandContext',
 
 
 # LLM-assisted conversation summarization (opus6 item 2 / `/compact llm`).
-LLM_COMPACT_TRANSCRIPT_CHARS = 6000  # Cap the excerpt sent to the model
+LLM_COMPACT_TRANSCRIPT_CHARS = 6000    # Cap the excerpt sent to the model
+LLM_COMPACT_BREAKDOWN_CHARS = 4000    # Cap the token breakdown kept in the summary message
+LLM_COMPACT_BREAKDOWN_TEXT = 80       # Per-line text excerpt in the breakdown
 LLM_COMPACT_SUMMARY_MARKER = "[CONVERSATION SUMMARY (LLM)]"
+
+
+def _cap_line(text: str, max_len: int) -> str:
+    """Strip and truncate a single line to at most `max_len` chars."""
+    text = text.strip()
+    if len(text) > max_len:
+        return text[:max_len] + "..."
+    return text
+
+
+def _render_token_breakdown(middle: list, ctx: 'CommandContext',
+                            max_chars: int = LLM_COMPACT_BREAKDOWN_CHARS) -> str:
+    """Render a `/tokencount`-style breakdown of the messages being compacted.
+
+    Every line carries the role, token count (· exact / ~ estimated), an [OK] or
+    [KO] marker for tool results, and ~`LLM_COMPACT_BREAKDOWN_TEXT` chars of the
+    text — enough for a model reading the compacted summary to reconstruct what
+    happened step by step (queries, attempts, tool calls and their outcomes).
+    Tool-call JSON in assistant lines is long, so the excerpt budget (~80 chars)
+    is sized to expose at least the tool name and the start of its arguments.
+
+    Args:
+        middle: The older message list being compacted.
+        ctx: CommandContext (token estimation for unstamped messages).
+        max_chars: Total output cap.
+
+    Returns:
+        A formatted breakdown string.
+    """
+    lines = []
+    for i, msg in enumerate(middle):
+        role = msg.get('role', 'unknown')
+        content = msg.get('content', '')
+        if not isinstance(content, str):
+            content = str(content)
+        if '_tokens' in msg:
+            tokens = msg['_tokens']
+            marker = "·"
+        else:
+            tokens = ctx.estimate_tokens(content) + 2
+            marker = "~"
+        if role == 'tool':
+            ok = 'OK' if 'ERROR' not in content[:100] else 'KO'
+            excerpt = _cap_line(content.split('\n')[0] if content else '', LLM_COMPACT_BREAKDOWN_TEXT)
+            text = f"[{ok}] {excerpt}"
+        else:
+            text = _cap_line(content.replace('\n', ' '), LLM_COMPACT_BREAKDOWN_TEXT)
+        lines.append(f"  [{i:3d}] {role:10s} {marker}{tokens:6d} tok  {text}")
+    breakdown = "\n".join(lines)
+    if len(breakdown) > max_chars:
+        breakdown = breakdown[:max_chars] + "\n[...]"
+    return breakdown
+
+
+def _extract_gen_tokens(ctx: 'CommandContext', response: object) -> int:
+    """Extract the number of generated (completion) tokens from a sync response.
+
+    Args:
+        ctx: CommandContext (backend selects the shape).
+        response: The query_sync response dict.
+
+    Returns:
+        Generated token count, or 0 when unavailable.
+    """
+    if not isinstance(response, dict):
+        return 0
+    if ctx.backend == "ollama":
+        return int(response.get("eval_count", 0) or 0)
+    usage = response.get("usage") or {}
+    return int(usage.get("completion_tokens", 0) or 0)
 
 
 def _render_conversation_transcript(middle: list,
                                     max_chars: int = LLM_COMPACT_TRANSCRIPT_CHARS) -> str:
     """Render a compact text transcript of older turns for the LLM summarizer.
 
-    Tool results reduce to a status line (they are handled separately by
-    `summarize_tool_results` / the excerpt summary); user/assistant text is kept
-    near-verbatim so the model can follow the actual conversation.
+    Tool results reduce to a status line plus a short outcome excerpt (they are
+    otherwise handled separately by `summarize_tool_results`); user/assistant
+    text is kept near-verbatim so the model can follow the actual conversation.
     """
     lines = []
     for msg in middle:
         role = msg.get('role', 'unknown')
         content = msg.get('content', '')
         if role == 'tool':
-            name = msg.get('name', 'unknown')
+            name = msg.get('name', 'tool')
             ok = 'OK' if 'ERROR' not in content[:100] else 'FAILED'
-            lines.append(f"[tool {name}: {ok}]")
+            excerpt = content.split('\n')[0] if isinstance(content, str) and content else ''
+            if excerpt:
+                excerpt = _cap_line(excerpt, 100)
+                lines.append(f"[tool {name}: {ok}] {excerpt}")
+            else:
+                lines.append(f"[tool {name}: {ok}]")
             continue
         if not isinstance(content, str):
             content = str(content)
@@ -1636,7 +1722,7 @@ def _render_conversation_transcript(middle: list,
 
 
 def _llm_summarize_conversation(ctx: 'CommandContext', query_handler: 'ModelQuery',
-                                middle: list) -> Optional[str]:
+                                middle: list) -> tuple:
     """Ask the model for a faithful narrative summary of older conversation turns.
 
     Args:
@@ -1645,11 +1731,13 @@ def _llm_summarize_conversation(ctx: 'CommandContext', query_handler: 'ModelQuer
         middle: Older message list to summarize.
 
     Returns:
-        The summary text, or None on failure/empty response.
+        (summary, gen_tokens, elapsed_sec): the summary text (or None on
+        failure/empty response), the number of generated tokens, and the wall
+        time of the summarization call.
     """
     transcript = _render_conversation_transcript(middle)
     if not transcript.strip():
-        return None
+        return None, 0, 0.0
     system = (
         "You are a context optimizer for a CLI chat session. The conversation is "
         "approaching the context limit, so the EARLIER turns below must be compacted "
@@ -1660,6 +1748,7 @@ def _llm_summarize_conversation(ctx: 'CommandContext', query_handler: 'ModelQuer
         "if the transcript were deleted."
     )
     user = f"EARLIER CONVERSATION TO SUMMARIZE:\n\n{transcript}"
+    start = time.time()
     try:
         response = query_handler.query_sync(
             [{'role': 'system', 'content': system},
@@ -1668,9 +1757,40 @@ def _llm_summarize_conversation(ctx: 'CommandContext', query_handler: 'ModelQuer
             temperature=0.3,
         )
     except Exception:
-        return None
+        return None, 0, 0.0
+    elapsed = time.time() - start
     summary = _extract_sync_content(ctx, response).strip()
-    return summary or None
+    return (summary or None), _extract_gen_tokens(ctx, response), elapsed
+
+
+def _extract_compaction_log(content: object) -> str:
+    """Return the body of a prior compaction summary message for re-embedding.
+
+    A previous `llm_compact_messages` result starts with the summary marker and
+    an intro line; the dated entries after it are extracted so they can be kept
+    verbatim when a new compaction entry is appended — the log grows by roughly
+    one entry per `/compact llm`, but earlier entries are never re-summarized
+    away, so the session model keeps its full memory of what was achieved.
+
+    Args:
+        content: The prior compacted message content (or any non-string).
+
+    Returns:
+        The entries block without the marker/intro, or '' when `content` is
+        not a prior compaction summary.
+    """
+    if not isinstance(content, str) or not content.startswith(LLM_COMPACT_SUMMARY_MARKER):
+        return ''
+    lines = content.split('\n')
+    rest = lines[1:]
+    if rest and (rest[0].startswith('Earlier conversation compacted')
+                 or rest[0].startswith('Compaction log')):
+        rest = rest[1:]
+    while rest and not rest[0].strip():
+        rest = rest[1:]
+    while rest and not rest[-1].strip():
+        rest.pop()
+    return '\n'.join(rest)
 
 
 def llm_compact_messages(messages: list, ctx: 'CommandContext', query_handler: 'ModelQuery',
@@ -1679,8 +1799,15 @@ def llm_compact_messages(messages: list, ctx: 'CommandContext', query_handler: '
 
     Unlike `compact_messages` (excerpt previews), the dropped middle is handed to
     the model for a faithful summary, preserving facts the excerpt-based approach
-    would drop. On LLM failure (or when there is nothing to compact) falls back to
-    the mechanical `compact_messages`.
+    would drop. The compacted message embeds the narrative summary followed by
+    the `/tokencount`-style breakdown of the compacted turns (roles, token
+    counts, OK/KO tool results, ~50 chars of text) plus the before/after context
+    size and the summarization token rate, so the session model can reconstruct
+    what was achieved. When a prior `/compact llm` summary message exists, its
+    dated entries are kept verbatim and the new entry is appended — the summary
+    becomes a dated log that grows by ~one entry per compaction. On LLM failure
+    (or when there is nothing to compact) falls back to the mechanical
+    `compact_messages`.
 
     Args:
         messages: Full message list (not mutated — returns a new list).
@@ -1698,22 +1825,45 @@ def llm_compact_messages(messages: list, ctx: 'CommandContext', query_handler: '
     if not middle:
         return list(messages)
 
-    summary = _llm_summarize_conversation(ctx, query_handler, middle)
+    before_tokens = ctx.calculate_context_tokens(messages)
+    summary, gen_tokens, elapsed = _llm_summarize_conversation(ctx, query_handler, middle)
     if not summary:
         return compact_messages(messages, ctx, keep_recent=keep_recent)
 
-    summary_text = (
-        LLM_COMPACT_SUMMARY_MARKER + "\n"
-        "Earlier conversation compacted into the summary below:\n"
+    # Append to the dated compaction log if a prior summary message exists, so
+    # earlier entries survive verbatim instead of being re-summarized away.
+    prev_log = _extract_compaction_log(middle[0].get('content', '')) if middle else ''
+    timestamp = time.strftime("%Y-%m-%d %H:%M")
+    entry = (
+        f"[{timestamp}]\n"
         + summary
+        + "\n\nToken breakdown of the compacted turns:\n"
+        + _render_token_breakdown(middle, ctx)
     )
-    compacted_msg = {'role': 'user', 'content': summary_text}
+    body = prev_log + "\n\n" + entry if prev_log else entry
+    base_text = (
+        LLM_COMPACT_SUMMARY_MARKER + "\n"
+        "Compaction log (oldest first):\n\n"
+        + body
+    )
+    compacted_msg = {'role': 'user', 'content': base_text}
     ctx.stamp_tokens(compacted_msg)
     result = [system_msg, compacted_msg]
     if recent and recent[-1].get('role') == 'user':
         result.append({'role': 'assistant', 'content': '[Context continued...]'})
     result.extend(recent)
     sanitize_tool_pairing(result)
+    after_tokens = ctx.calculate_context_tokens(result)
+
+    saved = before_tokens - after_tokens
+    pct = (saved / before_tokens * 100) if before_tokens else 0.0
+    speed = (gen_tokens / elapsed) if elapsed > 0 else 0.0
+    compacted_msg['content'] = (
+        base_text
+        + f"\n\nContext: {before_tokens} → {after_tokens} tokens ({pct:.0f}% saved)"
+        + f" | summary generation: {speed:.1f} tok/s ({gen_tokens} tok in {elapsed:.1f}s)"
+    )
+    ctx.stamp_tokens(compacted_msg)
     return result
 
 
@@ -5084,6 +5234,84 @@ class ModelQuery:
             if param in kwargs:
                 payload[param] = kwargs[param]
 
+    @staticmethod
+    def _apply_no_thinking(payload: dict, backend: str) -> None:
+        """Disable the model's reasoning phase via the backend template flag.
+
+        Reasoning models ignore prompt-level instructions, so the thinking phase
+        must be turned off through the chat-template flag. Each local backend and
+        model family exposes it differently:
+          - ollama: /api/chat `options.think = false`
+          - llama.cpp / lmstudio Qwen-style templates: `chat_template_kwargs`
+            (llama.cpp uses `thinking`, vLLM uses `enable_thinking`; both keys
+            are set so either is honored, unknown keys are ignored by templates)
+          - gpt-oss: has NO reasoning off-switch — the model is trained to always
+            reason (llama.cpp: "incapable of not reasoning"). Only
+            `reasoning_effort` (low/medium/high) is supported, so `/thinkingoff`
+            downgrades it to "low" to minimize the analysis phase.
+
+        Args:
+            payload: The payload dict (mutated in place).
+            backend: Backend name.
+        """
+        if backend == "ollama":
+            payload["options"] = {**payload.get("options", {}), "think": False}
+        elif backend in ("llamacpp", "lmstudio"):
+            kwargs = dict(payload.get("chat_template_kwargs") or {})
+            model = str(payload.get("model", "")).lower()
+            if "gpt-oss" in model or "gpt_oss" in model:
+                kwargs["reasoning_effort"] = "low"
+            else:
+                kwargs["enable_thinking"] = False
+                kwargs["thinking"] = False
+            payload["chat_template_kwargs"] = kwargs
+
+    @staticmethod
+    def _apply_reasoning_effort(payload: dict, backend: str, effort: str) -> None:
+        """Set the model's reasoning effort via the backend-specific field.
+
+        Templates that support reasoning levels (gpt-oss, newer Qwen3) read
+        `reasoning_effort` (low/medium/high); templates that don't silently
+        ignore it. Ollama exposes it through `options`, the OpenAI-compatible
+        backends through `chat_template_kwargs`.
+
+        Args:
+            payload: The payload dict (mutated in place).
+            backend: Backend name.
+            effort: Reasoning effort level ("low", "medium" or "high").
+        """
+        if backend == "ollama":
+            payload["options"] = {**payload.get("options", {}), "reasoning_effort": effort}
+        elif backend in ("llamacpp", "lmstudio"):
+            kwargs = dict(payload.get("chat_template_kwargs") or {})
+            kwargs["reasoning_effort"] = effort
+            payload["chat_template_kwargs"] = kwargs
+
+    def reasoning_flags(self, model: str, backend: str, force_no_thinking: bool,
+                        reasoning_effort: Optional[str] = None) -> dict:
+        """Return the payload fields that would be sent for a reasoning state.
+
+        Used by `/reasoning status` so the user can see the exact backend flag
+        the next query will carry (e.g. `options.think` vs
+        `chat_template_kwargs.reasoning_effort`), rather than only a label.
+
+        Args:
+            model: Model name (gpt-oss vs Qwen-style select the flag shape).
+            backend: Backend name.
+            force_no_thinking: Whether reasoning suppression is requested.
+            reasoning_effort: Explicit effort level ("low"/"medium"/"high").
+                Takes precedence over `force_no_thinking`.
+
+        Returns:
+            dict of payload fields (without "model"), empty when no flag applies.
+        """
+        payload = {"model": model}
+        if reasoning_effort:
+            self._apply_reasoning_effort(payload, backend, reasoning_effort)
+        elif force_no_thinking:
+            self._apply_no_thinking(payload, backend)
+        return {k: v for k, v in payload.items() if k != "model"}
+
     def _apply_size_options(self, payload: dict, backend: str, kwargs: dict) -> None:
         """Apply warmup/context-size options to the payload.
 
@@ -5129,6 +5357,12 @@ class ModelQuery:
             payload["tools"] = tools
 
         self._apply_backend_inference_params(payload, self.backend, kwargs)
+
+        if kwargs.get('no_thinking'):
+            self._apply_no_thinking(payload, self.backend)
+
+        if effort := kwargs.get('reasoning_effort'):
+            self._apply_reasoning_effort(payload, self.backend, str(effort))
 
         return payload
 
@@ -6396,6 +6630,7 @@ class ChatLoop:
             self.run_handle_dumpcontext,
             self.run_handle_debug,
             self.run_handle_thinking,
+            self.run_handle_reasoning,
             self.run_handle_cwd,
             self.run_handle_ls,
             self.run_handle_switchmodel,
@@ -6958,6 +7193,51 @@ class ChatLoop:
             return False
         return None
 
+    def run_handle_reasoning(self, full_input: str) -> Optional[bool]:
+        """Handle /reasoning [off|on|low|medium|high] command."""
+        if not full_input.startswith('/reasoning'):
+            return None
+        parts = full_input.split()
+        if len(parts) == 1 or parts[1] in ('status', 'show'):
+            if self.ctx.reasoning_effort:
+                state_str = f"Reasoning effort: {self.ctx.reasoning_effort}"
+            elif self.ctx.force_no_thinking:
+                state_str = "Reasoning: off"
+            else:
+                state_str = "Reasoning: on (model default effort)"
+            print(colorize(f"[{state_str}]", 'info'), file=sys.stderr)
+            self._print_reasoning_flag()
+            return False
+        val = parts[1].lower()
+        if val == 'off':
+            self.ctx.force_no_thinking = True
+            self.ctx.reasoning_effort = None
+            print(colorize("[Reasoning: off — model will skip reasoning phase]", 'warning'), file=sys.stderr)
+            self._print_reasoning_flag()
+            return False
+        if val == 'on':
+            self.ctx.force_no_thinking = False
+            self.ctx.reasoning_effort = None
+            print(colorize("[Reasoning: on — model default effort]", 'success'), file=sys.stderr)
+            self._print_reasoning_flag()
+            return False
+        if val in ('low', 'medium', 'high'):
+            self.ctx.force_no_thinking = False
+            self.ctx.reasoning_effort = val
+            print(colorize(f"[Reasoning effort: {val}]", 'info'), file=sys.stderr)
+            self._print_reasoning_flag()
+            return False
+        print(colorize("[Usage: /reasoning [off|on|low|medium|high]]", 'warning'), file=sys.stderr)
+        return False
+
+    def _print_reasoning_flag(self) -> None:
+        """Print the exact backend flag the next query will carry for reasoning."""
+        flags = self.query_handler.reasoning_flags(
+            self.ctx.model, self.ctx.backend,
+            self.ctx.force_no_thinking, self.ctx.reasoning_effort)
+        flag_str = ", ".join(f"{k}={json.dumps(v)}" for k, v in flags.items()) or "none"
+        print(colorize(f"[Backend flag: {flag_str}]", 'muted'), file=sys.stderr)
+
     def run_handle_cwd(self, full_input: str) -> Optional[bool]:
         """Handle /cwd command."""
         if full_input.startswith('/cwd'):
@@ -7070,14 +7350,14 @@ class ChatLoop:
             return self._agentic_set_full()
         if subcmd == "sandbox":
             return self._agentic_toggle_sandbox()
-        if subcmd in ("iterations", "timeout"):
+        if subcmd in ("iterations", "timeout", "heartbeattokens"):
             return self._agentic_set_number(subcmd, parts)
         if subcmd in self._AGENTIC_TOGGLE_MAP:
             return self._agentic_toggle_named(subcmd)
         if subcmd == "acl":
             return self._handle_agentic_acl(parts)
 
-        print(colorize("[Usage: /agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|lazytool|acl|iterations <N>|timeout <N>|status]]", 'warning'), file=sys.stderr)
+        print(colorize("[Usage: /agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|lazytool|acl|iterations <N>|timeout <N>|heartbeattokens <N>|status]]", 'warning'), file=sys.stderr)
         return False
 
     # Named toggles (always toggle between on/off)
@@ -7134,14 +7414,18 @@ class ChatLoop:
         return False
 
     def _agentic_set_number(self, subcmd: str, parts: list) -> bool:
-        """Set a numeric agentic setting (iterations or step timeout)."""
+        """Set a numeric agentic setting (iterations, step timeout, heartbeat tokens)."""
         if len(parts) < 3 or not parts[2].isdigit():
             print(colorize(f"[Usage: /agentic {subcmd} <number>]", 'warning'), file=sys.stderr)
             return False
-        val = int(parts[2])
-        attr = "agentic_max_iterations" if subcmd == "iterations" else "agentic_step_timeout"
+        val = max(1, int(parts[2]))
+        attr_map = {
+            "iterations": ("agentic_max_iterations", "Max iterations"),
+            "timeout": ("agentic_step_timeout", "Step timeout"),
+            "heartbeattokens": ("agentic_heartbeat_tokens", "Tokens per heartbeat dot"),
+        }
+        attr, label = attr_map[subcmd]
         setattr(self.ctx, attr, val)
-        label = "Max iterations" if subcmd == "iterations" else "Step timeout"
         print(colorize(f"[{label}: {val}]", 'info'), file=sys.stderr)
         return False
 
@@ -7232,7 +7516,7 @@ class ChatLoop:
         c = self.ctx
         print(colorize("\n[Agentic Settings - Use /agentic <option> [value]]", 'info'), file=sys.stderr)
         print("  Subcommands: on, off, full, auto, sandbox, verbose, thinking, trace, log, lazytool,", file=sys.stderr)
-        print("               iterations <N>, timeout <N>, acl, status", file=sys.stderr)
+        print("               iterations <N>, timeout <N>, heartbeattokens <N>, acl, status", file=sys.stderr)
         print(file=sys.stderr)
 
         settings = [
@@ -7246,6 +7530,7 @@ class ChatLoop:
             ("lazytool",   "Extract tool calls from anywhere in reply", str(c.lazy_tool).lower()),
             ("iterations", "Max ReAct loop iterations", str(c.agentic_max_iterations)),
             ("timeout",    "Per-step timeout (seconds)", f"{c.agentic_step_timeout}s"),
+            ("heartbeattokens", "Tokens per heartbeat dot", str(c.agentic_heartbeat_tokens)),
         ]
         for name, desc, value in settings:
             marker = ">" if (value not in ("off", "false", "host", "0") and "off" not in value) else " "
@@ -7675,43 +7960,49 @@ class ChatLoop:
             thought: Reasoning text for this chunk.
             content: Assistant text for this chunk.
             show_thinking: Whether to stream the reasoning live.
+
+        Note: when thinking is not streamed, liveness dots come from the
+        watchdog thread started in `_make_agentic_step_feedback`, not from
+        chunk arrival — long tool-call generations may deliver no chunks at
+        all, so a chunk-driven heartbeat would leave the terminal silent.
         """
         if show_thinking:
             if thought:
-                if not state["thinking_open"]:
-                    state["thinking_open"] = True
-                    sys.stderr.write("\n<thinking>\n")
-                sys.stderr.write(thought)
-                sys.stderr.flush()
+                with state["write_lock"]:
+                    if not state["thinking_open"]:
+                        state["thinking_open"] = True
+                        sys.stderr.write("\n<thinking>\n")
+                    sys.stderr.write(thought)
+                    sys.stderr.flush()
             if content and state["thinking_open"]:
-                sys.stderr.write("\n</thinking>\n")
-                sys.stderr.flush()
-                state["thinking_open"] = False
-        else:
-            now = time.time()
-            if now - state["last_heartbeat"] >= 1.0:
-                state["last_heartbeat"] = now
-                state["heartbeat_shown"] = True
-                sys.stderr.write(".")
-                sys.stderr.flush()
+                with state["write_lock"]:
+                    sys.stderr.write("\n</thinking>\n")
+                    sys.stderr.flush()
+                    state["thinking_open"] = False
 
     def _make_agentic_step_feedback(self) -> tuple:
         """Build live feedback callbacks for an agentic ReAct step.
 
         Returns (on_chunk, finalize, buffer). `on_chunk(thought, content, is_final)`
         streams model thinking to stderr in real time when `agentic_show_thinking`
-        is enabled; otherwise it emits a heartbeat dot (~1/s) so the user sees the
-        model is still generating. `buffer` is a dict with accumulated
-        `content`/`thought` — used after a timeout to decide abort-vs-continue.
-        `finalize()` closes any open `<thinking>` block and stops the lingering
-        worker thread (on timeout) from writing further feedback.
+        is enabled. Heartbeat dots are token-driven: one dot per
+        `ctx.agentic_heartbeat_tokens` (default 10) streamed tokens, so the
+        cadence reflects real generation progress rather than wall-clock. Because
+        some generations deliver no chunks at all (e.g. llama.cpp buffering a
+        tool-call response for tens of seconds), a daemon watchdog thread also
+        emits a dot (~1/s) once the step has been silent for ~2s, resuming as
+        soon as tokens flow again. While thinking is being streamed live both
+        mechanisms hold off (the user already sees progress). `buffer` is a dict
+        with accumulated `content`/`thought` — used after a timeout to decide
+        abort-vs-continue. `finalize()` closes any open `<thinking>` block and
+        stops the watchdog + lingering worker thread (on timeout) from writing
+        further feedback.
 
         Returns:
             (on_chunk, finalize, buffer) tuple of callables + state dict.
         """
         state = {
             "thinking_open": False,
-            "last_heartbeat": time.time(),
             "last_activity": time.time(),
             "cancelled": False,
             "heartbeat_shown": False,
@@ -7719,8 +8010,43 @@ class ChatLoop:
             "thought": "",
             "thinking_tokens": 0,
             "thinking_capped": False,
+            "tok_acc": 0,
+            "write_lock": threading.Lock(),
         }
         show_thinking = self.ctx.agentic_show_thinking
+        heartbeat_tokens = max(1, int(getattr(self.ctx, 'agentic_heartbeat_tokens', 10) or 10))
+
+        def watchdog() -> None:
+            """Idle-fallback liveness: dot ~1/s while the step is silent.
+
+            Token-driven dots (see on_chunk) cover active streaming; generations
+            that deliver no chunks at all would otherwise leave the terminal
+            silent, so after ~2s without token activity the watchdog ticks once
+            per second until tokens resume. This fires even while the
+            `<thinking>` block is open: a silent thinking phase usually means the
+            model has switched to a tool call (native tool-call deltas carry no
+            content, so the block never closes on its own) — the block is closed
+            and the dots keep the user informed. If thinking later resumes, the
+            block reopens.
+            """
+            idle_grace = 2.0
+            while not state["cancelled"]:
+                time.sleep(1.0)
+                if state["cancelled"]:
+                    return
+                if time.time() - state["last_activity"] < idle_grace:
+                    continue
+                with state["write_lock"]:
+                    if state["cancelled"]:
+                        return
+                    if state["thinking_open"]:
+                        sys.stderr.write("\n</thinking>\n")
+                        state["thinking_open"] = False
+                    state["heartbeat_shown"] = True
+                    sys.stderr.write(".")
+                    sys.stderr.flush()
+
+        threading.Thread(target=watchdog, daemon=True).start()
 
         def on_chunk(thought: str, content: str, is_final: bool) -> None:
             """Handle a parsed stream chunk: accumulate + render feedback.
@@ -7734,18 +8060,27 @@ class ChatLoop:
                 return
             self._accumulate_step_feedback(state, thought, content)
             self._render_step_feedback(state, thought, content, show_thinking)
+            if (thought or content) and not state["thinking_open"]:
+                state["tok_acc"] += max(1, len(thought) // 4) + max(1, len(content) // 4)
+                while state["tok_acc"] >= heartbeat_tokens:
+                    state["tok_acc"] -= heartbeat_tokens
+                    state["heartbeat_shown"] = True
+                    with state["write_lock"]:
+                        sys.stderr.write(".")
+                        sys.stderr.flush()
 
         def finalize() -> None:
             """Close any open thinking block and stop further feedback output."""
-            if state["thinking_open"]:
-                sys.stderr.write("\n</thinking>\n")
-                sys.stderr.flush()
-                state["thinking_open"] = False
-            elif state["heartbeat_shown"]:
-                sys.stderr.write("\n")
-                sys.stderr.flush()
-                state["heartbeat_shown"] = False
-            state["cancelled"] = True
+            with state["write_lock"]:
+                if state["thinking_open"]:
+                    sys.stderr.write("\n</thinking>\n")
+                    sys.stderr.flush()
+                    state["thinking_open"] = False
+                elif state["heartbeat_shown"]:
+                    sys.stderr.write("\n")
+                    sys.stderr.flush()
+                    state["heartbeat_shown"] = False
+                state["cancelled"] = True
 
         return on_chunk, finalize, state
 
@@ -8273,6 +8608,8 @@ class ChatLoop:
                 context_size=self.ctx.context_size,
                 images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
                 tool_calls_out=stream_tool_calls_out,
+                no_thinking=self.ctx.force_no_thinking,
+                reasoning_effort=self.ctx.reasoning_effort,
                 **stream_kwargs
             )
             if response or stream_tool_calls_out:
@@ -8465,6 +8802,8 @@ class ChatLoop:
                 reentry_messages, self.ctx.model,
                 context_size=self.ctx.context_size,
                 images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
+                no_thinking=self.ctx.force_no_thinking,
+                reasoning_effort=self.ctx.reasoning_effort,
                 **sync_kwargs
             )
             reentry_text = _extract_sync_content(self.ctx, reentry_response)
@@ -8884,6 +9223,10 @@ class ChatLoop:
                 sync_kwargs = dict(get_inference_params(self.ctx.model))
                 if send_tools_api:
                     sync_kwargs["tools"] = openai_tools
+                if self.ctx.force_no_thinking:
+                    sync_kwargs["no_thinking"] = True
+                if self.ctx.reasoning_effort:
+                    sync_kwargs["reasoning_effort"] = self.ctx.reasoning_effort
                 on_chunk, finalize_step, step_buf = self._make_agentic_step_feedback()
                 step_cancel = {"event": threading.Event(), "close": None}
 
@@ -9264,11 +9607,27 @@ class ChatLoop:
         return None
 
     def run_handle_tokencount(self, full_input: str) -> Optional[bool]:
-        """Handle /tokencount command to show token breakdown."""
+        """Handle /tokencount command to show token breakdown.
+
+        ` /tokencount <index>` additionally unfolds the full content of that
+        message below the summary table.
+        """
         if full_input.startswith('/tokencount'):
             if not hasattr(self, 'messages') or not self.messages:
                 print(colorize("[TokenCount] No messages in session.", 'warning'), file=sys.stderr)
                 return False
+            parts = full_input.split()
+            unfold_index = None
+            if len(parts) > 1:
+                try:
+                    unfold_index = int(parts[1])
+                except ValueError:
+                    unfold_index = None
+                if unfold_index is not None and not (0 <= unfold_index < len(self.messages)):
+                    print(colorize(
+                        f"[TokenCount] Index {unfold_index} out of range (0-{len(self.messages) - 1}).",
+                        'error'), file=sys.stderr)
+                    return False
             total = 0
             exact_count = 0
             print(colorize("\n--- Token Breakdown ---", 'info'), file=sys.stderr)
@@ -9286,14 +9645,32 @@ class ChatLoop:
                 preview = content[:60].replace('\n', ' ') if isinstance(content, str) else str(content)[:60]
                 if len(content) > 60:
                     preview += '...'
+                if role == 'tool' and isinstance(content, str):
+                    ok = 'OK' if 'ERROR' not in content[:100] else 'KO'
+                    preview = f"[{ok}] {preview}"
                 print(colorize(f"  [{i:3d}] {role:10s} {marker}{tokens:6d} tok  {preview}", 'info'), file=sys.stderr)
             print(colorize(f"\n  Total: {total} tokens ({exact_count}/{len(self.messages)} exact, · = exact, ~ = estimated)", 'info'), file=sys.stderr)
             if self.ctx.context_window_size > 0:
                 pct = total / self.ctx.context_window_size
                 print(colorize(f"  Context: {total}/{self.ctx.context_window_size} ({pct:.1%})", 'info'), file=sys.stderr)
+            if unfold_index is not None:
+                self._print_full_message(unfold_index)
             print(colorize("--- End Token Breakdown ---\n", 'info'), file=sys.stderr)
             return False
         return None
+
+    def _print_full_message(self, index: int) -> None:
+        """Print the complete content of message `index` to stderr."""
+        msg = self.messages[index]
+        role = msg.get('role', 'unknown')
+        content = msg.get('content', '')
+        tokens = msg.get('_tokens') or self.ctx.estimate_tokens(content) + 2
+        print(colorize(f"\n--- Full Message [{index}] ({role}, {tokens} tok) ---", 'info'), file=sys.stderr)
+        if isinstance(content, str):
+            print(content, file=sys.stderr)
+        else:
+            print(json.dumps(content, indent=2, ensure_ascii=False), file=sys.stderr)
+        print(colorize(f"--- End Message [{index}] ---", 'info'), file=sys.stderr)
 
     def run_handle_sessions(self, full_input: str) -> Optional[bool]:
         """Handle /sessions command to list saved sessions."""
@@ -9390,12 +9767,6 @@ class ChatLoop:
 
         payload_messages = list(self.messages)
 
-        if self.ctx.force_no_thinking:
-            payload_messages.append({
-                'role': 'system',
-                'content': 'Do NOT output reasoning or thoughts'
-            })
-
         if payload_messages[-1]['role'] == 'user':
             if not self.ctx.model:
                 print(colorize("\n[ERROR] No model selected. Use /switchmodel <name> to select a model first.", 'error'), file=sys.stderr)
@@ -9408,7 +9779,9 @@ class ChatLoop:
                 debug=self.ctx.debug_mode,
                 show_thinking=(not self.ctx.force_no_thinking),
                 context_size=self.ctx.context_size,
-                images=([] if self.ctx.supports_vision is False else self.ctx.current_images)
+                images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
+                no_thinking=self.ctx.force_no_thinking,
+                reasoning_effort=self.ctx.reasoning_effort
             )
 
             if response:
