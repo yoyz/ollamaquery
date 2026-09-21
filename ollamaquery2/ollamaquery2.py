@@ -57,7 +57,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.8"
+__version__ = "0.2.10"
 
 
 # ============================================================================
@@ -604,24 +604,27 @@ def _request_with_retry(req: Request, max_retries: int = 3, delay: float = 1,
         HTTPError: For 4xx errors or if all retries exhausted
         URLError: If all retries exhausted
     """
-    last_exception = None
-    for attempt in range(max_retries):
+    max_retries = max(1, max_retries)
+    for attempt in range(1, max_retries + 1):
         try:
             return urlopen(req, timeout=timeout, **kwargs)
         except (URLError, HTTPError, ConnectionResetError, ConnectionError, TimeoutError, OSError) as e:
-            last_exception = e
             if isinstance(e, HTTPError) and e.code < 500:
                 raise  # Don't retry 4xx client errors
-            if attempt < max_retries - 1:
+            if attempt < max_retries:
                 sys.stderr.write(
                     colorize(f"\n[RETRY] Request failed ({e}), "
-                             f"retrying in {delay}s (attempt {attempt+1}/{max_retries})\n",
+                             f"retrying in {delay}s (next attempt {attempt + 1}/{max_retries})\n",
                              'warning')
                 )
                 time.sleep(delay)
                 continue
+            sys.stderr.write(
+                colorize(f"\n[RETRY] Request failed ({e}); "
+                         f"giving up after {max_retries} attempt(s).\n",
+                         'warning')
+            )
             raise
-    raise last_exception  # Shouldn't reach here
 
 
 # ============================================================================
@@ -1099,11 +1102,12 @@ class CommandContext:
         self.agentic_trace: bool = False
         self.agentic_logging: bool = True
         self.agentic_max_iterations: int = 50
-        self.agentic_step_timeout: int = 120
-        self.agentic_timeout_max: int = 480
+        self.agentic_step_timeout: int = 300
+        self.agentic_timeout_max: int = 600
         self.agentic_progress_grace: int = 15
         self.agentic_max_thinking_tokens: int = 2048
         self.agentic_heartbeat_tokens: int = 10
+        self.agentic_compact_threshold: float = 0.85  # Agentic auto-compact trigger (later than compaction_threshold to keep working memory)
         self.agentic_consecutive_timeouts: int = 0
         self.agentic_has_executed_tool: bool = False
         self.agentic_last_tool_name: str = ""
@@ -3457,6 +3461,11 @@ DESTRUCTIVE_TOOLS = {"write_file", "run_python", "run_command", "patch", "edit_f
 # policy to abort (rather than extend) when the last executed tool was one of these.
 AGENTIC_TIMEOUT_ABORT_TOOLS = {"run_command", "patch", "edit_file"}
 
+# Absolute ceiling for `agentic_timeout_max`. The escalation policy doubles the
+# max each time the current budget reaches it, up to this hard cap; at the cap it
+# stops growing (State B aborts, State A aborts after two stalled retries).
+AGENTIC_TIMEOUT_MAX_CEILING = 7200
+
 
 # ============================================================================
 # ============= AGENTIC TOOL HANDLERS         ================================
@@ -5120,49 +5129,193 @@ class ModelQuery:
         """Calculate estimated total tokens in conversation context. Delegates to CommandContext."""
         return self.ctx.calculate_context_tokens(messages)
 
-    def calculate_stats(self, total_time: float, content: str, usage: Optional[dict] = None, messages: Optional[list] = None) -> dict:
-        """Calculate stats for current query AND update cumulative totals in context.
+    @staticmethod
+    def _extract_usage_timings(usage: dict) -> tuple:
+        """Extract server-reported prefill/decode timings and rates.
+
+        Handles Ollama nanosecond durations (prompt_eval_duration /
+        eval_duration) and llama.cpp millisecond timings plus precomputed
+        rates (prompt_ms / predicted_ms / prompt_per_second /
+        predicted_per_second).
 
         Args:
-            total_time: Wall-clock seconds for the query.
-            content: The response text.
-            usage: Optional server usage dict.
-            messages: Optional message list for context-token fallback.
+            usage: Server usage dict.
 
         Returns:
-            dict of eval_count/prompt_eval_count/total_context_tokens/total_time/tps/content_length.
+            (prefill_sec, gen_sec, prefill_tps, gen_tps), each None if absent.
         """
-        eval_count = 0
-        prompt_tokens = 0
-        total_context_tokens = 0
+        prefill_sec = gen_sec = prefill_tps = gen_tps = None
+        pe_dur = usage.get("prompt_eval_duration") or 0   # Ollama nanoseconds
+        ev_dur = usage.get("eval_duration") or 0
+        if pe_dur > 0:
+            prefill_sec = pe_dur / 1e9
+        if ev_dur > 0:
+            gen_sec = ev_dur / 1e9
+        if usage.get("prompt_ms"):
+            prefill_sec = float(usage["prompt_ms"]) / 1000.0
+        if usage.get("predicted_ms"):
+            gen_sec = float(usage["predicted_ms"]) / 1000.0
+        if usage.get("prompt_per_second"):
+            prefill_tps = float(usage["prompt_per_second"])
+        if usage.get("predicted_per_second"):
+            gen_tps = float(usage["predicted_per_second"])
+        return prefill_sec, gen_sec, prefill_tps, gen_tps
 
-        if usage:
-            eval_count = usage.get("completion_tokens", 0) or usage.get("eval_count", 0)
-            prompt_tokens = usage.get("prompt_tokens", 0) or usage.get("prompt_eval_count", 0)
-            total_context_tokens = usage.get("total_tokens", 0) or (prompt_tokens + eval_count)
+    @staticmethod
+    def _client_phase_seconds(phase_times: Optional[dict]) -> tuple:
+        """Derive wall-clock (prefill, thinking, answer) seconds from timestamps.
+
+        Args:
+            phase_times: Optional dict with start/first_token/first_content/end.
+
+        Returns:
+            (prefill_sec, thinking_sec, answer_sec), each None if underivable.
+        """
+        if not phase_times:
+            return None, None, None
+        start = phase_times.get("start")
+        first = phase_times.get("first_token")
+        first_content = phase_times.get("first_content")
+        end = phase_times.get("end")
+        prefill = max(first - start, 0.0) if (start is not None and first is not None) else None
+        thinking = max(first_content - first, 0.0) if (first is not None and first_content is not None) else None
+        if first_content is not None and end is not None:
+            answer = max(end - first_content, 0.0)
+        elif first is not None and end is not None:
+            answer = max(end - first, 0.0)
+        else:
+            answer = None
+        return prefill, thinking, answer
+
+    def _split_generation_tokens(self, content: str, thought: str, eval_count: int) -> tuple:
+        """Split generated tokens into (thinking, answer) via a length ratio.
+
+        The server reports one combined generated-token count (thinking +
+        answer). The ratio is estimated from text length and scaled to the
+        server total so the two parts always sum to `eval_count`.
+
+        Args:
+            content: Visible answer text.
+            thought: Thinking/reasoning text.
+            eval_count: Combined server-reported generated tokens.
+
+        Returns:
+            (think_tokens, answer_tokens).
+        """
+        if not thought:
+            return 0, eval_count
+        think_est = self.estimate_tokens(thought)
+        answer_est = self.estimate_tokens(content)
+        total_est = think_est + answer_est
+        if eval_count > 0 and total_est > 0:
+            think_tokens = min(int(round(eval_count * think_est / total_est)), eval_count)
+            answer_tokens = eval_count - think_tokens
+            # Never round a present answer down to zero.
+            if answer_est > 0 and answer_tokens == 0:
+                answer_tokens = 1
+                think_tokens = max(eval_count - 1, 0)
+            return think_tokens, answer_tokens
+        return think_est, answer_est
+
+    def calculate_stats(self, total_time: float, content: str, usage: Optional[dict] = None,
+                        messages: Optional[list] = None, thought: str = "",
+                        phase_times: Optional[dict] = None) -> dict:
+        """Calculate per-query stats with prefill, thinking and answer rates.
+
+        Timing is hybrid: server-reported durations (Ollama/llama.cpp) are
+        preferred, with client wall-clock phase timestamps (time-to-first-token,
+        first-content, stream end) as fallback for backends that report none.
+
+        Args:
+            total_time: Wall-clock seconds for the whole query.
+            content: The visible response text.
+            usage: Optional server usage dict.
+            messages: Optional message list for context-token fallback.
+            thought: Accumulated thinking/reasoning text.
+            phase_times: Optional client phase timestamps dict.
+
+        Returns:
+            dict of eval_count/prompt_eval_count/total_context_tokens/total_time/
+            tps/prefill_tps/think_tokens/think_tps/answer_tokens/answer_tps/
+            gen_sec/content_length.
+        """
+        usage = usage or {}
+        eval_count = usage.get("completion_tokens", 0) or usage.get("eval_count", 0)
+        prompt_tokens = usage.get("prompt_tokens", 0) or usage.get("prompt_eval_count", 0)
+        total_context_tokens = usage.get("total_tokens", 0) or (prompt_tokens + eval_count)
 
         if not total_context_tokens and messages:
             total_context_tokens = self.calculate_context_tokens(messages)
 
-        if not eval_count and content:
-            eval_count = len(content.split())
+        if not eval_count and (content or thought):
+            eval_count = self.estimate_tokens(content) + self.estimate_tokens(thought)
 
-        tps = eval_count / total_time if eval_count > 0 and total_time > 0 else 0.0
+        srv_prefill_sec, srv_gen_sec, srv_prefill_tps, srv_gen_tps = self._extract_usage_timings(usage)
+        cli_prefill, cli_think, cli_answer = self._client_phase_seconds(phase_times)
 
-        current_stats = {
+        prefill_sec = srv_prefill_sec if srv_prefill_sec is not None else cli_prefill
+        prefill_tps = srv_prefill_tps
+        if prefill_tps is None and prefill_sec and prompt_tokens > 0:
+            prefill_tps = prompt_tokens / prefill_sec
+
+        think_tokens, answer_tokens = self._split_generation_tokens(content, thought, eval_count)
+
+        # Decode window: server-reported total (accurate) is apportioned between
+        # thinking and answer by token ratio. Thinking and answer tokens share the
+        # same decode loop, so their rate equals the overall decode rate; the
+        # useful split is the token counts. Without server timing, fall back to
+        # the client-measured answer/thinking phase windows.
+        if srv_gen_sec is not None and eval_count > 0:
+            gen_sec = srv_gen_sec
+            think_sec = srv_gen_sec * (think_tokens / eval_count)
+            answer_sec = srv_gen_sec * (answer_tokens / eval_count)
+        elif cli_answer is not None and cli_answer >= 0.05:
+            # A near-zero client window means a single non-streamed chunk, not
+            # a real decode phase — avoid fabricating an infinite rate.
+            think_sec = cli_think if cli_think is not None else 0.0
+            answer_sec = cli_answer
+            gen_sec = think_sec + answer_sec
+        else:
+            gen_sec = think_sec = answer_sec = None
+
+        think_tps = think_tokens / think_sec if think_sec and think_tokens > 0 else 0.0
+        answer_tps = answer_tokens / answer_sec if answer_sec and answer_tokens > 0 else 0.0
+
+        # Overall decode rate excluding prefill (server rate > server window > client).
+        if srv_gen_tps is not None:
+            tps = srv_gen_tps
+        elif gen_sec and eval_count > 0:
+            tps = eval_count / gen_sec
+        else:
+            tps = eval_count / total_time if eval_count > 0 and total_time > 0 else 0.0
+
+        # With no thinking, the answer rate equals the overall decode rate.
+        if answer_tps == 0.0 and think_tokens == 0 and answer_tokens > 0 and tps > 0:
+            answer_tps = tps
+
+        return {
             "eval_count": eval_count,
             "prompt_eval_count": prompt_tokens,
             "total_context_tokens": total_context_tokens,
             "total_time": total_time,
             "tps": tps,
+            "prefill_tps": prefill_tps or 0.0,
+            "prefill_sec": prefill_sec or 0.0,
+            "gen_sec": gen_sec or 0.0,
+            "think_tokens": think_tokens,
+            "think_tps": think_tps,
+            "answer_tokens": answer_tokens,
+            "answer_tps": answer_tps,
             "content_length": len(content)
         }
-
-        return current_stats
 
 
     def print_stats_display(self, stats: dict) -> None:
         """Print formatted stats to stderr.
+
+        Shows prefill (prompt-eval) throughput, thinking throughput and
+        answer-only throughput so thinking tokens no longer dilute the
+        visible generation rate.
 
         Args:
             stats: Stats dict from calculate_stats().
@@ -5172,8 +5325,18 @@ class ModelQuery:
 
         parts = [f"{stats['total_time']:.2f}s total"]
 
+        prompt_tokens = stats.get("prompt_eval_count", 0)
+        if prompt_tokens > 0 and stats.get("prefill_tps", 0.0) > 0:
+            parts.append(f"prefill {prompt_tokens} tok @ {stats['prefill_tps']:.1f} t/s")
+        if stats.get("think_tokens", 0) > 0:
+            parts.append(f"think {stats['think_tokens']} tok @ {stats.get('think_tps', 0.0):.1f} t/s")
+
         if stats.get("eval_count", 0) > 0:
-            parts.append(f"{stats['tps']:.2f} t/s")
+            answer_tokens = stats.get("answer_tokens", stats["eval_count"])
+            if answer_tokens > 0:
+                parts.append(f"answer {answer_tokens} tok @ {stats.get('answer_tps', 0.0):.1f} t/s")
+            else:
+                parts.append(f"gen {stats['eval_count']} tok @ {stats.get('tps', 0.0):.1f} t/s")
             ctx = self.ctx.current_context_tokens
             if not ctx:
                 ctx = stats.get("total_context_tokens", 0)
@@ -5631,6 +5794,23 @@ class ModelQuery:
             usage["prompt_tokens"] = t.get("prompt_n", 0)
             usage["completion_tokens"] = t.get("predicted_n", 0)
             usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+            # Server-measured phase timings/rates (exclude prefill from decode rate)
+            if t.get("prompt_ms"):
+                usage["prompt_ms"] = t["prompt_ms"]
+            if t.get("predicted_ms"):
+                usage["predicted_ms"] = t["predicted_ms"]
+            if t.get("prompt_per_second"):
+                usage["prompt_per_second"] = t["prompt_per_second"]
+            if t.get("predicted_per_second"):
+                usage["predicted_per_second"] = t["predicted_per_second"]
+
+        # Format 4: LM Studio stats block (tokens_per_second / time_to_first_token)
+        if "stats" in chunk and chunk["stats"]:
+            s = chunk["stats"]
+            if s.get("tokens_per_second"):
+                usage["predicted_per_second"] = s["tokens_per_second"]
+            if s.get("time_to_first_token"):
+                usage.setdefault("prompt_ms", s["time_to_first_token"] * 1000.0)
 
         # Format 3: Root-level fields (some versions)
         if "prompt_eval_count" in chunk:
@@ -5683,6 +5863,10 @@ class ModelQuery:
                     usage = {
                         "prompt_eval_count": chunk.get("prompt_eval_count", 0),
                         "eval_count": chunk.get("eval_count", 0),
+                        "prompt_eval_duration": chunk.get("prompt_eval_duration", 0),
+                        "eval_duration": chunk.get("eval_duration", 0),
+                        "total_duration": chunk.get("total_duration", 0),
+                        "load_duration": chunk.get("load_duration", 0),
                     }
             return thought, content, is_final, usage, tool_calls
         elif backend in ("llamacpp", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
@@ -5857,7 +6041,10 @@ class ModelQuery:
             The accumulated full response content.
         """
         full_content = ""
+        full_thought = ""
         start_time = time.time()
+        first_token_time = None
+        first_content_time = None
         backend = self.backend
 
         if images and messages and messages[-1].get("role") == "user":
@@ -5883,6 +6070,15 @@ class ModelQuery:
                     try:
                         chunk = json.loads(raw_line)
                         thought, content, is_final, usage, tool_calls = self._parse_chunk(chunk, backend)
+
+                        # Client-side phase timing: first token ends prefill,
+                        # first content ends thinking, stream end ends the answer.
+                        if thought:
+                            full_thought += thought
+                        if first_token_time is None and (thought or content or tool_calls):
+                            first_token_time = time.time()
+                        if first_content_time is None and content:
+                            first_content_time = time.time()
 
                         self._debug_response_chunk(chunk, first_chunk, is_final)
                         first_chunk = False
@@ -5911,10 +6107,20 @@ class ModelQuery:
 
             self._close_thinking_block(display_state["start_thinking"], display_state["started_content"])
 
-            total_time = time.time() - start_time
+            end_time = time.time()
+            total_time = end_time - start_time
             self._update_context_tokens(backend, aggregated_usage, messages)
-            usage = self.calculate_stats(total_time, full_content, aggregated_usage, messages)
-            self.ctx.update_stats(usage["eval_count"], usage["prompt_eval_count"], total_time, usage["content_length"])
+            phase_times = {
+                "start": start_time,
+                "first_token": first_token_time,
+                "first_content": first_content_time,
+                "end": end_time,
+            }
+            usage = self.calculate_stats(total_time, full_content, aggregated_usage, messages,
+                                         thought=full_thought, phase_times=phase_times)
+            # Track decode time (excl. prefill) so /stats avg throughput is not diluted.
+            self.ctx.update_stats(usage["eval_count"], usage["prompt_eval_count"],
+                                  usage.get("gen_sec") or total_time, usage["content_length"])
             self.print_stats_display(usage)
 
             return full_content
@@ -6058,6 +6264,72 @@ def _add_history(text: str) -> None:
         readline.add_history(text)
 
 
+_HISTORY_ESC = '\x1e'  # record separator: escape marker inside one history entry
+
+
+def _encode_history_entry(text: str) -> str:
+    """Encode embedded newlines so a multi-line entry survives the history file.
+
+    Readline persists one entry per physical line, so a multi-line block would be
+    split on save and come back as separate one-line entries. Escaping is
+    reversible: a literal marker becomes `ESCESC` and a newline becomes `ESC n`.
+
+    Args:
+        text: A single history entry (may contain newlines).
+
+    Returns:
+        A one-line encoding suitable for `_save_history_file`.
+    """
+    return text.replace(_HISTORY_ESC, _HISTORY_ESC * 2).replace('\n', _HISTORY_ESC + 'n')
+
+
+def _decode_history_entry(text: str) -> str:
+    """Reverse `_encode_history_entry` (`ESCESC` -> marker, `ESC n` -> newline)."""
+    out = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index] == _HISTORY_ESC:
+            nxt = text[index + 1] if index + 1 < length else ''
+            if nxt == _HISTORY_ESC:
+                out.append(_HISTORY_ESC)
+                index += 2
+                continue
+            if nxt == 'n':
+                out.append('\n')
+                index += 2
+                continue
+        out.append(text[index])
+        index += 1
+    return ''.join(out)
+
+
+def _save_history_file(path: str) -> None:
+    """Persist readline history, preserving multi-line entries as single items."""
+    if not READLINE_AVAILABLE:
+        return
+    current = readline.get_current_history_length()
+    limit = readline.get_history_length()
+    start = current - limit + 1 if limit and limit > 0 and current > limit else 1
+    with open(path, 'w', encoding='utf-8') as f:
+        for i in range(start, current + 1):
+            item = readline.get_history_item(i)
+            if item is None:
+                continue
+            f.write(_encode_history_entry(item) + '\n')
+
+
+def _load_history_file(path: str) -> None:
+    """Load readline history, restoring entries encoded by `_save_history_file`."""
+    if not READLINE_AVAILABLE:
+        return
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        for raw in f:
+            raw = raw.rstrip('\n')
+            if raw:
+                readline.add_history(_decode_history_entry(raw))
+
+
 def _read_multiline_lines(cont_prompt: str, is_terminator: object, transform: object = lambda ln: ln,
                           include_terminator: bool = False) -> Optional[list]:
     """Read continuation lines until the terminator predicate fires.
@@ -6086,17 +6358,29 @@ def _read_multiline_lines(cont_prompt: str, is_terminator: object, transform: ob
             return None
 
 
+class _ExitRequested(Exception):
+    """Raised when the user asks to leave the chat loop (double Ctrl+C at the prompt)."""
+
+
 def gather_user_input(prompt_prefix: str, show_multiline: bool = True) -> Optional[str]:
     """
     Gather user input with multiline support.
 
     Supports triple-quote (`\"\"\"`) block entry and backslash (`\\`) line
-    continuation. Returns the entered text, or None if the user cancelled
-    (double Ctrl+C) or closed input (double Ctrl+D / EOF).
+    continuation. Recalling a previously-submitted multiline block with the
+    up/down keys restores it as a native readline multi-line buffer: Left/Right
+    move across the whole block, editing keys work as in bash, Ctrl+J (or
+    Alt+Enter) inserts a new line, and Enter sends it. Returns the entered text,
+    or None if a multiline entry was cancelled (single Ctrl+C inside a `\"\"\"` /
+    `\\` block). A double Ctrl+C at the main prompt raises `_ExitRequested` so
+    the chat loop can exit cleanly; a double Ctrl+D / EOF exits directly.
 
     Args:
         prompt_prefix: String shown before the input prompt.
         show_multiline: Whether to honor `\"\"\"` / `\\` multiline entry.
+
+    Raises:
+        _ExitRequested: When the user presses Ctrl+C twice at the main prompt.
     """
     ctrl_c_count = 0
     ctrl_d_count = 0
@@ -6117,6 +6401,7 @@ def gather_user_input(prompt_prefix: str, show_multiline: bool = True) -> Option
                 if lines is None:
                     return None  # Escape out of multiline without quitting
                 result = "\n".join(lines)
+                _remove_last_history_item()  # drop the opening """ entry
                 _add_history(result)
                 return result
 
@@ -6131,6 +6416,7 @@ def gather_user_input(prompt_prefix: str, show_multiline: bool = True) -> Option
                 if tail is None:
                     return None
                 result = "\n".join(lines + tail)
+                _remove_last_history_item()  # drop the opening "\" entry
                 _add_history(result)
                 return result
 
@@ -6140,8 +6426,7 @@ def gather_user_input(prompt_prefix: str, show_multiline: bool = True) -> Option
         except KeyboardInterrupt:
             ctrl_c_count += 1
             if ctrl_c_count >= 2:
-                print("\n[Cancelled]", file=sys.stderr)
-                return None
+                raise _ExitRequested()
             print("\n(Press Ctrl+C again to exit)", file=sys.stderr)
 
         except EOFError:
@@ -6591,6 +6876,10 @@ class ChatLoop:
 
                 self.run_process_query(full_input)
 
+            except _ExitRequested:
+                self.run_handle_exit('exit')
+                break
+
             except KeyboardInterrupt:
                 print("\n[Interrupted]", file=sys.stderr)
                 continue
@@ -6887,7 +7176,12 @@ class ChatLoop:
 
         print(colorize(f"\n[ollamaquery2 v{__version__} - {self.ctx.backend.upper()} Chat Mode]", 'info'), file=sys.stderr)
         print(format_help_text(compact=True), file=sys.stderr)
-        print(colorize("Type /help for details\n", 'muted'), file=sys.stderr)
+        print(colorize("Type /help for details", 'muted'), file=sys.stderr)
+        if READLINE_AVAILABLE:
+            print(colorize('Multiline: open/close with """ ; recall with Up/Down, '
+                           'edit with Left/Right, Ctrl+J adds a line\n', 'muted'), file=sys.stderr)
+        else:
+            print(file=sys.stderr)
 
         if images:
             self.ctx.current_images = images
@@ -6899,13 +7193,21 @@ class ChatLoop:
                 readline.set_completer(self.completer.complete)
                 readline.parse_and_bind('tab: complete')
 
+                # Let a recalled multi-line buffer grow a line: Ctrl+J / Alt+Enter
+                # insert a literal newline instead of submitting (Enter still sends).
+                try:
+                    readline.parse_and_bind(r'"\C-j": "\C-v\C-j"')
+                    readline.parse_and_bind(r'"\e\r": "\C-v\C-j"')
+                except Exception:
+                    pass
+
                 histfile = os.path.expanduser("~/.ollamaquery.d/session")
                 histdir = os.path.dirname(histfile)
                 if not os.path.exists(histdir):
                     os.makedirs(histdir, exist_ok=True)
 
                 try:
-                    readline.read_history_file(histfile)
+                    _load_history_file(histfile)
                 except Exception:
                     pass
 
@@ -6915,7 +7217,7 @@ class ChatLoop:
                     """Persist the readline history to disk at exit."""
                     if READLINE_AVAILABLE:
                         try:
-                            readline.write_history_file(histfile)
+                            _save_history_file(histfile)
                         except Exception:
                             pass
 
@@ -7352,12 +7654,14 @@ class ChatLoop:
             return self._agentic_toggle_sandbox()
         if subcmd in ("iterations", "timeout", "heartbeattokens"):
             return self._agentic_set_number(subcmd, parts)
+        if subcmd == "compactthreshold":
+            return self._agentic_set_threshold(parts)
         if subcmd in self._AGENTIC_TOGGLE_MAP:
             return self._agentic_toggle_named(subcmd)
         if subcmd == "acl":
             return self._handle_agentic_acl(parts)
 
-        print(colorize("[Usage: /agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|lazytool|acl|iterations <N>|timeout <N>|heartbeattokens <N>|status]]", 'warning'), file=sys.stderr)
+        print(colorize("[Usage: /agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|lazytool|acl|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|status]]", 'warning'), file=sys.stderr)
         return False
 
     # Named toggles (always toggle between on/off)
@@ -7427,6 +7731,33 @@ class ChatLoop:
         attr, label = attr_map[subcmd]
         setattr(self.ctx, attr, val)
         print(colorize(f"[{label}: {val}]", 'info'), file=sys.stderr)
+        return False
+
+    def _agentic_set_threshold(self, parts: list) -> bool:
+        """Set the agentic auto-compact threshold (fraction or percent).
+
+        Args:
+            parts: Split /agentic args (parts[2] is the threshold value, e.g.
+                `0.85` or `85`).
+
+        Returns:
+            False to keep the chat loop running.
+        """
+        if len(parts) < 3:
+            print(colorize("[Usage: /agentic compactthreshold <value>]  (e.g. 0.85 or 85)", 'warning'), file=sys.stderr)
+            return False
+        try:
+            val = float(parts[2])
+        except ValueError:
+            print(colorize(f"[Agentic] '{parts[2]}' is not a number.", 'error'), file=sys.stderr)
+            return False
+        if val > 1:
+            val = val / 100.0
+        if not (0.0 < val < 1.0):
+            print(colorize("[Agentic] Threshold must be between 0 and 1 (or 1-99 as percent).", 'error'), file=sys.stderr)
+            return False
+        self.ctx.agentic_compact_threshold = val
+        print(colorize(f"[Agentic] Auto-compact threshold set to {val:.0%}.", 'success'), file=sys.stderr)
         return False
 
     def _agentic_toggle_named(self, subcmd: str) -> bool:
@@ -7516,7 +7847,7 @@ class ChatLoop:
         c = self.ctx
         print(colorize("\n[Agentic Settings - Use /agentic <option> [value]]", 'info'), file=sys.stderr)
         print("  Subcommands: on, off, full, auto, sandbox, verbose, thinking, trace, log, lazytool,", file=sys.stderr)
-        print("               iterations <N>, timeout <N>, heartbeattokens <N>, acl, status", file=sys.stderr)
+        print("               iterations <N>, timeout <N>, heartbeattokens <N>, compactthreshold <v>, acl, status", file=sys.stderr)
         print(file=sys.stderr)
 
         settings = [
@@ -7531,6 +7862,7 @@ class ChatLoop:
             ("iterations", "Max ReAct loop iterations", str(c.agentic_max_iterations)),
             ("timeout",    "Per-step timeout (seconds)", f"{c.agentic_step_timeout}s"),
             ("heartbeattokens", "Tokens per heartbeat dot", str(c.agentic_heartbeat_tokens)),
+            ("compactthreshold", "Agentic auto-compact trigger", f"{c.agentic_compact_threshold:.0%}"),
         ]
         for name, desc, value in settings:
             marker = ">" if (value not in ("off", "false", "host", "0") and "off" not in value) else " "
@@ -7634,7 +7966,8 @@ class ChatLoop:
             idx = text.rfind('{', 0, idx)
         return -1
 
-    def _extract_json_balanced(self, text: str, start: int) -> Optional[str]:
+    @staticmethod
+    def _extract_json_balanced(text: str, start: int) -> Optional[str]:
         """Extract balanced JSON from text starting at an opening brace.
 
         Args:
@@ -8118,7 +8451,7 @@ class ChatLoop:
             idx = ChatLoop._find_tool_call_brace(text)
             if idx == -1:
                 return False
-            return ChatLoop._extract_json_balanced(None, text, idx) is None
+            return ChatLoop._extract_json_balanced(text, idx) is None
         except Exception:
             return False
 
@@ -8241,8 +8574,10 @@ class ChatLoop:
                                  content_is_tool: bool, _nudge_metrics: object) -> tuple:
         """State A policy: no tool executed yet.
 
-        Extends the budget while the model is actively generating (F3);
-        otherwise retries once and aborts after two consecutive timeouts.
+        Extends the budget while the model is actively generating (F3), doubling
+        `agentic_timeout_max` up to `AGENTIC_TIMEOUT_MAX_CEILING` when the ceiling
+        is reached; otherwise retries once and aborts after two consecutive
+        timeouts.
 
         Args:
             iteration: Current iteration.
@@ -8269,9 +8604,24 @@ class ChatLoop:
                 'warning'), file=sys.stderr)
             messages.append({'role': 'user', 'content': self._timeout_nudge(
                 partial_text, partial_thought, content_is_tool,
-                metrics=_nudge_metrics(step_timeout))})
+                metrics=_nudge_metrics(step_timeout)), '_system_nudge': True})
             return False, step_timeout
-        # No recent progress → conservative; abort after two timeouts.
+        if making_progress and self.ctx.agentic_timeout_max < AGENTIC_TIMEOUT_MAX_CEILING:
+            # At the ceiling but still generating — raise the ceiling (capped at
+            # the hard ceiling) so a genuinely long think can finish.
+            self.ctx.agentic_timeout_max = min(
+                self.ctx.agentic_timeout_max * 2, AGENTIC_TIMEOUT_MAX_CEILING)
+            step_timeout = self.ctx.agentic_timeout_max
+            print(colorize(
+                f"\n[Agentic] Step {iteration} timed out after {expired}s but still "
+                f"generating ({tok_per_sec:.1f} tok/s) — raising max timeout to "
+                f"{self.ctx.agentic_timeout_max}s.", 'warning'), file=sys.stderr)
+            messages.append({'role': 'user', 'content': self._timeout_nudge(
+                partial_text, partial_thought, content_is_tool,
+                metrics=_nudge_metrics(step_timeout)), '_system_nudge': True})
+            return False, step_timeout
+        # No recent progress, or the hard timeout ceiling is reached →
+        # conservative; abort after two timeouts.
         if self.ctx.agentic_consecutive_timeouts >= 2:
             print(colorize(
                 f"\n[Agentic] Step {iteration} timed out twice. Model may be stuck. Aborting.",
@@ -8283,13 +8633,15 @@ class ChatLoop:
             'warning'), file=sys.stderr)
         messages.append({'role': 'user', 'content': self._timeout_nudge(
             partial_text, partial_thought, content_is_tool,
-            metrics=_nudge_metrics(step_timeout))})
+            metrics=_nudge_metrics(step_timeout)), '_system_nudge': True})
         return False, step_timeout
 
     def _agentic_timeout_state_b(self, iteration: int, expired: int, messages: list,
                                  step_timeout: int, partial_text: str, partial_thought: str,
                                  content_is_tool: bool, _nudge_metrics: object) -> tuple:
-        """State B policy: a tool already ran — exponential backoff up to max.
+        """State B policy: a tool already ran — exponential backoff, raising the
+        max ceiling (doubling it, capped at `AGENTIC_TIMEOUT_MAX_CEILING`) when
+        the current budget has reached it.
 
         Args:
             iteration: Current iteration.
@@ -8303,19 +8655,32 @@ class ChatLoop:
             (should_break, step_timeout).
         """
         if step_timeout >= self.ctx.agentic_timeout_max:
+            if self.ctx.agentic_timeout_max >= AGENTIC_TIMEOUT_MAX_CEILING:
+                # Hard ceiling reached — stop growing and abort.
+                print(colorize(
+                    f"\n[Agentic] Max timeout ceiling ({AGENTIC_TIMEOUT_MAX_CEILING}s) "
+                    "reached. Aborting agentic query.", 'error'), file=sys.stderr)
+                return True, step_timeout
+            # Already at the ceiling — raise the ceiling by doubling it (capped
+            # at the hard ceiling) rather than aborting, so a slow-but-progressing
+            # model can finish.
+            self.ctx.agentic_timeout_max = min(
+                self.ctx.agentic_timeout_max * 2, AGENTIC_TIMEOUT_MAX_CEILING)
+            step_timeout = self.ctx.agentic_timeout_max
             print(colorize(
-                f"\n[Agentic] Max timeout ({self.ctx.agentic_timeout_max}s) reached. Aborting agentic query.",
-                'error'), file=sys.stderr)
-            return True, step_timeout
-        step_timeout = min(step_timeout * 2, self.ctx.agentic_timeout_max)
-        print(colorize(
-            f"\n[Agentic] Step {iteration} timed out after {expired}s. "
-            f"Model was executing tools — extending to {step_timeout}s.",
-            'warning'), file=sys.stderr)
+                f"\n[Agentic] Step {iteration} timed out after {expired}s. "
+                f"Model was executing tools — raising max timeout to {self.ctx.agentic_timeout_max}s.",
+                'warning'), file=sys.stderr)
+        else:
+            step_timeout = min(step_timeout * 2, self.ctx.agentic_timeout_max)
+            print(colorize(
+                f"\n[Agentic] Step {iteration} timed out after {expired}s. "
+                f"Model was executing tools — extending to {step_timeout}s.",
+                'warning'), file=sys.stderr)
 
         messages.append({'role': 'user', 'content': self._timeout_nudge(
             partial_text, partial_thought, content_is_tool,
-            metrics=_nudge_metrics(step_timeout))})
+            metrics=_nudge_metrics(step_timeout)), '_system_nudge': True})
         return False, step_timeout
 
     def _handle_agentic_timeout(self, iteration: int, step_timeout: int, messages: list,
@@ -8332,7 +8697,7 @@ class ChatLoop:
                     it). If the model was mid-narration with no tool call pending,
                     the destructive tool already completed, so continue with backoff.
           State A — no tool executed yet       → extend if generating, else retry once / abort after two.
-          State B — a tool already ran         → exponential backoff up to max.
+          State B — a tool already ran         → exponential backoff; doubles the max ceiling (up to AGENTIC_TIMEOUT_MAX_CEILING) when reached.
 
         On any continue, the nudge message includes the model's partial reasoning
         (and partial content when no tool call was pending) so it resumes rather
@@ -8340,6 +8705,8 @@ class ChatLoop:
         mid-thought would otherwise restart from scratch and hit the same wall.
         It also reports the model's generation speed and the new budget (F3
         budget-awareness) so it can self-throttle within the extended timeout.
+        Nudges are tagged `_system_nudge` so they steer the in-flight loop but are
+        excluded from the persisted conversation history.
 
         Args:
             iteration: Current ReAct iteration number.
@@ -8848,15 +9215,16 @@ class ChatLoop:
         """Auto-compact the ReAct loop's local messages near the context limit.
 
         Agentic steps can balloon the local `messages` array (tool observations,
-        re-queries). When usage passes 85% of the window, mechanically compact
-        with a wider keep-recent window so the loop keeps working memory.
+        re-queries). When usage passes `ctx.agentic_compact_threshold` (default
+        85%, later than the regular `ctx.compaction_threshold`), mechanically
+        compact with a wider keep-recent window so the loop keeps working memory.
 
         Returns the (possibly compacted) message list.
         """
         if self.ctx.context_window_size <= 0:
             return messages
         msg_tokens = self.ctx.calculate_context_tokens(messages)
-        if msg_tokens <= int(self.ctx.context_window_size * 0.85):
+        if msg_tokens <= int(self.ctx.context_window_size * self.ctx.agentic_compact_threshold):
             return messages
         before_len = len(messages)
         messages = compact_messages(messages, self.ctx,

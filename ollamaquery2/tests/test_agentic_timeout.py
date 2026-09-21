@@ -26,7 +26,7 @@ import ollamaquery2 as m
 class FakeCtx:
     def __init__(self):
         self.agentic_step_timeout = 120
-        self.agentic_timeout_max = 480
+        self.agentic_timeout_max = 600
         self.agentic_progress_grace = 15
         self.agentic_max_thinking_tokens = 2048
         self.agentic_heartbeat_tokens = 10
@@ -141,12 +141,35 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
         _, new_timeout, _ = self._call(step_timeout=240)
         self.assertEqual(new_timeout, 480)
 
-    def test_state_b_aborts_at_max(self):
+    def test_state_b_raises_max_when_reached(self):
         self.ctx.agentic_has_executed_tool = True
         self.ctx.agentic_last_tool_name = 'read_file'
-        should_break, new_timeout, _ = self._call(step_timeout=480)
+        # At the ceiling: the max itself doubles instead of aborting.
+        should_break, new_timeout, _ = self._call(step_timeout=600)
+        self.assertFalse(should_break)
+        self.assertEqual(new_timeout, 1200)
+        self.assertEqual(self.ctx.agentic_timeout_max, 1200)
+
+    def test_state_b_doubling_capped_at_hard_ceiling(self):
+        """Doubling `agentic_timeout_max` never exceeds AGENTIC_TIMEOUT_MAX_CEILING."""
+        self.ctx.agentic_has_executed_tool = True
+        self.ctx.agentic_last_tool_name = 'read_file'
+        self.ctx.agentic_timeout_max = 4800
+        should_break, new_timeout, _ = self._call(step_timeout=4800)
+        self.assertFalse(should_break)
+        self.assertEqual(new_timeout, m.AGENTIC_TIMEOUT_MAX_CEILING)
+        self.assertEqual(self.ctx.agentic_timeout_max, m.AGENTIC_TIMEOUT_MAX_CEILING)
+
+    def test_state_b_aborts_at_hard_ceiling(self):
+        """Once the hard ceiling is reached, State B stops growing and aborts."""
+        self.ctx.agentic_has_executed_tool = True
+        self.ctx.agentic_last_tool_name = 'read_file'
+        self.ctx.agentic_timeout_max = m.AGENTIC_TIMEOUT_MAX_CEILING
+        should_break, new_timeout, messages = self._call(
+            step_timeout=m.AGENTIC_TIMEOUT_MAX_CEILING)
         self.assertTrue(should_break)
-        self.assertEqual(new_timeout, 480)
+        self.assertEqual(new_timeout, m.AGENTIC_TIMEOUT_MAX_CEILING)
+        self.assertEqual(messages, [])
 
     def test_state_b_respects_custom_max(self):
         self.ctx.agentic_timeout_max = 240
@@ -162,6 +185,27 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
         self.ctx.agentic_last_tool_name = 'read_file'
         _, _, messages = self._call()
         self.assertIn('continue your previous response', messages[0]['content'])
+
+    def test_timeout_nudge_not_persisted(self):
+        """A timeout nudge must stay local to the loop: it is tagged
+        `_system_nudge` so `_persist_agentic_history` excludes it from the
+        persistent conversation (repeated timeouts must not pile into context)."""
+        self.ctx.agentic_has_executed_tool = True
+        self.ctx.agentic_last_tool_name = 'read_file'
+        _, _, messages = self._call(partial_thought="partial reasoning")
+        self.assertTrue(messages[0].get('_system_nudge'))
+
+        self.ctx.context_window_size = 0
+        self.ctx.calculate_context_tokens = lambda msgs: 0
+        self.loop.messages = [
+            {'role': 'system', 'content': 'sys'},
+            {'role': 'user', 'content': 'q'},
+        ]
+        self.loop._persist_agentic_history(
+            [{'role': 'system', 'content': 'sys'},
+             {'role': 'user', 'content': 'q'}] + messages, 2)
+        self.assertFalse(any('interrupted by a timeout' in m.get('content', '')
+                             for m in self.loop.messages))
 
     # --- Partial reasoning fed back to the model ----------------------------
 
@@ -240,7 +284,8 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
         self.assertEqual(new_timeout, 120)
 
     def test_state_a_progress_extends_until_max(self):
-        """F3: progress extension caps at agentic_timeout_max."""
+        """F3: progress extension caps at agentic_timeout_max; at the ceiling the
+        ceiling itself doubles rather than the step being retried/aborted."""
         self.ctx.agentic_has_executed_tool = False
         self.ctx.agentic_timeout_max = 480
         # 120 -> 240 (progress path extends)
@@ -248,11 +293,28 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
             step_timeout=120, partial_tokens=1000, elapsed_sec=120, idle_sec=1)
         self.assertEqual(new_timeout, 240)
         self.ctx.agentic_consecutive_timeouts = 0  # isolate the at-max assertion
-        # at max: progress branch is skipped (not < max) -> same-budget retry
+        # at max: the max doubles and the step budget follows it
         should_break, new_timeout, _ = self._call(
             step_timeout=480, partial_tokens=1000, elapsed_sec=480, idle_sec=1)
         self.assertFalse(should_break)
-        self.assertEqual(new_timeout, 480)
+        self.assertEqual(new_timeout, 960)
+        self.assertEqual(self.ctx.agentic_timeout_max, 960)
+
+    def test_state_a_at_hard_ceiling_aborts_after_two(self):
+        """At the hard ceiling State A cannot grow further: the first timeout
+        retries at the same budget, the second aborts."""
+        self.ctx.agentic_has_executed_tool = False
+        self.ctx.agentic_timeout_max = m.AGENTIC_TIMEOUT_MAX_CEILING
+        should_break, new_timeout, _ = self._call(
+            step_timeout=m.AGENTIC_TIMEOUT_MAX_CEILING,
+            partial_tokens=1000, elapsed_sec=m.AGENTIC_TIMEOUT_MAX_CEILING, idle_sec=1)
+        self.assertFalse(should_break)
+        self.assertEqual(new_timeout, m.AGENTIC_TIMEOUT_MAX_CEILING)
+        self.assertEqual(self.ctx.agentic_timeout_max, m.AGENTIC_TIMEOUT_MAX_CEILING)
+        should_break, _, _ = self._call(
+            step_timeout=m.AGENTIC_TIMEOUT_MAX_CEILING,
+            partial_tokens=1000, elapsed_sec=m.AGENTIC_TIMEOUT_MAX_CEILING, idle_sec=1)
+        self.assertTrue(should_break)
 
     def test_nudge_metrics_block(self):
         """F3: the nudge reports generation speed, the expired timeout, and the
@@ -371,6 +433,18 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
         on_chunk("", "x" * 40, False)   # ~10 tokens / 5 per dot -> two dots
         self.assertEqual(self._stderr.getvalue(), "..")
         finalize()
+
+    def test_extract_json_balanced_is_staticmethod(self):
+        """Regression: `_extract_json_balanced` must be callable unbound — it is
+        invoked as `ChatLoop._extract_json_balanced(text, start)` from the
+        staticmethod `_looks_like_truncated_tool_call` (previously passed None as
+        self, a landmine for any future edit that touched self)."""
+        self.assertEqual(m.ChatLoop._extract_json_balanced('{"a": 1}', 0), '{"a": 1}')
+        self.assertIsNone(m.ChatLoop._extract_json_balanced('{"a": 1', 0))
+
+    def test_looks_like_truncated_tool_call(self):
+        self.assertTrue(m.ChatLoop._looks_like_truncated_tool_call('{"tool": "run_command"'))
+        self.assertFalse(m.ChatLoop._looks_like_truncated_tool_call('{"tool": "run_command"}'))
 
 
 if __name__ == '__main__':

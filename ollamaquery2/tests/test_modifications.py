@@ -12,6 +12,7 @@ import time
 import json
 import types
 import socket
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
 from urllib.request import Request
@@ -232,7 +233,22 @@ class TestRetryUtility(unittest.TestCase):
             finally:
                 sys.stderr = old_stderr
             self.assertIn('[RETRY]', stderr.getvalue())
-            self.assertIn('attempt 1/2', stderr.getvalue())
+            self.assertIn('next attempt 2/2', stderr.getvalue())
+
+    def test_exhausted_retries_shows_giving_up_banner(self):
+        """A final banner is printed before the exception is raised."""
+        with patch.object(m, 'urlopen') as mock:
+            mock.side_effect = URLError('always down')
+            stderr = io.StringIO()
+            old_stderr, sys.stderr = sys.stderr, stderr
+            try:
+                with self.assertRaises(URLError):
+                    m._request_with_retry(Request('http://localhost/x'),
+                                        max_retries=2, delay=0.01)
+            finally:
+                sys.stderr = old_stderr
+            self.assertIn('[RETRY]', stderr.getvalue())
+            self.assertIn('giving up', stderr.getvalue())
 
     def test_timeout_passed_through(self):
         """timeout= kwarg is forwarded to urlopen."""
@@ -858,6 +874,88 @@ class TestCalculateStatsSideEffectFree(unittest.TestCase):
 
 
 # ============================================================================
+# 7b. calculate_stats() splits prefill / thinking / answer rates
+# ============================================================================
+
+class TestTokenStatsBreakdown(unittest.TestCase):
+    """calculate_stats() reports prefill + thinking + answer-only throughput."""
+
+    def setUp(self):
+        m.CommandContext._instance = None
+        m.CommandContext._initialized = False
+        self.ctx = m.CommandContext()
+        self.mq = m.ModelQuery('http://127.0.0.1:8080', 'llamacpp', context=self.ctx)
+
+    def test_llamacpp_timings_split_thinking_and_answer(self):
+        """llama.cpp predicted/prompt timings drive the split; parts sum to total."""
+        usage = {
+            'prompt_tokens': 1000, 'completion_tokens': 500,
+            'prompt_ms': 2000.0, 'prompt_per_second': 500.0,
+            'predicted_ms': 10000.0, 'predicted_per_second': 50.0,
+        }
+        stats = self.mq.calculate_stats(14.0, 'a' * 400, usage, None, thought='t' * 600)
+        self.assertAlmostEqual(stats['prefill_tps'], 500.0)
+        self.assertAlmostEqual(stats['tps'], 50.0)
+        self.assertEqual(stats['think_tokens'] + stats['answer_tokens'], 500)
+        self.assertGreater(stats['think_tokens'], 0)
+        self.assertGreater(stats['answer_tokens'], 0)
+        self.assertGreater(stats['answer_tps'], 0.0)
+
+    def test_prefill_excluded_from_decode_rate(self):
+        """Decode rate uses server generation rate, not eval_count/total_time."""
+        usage = {'prompt_tokens': 1000, 'completion_tokens': 500,
+                 'predicted_per_second': 50.0}
+        stats = self.mq.calculate_stats(13.6, 'a' * 400, usage, None)
+        # Naive eval_count / total_time would be 36.8 t/s (prefill diluted).
+        self.assertAlmostEqual(stats['tps'], 50.0)
+
+    def test_ollama_nanosecond_durations(self):
+        """Ollama prompt_eval_duration/eval_duration (ns) are converted to rates."""
+        usage = {'prompt_eval_count': 800, 'eval_count': 200,
+                 'prompt_eval_duration': 2_000_000_000, 'eval_duration': 5_000_000_000}
+        stats = self.mq.calculate_stats(7.5, 'hello world ' * 20, usage, None)
+        self.assertAlmostEqual(stats['prefill_tps'], 400.0)
+        self.assertAlmostEqual(stats['tps'], 40.0)
+        self.assertEqual(stats['think_tokens'], 0)
+        self.assertEqual(stats['answer_tokens'], 200)
+        self.assertAlmostEqual(stats['answer_tps'], 40.0)
+
+    def test_client_phase_fallback_without_server_timing(self):
+        """Cloud backends with no timings fall back to client phase timestamps."""
+        usage = {'prompt_tokens': 300, 'completion_tokens': 100}
+        phase = {'start': 0.0, 'first_token': 3.0, 'first_content': 6.0, 'end': 10.0}
+        stats = self.mq.calculate_stats(10.0, 'x' * 200, usage, None,
+                                        thought='y' * 300, phase_times=phase)
+        self.assertAlmostEqual(stats['prefill_tps'], 100.0)
+        self.assertGreater(stats['think_tps'], 0.0)
+        self.assertGreater(stats['answer_tps'], 0.0)
+
+    def test_no_usage_estimates_generation(self):
+        """Without server usage, eval_count/tps still come from text estimation."""
+        stats = self.mq.calculate_stats(4.0, 'some answer text here', {}, None)
+        self.assertGreater(stats['eval_count'], 0)
+        self.assertGreater(stats['tps'], 0.0)
+
+    def test_print_stats_display_shows_breakdown(self):
+        """Stats line advertises prefill, thinking and answer rates."""
+        usage = {'prompt_tokens': 1000, 'completion_tokens': 500,
+                 'prompt_per_second': 500.0, 'predicted_per_second': 50.0}
+        stats = self.mq.calculate_stats(5.0, 'a' * 400, usage, None, thought='t' * 600)
+        buf = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = buf
+        try:
+            self.mq.print_stats_display(stats)
+        finally:
+            sys.stderr = old_stderr
+        out = buf.getvalue()
+        self.assertIn('prefill', out)
+        self.assertIn('think', out)
+        self.assertIn('answer', out)
+        self.assertIn('t/s', out)
+
+
+# ============================================================================
 # 8.  --show and --show-details are both reachable
 # ============================================================================
 
@@ -1104,6 +1202,90 @@ class TestNoThinkingPayload(unittest.TestCase):
             [{'role': 'user', 'content': 'hi'}], 'gpt-oss-20b.gguf',
             no_thinking=True, reasoning_effort='high')
         self.assertEqual(p['chat_template_kwargs']['reasoning_effort'], 'high')
+
+
+class TestAgenticCompactThreshold(unittest.TestCase):
+    """The agentic auto-compact threshold is a dedicated, tunable knob."""
+
+    def setUp(self):
+        m.CommandContext._instance = None
+        m.CommandContext._initialized = False
+
+    def _loop(self):
+        loop = object.__new__(m.ChatLoop)
+        loop.ctx = m.CommandContext()
+        return loop, loop.ctx
+
+    def test_default_is_085(self):
+        self.assertEqual(m.CommandContext().agentic_compact_threshold, 0.85)
+
+    def test_set_threshold_accepts_fraction_and_percent(self):
+        loop, ctx = self._loop()
+        loop._agentic_set_threshold(['/agentic', 'compactthreshold', '0.6'])
+        self.assertAlmostEqual(ctx.agentic_compact_threshold, 0.6)
+        loop._agentic_set_threshold(['/agentic', 'compactthreshold', '70'])
+        self.assertAlmostEqual(ctx.agentic_compact_threshold, 0.70)
+
+    def test_set_threshold_rejects_out_of_range_and_garbage(self):
+        loop, ctx = self._loop()
+        before = ctx.agentic_compact_threshold
+        for bad in ('150', '0', 'abc'):
+            loop._agentic_set_threshold(['/agentic', 'compactthreshold', bad])
+            self.assertEqual(ctx.agentic_compact_threshold, before, bad)
+
+
+class TestMultilineRecallEditing(unittest.TestCase):
+    """A recalled multiline block is returned as-is (native readline editing)."""
+
+    def test_recalled_block_returned_unchanged(self):
+        # readline restores a multi-line history entry as one buffer; the
+        # user edits it natively (Left/Right, Ctrl+J for a new line) and
+        # Enter sends it. gather_user_input must not re-ask line by line.
+        with patch('builtins.input', side_effect=["line1\nline2"]):
+            out = m.gather_user_input("p")
+        self.assertEqual(out, "line1\nline2")
+
+    def test_fresh_triple_quote_block_unaffected(self):
+        seq = ['"""', "hello", "world", '"""']
+        with patch('builtins.input', side_effect=seq):
+            out = m.gather_user_input("p")
+        self.assertEqual(out, "hello\nworld")
+
+    def test_ctrl_c_inside_multiline_cancels(self):
+        seq = ['"""', KeyboardInterrupt]
+        with patch('builtins.input', side_effect=seq):
+            out = m.gather_user_input("p")
+        self.assertIsNone(out)
+
+    def test_history_entry_encoding_roundtrip(self):
+        cases = ["plain", "a\nb", "a\nb\nc\nd", "\x1ex", "\x1en", "n\n\x1e", "\x1e\x1e", "trail\n"]
+        for text in cases:
+            encoded = m._encode_history_entry(text)
+            self.assertNotIn('\n', encoded, text)
+            self.assertEqual(m._decode_history_entry(encoded), text, text)
+
+    @unittest.skipUnless(m.READLINE_AVAILABLE, "readline not available")
+    def test_history_file_preserves_multiline_entry(self):
+        import readline
+        block = "udp6 line1\nudp6 line2\nudp6 line3"
+        readline.clear_history()
+        readline.add_history("first")
+        readline.add_history(block)
+        readline.set_history_length(1000)
+        path = tempfile.mktemp()
+        try:
+            m._save_history_file(path)
+            with open(path, encoding='utf-8') as f:
+                self.assertEqual(f.read().count('\n'), 2, "one physical line per entry")
+            readline.clear_history()
+            m._load_history_file(path)
+            count = readline.get_current_history_length()
+            items = [readline.get_history_item(i) for i in range(1, count + 1)]
+            self.assertEqual(items, ["first", block])
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+            readline.clear_history()
 
 
 class TestAgentsMdConsistency(unittest.TestCase):
