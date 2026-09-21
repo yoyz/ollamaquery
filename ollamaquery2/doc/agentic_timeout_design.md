@@ -31,8 +31,8 @@ All knobs live on `CommandContext` and are tunable at runtime:
 
 | Setting | Default | Effect |
 |---------|---------|--------|
-| `agentic_step_timeout` | 120 | Initial per-step wall-clock budget. `/agentic timeout <s>` |
-| `agentic_timeout_max` | 480 | Ceiling for budget extension (backoff 120→240→480). |
+| `agentic_step_timeout` | 300 | Initial per-step wall-clock budget. `/agentic timeout <s>` |
+| `agentic_timeout_max` | 600 | Ceiling for budget extension (backoff 300→600); doubles when reached (600→1200→…), hard-capped at `AGENTIC_TIMEOUT_MAX_CEILING` (7200). |
 | `agentic_progress_grace` | 15 | Seconds of allowed silence before a *running* step is treated as stalled (i.e. not extended). |
 | `agentic_max_iterations` | 50 | ReAct loop step cap. `/agentic iterations <n>` |
 
@@ -85,7 +85,7 @@ Classified by what the model was doing:
 | **C** | Last executed tool was destructive (`run_command`/`patch`/`edit_file`) **and** a tool call was pending in the timed-out generation | Abort — a retry could re-execute it |
 | **C′** | Destructive last tool, but only prose (no tool call pending) | Tool already completed; continue via State B backoff |
 | **A** | No tool executed yet | **Extend** `min(timeout*2, max)` if the model is still generating; else same-budget retry once, abort after two |
-| **B** | A tool already ran | Exponential backoff 120→240→480 (cap `agentic_timeout_max`), abort at max |
+| **B** | A tool already ran | Exponential backoff 300→600; when the ceiling is reached it doubles `agentic_timeout_max` (600→1200→…, hard-capped at 7200) instead of aborting; aborts at the hard ceiling |
 
 On any continue, a nudge message is appended so the model resumes rather than restarts.
 
@@ -112,8 +112,8 @@ can self-throttle instead of re-deriving and hitting the wall again:
 ```
 Generation metrics:
 - ~12.5 tokens/second
-- cut off after 120s (step timeout)
-- new budget: 240s (~3000 tokens at your current speed)
+- cut off after 300s (step timeout)
+- new budget: 600s (~3000 tokens at your current speed)
 Keep your total thinking + output within that budget — finish as soon as you have enough to
 act, and prefer a tool call or final answer over re-deriving your full analysis.
 ```
@@ -172,10 +172,55 @@ caps the echoed reasoning from the end (`_cap_tail`, `[-4000:]`, prefixed
   to the main thread during `thread.join()`) is exercised manually; the offline unit test drives
   the same code path by raising `KeyboardInterrupt` from a mocked step executor.
 
+### 5.1 Preserving the interrupted step without polluting context (proposal, to think about)
+
+On a step timeout (or `^C`) the model is cut mid-generation. Today `_timeout_nudge`
+echoes up to 4000 chars of the *tail* of the reasoning (and partial content) inline
+into a **user** message. Three gaps:
+
+1. **Context pollution / cost.** Every timeout re-injects up to ~4K chars (~1K tokens)
+   of the model's own monologue into the conversation; repeated timeouts compound.
+2. **Restart, not resume.** The echo is a user message with no assistant prefix, so
+   instruction-tuned models often re-derive from scratch rather than continue.
+3. **Lost in-flight tool call.** Native `tool_calls` deltas accumulate only in
+   `_aggregate_sync_stream` (`tool_call_index`, `ollamaquery2.py:5525`), inside the
+   worker thread. On timeout `_call_with_timeout` returns `None` and those partial
+   calls are discarded — a cut-off `write_file`/`run_command` emission is gone.
+
+**Idea — spill to a scratch file, point the model at it.** On timeout/interrupt, write
+the accumulated `thought` + `content` (+ partial tool-call args) to a per-session
+scratch file (e.g. `~/.ollamaquery.d/agentic/<session>/interrupt-<step>.md`, reaped by
+the existing `AGENTIC_LOG_RETENTION_DAYS` cleanup). Replace the inline echo in
+`_timeout_nudge` with a short pointer: *"Your interrupted reasoning was saved to
+`<path>`. Read it if you need it, then continue."* — a few tokens instead of ~1K, and
+no monologue in the history. The model can `read_file` it on demand (subject to the
+Path ACL) or ignore it.
+
+Three composable mechanisms:
+
+- **A. Spill to file (harness).** Write the partial text; nudge only points to it.
+  Pros: cheap, no context pollution, model reads on demand. Cons: an extra `read_file`
+  round-trip; ACL/retention/secret-leakage to consider; the model may not read it.
+- **B. Self-status tool (model).** A new `remember`/`set_status` tool the model calls to
+  record its intent/plan; stored to the same scratch file. Pros: model-authored *intent*
+  that is concise and survives compaction and `/switchmodel`. Cons: only helps if the
+  model calls it at the right moment (unreliable mid-thought).
+- **C. Partial tool-call capture (harness, root cause).** Publish the aggregator's
+  `tool_call_index` into the step/cancel state so the nudge can name the in-flight call
+  (and, if the accumulated JSON parses, execute it or offer it for confirmation).
+  Pros: deterministic, no model cooperation, recovers the lost call. Cons: plumbing the
+  partial state out of the worker thread; partial JSON may be invalid.
+
+Suggested order: **C → A → B**. C fixes the lost call, A removes the nudge's context
+cost, B adds model intent that survives a full restart. Open questions: scratch location
+(session dir vs workspace), Path ACL implications, secret redaction, retention/cleanup,
+and whether the same scratch file should back `/compact` summaries and `/switchmodel`
+hand-off.
+
 ## 6. Tests
 
 ```bash
-python3 -m unittest tests.test_agentic_timeout -v      # 27 tests (States A/B/C, tail-cap, metrics, F5)
+python3 -m unittest tests.test_agentic_timeout -v      # 38 tests (States A/B/C, tail-cap, metrics, F5, nudge exclusion, max ceiling, staticmethod guard)
 python3 -m unittest tests.test_agentic.TestReActLoopUnit -v   # 9 tests (incl. interrupt-persist + quiet-cancel)
 # plus the offline suites that guard the touched code:
 python3 -m unittest tests.test_modifications -v

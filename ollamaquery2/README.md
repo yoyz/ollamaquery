@@ -102,7 +102,7 @@ spawnshell are disabled when unavailable.
 
 Subcommands: `/agentic auto`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `iterations <N>`, `timeout <N>`.
 
-Safety features: destructive tool confirmation, path ACL (see below), shell approval gate, step timeout (default 120s), stuck detection, same-tool-loop abort, optional container sandbox (podman/docker).
+Safety features: destructive tool confirmation, path ACL (see below), shell approval gate, step timeout (default 300s), stuck detection, same-tool-loop abort, optional container sandbox (podman/docker).
 
 ### Access Control (Path ACL)
 
