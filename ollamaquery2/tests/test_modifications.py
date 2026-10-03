@@ -954,6 +954,24 @@ class TestTokenStatsBreakdown(unittest.TestCase):
         self.assertIn('answer', out)
         self.assertIn('t/s', out)
 
+    def test_print_stats_display_no_double_count_thinking_only(self):
+        """Pure tool-call steps (thinking, no answer content) must not show a
+        duplicate `gen` line that double-counts the think tokens."""
+        usage = {'prompt_tokens': 1000, 'completion_tokens': 500,
+                 'predicted_per_second': 50.0}
+        stats = self.mq.calculate_stats(5.0, '', usage, None, thought='t' * 600)
+        buf = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = buf
+        try:
+            self.mq.print_stats_display(stats)
+        finally:
+            sys.stderr = old_stderr
+        out = buf.getvalue()
+        self.assertIn('think', out)
+        self.assertNotIn('gen ', out)
+        self.assertNotIn('answer', out)
+
 
 # ============================================================================
 # 8.  --show and --show-details are both reachable

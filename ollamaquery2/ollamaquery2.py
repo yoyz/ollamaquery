@@ -22,6 +22,7 @@ import base64
 import argparse
 import subprocess
 import shlex
+import shutil
 import threading
 import time
 import traceback
@@ -57,7 +58,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.10"
+__version__ = "0.2.12"
 
 
 # ============================================================================
@@ -1112,6 +1113,7 @@ class CommandContext:
         self.agentic_has_executed_tool: bool = False
         self.agentic_last_tool_name: str = ""
         self.lazy_tool: bool = True  # Enabled by default: many models embed tool calls after thinking/preamble
+        self.plan_mode: bool = False  # Read-only planning mode (restricts tools + prompts)
         self.supports_vision: Optional[bool] = None  # None = unknown (treated as capable)
 
         # Context window tracking
@@ -2053,6 +2055,19 @@ AGENTIC_RULES_BLOCK = """## General rules
 - Be precise with file paths. If you create a file in a subdirectory, use the same path when compiling or reading it later.
 - Mirror the user's language — if they write in French, reply in French."""
 
+# Read-only planning-mode block, appended when `/agentic plan` is active. The
+# model is told it may only inspect and plan — enforcement also happens at the
+# tool-surface and execution layers, so this is behavioral guidance, not the
+# only defense.
+AGENTIC_PLAN_BLOCK = """## Read-only planning mode
+You are operating in READ-ONLY PLANNING MODE. Your job is to INSPECT and PLAN, never to change anything.
+
+- You MUST NOT modify, create, delete, move, or overwrite any files, and you MUST NOT change any system state.
+- Only use the tools available to you to read and inspect: read_file, list_directory, glob, fetch_url, diff, and run_command.
+- For run_command, only issue read-only inspection commands (e.g. ls, cat, head, git status, git diff, ps, grep, find). The user is asked to confirm every command before it runs.
+- Never attempt write_file, run_python, patch, edit_file, or apply_patch — they are disabled in this mode.
+- When you have gathered enough information, present a clear, step-by-step plan to the user. Do NOT execute the plan yourself."""
+
 # Registry mapping format style names to their blocks.
 AGENTIC_FORMAT_REGISTRY = {
     "strict": AGENTIC_FORMAT_STRICT,
@@ -2117,7 +2132,7 @@ def get_prompt_style(model_name: str) -> str:
 
 
 def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
-                       include_tool_defs: bool = True) -> str:
+                       include_tool_defs: bool = True, plan_mode: bool = False) -> str:
     """Assemble the agentic system prompt from composable blocks.
 
     Args:
@@ -2125,6 +2140,8 @@ def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
         tool_defs_block: Tool definitions block (from ToolRegistry.get_system_prompt_block()).
             Inserted after the role block so models see available tools before format instructions.
         include_tool_defs: If False, skip tool_defs_block (for models using native tools API).
+        plan_mode: If True, append the read-only planning-mode block so the
+            model knows it may only inspect and plan (never modify state).
 
     Format selection:
         - openai tool format (native tools API): AGENTIC_FORMAT_NATIVE — never
@@ -2142,6 +2159,8 @@ def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
     else:
         blocks.append(AGENTIC_FORMAT_REGISTRY[style])
         blocks.append(AGENTIC_EXAMPLE_REGISTRY[style])
+    if plan_mode:
+        blocks.append(AGENTIC_PLAN_BLOCK)
     blocks.append(AGENTIC_RULES_BLOCK)
     return "\n\n".join(blocks)
 
@@ -2456,6 +2475,21 @@ DEFAULT_SHELL_PERMISSION = {
         "chmod *": "ask",
         "chown *": "ask",
         "rm *": "ask",
+        # Kubernetes / OpenShift read-only consultation (kubernetes_cluster_query).
+        # Only read verbs + current-context are allowed; mutating verbs (apply,
+        # delete, exec, ...) stay at the default ask.
+        "oc get *": "allow",
+        "oc logs *": "allow",
+        "oc describe *": "allow",
+        "oc config current-context": "allow",
+        "kubectl get *": "allow",
+        "kubectl logs *": "allow",
+        "kubectl describe *": "allow",
+        "kubectl config current-context": "allow",
+        "omc use *": "allow",          # select a local must-gather dir (local config write)
+        "omc get *": "allow",
+        "omc logs *": "allow",
+        "omc describe *": "allow",
         # Home hard-deny overrides the ask above (last-match-wins needs explicit deny after)
         "rm -rf ~": "deny",
         "rm -rf ~/ *": "deny",
@@ -2465,6 +2499,22 @@ DEFAULT_SHELL_PERMISSION = {
         "rm -rf ${HOME} *": "deny",
     }
 }
+
+# Cluster MUTATING verbs are hard-denied. Without this, the CWD-leniency
+# auto-allow would let `oc delete pod x` (operands look like CWD paths) through
+# the gate — defeating the read-only consultation guarantee. A session allow
+# rule (approved list, evaluated last) can still re-enable a specific one.
+_CLUSTER_MUTATING_VERBS = (
+    "delete", "apply", "create", "edit", "replace", "patch", "scale", "rollout",
+    "exec", "port-forward", "attach", "run", "autoscale", "label", "annotate",
+    "taint", "cordon", "uncordon", "drain",
+)
+for _cli in ("oc", "kubectl", "omc"):
+    for _verb in _CLUSTER_MUTATING_VERBS:
+        DEFAULT_SHELL_PERMISSION["bash"][f"{_cli} {_verb} *"] = "deny"
+for _cli in ("oc", "kubectl"):
+    for _verb in ("adm", "login", "logout", "config set-context", "config use-context"):
+        DEFAULT_SHELL_PERMISSION["bash"][f"{_cli} {_verb} *"] = "deny"
 
 _SHELL_SESSION_APPROVED = []  # list of {"permission":"bash","pattern":..., "action":"allow"}
 
@@ -2527,10 +2577,14 @@ _SHELL_ARITY = {
     "git remote": 3, "git stash": 3, "go": 2, "gradle": 2, "helm": 2,
     "heroku": 2, "hugo": 2, "ip": 2, "ip addr": 3, "ip link": 3,
     "ip netns": 3, "ip route": 3, "kind": 2, "kind create": 3, "kubectl": 2,
+    "kubectl config": 3, "kubectl describe": 3, "kubectl get": 3, "kubectl logs": 3,
     "kubectl kustomize": 3, "kubectl rollout": 3, "kustomize": 2, "make": 2,
     "mc": 2, "mc admin": 3, "minikube": 2, "mongosh": 2, "mysql": 2,
     "mvn": 2, "ng": 2, "npm": 2, "npm exec": 3, "npm init": 3, "npm run": 3,
-    "npm view": 3, "nvm": 2, "nx": 2, "openssl": 2, "openssl req": 3,
+    "npm view": 3, "nvm": 2, "nx": 2, "oc": 2, "oc adm": 3, "oc auth": 3, "oc config": 3, "oc describe": 3,
+    "oc get": 3, "oc logs": 3,
+    "omc": 2, "omc describe": 3, "omc get": 3, "omc logs": 3, "omc use": 3,
+    "openssl": 2, "openssl req": 3,
     "openssl x509": 3, "pip": 2, "pipenv": 2, "pnpm": 2, "pnpm dlx": 3,
     "pnpm exec": 3, "pnpm run": 3, "poetry": 2, "podman": 2,
     "podman container": 3, "podman image": 3, "psql": 2, "pulumi": 2,
@@ -3452,10 +3506,77 @@ AGENTIC_TOOL_DEFS = {
             },
             "required": ["patch_text"]
         }
+    },
+    "kubernetes_cluster_query": {
+        "description": "Read-only query of a Kubernetes/OpenShift cluster. NEVER modifies anything. Online (oc/kubectl) talks to the live cluster via kubeconfig; offline (omc) inspects a local OpenShift must-gather directory. cluster_type auto: KUBECONFIG env var set → online; else omc configured (binary + ~/.omc/omc.json) → offline; else online via default kubeconfig. Resources differ by platform — OpenShift also has projects, routes, buildconfigs, deploymentconfigs. Use CANONICAL resource names: `persistentvolumes`/`persistentvolumeclaims` (or `pv`/`pvc`) — do NOT invent plural forms like `pvs`, `volumeclaims`, or `claims`, which the backend rejects. Object storage (ODF) uses `objectbucketclaim`/`objectbucket`; those may not be collected in a must-gather, so a 'resource type not known' error there means the data is not available offline — try the canonical name once, then report it rather than retrying other spellings. Logs are tailed (default 50 lines). For LISTING tasks (e.g. 'list all PVs and their sizes') prefer output='custom-columns' with fields= (compact, one line per object) or output='wide' over output='json' — json dumps whole objects and large results are spilled to a file you must read via read_file. When a result IS spilled, the file path returned in the observation is authoritative: read it directly with read_file(file_path=\"...\") and page with its `next` offset — do NOT list the parent directory (~/.ollamaquery.d) to locate it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cluster_type": {"type": "string", "enum": ["omc", "openshift", "kubernetes", "auto"], "description": "Consultation backend: omc=offline must-gather, openshift=oc, kubernetes=kubectl, auto=detect from environment (default)"},
+                "verb": {"type": "string", "enum": ["get", "logs", "describe", "events", "current-context"], "description": "Read-only action (default: get)"},
+                "resource": {"type": "string", "description": "Resource type to query, e.g. pods, deployments, nodes, namespaces (required for get/logs/describe)"},
+                "name": {"type": "string", "description": "Optional resource instance name, e.g. my-pod"},
+                "namespace": {"type": "string", "description": "Optional namespace (-n)"},
+                "offline_dir": {"type": "string", "description": "Optional OpenShift must-gather directory for offline (omc) queries. Defaults to the dir selected in ~/.omc/omc.json."},
+                "tail": {"type": "integer", "description": "Logs only: last N lines (default 50)"},
+                "output": {"type": "string", "enum": ["json", "yaml", "wide", "custom-columns", "jsonpath"], "description": "get/events output format (default: json). custom-columns / jsonpath need `fields`."},
+                "fields": {"type": "string", "description": "Required when output=custom-columns (e.g. 'NAME:.metadata.name,SIZE:.spec.capacity.storage') or output=jsonpath (e.g. '{.items[*].metadata.name}')"}
+            },
+            "required": []
+        }
     }
 }
 
 DESTRUCTIVE_TOOLS = {"write_file", "run_python", "run_command", "patch", "edit_file", "apply_patch"}
+
+# Read-only planning mode (/agentic plan) tool surface. The model may only
+# inspect: read files, search, list directories, fetch URLs, diff files, run
+# shell commands that always ask for confirmation before executing, and query a
+# Kubernetes/OpenShift cluster read-only. Everything else (write_file,
+# run_python, patch, edit_file, apply_patch) is hidden from the prompt/tools API
+# AND denied at the execution backstop.
+PLAN_MODE_TOOLS = {"read_file", "glob", "list_directory", "fetch_url", "diff",
+                   "run_command", "kubernetes_cluster_query"}
+
+# Kubernetes / OpenShift read-only consultation (kubernetes_cluster_query tool).
+# cluster_type auto: KUBECONFIG env var set → online; else omc configured
+# (binary + ~/.omc/omc.json) → offline; else online via default kubeconfig.
+CLUSTER_QUERY_VERBS = {"get", "logs", "describe", "events", "current-context"}
+CLUSTER_QUERY_OUTPUTS = {"json", "yaml", "wide", "custom-columns", "jsonpath"}
+CLUSTER_QUERY_TIMEOUT = 60
+OMC_CONFIG_PATH = os.path.expanduser("~/.omc/omc.json")
+
+# Large `kubernetes_cluster_query` results are spilled to per-query files in the
+# spill dir so the model can page through them with `read_file` (observation-cap-
+# exempt, carries a `next` pointer). Filenames are scoped by verb + resource
+# (cluster_result_<verb>_<resource>.json) so one query never clobbers another
+# that is still being paged. All spill files are removed at process exit (atexit).
+CLUSTER_SPILL_THRESHOLD = 3500  # spill results larger than this (chars)
+CLUSTER_SPILL_DIR = os.path.expanduser("~/.ollamaquery.d/spill")
+
+
+def _cluster_spill_path(verb: str, resource: str) -> str:
+    """Return the scoped spill file path for a (verb, resource) cluster query."""
+    stem = f"{verb}_{resource}" if resource else verb
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("_") or "query"
+    return os.path.join(CLUSTER_SPILL_DIR, f"cluster_result_{stem}.json")
+
+
+def _cleanup_cluster_spill_files() -> None:
+    """Remove all cluster spill files at process exit."""
+    try:
+        if os.path.isdir(CLUSTER_SPILL_DIR):
+            for fname in os.listdir(CLUSTER_SPILL_DIR):
+                if fname.startswith("cluster_result_") and fname.endswith(".json"):
+                    try:
+                        os.unlink(os.path.join(CLUSTER_SPILL_DIR, fname))
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+
+
+atexit.register(_cleanup_cluster_spill_files)
 
 # Tools whose re-execution can cause harm; used by the agentic timeout escalation
 # policy to abort (rather than extend) when the last executed tool was one of these.
@@ -3465,6 +3586,12 @@ AGENTIC_TIMEOUT_ABORT_TOOLS = {"run_command", "patch", "edit_file"}
 # max each time the current budget reaches it, up to this hard cap; at the cap it
 # stops growing (State B aborts, State A aborts after two stalled retries).
 AGENTIC_TIMEOUT_MAX_CEILING = 7200
+
+# Same-tool-loop guard threshold: re-running the same tool can be legitimate
+# (e.g. the model rerunning a command), so the ReAct loop only aborts when the
+# IDENTICAL call is emitted this many times in a row. The streak resets whenever
+# the tool name or its arguments change.
+AGENTIC_SAME_TOOL_MAX = 10
 
 
 # ============================================================================
@@ -4632,6 +4759,257 @@ def _tool_handle_apply_patch(self, args: dict) -> dict:
         return {"success": False, "output": "", "error": str(e)}
 
 
+def _resolve_cluster_backend(cluster_type: Optional[str]) -> Optional[str]:
+    """Resolve the consultation backend for a cluster query.
+
+    Args:
+        cluster_type: "omc" | "openshift" | "kubernetes" | "auto" (or None).
+
+    Returns:
+        "omc", "oc", or "kubectl" (or None when no usable client was found).
+
+    `auto` rule (all local, no cluster round-trip): a `KUBECONFIG` env var means
+    online; without it, offline (omc) when an `omc` binary + `~/.omc/omc.json`
+    are present; otherwise online via the default kubeconfig — `oc` binary in
+    PATH → openshift, else kubernetes.
+    """
+    t = (cluster_type or "auto").lower()
+    if t == "omc":
+        return "omc"
+    if t == "openshift":
+        return "oc"
+    if t == "kubernetes":
+        return "kubectl"
+    # auto
+    if os.environ.get("KUBECONFIG"):
+        return "oc" if shutil.which("oc") else "kubectl"
+    if shutil.which("omc") and os.path.exists(OMC_CONFIG_PATH):
+        return "omc"
+    return "oc" if shutil.which("oc") else "kubectl"
+
+
+def _read_omc_config_must_gather_dir() -> Optional[str]:
+    """Read the must-gather dir selected by omc from `~/.omc/omc.json`.
+
+    Returns:
+        The configured directory string, or None when absent/unreadable.
+    """
+    if not os.path.exists(OMC_CONFIG_PATH):
+        return None
+    try:
+        with open(OMC_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        for key in ("must_gather_dir", "must-gather-dir", "mustGatherDir", "dir", "path"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        for val in data.values():
+            if isinstance(val, str) and val.strip().startswith("/"):
+                return val.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _cluster_query_verb_args(verb: str, args: dict) -> list:
+    """Build the verb-specific command tokens for a cluster query.
+
+    Args:
+        verb: One of get/logs/describe/events.
+        args: Tool args (resource, name, namespace, tail, output).
+
+    Returns:
+        Command token list following the verb.
+
+    Raises:
+        ValueError: when a required resource is missing.
+    """
+    parts = ["get", "events"] if verb == "events" else [verb]
+    if verb != "events":
+        resource = str(args.get("resource") or "").strip()
+        if not resource:
+            raise ValueError(f"resource is required for verb '{verb}'")
+        parts.append(resource)
+        name = str(args.get("name") or "").strip()
+        if name:
+            parts.append(name)
+    namespace = str(args.get("namespace") or "").strip()
+    if namespace:
+        parts += ["-n", namespace]
+    if verb == "logs":
+        tail = args.get("tail")
+        if tail is not None:
+            try:
+                parts.append(f"--tail={max(1, int(tail))}")
+            except (TypeError, ValueError):
+                pass
+    elif verb in ("get", "events"):
+        output = str(args.get("output", "json")).lower()
+        if output == "custom-columns":
+            fields = str(args.get("fields") or "").strip()
+            if not fields:
+                raise ValueError(
+                    "fields is required for output='custom-columns' "
+                    "(e.g. 'NAME:.metadata.name,SIZE:.spec.capacity.storage')")
+            parts += ["-o", f"custom-columns={fields}"]
+        elif output == "jsonpath":
+            fields = str(args.get("fields") or "").strip()
+            if not fields:
+                raise ValueError(
+                    "fields is required for output='jsonpath' (e.g. '{.items[*].metadata.name}')")
+            parts += ["-o", f"jsonpath={fields}"]
+        else:
+            parts += ["-o", output]
+    return parts
+
+
+def _cluster_current_context(executor: object, cli: str) -> str:
+    """Return the active kubeconfig context via `cli config current-context`.
+
+    Args:
+        executor: The Executor used to run the command.
+        cli: "oc" or "kubectl".
+
+    Returns:
+        The trimmed context name, or "" when it cannot be determined.
+    """
+    try:
+        res = executor.run(f"{cli} config current-context", timeout=CLUSTER_QUERY_TIMEOUT)
+        if res.get("returncode") == 0:
+            return (res.get("stdout") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _spill_cluster_result(ctx: object, output_text: str, verb: str = "get",
+                          resource: str = "") -> str:
+    """Spill a large cluster result to a per-query spill file for paged reading.
+
+    Args:
+        ctx: The ToolRegistry context (for the path ACL).
+        output_text: The full command output.
+        verb: The query verb (scopes the spill filename).
+        resource: The queried resource (scopes the spill filename).
+
+    Returns:
+        The observation text for the model. When the result exceeds
+        CLUSTER_SPILL_THRESHOLD the full output is written to a file scoped by
+        verb + resource (cluster_result_<verb>_<resource>.json) and a pure pointer
+        is returned — size (chars/lines) plus a `read_file` instruction — with NO
+        content inline, so the payload is not fed into context twice (it only
+        appears when the model pages it via `read_file`, which is
+        observation-cap-exempt and carries a `next` offset). A session Path-ACL
+        read-allow rule is added for the spill dir so `read_file` on it doesn't
+        prompt (it is a home dotfile dir outside CWD). On any failure the full
+        output is returned unchanged (it will be observation-capped).
+    """
+    if len(output_text) <= CLUSTER_SPILL_THRESHOLD:
+        return output_text
+    try:
+        os.makedirs(CLUSTER_SPILL_DIR, exist_ok=True)
+        acl = getattr(ctx, "path_acl", None)
+        if acl is not None:
+            acl.add("read", "allow", CLUSTER_SPILL_DIR, source="session")
+        spill_file = _cluster_spill_path(verb, resource)
+        with open(spill_file, "w", encoding="utf-8") as f:
+            f.write(output_text)
+        n_chars = len(output_text)
+        n_lines = len(output_text.splitlines())
+        return (
+            f"[kubernetes_cluster_query] Result is large ({n_chars} chars / {n_lines} lines) — "
+            f"the output is NOT included here to avoid duplicating it in context. Read it with "
+            f"read_file(file_path=\"{spill_file}\"); read_file pages large files "
+            f"automatically via the `next` offset (up to 2000 lines / 100KB per page)."
+        )
+    except Exception:
+        return output_text
+
+
+def _tool_handle_cluster_query(self, args: dict) -> dict:
+    """Query a Kubernetes/OpenShift cluster in read-only mode (online or offline).
+
+    Args:
+        args: Tool arguments (cluster_type, verb, resource, name, namespace,
+            offline_dir, tail, output).
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}. The output is
+        prefixed with a `platform: ... | context/must-gather: ...` header so the
+        model (and logs) always record which cluster was consulted.
+    """
+    verb = str(args.get("verb", "get")).lower()
+    if verb not in CLUSTER_QUERY_VERBS:
+        return {"success": False, "output": "",
+                "error": f"Unsupported verb '{verb}' (allowed: {', '.join(sorted(CLUSTER_QUERY_VERBS))})"}
+    output = str(args.get("output", "json")).lower()
+    if output not in CLUSTER_QUERY_OUTPUTS:
+        return {"success": False, "output": "",
+                "error": f"Unsupported output format '{output}' (allowed: json, yaml, wide)"}
+    backend = _resolve_cluster_backend(args.get("cluster_type"))
+    if backend is None:
+        return {"success": False, "output": "",
+                "error": "No cluster client available: install oc, kubectl, or omc"}
+
+    header = [f"platform: {backend}"]
+    offline_dir = ""
+    try:
+        if backend == "omc":
+            offline_dir = str(args.get("offline_dir") or "").strip() or \
+                (_read_omc_config_must_gather_dir() or "")
+            if verb == "current-context":
+                header.append(f"must-gather: {offline_dir or OMC_CONFIG_PATH}")
+                return {"success": True, "output": " | ".join(header), "error": None}
+            if not offline_dir and not os.path.exists(OMC_CONFIG_PATH):
+                return {"success": False, "output": "",
+                        "error": "offline (omc) query needs a must-gather dir: pass "
+                                 "offline_dir or run `omc use <dir>` (stored in ~/.omc/omc.json)"}
+            commands = []
+            if offline_dir:
+                commands.append(f"omc use {shlex.quote(offline_dir)}")
+            commands.append("omc " + " ".join(_cluster_query_verb_args(verb, args)))
+            header.append(f"must-gather: {offline_dir or OMC_CONFIG_PATH}")
+        else:
+            cli = "oc" if backend == "oc" else "kubectl"
+            if verb == "current-context":
+                commands = [f"{cli} config current-context"]
+            else:
+                ctx = _cluster_current_context(self.executor, cli)
+                header.append(f"context: {ctx or 'unknown'}")
+                commands = [cli + " " + " ".join(_cluster_query_verb_args(verb, args))]
+
+        output_text = ""
+        returncode = 0
+        stderr_text = ""
+        for command in commands:
+            result = self.executor.run(command, timeout=CLUSTER_QUERY_TIMEOUT)
+            if result.get("stderr"):
+                stderr_text += result["stderr"]
+            if result.get("returncode") != 0:
+                returncode = result["returncode"]
+                output_text += result.get("stdout", "")
+                break
+            output_text += result.get("stdout", "")
+        if returncode != 0:
+            return {"success": False, "output": output_text,
+                    "error": (stderr_text or f"command failed ({returncode})")}
+    except ValueError as e:
+        return {"success": False, "output": "", "error": str(e)}
+    except Exception as e:
+        return {"success": False, "output": "", "error": str(e)}
+
+    if verb == "current-context" and backend != "omc":
+        header.append(f"context: {output_text.strip() or 'unknown'}")
+    prefix = " | ".join(header)
+    body = _spill_cluster_result(self._ctx, output_text,
+                                 verb=verb, resource=str(args.get("resource") or ""))
+    if body:
+        return {"success": True, "output": prefix + "\n" + body, "error": None}
+    return {"success": True, "output": prefix, "error": None}
+
+
 # ============================================================================
 # ============= TOOL REGISTRY                  ================================
 # ============================================================================
@@ -4646,6 +5024,10 @@ TOOL_ARG_ALIASES = {
     "list_directory": {"path": ["directory", "dir"]},
     "edit_file": {"file_path": ["file", "path", "filename", "filepath"]},
     "apply_patch": {},
+    "kubernetes_cluster_query": {"resource": ["kind", "type", "resource_type"],
+                                 "offline_dir": ["must_gather_dir", "dir", "mgdir"],
+                                 "verb": ["action"],
+                                 "fields": ["columns", "jsonpath_expr", "expr"]},
 }
 
 class ToolRegistry:
@@ -4679,12 +5061,27 @@ class ToolRegistry:
             "patch": _tool_handle_patch,
             "edit_file": _tool_handle_edit_file,
             "apply_patch": _tool_handle_apply_patch,
+            "kubernetes_cluster_query": _tool_handle_cluster_query,
         }
+
+    def _plan_allowed_tools(self) -> dict:
+        """Return the visible tool definitions for the active mode.
+
+        Plan mode restricts the surface to PLAN_MODE_TOOLS so the model cannot
+        even see (or, via the schema, emit) write tools.
+
+        Returns:
+            A dict of tool name -> definition for the current mode.
+        """
+        if self._ctx and getattr(self._ctx, 'plan_mode', False):
+            return {name: defn for name, defn in AGENTIC_TOOL_DEFS.items()
+                    if name in PLAN_MODE_TOOLS}
+        return dict(AGENTIC_TOOL_DEFS)
 
     def get_system_prompt_block(self) -> str:
         """Build tool definitions section for embedding in the agentic system prompt."""
         lines = ["## Available tools\n"]
-        for name, defn in AGENTIC_TOOL_DEFS.items():
+        for name, defn in self._plan_allowed_tools().items():
             lines.append(f"### {name}")
             lines.append(f"{defn['description']}\n")
             lines.append("Parameters:")
@@ -4696,16 +5093,37 @@ class ToolRegistry:
             lines.append(f"\nCall format: {{\"tool\": \"{name}\", \"arguments\": {{...}}}}\n")
         return "\n".join(lines)
 
+    def openai_tools_spec(self) -> list:
+        """Build the OpenAI `tools` API parameter list for the active mode.
+
+        Plan mode restricts the schema to PLAN_MODE_TOOLS so models using the
+        native tools API cannot even emit calls for the hidden write tools.
+
+        Returns:
+            List of {"type": "function", "function": {...}} dicts.
+        """
+        return [
+            {"type": "function",
+             "function": {"name": name, "description": defn["description"],
+                          "parameters": defn["parameters"]}}
+            for name, defn in self._plan_allowed_tools().items()
+        ]
+
     def list_tools_str(self) -> str:
         """Format the tool list for /listtool display."""
         lines = []
-        for name, defn in AGENTIC_TOOL_DEFS.items():
+        for name, defn in self._plan_allowed_tools().items():
             destructive = "! " if name in DESTRUCTIVE_TOOLS else "  "
             lines.append(f"{destructive}{name:<16} {defn['description']}")
         return "\n".join(lines)
 
     def _confirm(self, tool_name: str, args: dict) -> bool:
-        """Ask the user before running a destructive tool (unless auto-confirm).
+        """Ask the user before running a destructive tool.
+
+        Plan mode forces a confirmation for every destructive tool (only
+        run_command is destructive in the plan surface), bypassing auto-confirm
+        — exactly like the Path ACL's bypass-immune `ask` rules. Otherwise
+        destructive tools are confirmed unless auto-confirm is on.
 
         Args:
             tool_name: Name of the tool to run.
@@ -4716,8 +5134,22 @@ class ToolRegistry:
         """
         if tool_name not in DESTRUCTIVE_TOOLS:
             return True
+        if self._ctx and getattr(self._ctx, 'plan_mode', False):
+            return self._prompt_confirm(tool_name, args)
         if self._ctx and self._ctx.auto_confirm:
             return True
+        return self._prompt_confirm(tool_name, args)
+
+    def _prompt_confirm(self, tool_name: str, args: dict) -> bool:
+        """Interactive [y/N] confirmation for a destructive tool.
+
+        Args:
+            tool_name: Name of the tool to run.
+            args: The tool's arguments (shown in the prompt).
+
+        Returns:
+            True when the user answered yes.
+        """
         args_display = ", ".join(f"{k}={v!r}" for k, v in args.items())
         prompt = f"\n[Agentic] Run {tool_name}({args_display})? [y/N] "
         try:
@@ -4738,6 +5170,13 @@ class ToolRegistry:
         """
         if tool_name not in self._handlers:
             return {"success": False, "output": "", "error": f"Unknown tool '{tool_name}'"}
+        # Plan mode backstop: even if the model hallucinates a write tool (or a
+        # hidden tool leaks through the surface filter), deny it here. Defense
+        # in depth — the prompt and tool schema already hide these tools.
+        if self._ctx and getattr(self._ctx, 'plan_mode', False) and tool_name not in PLAN_MODE_TOOLS:
+            return {"success": False, "output": "",
+                    "error": f"Tool '{tool_name}' is disabled in read-only plan mode "
+                             f"(allowed: {', '.join(sorted(PLAN_MODE_TOOLS))})"}
         # Normalize argument name aliases (e.g. "path" -> "file")
         if tool_name in TOOL_ARG_ALIASES:
             for canonical, aliases in TOOL_ARG_ALIASES[tool_name].items():
@@ -5335,7 +5774,11 @@ class ModelQuery:
             answer_tokens = stats.get("answer_tokens", stats["eval_count"])
             if answer_tokens > 0:
                 parts.append(f"answer {answer_tokens} tok @ {stats.get('answer_tps', 0.0):.1f} t/s")
-            else:
+            elif stats.get("think_tokens", 0) == 0:
+                # No reasoning split and no visible answer (plain generation):
+                # report the overall decode rate. When reasoning IS present the
+                # `think` line already accounts for every generated token, so a
+                # `gen` line here would double-count (e.g. pure tool-call steps).
                 parts.append(f"gen {stats['eval_count']} tok @ {stats.get('tps', 0.0):.1f} t/s")
             ctx = self.ctx.current_context_tokens
             if not ctx:
@@ -5739,6 +6182,7 @@ class ModelQuery:
         context_size = kwargs.pop("context_size", None)
         socket_timeout = kwargs.pop("timeout", 120)
         cancel = kwargs.pop("cancel", None)
+        usage_out = kwargs.pop("usage_out", None)
         backend = self.backend
 
         if images and messages and messages[-1].get("role") == "user":
@@ -5769,6 +6213,9 @@ class ModelQuery:
                     "arguments": tc["function"]["arguments"],
                 }
             })
+
+        if usage_out is not None and isinstance(usage_out, list):
+            usage_out.append(usage)
 
         return self._synthesize_sync_response(full_content, full_thinking, tool_calls, usage)
 
@@ -7660,8 +8107,10 @@ class ChatLoop:
             return self._agentic_toggle_named(subcmd)
         if subcmd == "acl":
             return self._handle_agentic_acl(parts)
+        if subcmd == "plan":
+            return self._agentic_toggle_plan(parts)
 
-        print(colorize("[Usage: /agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|lazytool|acl|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|status]]", 'warning'), file=sys.stderr)
+        print(colorize("[Usage: /agentic [on|off|full|auto|plan|sandbox|verbose|thinking|trace|log|lazytool|acl|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|status]]", 'warning'), file=sys.stderr)
         return False
 
     # Named toggles (always toggle between on/off)
@@ -7683,7 +8132,7 @@ class ChatLoop:
         state = "ON" if self.ctx.agentic_mode else "OFF"
         if self.ctx.agentic_mode:
             self.ctx._saved_system_prompt = self.ctx.system_prompt
-            self.ctx.system_prompt = get_agentic_prompt(self.ctx.model)
+            self.ctx.system_prompt = get_agentic_prompt(self.ctx.model, plan_mode=self.ctx.plan_mode)
         else:
             if hasattr(self.ctx, '_saved_system_prompt'):
                 self.ctx.system_prompt = self.ctx._saved_system_prompt
@@ -7693,7 +8142,7 @@ class ChatLoop:
     def _agentic_set_full(self) -> bool:
         """Enable everything: agentic mode, verbose, thinking, trace, auto-confirm, lazy."""
         self.ctx._saved_system_prompt = self.ctx.system_prompt
-        self.ctx.system_prompt = get_agentic_prompt(self.ctx.model)
+        self.ctx.system_prompt = get_agentic_prompt(self.ctx.model, plan_mode=self.ctx.plan_mode)
         self.ctx.agentic_mode = True
         self.ctx.agentic_verbose = True
         self.ctx.agentic_show_thinking = True
@@ -7707,6 +8156,53 @@ class ChatLoop:
         print(colorize("[Trace: ON]", 'info'), file=sys.stderr)
         print(colorize("[Auto-confirm: ON]", 'info'), file=sys.stderr)
         print(colorize("[Lazy tool extraction: ON]", 'info'), file=sys.stderr)
+        return False
+
+    def _agentic_toggle_plan(self, parts: list) -> bool:
+        """Toggle read-only planning mode (/agentic plan [on|off]).
+
+        Enabling forces agentic mode ON and restricts the tool surface to
+        PLAN_MODE_TOOLS (read_file, glob, list_directory, fetch_url, diff,
+        run_command) at all three layers: the system prompt block, the native
+        tools API schema, and the execution backstop. run_command always asks
+        for confirmation in plan mode, even with auto-confirm enabled
+        (bypass-immune). Disabling restores the agentic_mode that was active
+        before plan mode was enabled.
+
+        Args:
+            parts: Split /agentic args (parts[2] is "on"/"off" or omitted).
+
+        Returns:
+            False to keep the chat loop running.
+        """
+        arg = parts[2] if len(parts) > 2 else "on"
+        if arg not in ("on", "off"):
+            print(colorize("[Usage: /agentic plan [on|off]]", 'warning'), file=sys.stderr)
+            return False
+
+        if arg == "off":
+            if not self.ctx.plan_mode:
+                print(colorize("[Agentic plan mode already OFF]", 'muted'), file=sys.stderr)
+                return False
+            self.ctx.plan_mode = False
+            self.ctx.agentic_mode = getattr(self.ctx, '_plan_prev_agentic', False)
+            if hasattr(self.ctx, '_saved_system_prompt'):
+                self.ctx.system_prompt = self.ctx._saved_system_prompt
+            print(colorize("[Agentic plan mode: OFF — read-only restrictions lifted]", 'warning'), file=sys.stderr)
+            return False
+
+        # Enabling plan mode
+        if self.ctx.plan_mode:
+            print(colorize("[Agentic plan mode already ON]", 'muted'), file=sys.stderr)
+            return False
+        self.ctx._plan_prev_agentic = self.ctx.agentic_mode
+        self.ctx.plan_mode = True
+        self.ctx.agentic_mode = True
+        self.ctx._saved_system_prompt = self.ctx.system_prompt
+        self.ctx.system_prompt = get_agentic_prompt(self.ctx.model, plan_mode=True)
+        print(colorize("[Agentic plan mode: ON — read-only planner]", 'success'), file=sys.stderr)
+        print(colorize("[Tools restricted to: read_file, glob, list_directory, fetch_url, diff, run_command]", 'muted'), file=sys.stderr)
+        print(colorize("[run_command will ask for confirmation before executing]", 'info'), file=sys.stderr)
         return False
 
     def _agentic_toggle_sandbox(self) -> bool:
@@ -7846,12 +8342,13 @@ class ChatLoop:
         """Display current agentic settings like /debug output."""
         c = self.ctx
         print(colorize("\n[Agentic Settings - Use /agentic <option> [value]]", 'info'), file=sys.stderr)
-        print("  Subcommands: on, off, full, auto, sandbox, verbose, thinking, trace, log, lazytool,", file=sys.stderr)
+        print("  Subcommands: on, off, full, auto, plan, sandbox, verbose, thinking, trace, log, lazytool,", file=sys.stderr)
         print("               iterations <N>, timeout <N>, heartbeattokens <N>, compactthreshold <v>, acl, status", file=sys.stderr)
         print(file=sys.stderr)
 
         settings = [
             ("agentic",    "Master toggle",             str(c.agentic_mode).lower()),
+            ("plan",       "Read-only planner (read/glob/list/fetch/diff/run)", str(c.plan_mode).lower()),
             ("auto",       "Skip destructive tool confirmation", str(c.auto_confirm).lower()),
             ("sandbox",    "Run tool subprocesses in container", self.executor.mode),
             ("verbose",    "Show raw model responses during ReAct", str(c.agentic_verbose).lower()),
@@ -8779,7 +9276,9 @@ class ChatLoop:
             send_tools_api = False
 
         tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
-        messages = [{'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs)}]
+        messages = [{'role': 'system', 'content': get_agentic_prompt(
+            self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
+            plan_mode=self.ctx.plan_mode)}]
         if len(self.messages) > 1:
             messages.extend(self.messages[1:])
 
@@ -8787,16 +9286,7 @@ class ChatLoop:
         if logger:
             logger.write(type="start", user_input=final_content)
 
-        openai_tools = []
-        for name, defn in AGENTIC_TOOL_DEFS.items():
-            openai_tools.append({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": defn["description"],
-                    "parameters": defn["parameters"]
-                }
-            })
+        openai_tools = self.tool_registry.openai_tools_spec()
 
         return messages, logger, openai_tools, send_tools_api
 
@@ -8890,13 +9380,21 @@ class ChatLoop:
         return {"observation": f"[{tool_name}] {timed_observation}", "raw": observation,
                 "success": result["success"], "cancelled": cancelled}
 
-    def _execute_tool_calls(self, tool_calls: list, last_tool_call: Optional[dict], iteration: int, logger: Optional['AgenticLogger'],
-                            messages: list, response_text: str, api_tool_calls: list) -> tuple:
+    def _execute_tool_calls(self, tool_calls: list, last_tool_call: Optional[dict],
+                            last_tool_count: int, iteration: int,
+                            logger: Optional['AgenticLogger'], messages: list,
+                            response_text: str, api_tool_calls: list) -> tuple:
         """Execute a list of tool calls, collecting observations.
+
+        Re-running the same tool can be legitimate, so the same-tool-loop guard
+        only aborts when the IDENTICAL call (name + arguments) is emitted
+        `AGENTIC_SAME_TOOL_MAX` times consecutively — e.g. a model stuck in a
+        loop. The streak resets whenever the call changes.
 
         Args:
             tool_calls: Normalized tool call list.
-            last_tool_call: Previous tool call (for same-tool-loop detection).
+            last_tool_call: Previous executed tool call (for same-tool-loop detection).
+            last_tool_count: Consecutive streak of `last_tool_call` so far.
             iteration: Current ReAct iteration.
             logger: Optional AgenticLogger.
             messages: The conversation list.
@@ -8904,24 +9402,33 @@ class ChatLoop:
             api_tool_calls: Native tool calls from the response.
 
         Returns:
-            (observations, raw_observations, abort_loop, last_tool_call, final_answer).
+            (observations, raw_observations, abort_loop, last_tool_call,
+             last_tool_count, final_answer).
         """
         observations = []
         raw_observations = []
         abort_loop = False
         final_answer = ""
-        for i, tool_call in enumerate(tool_calls):
+        for tool_call in tool_calls:
             tool_name = tool_call["tool"]
             tool_args = tool_call.get("arguments", {})
-
             current_call = (tool_name, json.dumps(tool_args, sort_keys=True))
-            if i == 0 and current_call == last_tool_call:
-                print(colorize("[Agentic] Same tool call repeated, breaking loop.", 'warning'), file=sys.stderr)
-                final_answer = "[Agentic: model stuck in tool loop]"
-                abort_loop = True
-                break
-            if i == 0:
-                last_tool_call = current_call
+
+            # Consecutive-call guard: allow repeats (e.g. re-running the same
+            # command), but abort if the identical call is emitted
+            # AGENTIC_SAME_TOOL_MAX times in a row.
+            if current_call == last_tool_call:
+                last_tool_count += 1
+                if last_tool_count >= AGENTIC_SAME_TOOL_MAX:
+                    print(colorize(
+                        f"\n[Agentic] Same tool call emitted {last_tool_count} times "
+                        "in a row, breaking loop.", 'warning'), file=sys.stderr)
+                    final_answer = "[Agentic: model stuck in tool loop]"
+                    abort_loop = True
+                    break
+            else:
+                last_tool_count = 1
+            last_tool_call = current_call
 
             exec = self._execute_single_tool(tool_name, tool_args, iteration, logger, messages)
             if exec["cancelled"]:
@@ -8933,7 +9440,7 @@ class ChatLoop:
             observations.append(exec["observation"])
             raw_observations.append(exec["raw"])
 
-        return observations, raw_observations, abort_loop, last_tool_call, final_answer
+        return observations, raw_observations, abort_loop, last_tool_call, last_tool_count, final_answer
 
     def _finalize_agentic_query(self, messages: list, final_answer: str, final_content: str,
                                 send_tools_api: bool, openai_tools: list,
@@ -9159,7 +9666,9 @@ class ChatLoop:
             tool_format = get_tool_format(self.ctx.model)
             include_tool_defs = tool_format != "openai"
             tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
-            reentry_messages = [{'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs)}]
+            reentry_messages = [{'role': 'system', 'content': get_agentic_prompt(
+                self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
+                plan_mode=self.ctx.plan_mode)}]
             if len(self.messages) > 1:
                 reentry_messages.extend(self.messages[1:])
             sync_kwargs = dict(get_inference_params(self.ctx.model))
@@ -9478,7 +9987,9 @@ class ChatLoop:
         if send_tools_api and check_tools_error(response):
             send_tools_api = False
             tool_defs_block = self.tool_registry.get_system_prompt_block()
-            messages[0] = {'role': 'system', 'content': get_agentic_prompt(self.ctx.model, tool_defs_block, include_tool_defs=True)}
+            messages[0] = {'role': 'system', 'content': get_agentic_prompt(
+                self.ctx.model, tool_defs_block, include_tool_defs=True,
+                plan_mode=self.ctx.plan_mode)}
             print(colorize("\n[WARNING] Model does not support native tools API. Falling back to inline tool definitions.", 'warning'), file=sys.stderr)
             return "tools", "", send_tools_api
         return "ok", "", send_tools_api
@@ -9574,6 +10085,7 @@ class ChatLoop:
             max_iterations = self.ctx.agentic_max_iterations
             final_answer = ""
             last_tool_call = None
+            last_tool_count = 0
             step_timeout = self.ctx.agentic_step_timeout
             response_text = ""
             api_error = ""
@@ -9595,6 +10107,8 @@ class ChatLoop:
                     sync_kwargs["no_thinking"] = True
                 if self.ctx.reasoning_effort:
                     sync_kwargs["reasoning_effort"] = self.ctx.reasoning_effort
+                step_usage = []
+                sync_kwargs["usage_out"] = step_usage
                 on_chunk, finalize_step, step_buf = self._make_agentic_step_feedback()
                 step_cancel = {"event": threading.Event(), "close": None}
 
@@ -9625,6 +10139,18 @@ class ChatLoop:
                                      '_system_nudge': True})
                     continue
 
+                # Per-step stats in the chat-mode format: time, prefill/think/
+                # answer rates, and the growing context size — so the user can
+                # interrupt (^C) before the context runs away. Server-reported
+                # timings flow out via `step_usage`; `ctx.update_stats` is
+                # intentionally NOT called (cumulative /stats only counts the
+                # final answer stream, unchanged).
+                stats = self.query_handler.calculate_stats(
+                    time.time() - step_start, response_text,
+                    step_usage[0] if step_usage else None, messages,
+                    thought=step_buf.get("thought", ""))
+                self.query_handler.print_stats_display(stats)
+
                 if response_text and self._is_stuck(response_text):
                     print(colorize("\n[Agentic] Model appears stuck (repetitive output), aborting.", 'warning'), file=sys.stderr)
                     break
@@ -9640,8 +10166,8 @@ class ChatLoop:
                     self.ctx.agentic_consecutive_timeouts = 0
                     break
 
-                observations, raw_observations, abort_loop, last_tool_call, tool_final = self._execute_tool_calls(
-                    tool_calls, last_tool_call, iteration, logger, messages, response_text, api_tool_calls
+                observations, raw_observations, abort_loop, last_tool_call, last_tool_count, tool_final = self._execute_tool_calls(
+                    tool_calls, last_tool_call, last_tool_count, iteration, logger, messages, response_text, api_tool_calls
                 )
                 if tool_calls:
                     self.ctx.agentic_has_executed_tool = True

@@ -99,10 +99,16 @@ spawnshell are disabled when unavailable.
 | `patch` | Apply unified diff |
 | `edit_file` | Precise string replacement |
 | `apply_patch` | Apply diff with file headers |
+| `kubernetes_cluster_query` | Read-only OpenShift/Kubernetes cluster consultation (online `oc`/`kubectl`, offline `omc` must-gather) |
 
-Subcommands: `/agentic auto`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `iterations <N>`, `timeout <N>`.
+Subcommands: `/agentic auto`, `plan`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `iterations <N>`, `timeout <N>`.
 
-Safety features: destructive tool confirmation, path ACL (see below), shell approval gate, step timeout (default 300s), stuck detection, same-tool-loop abort, optional container sandbox (podman/docker).
+`/agentic plan` enables read-only planner mode: the tool surface is restricted to
+`read_file`, `glob`, `list_directory`, `fetch_url`, `diff`, `run_command`, and
+`run_command` always asks for confirmation (bypass-immune) — the model inspects
+and plans without ever mutating anything.
+
+Safety features: destructive tool confirmation, path ACL (see below), shell approval gate, step timeout (default 300s), stuck detection, same-tool-loop abort (after 10 consecutive identical calls), optional container sandbox (podman/docker).
 
 ### Access Control (Path ACL)
 

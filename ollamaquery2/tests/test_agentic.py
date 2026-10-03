@@ -194,6 +194,75 @@ class TestToolRegistry(unittest.TestCase):
         self.assertIn("run_python", block)
         self.assertNotIn("JSON tool call", block)  # format reminders are in format blocks now
 
+    def test_plan_mode_restricts_system_prompt_block(self):
+        self.ctx.plan_mode = True
+        try:
+            block = self.reg.get_system_prompt_block()
+            self.assertIn("read_file", block)
+            self.assertIn("run_command", block)
+            self.assertIn("list_directory", block)
+            self.assertIn("glob", block)
+            self.assertIn("fetch_url", block)
+            self.assertIn("diff", block)
+            self.assertNotIn("write_file", block)
+            self.assertNotIn("run_python", block)
+            self.assertNotIn("apply_patch", block)
+        finally:
+            self.ctx.plan_mode = False
+
+    def test_plan_mode_openai_tools_spec_restricted(self):
+        self.ctx.plan_mode = True
+        try:
+            spec = self.reg.openai_tools_spec()
+            names = {t["function"]["name"] for t in spec}
+            self.assertEqual(names, q.PLAN_MODE_TOOLS)
+        finally:
+            self.ctx.plan_mode = False
+
+    def test_plan_mode_denies_write_tools(self):
+        """Execution backstop: hidden write tools are denied even if called."""
+        self.ctx.plan_mode = True
+        try:
+            result = self.reg.execute("write_file", {"file_path": "x.txt", "content": "x"})
+            self.assertFalse(result["success"])
+            self.assertIn("read-only plan mode", result["error"])
+            result = self.reg.execute("run_python", {"code": "print(1)"})
+            self.assertFalse(result["success"])
+            self.assertIn("read-only plan mode", result["error"])
+        finally:
+            self.ctx.plan_mode = False
+
+    def test_plan_mode_allows_read_tools(self):
+        cwd = os.getcwd()
+        testfile = os.path.join(cwd, ".agentic_test_read.tmp")
+        self.ctx.plan_mode = True
+        try:
+            with open(testfile, "w") as f:
+                f.write("plan hello")
+            result = self.reg.execute("read_file", {"file": ".agentic_test_read.tmp"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn("plan hello", result["output"])
+            result = self.reg.execute("list_directory", {"path": "."})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            result = self.reg.execute("glob", {"pattern": "*.py"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+        finally:
+            self.ctx.plan_mode = False
+            if os.path.exists(testfile):
+                os.unlink(testfile)
+
+    def test_plan_mode_run_command_always_confirms(self):
+        """run_command must prompt even with auto_confirm (bypass-immune)."""
+        self.ctx.plan_mode = True
+        self.ctx.auto_confirm = True
+        try:
+            with patch("builtins.input", return_value="n"):
+                result = self.reg.execute("run_command", {"command": "echo plan-test"})
+            self.assertFalse(result["success"])
+            self.assertIn("Cancelled by user", result["error"])
+        finally:
+            self.ctx.plan_mode = False
+
     def test_read_file(self):
         """Test reading a file within CWD."""
         cwd = os.getcwd()
@@ -914,6 +983,35 @@ class TestReActLoopUnit(unittest.TestCase):
         self.assertEqual(last["role"], "assistant")
         self.assertIn("successfully", last["content"])
 
+    def test_step_stats_line_printed(self):
+        """Each ReAct step prints a chat-mode stats line (time, rates, context)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                calls = [
+                    self._make_sync_response(
+                        '{"tool": "write_file", "arguments": {"file": "hello.txt", "content": "world"}}'
+                    ),
+                    self._make_sync_response("The file was written successfully."),
+                ]
+                call_idx = [0]
+
+                def mock_sync(*args, **kwargs):
+                    idx = call_idx[0]
+                    call_idx[0] += 1
+                    return calls[idx] if idx < len(calls) else self._make_sync_response("done")
+
+                self.loop.query_handler.query_sync_stream = mock_sync
+                self.loop.query_handler.query_stream = MagicMock(return_value="The file was written successfully.")
+                err = io.StringIO()
+                with patch("sys.stderr", err):
+                    self.loop.run_agentic_query("Create a file with hello world")
+                self.assertIn("Stats:", err.getvalue())
+                self.assertIn("Context:", err.getvalue())
+            finally:
+                os.chdir(old_cwd)
+
     def test_tool_call_cancelled_aborts(self):
         """When user cancels a destructive tool, the loop aborts cleanly."""
         self.ctx.auto_confirm = False  # Re-enable confirmation
@@ -1395,6 +1493,269 @@ class TestLazyToolMode(unittest.TestCase):
         self.assertEqual(result["tool"], "run_command")
 
 
+class TestSameToolLoopGuard(unittest.TestCase):
+    """Same-tool-loop guard: repeats are allowed, abort only after N in a row."""
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.loop = object.__new__(q.ChatLoop)
+        self.loop.ctx = self.ctx
+        self.loop._execute_single_tool = MagicMock(return_value={
+            "observation": "[read_file] ok", "raw": "ok",
+            "success": True, "cancelled": False})
+
+    def _call(self, n=1, last=None, count=0):
+        calls = [{"tool": "read_file", "arguments": {"file_path": "x.txt"}} for _ in range(n)]
+        return self.loop._execute_tool_calls(calls, last, count, 1, None, [], "", [])
+
+    def test_single_repeat_is_allowed(self):
+        """Two identical calls across two batches run fine (streak carries to 2)."""
+        obs, raw, abort, last, count, final = self._call(n=1)
+        self.assertFalse(abort)
+        self.assertEqual(count, 1)
+        obs, raw, abort, last, count, final = self._call(n=1, last=last, count=count)
+        self.assertFalse(abort)
+        self.assertEqual(count, 2)
+        self.assertEqual(final, "")
+
+    def test_loop_aborts_at_max_in_single_batch(self):
+        """AGENTIC_SAME_TOOL_MAX identical calls: 9 run, the 10th is blocked."""
+        obs, raw, abort, last, count, final = self._call(n=q.AGENTIC_SAME_TOOL_MAX)
+        self.assertTrue(abort)
+        self.assertEqual(final, "[Agentic: model stuck in tool loop]")
+        self.assertEqual(count, q.AGENTIC_SAME_TOOL_MAX)
+        self.assertEqual(len(obs), q.AGENTIC_SAME_TOOL_MAX - 1)
+
+    def test_loop_aborts_across_batches(self):
+        """The streak carries across _execute_tool_calls invocations."""
+        obs, raw, abort, last, count, final = self._call(n=1)
+        self.assertFalse(abort)
+        self.assertEqual(count, 1)
+        obs, raw, abort, last, count, final = self._call(n=q.AGENTIC_SAME_TOOL_MAX - 1, last=last, count=count)
+        self.assertTrue(abort)
+        self.assertEqual(count, q.AGENTIC_SAME_TOOL_MAX)
+
+    def test_streak_resets_when_args_change(self):
+        """A, A, B (different args) resets the streak on B — never aborts."""
+        a1 = {"tool": "read_file", "arguments": {"file_path": "a.txt"}}
+        b = {"tool": "read_file", "arguments": {"file_path": "b.txt"}}
+        calls = [a1, a1, b]
+        obs, raw, abort, last, count, final = self.loop._execute_tool_calls(
+            calls, None, 0, 1, None, [], "", [])
+        self.assertFalse(abort)
+        self.assertEqual(count, 1)
+        self.assertEqual(len(obs), 3)
+
+    def test_streak_resets_on_different_tool(self):
+        """A, A, B(tool), A keeps count per consecutive run — no false abort."""
+        a = {"tool": "read_file", "arguments": {"file_path": "a.txt"}}
+        b = {"tool": "list_directory", "arguments": {"path": "."}}
+        calls = [a, a, b, a]
+        obs, raw, abort, last, count, final = self.loop._execute_tool_calls(
+            calls, None, 0, 1, None, [], "", [])
+        self.assertFalse(abort)
+        self.assertEqual(count, 1)
+        self.assertEqual(len(obs), 4)
+
+
+class TestClusterQueryTool(unittest.TestCase):
+    """kubernetes_cluster_query tool: verb whitelist, backend auto-detect, command build."""
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.auto_confirm = True
+        self.reg = q.ToolRegistry(ctx=self.ctx)
+        self.commands = []
+        self.reg.executor.run = MagicMock(side_effect=self._fake_run)
+
+    def _fake_run(self, command, timeout=120):
+        self.commands.append(command)
+        if "current-context" in command:
+            return {"stdout": "api.cluster.example\n", "stderr": "", "returncode": 0}
+        return {"stdout": "NAME READY\npod/a 1/1 Running\n", "stderr": "", "returncode": 0}
+
+    def _run(self, **args):
+        return self.reg.execute("kubernetes_cluster_query", args)
+
+    def test_unknown_verb_rejected(self):
+        result = self._run(verb="delete")
+        self.assertFalse(result["success"])
+        self.assertIn("Unsupported verb", result["error"])
+
+    def test_bad_output_rejected(self):
+        result = self._run(verb="get", resource="pods", output="xml")
+        self.assertFalse(result["success"])
+        self.assertIn("output format", result["error"])
+
+    def test_resource_required(self):
+        result = self._run(verb="get")
+        self.assertFalse(result["success"])
+        self.assertIn("resource is required", result["error"])
+
+    def test_auto_kubeconfig_uses_oc(self):
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="get", resource="pods", namespace="default")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertTrue(self.commands[0].startswith("oc config current-context"))
+        self.assertTrue(self.commands[1].startswith("oc get pods -n default -o json"))
+        self.assertIn("platform: oc", result["output"])
+        self.assertIn("context: api.cluster.example", result["output"])
+
+    def test_auto_no_kubeconfig_offline_when_omc_configured(self):
+        with patch.dict(os.environ, {"KUBECONFIG": ""}, clear=False), \
+             patch.object(q.shutil, "which",
+                          side_effect=lambda c: f"/usr/bin/{c}" if c == "omc" else None), \
+             patch.object(q.os.path, "exists", return_value=True):
+            result = self._run(verb="get", resource="pods")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertTrue(self.commands[0].startswith("omc get pods -o json"))
+        self.assertIn("platform: omc", result["output"])
+
+    def test_omc_explicit_dir_runs_use(self):
+        with patch.object(q.shutil, "which", return_value="/usr/bin/omc"):
+            result = self._run(cluster_type="omc", verb="get", resource="pods",
+                               offline_dir="/tmp/mg")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertEqual(self.commands[0], "omc use /tmp/mg")
+        self.assertTrue(self.commands[1].startswith("omc get pods"))
+        self.assertIn("must-gather: /tmp/mg", result["output"])
+
+    def test_omc_config_fallback_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "omc.json")
+            with open(cfg, "w") as f:
+                json.dump({"must_gather_dir": "/tmp/mg"}, f)
+            with patch.object(q.shutil, "which", return_value="/usr/bin/omc"), \
+                 patch.object(q, "OMC_CONFIG_PATH", cfg):
+                result = self._run(cluster_type="omc", verb="logs",
+                                   resource="pod/mypod", tail=20)
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertEqual(self.commands[0], "omc use /tmp/mg")
+            self.assertTrue(self.commands[1].startswith("omc logs pod/mypod --tail=20"))
+            self.assertIn("must-gather: /tmp/mg", result["output"])
+
+    def test_omc_without_any_dir_errors(self):
+        with patch.object(q.shutil, "which", return_value="/usr/bin/omc"), \
+             patch.object(q, "OMC_CONFIG_PATH", "/nonexistent/omc.json"):
+            result = self._run(cluster_type="omc", verb="get", resource="pods")
+        self.assertFalse(result["success"])
+        self.assertIn("must-gather dir", result["error"])
+
+    def test_current_context_verb(self):
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="current-context")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertEqual(self.commands[0], "oc config current-context")
+        self.assertIn("context: api.cluster.example", result["output"])
+
+    def test_events_verb_and_plan_mode_allowed(self):
+        self.assertIn("kubernetes_cluster_query", q.PLAN_MODE_TOOLS)
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="events", namespace="default")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertTrue(self.commands[1].startswith("oc get events -n default -o json"))
+
+    def test_large_result_spilled_to_file(self):
+        """Results over the threshold spill to a per-query file; read_file can page it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            spill_dir = os.path.join(tmp, "spill")
+            spill_file = os.path.join(spill_dir, "cluster_result_get_pods.json")
+            with patch.object(q, "CLUSTER_SPILL_DIR", spill_dir), \
+                 patch.object(q.shutil, "which", return_value="/usr/bin/omc"):
+                big = "PV-ITEM-7f3a9c\n" * 5000  # ~65KB, well over the spill threshold
+                def fake_run(command, timeout=120):
+                    if "omc get" in command:
+                        return {"stdout": big, "stderr": "", "returncode": 0}
+                    return {"stdout": "", "stderr": "", "returncode": 0}
+                self.reg.executor.run = MagicMock(side_effect=fake_run)
+                result = self._run(cluster_type="omc", verb="get", resource="pods",
+                                   offline_dir="/tmp/mg")
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn(spill_file, result["output"])
+            self.assertIn("chars", result["output"])
+            self.assertIn("lines", result["output"])
+            # No payload inline — the observation is a pure pointer + counts, so the
+            # content is not fed into context twice (only via read_file paging).
+            self.assertNotIn("PV-ITEM", result["output"])
+            self.assertLess(len(result["output"]), 600)
+            with open(spill_file) as f:
+                self.assertEqual(f.read(), big)
+            # read_file can now page the spill file (session ACL allow was added)
+            rd = self.reg.execute("read_file", {"file_path": spill_file})
+            self.assertTrue(rd["success"], msg=rd.get("error"))
+            self.assertIn("PV-ITEM", rd["output"])
+
+    def test_scoped_spill_filenames_do_not_clobber(self):
+        """Different resources spill to different files, so paging isn't clobbered."""
+        with tempfile.TemporaryDirectory() as tmp:
+            spill_dir = os.path.join(tmp, "spill")
+            with patch.object(q, "CLUSTER_SPILL_DIR", spill_dir), \
+                 patch.object(q.shutil, "which", return_value="/usr/bin/omc"):
+                big_pv = "PV-ITEM-A\n" * 5000
+                big_pvc = "PVC-ITEM-B\n" * 5000
+                def fake_run(command, timeout=120):
+                    if "omc get" in command and "persistentvolumes" in command:
+                        return {"stdout": big_pv, "stderr": "", "returncode": 0}
+                    if "omc get" in command and "persistentvolumeclaims" in command:
+                        return {"stdout": big_pvc, "stderr": "", "returncode": 0}
+                    return {"stdout": "", "stderr": "", "returncode": 0}
+                self.reg.executor.run = MagicMock(side_effect=fake_run)
+                r_pv = self._run(cluster_type="omc", verb="get", resource="persistentvolumes",
+                                 offline_dir="/tmp/mg")
+                r_pvc = self._run(cluster_type="omc", verb="get", resource="persistentvolumeclaims",
+                                  offline_dir="/tmp/mg")
+            self.assertTrue(r_pv["success"] and r_pvc["success"])
+            pv_file = os.path.join(spill_dir, "cluster_result_get_persistentvolumes.json")
+            pvc_file = os.path.join(spill_dir, "cluster_result_get_persistentvolumeclaims.json")
+            self.assertIn(pv_file, r_pv["output"])
+            self.assertIn(pvc_file, r_pvc["output"])
+            with open(pv_file) as f:
+                self.assertEqual(f.read(), big_pv)
+            with open(pvc_file) as f:
+                self.assertEqual(f.read(), big_pvc)
+
+    def test_custom_columns_output(self):
+        """output=custom-columns builds -o custom-columns=<fields>."""
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="get", resource="pv",
+                               output="custom-columns",
+                               fields="NAME:.metadata.name,SIZE:.spec.capacity.storage")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertTrue(self.commands[1].startswith(
+            "oc get pv -o custom-columns=NAME:.metadata.name,SIZE:.spec.capacity.storage"))
+
+    def test_custom_columns_requires_fields(self):
+        result = self._run(verb="get", resource="pv", output="custom-columns")
+        self.assertFalse(result["success"])
+        self.assertIn("fields is required", result["error"])
+
+    def test_jsonpath_output(self):
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="get", resource="pv", output="jsonpath",
+                               fields="{.items[*].metadata.name}")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertTrue(self.commands[1].startswith(
+            "oc get pv -o jsonpath={.items[*].metadata.name}"))
+
+    def test_jsonpath_requires_fields(self):
+        result = self._run(verb="get", resource="pv", output="jsonpath")
+        self.assertFalse(result["success"])
+        self.assertIn("fields is required", result["error"])
+
+    def test_small_result_stays_inline(self):
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="get", resource="pods")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertNotIn("written to", result["output"])
+        self.assertIn("pod/a 1/1 Running", result["output"])
+
+
 class TestComposableSystemPrompt(unittest.TestCase):
     """Test the composable agentic system prompt blocks."""
 
@@ -1445,6 +1806,77 @@ class TestComposableSystemPrompt(unittest.TestCase):
         prompt = q.get_agentic_prompt("test-model")
         self.assertIn("Mirror the user's language", prompt)
         self.assertIn("Be precise with file paths", prompt)
+
+    def test_get_agentic_prompt_plan_mode_includes_plan_block(self):
+        prompt = q.get_agentic_prompt("test-model", plan_mode=True)
+        self.assertIn("Read-only planning mode", prompt)
+        self.assertIn("READ-ONLY", prompt)
+        self.assertIn("Do NOT execute the plan yourself", prompt)
+        self.assertIn("Mirror the user's language", prompt)  # rules block still present
+
+    def test_get_agentic_prompt_plan_mode_absent_by_default(self):
+        prompt = q.get_agentic_prompt("test-model")
+        self.assertNotIn("Read-only planning mode", prompt)
+
+    def test_get_agentic_prompt_plan_mode_for_native_models(self):
+        """Native-tools models must keep the function-calling format AND get the plan block."""
+        prompt = q.get_agentic_prompt("qwen3:8b", plan_mode=True)
+        self.assertIn("function-calling interface", prompt)
+        self.assertIn("Read-only planning mode", prompt)
+
+
+class TestAgenticPlanCommand(unittest.TestCase):
+    """Test the /agentic plan command handler (read-only planning mode)."""
+
+    def setUp(self):
+        ctx = q.CommandContext()
+        ctx.plan_mode = False
+        ctx.agentic_mode = False
+
+    def tearDown(self):
+        ctx = q.CommandContext()
+        ctx.plan_mode = False
+        ctx.agentic_mode = False
+
+    def _loop(self):
+        loop = object.__new__(q.ChatLoop)
+        loop.ctx = q.CommandContext()
+        return loop
+
+    def test_plan_on_sets_plan_mode_and_agentic(self):
+        loop = self._loop()
+        self.assertFalse(loop._agentic_toggle_plan(['/agentic', 'plan']))
+        self.assertTrue(loop.ctx.plan_mode)
+        self.assertTrue(loop.ctx.agentic_mode)
+        self.assertIn("Read-only planning mode", loop.ctx.system_prompt)
+
+    def test_plan_off_restores_previous_agentic_mode(self):
+        loop = self._loop()
+        loop.ctx.agentic_mode = True
+        loop._agentic_toggle_plan(['/agentic', 'plan'])
+        loop._agentic_toggle_plan(['/agentic', 'plan', 'off'])
+        self.assertFalse(loop.ctx.plan_mode)
+        self.assertTrue(loop.ctx.agentic_mode)
+
+    def test_plan_off_from_normal_restores_off(self):
+        loop = self._loop()
+        loop.ctx.agentic_mode = False
+        loop._agentic_toggle_plan(['/agentic', 'plan'])
+        loop._agentic_toggle_plan(['/agentic', 'plan', 'off'])
+        self.assertFalse(loop.ctx.plan_mode)
+        self.assertFalse(loop.ctx.agentic_mode)
+
+    def test_plan_off_when_not_active(self):
+        loop = self._loop()
+        self.assertFalse(loop._agentic_toggle_plan(['/agentic', 'plan', 'off']))
+        self.assertFalse(loop.ctx.plan_mode)
+
+    def test_run_handle_agentic_dispatches_plan(self):
+        loop = self._loop()
+        self.assertFalse(loop.run_handle_agentic('/agentic plan'))
+        self.assertTrue(loop.ctx.plan_mode)
+        loop.run_handle_agentic('/agentic plan off')
+        self.assertFalse(loop.ctx.plan_mode)
 
 
 if __name__ == "__main__":
