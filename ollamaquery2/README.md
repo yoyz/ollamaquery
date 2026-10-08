@@ -98,6 +98,7 @@ spawnshell are disabled when unavailable.
 | `write_file` | Write file |
 | `list_directory` | List directory contents |
 | `glob` | Find files by pattern |
+| `grep` | Search file contents with a regex (case-insensitive by default, optional path + include glob) |
 | `run_python` | Execute Python 3 code |
 | `run_command` | Execute shell command (120s timeout) |
 | `diff` | Unified diff between files |
@@ -109,9 +110,9 @@ spawnshell are disabled when unavailable.
 Subcommands: `/agentic auto`, `plan`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `iterations <N>`, `timeout <N>`.
 
 `/agentic plan` enables read-only planner mode: the tool surface is restricted to
-`read_file`, `glob`, `list_directory`, `fetch_url`, `diff`, `run_command`, and
-`run_command` always asks for confirmation (bypass-immune) — the model inspects
-and plans without ever mutating anything.
+`read_file`, `glob`, `grep`, `list_directory`, `fetch_url`, `diff`, `run_command`,
+and `kubernetes_cluster_query`; `run_command` always asks for confirmation
+(bypass-immune) — the model inspects and plans without ever mutating anything.
 
 Safety features: destructive tool confirmation, path ACL (see below), shell approval gate, step timeout (default 300s), stuck detection, same-tool-loop abort (after 10 consecutive identical calls), optional container sandbox (podman/docker).
 

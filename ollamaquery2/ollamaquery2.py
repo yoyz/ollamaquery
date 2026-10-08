@@ -29,6 +29,7 @@ import traceback
 import glob
 import difflib
 import unicodedata
+import fnmatch
 from datetime import datetime
 
 from html.parser import HTMLParser
@@ -147,6 +148,9 @@ MAX_CONTEXT_SIZE = 4192000  # 4M tokens maximum limit (prevent OOM)
 MAX_READ_FILE_SIZE = 102400    # 100KB max per agentic read_file page
 MAX_READ_LINES = 2000          # max lines per agentic read_file page
 MAX_READ_LINE_LENGTH = 2000    # per-line truncation in read_file pages
+MAX_GREP_RESULTS = 100         # max matches returned per grep tool call
+MAX_GREP_LINE_LENGTH = 500     # per-line truncation in grep results
+GREP_SEARCH_TIMEOUT = 30       # seconds before a grep/rg subprocess is killed
 MAX_WRITE_FILE_SIZE = 1048576  # 1MB max for agentic write_file tool
 MAX_FILE_INCLUSION_SIZE = 5 * 1024 * 1024  # 5MB max for @file inclusions
 DEFAULT_OLLAMA_HOST    = 'http://127.0.0.1:11434'
@@ -2103,7 +2107,7 @@ AGENTIC_PLAN_BLOCK = """## Read-only planning mode
 You are operating in READ-ONLY PLANNING MODE. Your job is to INSPECT and PLAN, never to change anything.
 
 - You MUST NOT modify, create, delete, move, or overwrite any files, and you MUST NOT change any system state.
-- Only use the tools available to you to read and inspect: read_file, list_directory, glob, fetch_url, diff, and run_command.
+- Only use the tools available to you to read and inspect: read_file, list_directory, glob, grep, fetch_url, diff, kubernetes_cluster_query, and run_command.
 - For run_command, only issue read-only inspection commands (e.g. ls, cat, head, git status, git diff, ps, grep, find). The user is asked to confirm every command before it runs.
 - Never attempt write_file, run_python, patch, edit_file, or apply_patch — they are disabled in this mode.
 - When you have gathered enough information, present a clear, step-by-step plan to the user. Do NOT execute the plan yourself."""
@@ -3479,6 +3483,20 @@ AGENTIC_TOOL_DEFS = {
             "required": ["pattern"]
         }
     },
+    "grep": {
+        "description": "Search file contents with a regex and return matches grouped by file with line numbers. Optionally restrict to a path and an include glob (e.g. '*.md'). Case-insensitive by default (pass case_insensitive=false for exact case). Returns up to max_results matches (default 100); when the cap is hit, narrow the pattern/path/include or pass a higher max_results. Path relative to CWD; searching outside CWD (e.g. /etc, home dotfiles) may prompt for approval. Direct content search, NOT a shell command — never wrap the pattern in shell metacharacters.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Regex to search for in file contents"},
+                "path": {"type": "string", "description": "Directory or single file to search (default: '.')"},
+                "include": {"type": "string", "description": "Glob to restrict which files to search (e.g. '*.md', '*.{ts,tsx}')"},
+                "case_insensitive": {"type": "boolean", "description": "Match case-insensitively (default: true)"},
+                "max_results": {"type": "integer", "description": "Maximum matches to return (default 100, max 100)"}
+            },
+            "required": ["pattern"]
+        }
+    },
     "run_python": {
         "description": "Execute Python 3 code (inline or from a file). Returns stdout/stderr. Default timeout: 10s, max: 300s.",
         "parameters": {
@@ -3570,13 +3588,13 @@ AGENTIC_TOOL_DEFS = {
 DESTRUCTIVE_TOOLS = {"write_file", "run_python", "run_command", "patch", "edit_file", "apply_patch"}
 
 # Read-only planning mode (/agentic plan) tool surface. The model may only
-# inspect: read files, search, list directories, fetch URLs, diff files, run
-# shell commands that always ask for confirmation before executing, and query a
-# Kubernetes/OpenShift cluster read-only. Everything else (write_file,
-# run_python, patch, edit_file, apply_patch) is hidden from the prompt/tools API
-# AND denied at the execution backstop.
-PLAN_MODE_TOOLS = {"read_file", "glob", "list_directory", "fetch_url", "diff",
-                   "run_command", "kubernetes_cluster_query"}
+# inspect: read files, search path/contents (glob + grep), list directories,
+# fetch URLs, diff files, run shell commands that always ask for confirmation
+# before executing, and query a Kubernetes/OpenShift cluster read-only.
+# Everything else (write_file, run_python, patch, edit_file, apply_patch) is
+# hidden from the prompt/tools API AND denied at the execution backstop.
+PLAN_MODE_TOOLS = {"read_file", "glob", "grep", "list_directory", "fetch_url",
+                   "diff", "run_command", "kubernetes_cluster_query"}
 
 # Kubernetes / OpenShift read-only consultation (kubernetes_cluster_query tool).
 # cluster_type auto: KUBECONFIG env var set → online; else omc configured
@@ -3641,6 +3659,10 @@ AGENTIC_SAME_TOOL_MAX = 10
 def _tool_handle_fetch_url(self, args: dict) -> dict:
     """Fetch a URL and return its text content.
 
+    Surfacing failures: a blocked/unreachable URL returns success=False so the
+    agentic loop sees ERROR instead of silently treating "[Failed to fetch
+    URL: ...]" as real page content.
+
     Args:
         args: Tool arguments dict with "url".
 
@@ -3649,6 +3671,8 @@ def _tool_handle_fetch_url(self, args: dict) -> dict:
     """
     url = args["url"]
     text, _tool = fetch_and_convert_url(url)
+    if text.startswith("[Failed to fetch URL:"):
+        return {"success": False, "output": "", "error": text}
     return {"success": True, "output": text, "error": None}
 
 
@@ -4197,6 +4221,294 @@ def _tool_handle_glob(self, args: dict) -> dict:
         return {"success": True, "output": "\n".join(safe_matches), "error": None}
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
+
+
+def _grep_parse_match(line: str):
+    """Parse an rg/grep 'path:line:text' output line.
+
+    Args:
+        line: A raw match line from rg --no-heading or grep -n.
+
+    Returns:
+        (path, line_no, text) tuple, or None when unparsable.
+    """
+    try:
+        head, text = line.rsplit(":", 1)
+    except ValueError:
+        return None
+    try:
+        path_part, lno = head.rsplit(":", 1)
+        return path_part, int(lno), text
+    except ValueError:
+        return None
+
+
+def _grep_run_external(argv: list, cap: int, timeout: int) -> tuple:
+    """Run an rg/grep subprocess, capturing at most cap+1 matching lines.
+
+    Args:
+        argv: Raw argv list (no shell interpolation).
+        cap: Maximum matches to capture.
+        timeout: Hard wall-clock budget in seconds.
+
+    Returns:
+        (raw_lines, error|None). Error is set on timeout, spawn failure, or a
+        hard search-tool failure (exit >= 2, e.g. invalid regex).
+    """
+    raw = []
+    err = None
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace")
+    except (OSError, ValueError) as e:
+        return raw, f"could not start search tool: {e}"
+    deadline = time.monotonic() + timeout
+    try:
+        for line in proc.stdout:
+            if time.monotonic() > deadline:
+                err = f"search timed out after {timeout}s"
+                proc.terminate()
+                break
+            line = line.rstrip("\n")
+            if line:
+                raw.append(line)
+                if len(raw) > cap:
+                    proc.terminate()
+                    break
+    except Exception as e:
+        err = str(e)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    except Exception:
+        pass
+    stderr_tail = ""
+    if proc.stderr:
+        try:
+            stderr_tail = proc.stderr.read().strip()
+        except Exception:
+            stderr_tail = ""
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+    if err is None and proc.returncode not in (0, 1):
+        if stderr_tail:
+            err = stderr_tail.splitlines()[-1]
+        else:
+            err = f"search failed (exit {proc.returncode})"
+    return raw, err
+
+
+def _grep_parse_hits(raw: list, cap: int) -> tuple:
+    """Convert raw match lines into (path, line, text) hits, dropping blocked files.
+
+    Args:
+        raw: Raw 'path:line:text' lines from the search tool (may exceed cap).
+        cap: The configured match cap.
+
+    Returns:
+        (hits, truncated) tuple.
+    """
+    hits = []
+    for line in raw[:cap]:
+        parsed = _grep_parse_match(line)
+        if parsed is None:
+            continue
+        raw_path, lineno, text = parsed
+        try:
+            real = os.path.realpath(raw_path)
+        except (OSError, ValueError):
+            continue
+        if _is_blocked_system_file(real):
+            continue
+        hits.append((real, lineno, text))
+    return hits, len(raw) > cap
+
+
+def _grep_search_python(root: str, pattern: str, include: str, ci: bool, cap: int) -> tuple:
+    """Pure-Python fallback content search (rg/grep unavailable).
+
+    Args:
+        root: Directory or single file to search.
+        pattern: Regex pattern.
+        include: Optional basename glob filter.
+        ci: Case-insensitive flag.
+        cap: Maximum matches.
+
+    Returns:
+        ((path, line, text) hits, truncated, error|None).
+    """
+    try:
+        rx = re.compile(pattern, re.IGNORECASE if ci else 0)
+    except re.error as e:
+        return [], False, f"invalid regex: {e}"
+    targets = []
+    if os.path.isdir(root):
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in sorted(filenames):
+                if include and not fnmatch.fnmatch(name, include):
+                    continue
+                targets.append(os.path.join(dirpath, name))
+    else:
+        targets.append(root)
+    hits = []
+    for target in targets:
+        try:
+            real = os.path.realpath(target)
+            if _is_blocked_system_file(real):
+                continue
+            with open(target, "r", encoding="utf-8", errors="replace") as f:
+                for lineno, line in enumerate(f, 1):
+                    if rx.search(line.rstrip("\n")):
+                        hits.append((real, lineno, line.rstrip("\n")))
+                        if len(hits) >= cap:
+                            return hits, True, None
+        except (OSError, UnicodeError):
+            continue
+    return hits, False, None
+
+
+def _grep_search(root: str, pattern: str, include: str, ci: bool, cap: int) -> tuple:
+    """Search file contents, preferring ripgrep over grep over pure Python.
+
+    Args:
+        root: Directory or single file to search.
+        pattern: Regex pattern.
+        include: Optional glob file filter.
+        ci: Case-insensitive flag.
+        cap: Maximum matches.
+
+    Returns:
+        ((path, line, text) hits, truncated, error|None).
+    """
+    rg = shutil.which("rg")
+    single_file = os.path.isfile(root)
+    if rg:
+        argv = [rg, "-n", "--no-heading"]
+        if ci:
+            argv.append("-i")
+        if include:
+            argv += ["--glob", include]
+        if single_file:
+            # rg omits the "path:" prefix when searching a single file.
+            argv.append("--with-filename")
+        argv += ["--", pattern, root]
+        raw, err = _grep_run_external(argv, cap, GREP_SEARCH_TIMEOUT)
+        if err is None:
+            hits, truncated = _grep_parse_hits(raw, cap)
+            return hits, truncated, None
+    grep = shutil.which("grep")
+    if grep:
+        argv = ["grep", "-r", "-n", "-E", "-I"]
+        if ci:
+            argv.append("-i")
+        if include:
+            argv += [f"--include={include}"]
+        if single_file:
+            # grep -n alone prints "LINENUM:text" (no filename) for one file.
+            argv.append("-H")
+        argv += ["--", pattern, root]
+        raw, err = _grep_run_external(argv, cap, GREP_SEARCH_TIMEOUT)
+        if err is None:
+            hits, truncated = _grep_parse_hits(raw, cap)
+            return hits, truncated, None
+    return _grep_search_python(root, pattern, include, ci, cap)
+
+
+def _grep_display_path(path_abs: str) -> str:
+    """Show a match path relative to CWD when inside it, absolute otherwise.
+
+    Args:
+        path_abs: Realpath of a matched file.
+
+    Returns:
+        Display form of the path.
+    """
+    cwd_real = os.path.realpath(os.getcwd())
+    try:
+        if os.path.commonpath([cwd_real, path_abs]) == cwd_real:
+            return os.path.relpath(path_abs, cwd_real)
+    except ValueError:
+        pass
+    return path_abs
+
+
+def _grep_render(hits: list, truncated: bool, cap: int) -> str:
+    """Render hits opencode-style: grouped by file with line numbers.
+
+    Args:
+        hits: List of (path, line_no, text) tuples.
+        truncated: Whether results hit the cap.
+        cap: The configured match cap (for the truncation note).
+
+    Returns:
+        Formatted output string.
+    """
+    if not hits:
+        return "No files found"
+    lines = [f"Found {len(hits)} matches"]
+    current = None
+    for path_abs, lineno, text in hits:
+        if len(text) > MAX_GREP_LINE_LENGTH:
+            text = text[:MAX_GREP_LINE_LENGTH] + f" [+{len(text) - MAX_GREP_LINE_LENGTH} chars]"
+        shown = _grep_display_path(path_abs)
+        if current != shown:
+            if current is not None:
+                lines.append("")
+            current = shown
+            lines.append(f"{shown}:")
+        lines.append(f"  Line {lineno}: {text}")
+    if truncated:
+        lines.append("")
+        lines.append(f"(Results capped at {cap} matches. Narrow the pattern/path/include "
+                     f"or pass max_results={cap} for the same ceiling.)")
+    return "\n".join(lines)
+
+
+def _tool_handle_grep(self, args: dict) -> dict:
+    """Search file contents with a regex after a root-level path-ACL gate.
+
+    The ACL is consulted once for the search root (never per match), so a CWD
+    search is auto-allowed while a search rooted at e.g. /etc prompts once.
+    Matches are cap-bounded and per-line truncated before rendering.
+
+    Args:
+        args: Tool arguments with "pattern"; optional "path", "include",
+            "case_insensitive", "max_results".
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
+    pattern = args.get("pattern")
+    if not pattern:
+        return {"success": False, "output": "", "error": "pattern is required"}
+    raw = str(args.get("path", "") or ".")
+    ci = bool(args.get("case_insensitive", True))
+    try:
+        cap = int(args.get("max_results", MAX_GREP_RESULTS))
+    except (TypeError, ValueError):
+        cap = MAX_GREP_RESULTS
+    cap = max(1, min(cap, MAX_GREP_RESULTS))
+    include = args.get("include") or None
+
+    root, _allowed, _err = _resolve_tool_path(raw, allow_home=True)
+    ctx = self._ctx if self._ctx is not None else (CommandContext() if CommandContext._initialized else None)
+    decision, acl_err = _path_acl_decision(ctx, "read", os.path.realpath(root),
+                                           tool="grep", context=pattern, raw_path=raw)
+    if decision == "deny":
+        return {"success": False, "output": "", "error": acl_err or "Path traversal denied"}
+    if not os.path.lexists(root):
+        return {"success": False, "output": "", "error": f"Path not found: {raw}"}
+
+    hits, truncated, err = _grep_search(root, pattern, include, ci, cap)
+    if err:
+        return {"success": False, "output": "", "error": err}
+    return {"success": True, "output": _grep_render(hits, truncated, cap), "error": None}
 
 
 def _tool_handle_run_python(self, args: dict) -> dict:
@@ -5062,6 +5374,11 @@ TOOL_ARG_ALIASES = {
     "run_python": {"file_path": ["file", "path", "filename", "filepath"]},
     "run_command": {"command": ["cmd", "shell"]},
     "list_directory": {"path": ["directory", "dir"]},
+    "grep": {"pattern": ["regex", "search", "query", "re", "regexp"],
+             "path": ["directory", "dir", "root", "folder"],
+             "include": ["file_pattern", "include_pattern", "file_glob", "glob"],
+             "case_insensitive": ["ci", "insensitive", "ignore_case", "case"],
+             "max_results": ["limit", "count", "max", "results", "head"]},
     "edit_file": {"file_path": ["file", "path", "filename", "filepath"]},
     "apply_patch": {},
     "kubernetes_cluster_query": {"resource": ["kind", "type", "resource_type"],
@@ -5069,6 +5386,112 @@ TOOL_ARG_ALIASES = {
                                  "verb": ["action"],
                                  "fields": ["columns", "jsonpath_expr", "expr"]},
 }
+
+# curl/wget flags that keep a command a harmless read-only GET fetch (no body,
+# no method override, no output-to-disk, no auth). Anything outside this set
+# (or any `-o`/`-O`/`-d`/`-X`/pipe) disqualifies the command from being
+# auto-served by the fetch_url builtin.
+_CURL_SAFE_FLAGS = {"-s", "--silent", "-S", "--show-error", "-L", "--location",
+                    "-A", "--user-agent", "-H", "--header", "-g", "--globoff",
+                    "-k", "--insecure", "--compressed", "-N", "--no-buffer",
+                    "--max-time", "-t", "--tries"}
+_CURL_VALUE_FLAGS = {"-A", "--user-agent", "-H", "--header", "--max-time",
+                     "-t", "--tries"}
+# Single-char short flags with no value (e.g. -sL expands to -s -L).
+_CURL_SAFE_SINGLE = "sSLgkN"
+_SHELL_METACHARS = set(";&|<>`$")
+
+
+def _is_harmless_get_fetch(command: str) -> str:
+    """Detect a pure read-only GET fetch that the fetch_url builtin can serve.
+
+    Matches `curl`/`wget` fetching exactly one http(s) URL with only harmless
+    flags (no request method/body, no writing to disk, no pipes/redirection).
+    Everything else keeps run_command semantics.
+
+    Args:
+        command: The run_command argument string.
+
+    Returns:
+        The URL when the command is a harmless GET fetch, else empty string.
+    """
+    if not command or isinstance(command, (dict, list)):
+        return ""
+    if any(c in command for c in _SHELL_METACHARS):
+        return ""
+    try:
+        toks = shlex.split(command)
+    except ValueError:
+        return ""
+    if not toks:
+        return ""
+    prog = os.path.basename(toks[0])
+    if prog not in ("curl", "wget", "wget2"):
+        return ""
+    i = 1
+    url = ""
+    wget_stdout = False
+    while i < len(toks):
+        t = toks[i]
+        if prog.startswith("wget"):
+            if t in ("-q", "--quiet", "-nv", "--no-verbose", "-S", "--server-response"):
+                i += 1
+                continue
+            if t.startswith("--output-document="):
+                if t.split("=", 1)[1] == "-":
+                    wget_stdout = True
+                    i += 1
+                    continue
+                return ""
+            if t in ("-O", "--output-document"):
+                # wget writes files by default; only stdout (-O -) is side-effect free.
+                if i + 1 < len(toks) and toks[i + 1] == "-":
+                    wget_stdout = True
+                    i += 2
+                    continue
+                return ""
+            if t.startswith("--tries="):
+                i += 1
+                continue
+            if t in ("-t", "--tries"):
+                if i + 1 >= len(toks):
+                    return ""
+                i += 2
+                continue
+            if t.startswith("-"):
+                return ""
+        else:
+            if "=" in t and t.startswith("--"):
+                # Long option with inline value (--user-agent=UA).
+                if t.split("=", 1)[0] in _CURL_VALUE_FLAGS:
+                    i += 1
+                    continue
+            if t in _CURL_VALUE_FLAGS:
+                if i + 1 >= len(toks):
+                    return ""
+                i += 2
+                continue
+            if t in _CURL_SAFE_FLAGS:
+                i += 1
+                continue
+            if re.fullmatch(r"-[A-Za-z]+", t):
+                # Combined short flags (curl -sL == -s -L). Only side-effect-free
+                # single chars are allowed; value-taking short flags (-A/-H/-t)
+                # must appear as their own token so this rejects them.
+                if all(ch in _CURL_SAFE_SINGLE for ch in t[1:]):
+                    i += 1
+                    continue
+            if t.startswith("-"):
+                return ""
+        if url:
+            return ""  # more than one URL
+        if not t.startswith(("http://", "https://")):
+            return ""
+        url = t
+        i += 1
+    if prog.startswith("wget") and not wget_stdout:
+        return ""
+    return url
 
 class ToolRegistry:
     """Registers and executes agentic tools with confirmation support.
@@ -5095,6 +5518,7 @@ class ToolRegistry:
             "write_file": _tool_handle_write_file,
             "list_directory": _tool_handle_list_directory,
             "glob": _tool_handle_glob,
+            "grep": _tool_handle_grep,
             "run_python": _tool_handle_run_python,
             "run_command": _tool_handle_run_command,
             "diff": _tool_handle_diff,
@@ -5225,6 +5649,13 @@ class ToolRegistry:
                         if alias in args:
                             args[canonical] = args.pop(alias)
                             break
+        # A harmless read-only GET fetch (curl/wget hitting a URL) is served by
+        # the fetch_url builtin instead of the shell — no confirmation prompt,
+        # no side effects, and the model is nudged to use fetch_url directly.
+        if tool_name == "run_command":
+            fetch_url_arg = _is_harmless_get_fetch(args.get("command", ""))
+            if fetch_url_arg:
+                return self._serve_fetch_redirect(fetch_url_arg)
         if not self._confirm(tool_name, args):
             return {"success": False, "output": "", "error": "Cancelled by user"}
         try:
@@ -5233,6 +5664,25 @@ class ToolRegistry:
             return {"success": False, "output": "", "error": f"Missing required argument: {e}"}
         except Exception as e:
             return {"success": False, "output": "", "error": str(e)}
+
+    def _serve_fetch_redirect(self, url: str) -> dict:
+        """Serve a harmless GET fetch through the fetch_url builtin.
+
+        Args:
+            url: The URL the model asked curl/wget to fetch.
+
+        Returns:
+            Same shape as other tool handlers, with a steering note telling
+            the model to call fetch_url directly next time.
+        """
+        result = _tool_handle_fetch_url(self, {"url": url})
+        note = ("[run_command curl/wget GET auto-served by the fetch_url builtin — "
+                "use the fetch_url tool directly for network fetches.]")
+        if result["success"]:
+            result["output"] = f"{note}\n{result['output']}"
+        else:
+            result["error"] = f"{note}\n{result.get('error') or ''}"
+        return result
 
 
 # ============================================================================
@@ -7180,8 +7630,42 @@ def execute_os_command(command: str, timeout: Optional[int] = None) -> str:
     return f"\n[Command executed: `{command}`]\n```text\n{output.strip()}\n```\n"
 
 
+def _curl_fetch_text(url: str, timeout: int = 20) -> str:
+    """Fetch a URL via curl as a fallback when urllib is blocked.
+
+    Some sites (Red Hat docs, Akamai-fronted pages) reply 403 to urllib's
+    TLS/header fingerprint but serve curl a browser User-Agent fine. The
+    builtin should be as capable as a shell `curl`, so fetch_url tries this
+    rather than forcing the model to reach for run_command.
+
+    Args:
+        url: The URL to fetch.
+        timeout: Max seconds for curl.
+
+    Returns:
+        Decoded response body, or empty string when curl is unavailable/fails.
+    """
+    if shutil.which("curl") is None:
+        return ""
+    ua = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+    try:
+        proc = subprocess.run(
+            ["curl", "-sL", "--max-time", str(timeout), "-A", ua, url],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except (OSError, ValueError):
+        return ""
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return ""
+    return proc.stdout
+
+
 def fetch_and_convert_url(url: str) -> tuple:
     """Fetch URL and extract clean text using core standard libraries only.
+
+    Uses urllib first; when that is blocked (HTTP 4xx, timeout, empty body)
+    falls back to a curl subprocess with a browser User-Agent.
 
     Args:
         url: The URL to fetch.
@@ -7190,18 +7674,26 @@ def fetch_and_convert_url(url: str) -> tuple:
         (text, tool) tuple where tool is "htmlstrip" or "None".
     """
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    err = ""
     try:
         req = Request(url, headers=headers)
         with _request_with_retry(req, timeout=15) as response:
             charset = response.info().get_content_charset() or 'utf-8'
             html_content = response.read().decode(charset, errors='ignore')
-        if not html_content.strip():
-            return "", "None"
-        stripper = CoreHTMLStripper()
-        stripper.feed(html_content)
-        return stripper.get_text(), "htmlstrip"
+        if html_content.strip():
+            stripper = CoreHTMLStripper()
+            stripper.feed(html_content)
+            return stripper.get_text(), "htmlstrip"
+        err = "empty response body"
     except Exception as e:
-        return f"[Failed to fetch URL: {e}]", "None"
+        err = str(e)
+    # urllib blocked or empty — try curl (browser TLS/header fingerprint).
+    html = _curl_fetch_text(url)
+    if html:
+        stripper = CoreHTMLStripper()
+        stripper.feed(html)
+        return stripper.get_text(), "htmlstrip"
+    return f"[Failed to fetch URL: {err}]", "None"
 
 
 class CoreHTMLStripper(HTMLParser):
@@ -8204,12 +8696,12 @@ class ChatLoop:
         """Toggle read-only planning mode (/agentic plan [on|off]).
 
         Enabling forces agentic mode ON and restricts the tool surface to
-        PLAN_MODE_TOOLS (read_file, glob, list_directory, fetch_url, diff,
-        run_command) at all three layers: the system prompt block, the native
-        tools API schema, and the execution backstop. run_command always asks
-        for confirmation in plan mode, even with auto-confirm enabled
-        (bypass-immune). Disabling restores the agentic_mode that was active
-        before plan mode was enabled.
+        PLAN_MODE_TOOLS (read_file, glob, grep, list_directory, fetch_url, diff,
+        run_command, kubernetes_cluster_query) at all three layers: the system
+        prompt block, the native tools API schema, and the execution backstop.
+        run_command always asks for confirmation in plan mode, even with
+        auto-confirm enabled (bypass-immune). Disabling restores the
+        agentic_mode that was active before plan mode was enabled.
 
         Args:
             parts: Split /agentic args (parts[2] is "on"/"off" or omitted).
@@ -8243,7 +8735,7 @@ class ChatLoop:
         self.ctx._saved_system_prompt = self.ctx.system_prompt
         self.ctx.system_prompt = get_agentic_prompt(self.ctx.model, plan_mode=True)
         print(colorize("[Agentic plan mode: ON — read-only planner]", 'success'), file=sys.stderr)
-        print(colorize("[Tools restricted to: read_file, glob, list_directory, fetch_url, diff, run_command]", 'muted'), file=sys.stderr)
+        print(colorize("[Tools restricted to: read_file, glob, grep, list_directory, fetch_url, diff, run_command]", 'muted'), file=sys.stderr)
         print(colorize("[run_command will ask for confirmation before executing]", 'info'), file=sys.stderr)
         return False
 
@@ -9334,13 +9826,16 @@ class ChatLoop:
 
     @staticmethod
     def _cap_tool_observation(tool_name: str, observation: str, cap: int = 4000) -> str:
-        """Truncate a tool observation to fit the context, read_file pages excepted.
+        """Truncate a tool observation to fit the context, self-bounding tools excepted.
 
         `read_file` already bounds and paginates its own output and its header
         carries the `next` offset, so a blanket cap would silently drop the
-        continuation pointer and defeat chunked reads of large files.
+        continuation pointer and defeat chunked reads of large files. `grep`
+        self-bounds via max_results + per-line truncation, and a blanket cap
+        would eat the "(Results capped...)" note that tells the model to narrow
+        the search.
         """
-        if tool_name == "read_file":
+        if tool_name in ("read_file", "grep"):
             return observation
         if not observation:
             return observation

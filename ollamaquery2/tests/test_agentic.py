@@ -307,6 +307,242 @@ class TestToolRegistry(unittest.TestCase):
             if os.path.exists(testfile):
                 os.unlink(testfile)
 
+    def _grep_fixture(self):
+        """Create a temp CWD with fixture files, returning their dir path."""
+        import tempfile
+        tmpdir = tempfile.mkdtemp()
+        self._grep_old_cwd = os.getcwd()
+        os.chdir(tmpdir)
+        open("a.md", "w").write("Hello Storage nodes here\nno match\n")
+        os.mkdir("sub")
+        open(os.path.join("sub", "b.md"), "w").write("storageDeviceSets present\n")
+        open("notes.txt", "w").write("STORAGE NODES in txt\n")
+        return tmpdir
+
+    def _grep_cleanup(self):
+        if getattr(self, "_grep_old_cwd", None):
+            os.chdir(self._grep_old_cwd)
+
+    def test_grep_basic_case_insensitive_default(self):
+        """grep matches case-insensitively by default with include filter."""
+        self._grep_fixture()
+        try:
+            result = self.reg.execute("grep", {"pattern": "storage[ _-]?nodes|storageDeviceSets",
+                                               "include": "*.md"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn("Found 2 matches", result["output"])
+            self.assertIn("a.md:", result["output"])
+            self.assertIn("sub" + os.sep + "b.md:", result["output"])
+            self.assertIn("Line 1:", result["output"])
+            self.assertNotIn("notes.txt", result["output"])  # include=*.md excluded it
+        finally:
+            self._grep_cleanup()
+
+    def test_grep_case_sensitive(self):
+        """case_insensitive=false must not match a differently-cased substring."""
+        self._grep_fixture()
+        try:
+            result = self.reg.execute("grep", {"pattern": "Storage Nodes", "case_insensitive": False,
+                                               "include": "*.md"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertEqual("No files found", result["output"])
+            result = self.reg.execute("grep", {"pattern": "Storage nodes", "case_insensitive": False,
+                                               "include": "*.md"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn("Found 1 matches", result["output"])
+        finally:
+            self._grep_cleanup()
+
+    def test_grep_path_subdir_and_single_file(self):
+        """path can be a subdirectory or a single file."""
+        self._grep_fixture()
+        try:
+            result = self.reg.execute("grep", {"pattern": "storage", "path": "sub"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn("Found 1 matches", result["output"])
+            result = self.reg.execute("grep", {"pattern": "storage", "path": os.path.join("sub", "b.md")})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn("Found 1 matches", result["output"])
+            result = self.reg.execute("grep", {"pattern": "storage", "path": "notes.txt"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn("STORAGE", result["output"])
+        finally:
+            self._grep_cleanup()
+
+    def test_grep_no_match(self):
+        self._grep_fixture()
+        try:
+            result = self.reg.execute("grep", {"pattern": "zzz_nope"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertEqual("No files found", result["output"])
+        finally:
+            self._grep_cleanup()
+
+    def test_grep_alias_and_defaults(self):
+        """Argument aliases (regex/count) map to pattern/max_results."""
+        self._grep_fixture()
+        try:
+            result = self.reg.execute("grep", {"regex": "nodes", "count": 5})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn("Found 2 matches", result["output"])
+        finally:
+            self._grep_cleanup()
+
+    def test_grep_max_results_capped(self):
+        """Result cap: at most max_results matches plus a truncation note."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                for i in range(150):
+                    open(f"f{i}.txt", "w").write("SAME\n")
+                result = self.reg.execute("grep", {"pattern": "SAME"})
+                self.assertTrue(result["success"], msg=result.get("error"))
+                self.assertEqual(result["output"].count("Line 1:"), q.MAX_GREP_RESULTS)
+                self.assertIn("capped at", result["output"])
+            finally:
+                os.chdir(old_cwd)
+
+    def test_grep_invalid_regex(self):
+        self._grep_fixture()
+        try:
+            result = self.reg.execute("grep", {"pattern": "(unclosed"})
+            self.assertFalse(result["success"])
+            self.assertTrue(result["error"])
+        finally:
+            self._grep_cleanup()
+
+    def test_grep_acl_deny(self):
+        """A search rooted at a denied/ask path must fail without executing."""
+        result = self.reg.execute("grep", {"pattern": "x", "path": "/proc/1"})
+        self.assertFalse(result["success"])
+        self.assertIn("denied", result["error"])
+
+    def test_grep_missing_pattern_and_path(self):
+        result = self.reg.execute("grep", {})
+        self.assertFalse(result["success"])
+        self.assertIn("pattern is required", result["error"])
+        result = self.reg.execute("grep", {"pattern": "x", "path": "no_such_dir_xyz"})
+        self.assertFalse(result["success"])
+        self.assertIn("Path not found", result["error"])
+
+    def test_grep_plan_mode_allowed(self):
+        """grep is part of the read-only plan surface and runs without prompts."""
+        self._grep_fixture()
+        self.ctx.plan_mode = True
+        try:
+            result = self.reg.execute("grep", {"pattern": "storage", "include": "*.md"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn("Found", result["output"])
+        finally:
+            self.ctx.plan_mode = False
+            self._grep_cleanup()
+
+    def test_grep_pure_python_fallback(self):
+        """When rg and grep are both missing, the pure-Python backend still works."""
+        self._grep_fixture()
+        try:
+            with patch("ollamaquery2.shutil.which", return_value=None):
+                result = self.reg.execute("grep", {"pattern": "storage", "include": "*.md"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn("Found 2 matches", result["output"])
+        finally:
+            self._grep_cleanup()
+
+    def test_grep_cap_observation_exempt(self):
+        """grep results bypass the generic observation cap (self-bounding)."""
+        big = "x" * 9000
+        self.assertEqual(q.ChatLoop._cap_tool_observation("grep", big), big)
+
+    def test_harmless_get_fetch_detector(self):
+        """Only pure GET curl/wget with a single URL and no side effects match."""
+        ok = {
+            'curl -sL "https://example.com/a"': "https://example.com/a",
+            "curl -sSL -L https://x.y": "https://x.y",
+            "curl -A UA --max-time 5 https://x.y": "https://x.y",
+            "wget -q -O - https://x.y/z": "https://x.y/z",
+            "wget --quiet --output-document=- https://x.y": "https://x.y",
+        }
+        for cmd, url in ok.items():
+            self.assertEqual(q._is_harmless_get_fetch(cmd), url, cmd)
+        no = [
+            "curl -d a=1 https://x.y",             # POST body
+            "curl -o /tmp/a.html https://x.y",     # writes to disk
+            "curl -s https://x | grep foo",        # pipe
+            "curl -s https://x.y https://z",       # two URLs
+            "curl -X POST https://x.y",            # method override
+            "wget -q https://x.y",                 # wget writes files w/o -O -
+            "wget -O out.html https://x.y",        # output to file
+            "curl -s https://x.y ; echo hi",       # shell chaining
+            "grep foo bar.md", "", "rm -rf /",
+        ]
+        for cmd in no:
+            self.assertEqual(q._is_harmless_get_fetch(cmd), "", cmd)
+
+    def test_run_command_curl_get_redirects_to_fetch_url(self):
+        """A harmless GET curl in plan mode is served by fetch_url, no Y/N."""
+        self.ctx.plan_mode = True
+        self.ctx.auto_confirm = False  # would prompt if not redirected
+        try:
+            with patch("ollamaquery2.fetch_and_convert_url",
+                       return_value=("SERVED PAGES", "htmlstrip")):
+                result = self.reg.execute(
+                    "run_command", {"command": 'curl -sL "https://example.com"'})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn("fetch_url", result["output"])       # steering note
+            self.assertIn("SERVED PAGES", result["output"])    # actual content
+        finally:
+            self.ctx.plan_mode = False
+
+    def test_run_command_curl_failure_redirect(self):
+        """A redirected fetch still surfaces the failure instead of OK."""
+        self.ctx.plan_mode = True
+        try:
+            with patch("ollamaquery2.fetch_and_convert_url",
+                       return_value=("[Failed to fetch URL: HTTP Error 403: Forbidden]", "None")):
+                result = self.reg.execute(
+                    "run_command", {"command": "curl -s https://blocked.example"})
+            self.assertFalse(result["success"])
+            self.assertIn("fetch_url", result["error"])
+            self.assertIn("403", result["error"])
+        finally:
+            self.ctx.plan_mode = False
+
+    def test_non_fetch_curl_still_gated(self):
+        """curl that writes to disk is not intercepted; plan mode still asks."""
+        self.ctx.plan_mode = True
+        self.ctx.auto_confirm = True
+        try:
+            with patch("ollamaquery2.fetch_and_convert_url",
+                       return_value=("SHOULD NOT BE USED", "htmlstrip")):
+                with patch("builtins.input", return_value="n"):
+                    result = self.reg.execute(
+                        "run_command", {"command": "curl -o /tmp/fetch_test.html https://x.example"})
+            self.assertFalse(result["success"])
+            self.assertIn("Cancelled by user", result["error"])
+            self.assertNotIn("SHOULD NOT BE USED", result.get("output", ""))
+        finally:
+            self.ctx.plan_mode = False
+
+    def test_fetch_url_surfaces_failure(self):
+        """fetch_url must not report success while embedding a failure string."""
+        with patch("ollamaquery2.fetch_and_convert_url",
+                   return_value=("[Failed to fetch URL: HTTP Error 403: Forbidden]", "None")):
+            result = self.reg.execute("fetch_url", {"url": "https://blocked.example"})
+        self.assertFalse(result["success"])
+        self.assertIn("403", result["error"])
+
+    def test_fetch_url_curl_fallback(self):
+        """fetch_and_convert_url falls back to curl when urllib is blocked."""
+        with patch("ollamaquery2._request_with_retry",
+                   side_effect=Exception("HTTP Error 403: Forbidden")):
+            with patch("ollamaquery2._curl_fetch_text",
+                       return_value="<html><body>curl rescued content</body></html>"):
+                text, tool = q.fetch_and_convert_url("https://blocked.example")
+        self.assertIn("curl rescued content", text)
+        self.assertEqual(tool, "htmlstrip")
+
     def test_write_and_read_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             old_cwd = os.getcwd()
