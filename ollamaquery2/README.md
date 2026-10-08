@@ -1,6 +1,6 @@
 # ollamaquery2
 
-A feature-rich CLI for local LLMs via Ollama, Llama.cpp, and LM Studio backends. Single Python file, no pip install needed.
+A feature-rich CLI for local LLMs via Ollama, Llama.cpp, LM Studio, and Strata backends. Single Python file, no pip install needed.
 
 ## Backends
 
@@ -8,9 +8,14 @@ A feature-rich CLI for local LLMs via Ollama, Llama.cpp, and LM Studio backends.
 |---------|-------------|-----------|
 | Ollama | `http://127.0.0.1:11434` | HEAD `/` + body scan |
 | Llama.cpp | `http://127.0.0.1:8080` | HEAD `Server:` header |
+| Strata | `http://127.0.0.1:8080` | GET `/health` → `"service": "strata"` |
 | LM Studio | `http://127.0.0.1:1234` | GET `/v1/models` |
 
-Auto-detects available backends. Set `OLLAMA_HOST`, `LLAMACPP_HOST` env vars to override.
+Auto-detects available backends. Set `OLLAMA_HOST`, `LLAMACPP_HOST`, `STRATA_HOST` env vars to override.
+
+Strata shares Llama.cpp's default port (8080) and OpenAI dialect but streams
+reasoning via `delta.reasoning_content` and exposes Anthropic
+`/v1/messages/count_tokens`; it is recognized by its unique `/health` marker.
 
 ## Quick Start
 
@@ -24,7 +29,7 @@ python3 ollamaquery2.py -c
 ```text
 -c                  Interactive chat mode
 -m <model>          Model name
--b <backend>        Backend: ollama, llamacpp, lmstudio
+-b <backend>        Backend: ollama, llamacpp, strata, lmstudio
 -H <url>            Backend URL override
 -I "query"          Single-shot query
 -i <file>           Input file for batch
@@ -234,7 +239,7 @@ Test coverage: configuration, retry logic, theme system, command registry, shell
 ## Requirements
 
 - Python 3.x
-- A running LLM backend (Ollama / Llama.cpp / LM Studio)
+- A running LLM backend (Ollama / Llama.cpp / Strata / LM Studio)
 - Tested on Fedora 43 and Ubuntu 24
 
 ## System Prompt
@@ -266,6 +271,7 @@ from composable blocks (role, tool definitions, format, examples, rules).
 |----------|---------|-------------|
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama API URL |
 | `LLAMACPP_HOST` | `http://127.0.0.1:8080` | Llama.cpp API URL |
+| `STRATA_HOST` | `http://127.0.0.1:8080` | Strata API URL |
 | `OLLAMAQUERY_THEME` | `default` | Color theme name |
 | `NO_COLOR` | (unset) | Disable colors |
 

@@ -1,24 +1,24 @@
 # Backend Support Reference
 
-ollamaquery2 supports three backends: **Ollama**, **Llama.cpp**, and **LM Studio**.
+ollamaquery2 supports four backends: **Ollama**, **Llama.cpp**, **Strata**, and **LM Studio**.
 Each exposes a different API surface despite all serving LLMs.
 
 ## Quick Comparison
 
-| Feature | Ollama | Llama.cpp | LM Studio |
-|---------|--------|-----------|-----------|
-| Chat endpoint | `/api/chat` | `/v1/chat/completions` | `/v1/chat/completions` |
-| Model list | `/api/tags` | `/v1/models` | `/v1/models` |
-| Model ID format | `qwen3.5:9b` | `Qwen3.5-9B-Q4_K_M.gguf` | `openai/gpt-oss-20b` |
-| Context size | `/api/ps` or `/api/show` | `/slots` | None (use default) |
-| Token counting | `/api/tokenize` | `/tokenize` | None (use estimation) |
-| Thinking/reasoning field | `message.reasoning_content` | `delta.reasoning_content` | `delta.reasoning` |
-| Image support | `message.images` array | `content` array with `image_url` | `content` array with `image_url` |
-| SSE streaming | JSON lines, no prefix | `data: ` prefix + `[DONE]` | `data: ` prefix + `[DONE]` |
-| Default port | 11434 | 8080 | 1234 |
-| Server header | `ollama` | `llama.cpp` | (no reliable marker) |
-| Detection method | GET `/` for `ollama` string | HEAD check for `llama.cpp` header | GET `/v1/models` for model list |
-| Auto-discovery | HEAD check + host IP scan | HEAD check + host IP scan | GET `/v1/models` + host IP scan |
+| Feature                  | Ollama                      | Llama.cpp                         | Strata                             | LM Studio                        |
+|--------------------------|-----------------------------|-----------------------------------|------------------------------------|----------------------------------|
+| Chat endpoint            | `/api/chat`                 | `/v1/chat/completions`            | `/v1/chat/completions`             | `/v1/chat/completions`           |
+| Model list               | `/api/tags`                 | `/v1/models`                      | `/v1/models`                       | `/v1/models`                     |
+| Model ID format          | `qwen3.5:9b`                | `Qwen3.5-9B-Q4_K_M.gguf`          | `qwen3.8-flash-next-ud-q2_k_xl`    | `openai/gpt-oss-20b`             |
+| Context size             | `/api/ps` or `/api/show`    | `/slots`                          | `/slots`                           | None (use default)               |
+| Token counting           | `/api/tokenize`             | `/tokenize`                       | `/v1/messages/count_tokens`        | None (use estimation)            |
+| Thinking/reasoning field | `message.reasoning_content` | `delta.reasoning_content`         | `delta.reasoning_content`          | `delta.reasoning`                |
+| Image support            | `message.images` array      | `content` array with `image_url`  | `content` array with `image_url`   | `content` array with `image_url` |
+| SSE streaming            | JSON lines, no prefix       | `data: ` prefix + `[DONE]`        | `data: ` prefix + `[DONE]`         | `data: ` prefix + `[DONE]`       |
+| Default port             | 11434                       | 8080                              | 8080                               | 1234                             |
+| Server header            | `ollama`                    | `llama.cpp`                       | `BaseHTTP/...` (generic)           | (no reliable marker)             |
+| Detection method         | GET `/` for `ollama` string | HEAD check for `llama.cpp` header | GET `/health` for `service=strata` | GET `/v1/models` for model list  |
+| Auto-discovery           | GET `/` + host IP scan      | HEAD + host IP scan               | GET `/health` + host IP scan       | GET `/v1/models` + host IP scan  |
 
 ## Backend-Specific Details
 
@@ -53,6 +53,19 @@ Each exposes a different API surface despite all serving LLMs.
 - Server detection: GET to `/v1/models` and check for a non-empty `data` array.
 - Image format: OpenAI-compatible `content` array with `{"type": "image_url", "image_url": {"url": "data:image/...;base64,..."}}` (same as llama.cpp).
 
+### Strata
+- A standalone Python server (`python -m serve.server --engine strata ...`) that is OpenAI-compatible and deliberately llama.cpp-shaped, but **not** llama.cpp.
+- **Shares llama.cpp's default port 8080** — the two must be told apart by probing, not by port.
+- OpenAI-compatible `/v1/chat/completions` endpoint; also speaks `/v1/messages` (Anthropic) and `/v1/responses`.
+- SSE streaming with `data: ` prefix, ends with `data: [DONE]`; emits `: keep-alive` comment lines (skipped by the JSON parser).
+- Thinking/reasoning via `delta.reasoning_content` / `message.reasoning_content` (same as llama.cpp).
+- Reasoning control: `chat_template_kwargs.enable_thinking = false` to disable; `chat_template_kwargs.reasoning_effort` (`low`/`medium`/`high`, mapped to the template's `low`/`medium`/`xhigh`).
+- Usage/timings use llama.cpp's names (`timings.prompt_n`/`predicted_n`/`prompt_ms`/`predicted_per_second`).
+- Context size via `/slots` (returns `[{"n_ctx": ...}]`), same as llama.cpp.
+- Token counting via **Anthropic** `/v1/messages/count_tokens` → `{"input_tokens": N}`; it has no `/tokenize`. The whole templated turn is counted, so a one-time empty-turn baseline (~52 tokens) is measured and subtracted.
+- **Detection: GET `/health` and check for `"service": "strata"`.** Its HTTP `Server` header is generic (`BaseHTTP/...`), so the llama.cpp header check fails on it.
+- Inference parameters: same set as llama.cpp (`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `repeat_penalty`).
+
 ## Architecture: 4 Streaming Helpers
 
 A new backend requires implementing 4 methods in `ModelQuery`:
@@ -70,6 +83,7 @@ Plus: auto-detection, model listing, reachability check, CLI argument.
 
 ### `reasoning` vs `reasoning_content`
 Llama.cpp uses `delta.reasoning_content` in streaming and `message.reasoning_content` in non-streaming.
+Strata uses `delta.reasoning_content` / `message.reasoning_content` too (same as llama.cpp).
 LM Studio uses `delta.reasoning` and `message.reasoning` instead.
 Ollama uses `message.reasoning_content` (in `/api/chat` response).
 
@@ -80,11 +94,12 @@ thinking = msg.get('reasoning_content', '') or msg.get('reasoning', '')
 
 ### Response format differences
 Ollama returns `{"message": {"content": "..."}}` at top level.
-OpenAI-compatible backends (llama.cpp, LM Studio) return `{"choices": [{"message": {"content": "..."}}]}`.
+OpenAI-compatible backends (llama.cpp, Strata, LM Studio) return `{"choices": [{"message": {"content": "..."}}]}`.
 
 ### Model ID format
 In Ollama, model IDs are short tags (`qwen3.5:9b`).
 In Llama.cpp, model IDs are filenames (`Qwen3.5-9B-Q4_K_M.gguf`).
+In Strata, model IDs come from the loaded config (e.g. `qwen3.8-flash-next-ud-q2_k_xl`).
 In LM Studio, model IDs have vendor prefixes (`openai/gpt-oss-20b`, `nvidia/nemotron-3-nano-4b`).
 
 When switching models, use the exact ID format shown by `/listmodel`.
@@ -93,6 +108,7 @@ When switching models, use the exact ID format shown by `/listmodel`.
 Backend auto-detection follows this priority:
 1. User-specified `-b` and `-H`
 2. Saved backend configs (Most Recently Used, validated with HEAD/GET)
-3. Auto-discovery on default ports (127.0.0.1): llamacpp (8080) → ollama (11434) → lmstudio (1234)
+3. Auto-discovery on default ports (127.0.0.1): strata (8080) → llamacpp (8080) → ollama (11434) → lmstudio (1234)
+   (Strata is probed first on 8080 via `/health`; a llama.cpp server fails that probe and is caught by the header check)
 4. Auto-discovery on host IPs: same ports in same order
 5. Fallback to defaults

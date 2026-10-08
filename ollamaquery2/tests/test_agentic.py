@@ -16,6 +16,7 @@ import ollamaquery2 as q
 
 OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')
 LLAMACPP_HOST = os.environ.get('LLAMACPP_HOST', 'http://127.0.0.1:8080')
+STRATA_HOST = os.environ.get('STRATA_HOST', 'http://127.0.0.1:8080')
 
 # Auto-detect available backend
 BACKEND = None
@@ -69,6 +70,24 @@ def _try_llamacpp(url):
         pass
     return True, None
 
+def _try_strata(url):
+    """Check strata at url, return (ok, model). Keyed on the /health service marker."""
+    url = _normalize_url(url)
+    if not q.check_strata(url):
+        return False, None
+    # Try /v1/models for a model name (strata is OpenAI-compatible)
+    try:
+        data = json.loads(q.urlopen(q.Request(f"{url}/v1/models"), timeout=3).read().decode('utf-8'))
+        models = data.get('data', [])
+        if models:
+            m = models[0].get('id', models[0].get('name', ''))
+            if m.startswith('models/'):
+                m = m[7:]
+            return True, m
+    except Exception:
+        pass
+    return True, None
+
 def _discover_with_fallback(env_url, default_url, probe_fn):
     """Try env_url, then default, then local IPs via probe_fn."""
     candidates = []
@@ -108,6 +127,16 @@ def setUpModule():
         BACKEND = "ollama"
         BASE_URL = url
         MODEL = os.environ.get("TEST_MODEL") or model or "gpt-oss:20b"
+        BACKEND_AVAILABLE = True
+        return
+
+    # Strata shares llama.cpp's 8080 port but sends a generic Server header, so
+    # probe it before llama.cpp (mirrors auto_detect_backend's ordering).
+    ok, url, model = _discover_with_fallback(STRATA_HOST, 'http://127.0.0.1:8080', _try_strata)
+    if ok:
+        BACKEND = "strata"
+        BASE_URL = url
+        MODEL = os.environ.get("TEST_MODEL") or model or "strata"
         BACKEND_AVAILABLE = True
         return
 
@@ -1877,6 +1906,58 @@ class TestAgenticPlanCommand(unittest.TestCase):
         self.assertTrue(loop.ctx.plan_mode)
         loop.run_handle_agentic('/agentic plan off')
         self.assertFalse(loop.ctx.plan_mode)
+
+
+class TestAppendToolMessages(unittest.TestCase):
+    """Assistant-turn shape after a tool call.
+
+    Native-tools backends must get an empty assistant `content` plus the real
+    `tool_calls`; synthesizing a `{"tool": ...}` JSON as content makes Qwen-style
+    templates render hybrid JSON+XML (the bug the native format block prevents).
+    Inline backends still need the call echoed as text.
+    """
+
+    def _loop(self):
+        q.CommandContext._instance = None
+        q.CommandContext._initialized = False
+        ctx = q.CommandContext()
+        ctx.backend = 'strata'
+        ctx.model = 'qwen3.8-test'
+        return q.ChatLoop(ctx)
+
+    def _api_calls(self):
+        return [{"id": "call_1", "type": "function",
+                 "function": {"name": "list_directory", "arguments": '{"path": "."}'}}]
+
+    def test_native_mode_keeps_content_empty(self):
+        loop = self._loop()
+        messages = []
+        tool_calls = [{"tool": "list_directory", "arguments": {"path": "."}}]
+        loop._append_tool_messages(messages, "", self._api_calls(), tool_calls,
+                                   ["obs"], ["raw"], send_tools_api=True)
+        self.assertEqual(messages[0]["role"], "assistant")
+        self.assertEqual(messages[0]["content"], "")
+        self.assertIn("tool_calls", messages[0])
+        self.assertEqual(messages[1]["role"], "tool")
+        self.assertEqual(messages[1]["content"], "raw")
+
+    def test_inline_mode_synthesizes_json_content(self):
+        loop = self._loop()
+        messages = []
+        tool_calls = [{"tool": "list_directory", "arguments": {"path": "."}}]
+        loop._append_tool_messages(messages, "", self._api_calls(), tool_calls,
+                                   ["obs"], ["raw"], send_tools_api=False)
+        self.assertEqual(messages[0]["content"], json.dumps(tool_calls[0]))
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertIn("Tool result:", messages[1]["content"])
+
+    def test_preamble_content_is_preserved(self):
+        loop = self._loop()
+        messages = []
+        tool_calls = [{"tool": "list_directory", "arguments": {"path": "."}}]
+        loop._append_tool_messages(messages, "Let me look.", self._api_calls(), tool_calls,
+                                   ["obs"], ["raw"], send_tools_api=True)
+        self.assertEqual(messages[0]["content"], "Let me look.")
 
 
 if __name__ == "__main__":

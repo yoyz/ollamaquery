@@ -58,7 +58,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.12"
+__version__ = "0.2.13"
 
 
 # ============================================================================
@@ -152,6 +152,7 @@ MAX_FILE_INCLUSION_SIZE = 5 * 1024 * 1024  # 5MB max for @file inclusions
 DEFAULT_OLLAMA_HOST    = 'http://127.0.0.1:11434'
 DEFAULT_LLAMACPP_HOST  = 'http://127.0.0.1:8080'
 DEFAULT_LMSTUDIO_HOST  = 'http://127.0.0.1:1234'
+DEFAULT_STRATA_HOST    = 'http://127.0.0.1:8080'
 DEFAULT_GEMINI_HOST    = 'https://generativelanguage.googleapis.com/v1beta/openai'
 DEFAULT_OPENCODEZEN_HOST = 'https://opencode.ai/zen'
 DEFAULT_OPENCODEGO_HOST  = 'https://opencode.ai/zen/go'
@@ -160,6 +161,7 @@ DEFAULT_DEEPSEEK_HOST    = 'https://api.deepseek.com'
 DEFAULT_OLLAMA_PORT    =  11434
 DEFAULT_LLAMACPP_PORT  =  8080
 DEFAULT_LMSTUDIO_PORT  =  1234
+DEFAULT_STRATA_PORT    =  8080
 
 # Cloud backends share the OpenAI-compatible /v1/models shape but need an API key.
 CLOUD_BACKENDS = {"gemini", "opencodezen", "opencodego", "mistral", "deepseek"}
@@ -889,6 +891,36 @@ def get_message_token_count_llamacpp(base_url: str, text: str) -> int:
         return estimate_token_count(text)
 
 
+def get_message_token_count_strata(base_url: str, text: str) -> int:
+    """Get an exact token count via Strata's Anthropic count_tokens endpoint.
+
+    Strata has no llama.cpp-style /tokenize; its /v1/messages/count_tokens
+    counts the whole templated turn (chat-template overhead included). A
+    one-time empty-turn baseline is measured and subtracted so the per-message
+    counts approximate content tokens. Falls back to the heuristic estimator
+    when the endpoint is unavailable.
+    """
+    global _TOKEN_COUNT_WARNED, _STRATA_MSG_OVERHEAD
+    try:
+        url = f"{base_url}/v1/messages/count_tokens"
+        headers = {'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'}
+
+        def _count(content: str) -> int:
+            payload = json.dumps({"messages": [{"role": "user", "content": content}]}).encode('utf-8')
+            with _request_with_retry(Request(url, data=payload, headers=headers), timeout=5) as response:
+                data = json.loads(response.read().decode('utf-8'))
+            return int(data.get("input_tokens", 0))
+
+        if _STRATA_MSG_OVERHEAD is None:
+            _STRATA_MSG_OVERHEAD = _count("")
+        return max(1, _count(text) - _STRATA_MSG_OVERHEAD)
+    except Exception as e:
+        if not _TOKEN_COUNT_WARNED:
+            sys.stderr.write(colorize(f"[WARNING] Token counting failed (strata): {e}\n", 'warning'))
+            _TOKEN_COUNT_WARNED = True
+        return estimate_token_count(text)
+
+
 def get_message_token_count_ollama(base_url: str, text: str, model: str) -> int:
     """Get exact token count using the /api/tokenize endpoint (no GPU overhead).
 
@@ -994,6 +1026,11 @@ _TOKEN_COUNT_WARNED = False
 # probing it on every message wastes an HTTP round-trip and a 404. Cache the
 # determination: None=unknown, True=supported, False=unsupported (use estimates).
 _OLLAMA_TOKENIZE_SUPPORTED = None
+# Strata has no /tokenize; it exposes Anthropic's /v1/messages/count_tokens,
+# whose count includes the chat-template overhead (~52 tokens for an empty
+# single user turn on the reference build). The baseline is measured once and
+# subtracted so per-message counts approximate content tokens.
+_STRATA_MSG_OVERHEAD = None
 
 
 def estimate_token_count(text: str) -> int:
@@ -1232,6 +1269,8 @@ class CommandContext:
             return 0
         if self.backend == "llamacpp":
             return get_message_token_count_llamacpp(self.base_url, text)
+        elif self.backend == "strata":
+            return get_message_token_count_strata(self.base_url, text)
         elif self.backend == "ollama":
             return get_message_token_count_ollama(self.base_url, text, self.model)
         return self.estimate_tokens(text)
@@ -2053,7 +2092,8 @@ AGENTIC_EXAMPLE_NATIVE = """## ReAct protocol (Think → Act → Observe → Ans
 # Shared rules block — common to all models.
 AGENTIC_RULES_BLOCK = """## General rules
 - Be precise with file paths. If you create a file in a subdirectory, use the same path when compiling or reading it later.
-- Mirror the user's language — if they write in French, reply in French."""
+- Mirror the user's language — if they write in French, reply in French.
+- The user's message may already include file contents they referenced (marked `[Content of local file ...]`). If the information you need is already in the conversation, answer directly — do NOT call tools merely to confirm, re-read, or "explore" what you were already given."""
 
 # Read-only planning-mode block, appended when `/agentic plan` is active. The
 # model is told it may only inspect and plan — enforcement also happens at the
@@ -5826,7 +5866,7 @@ class ModelQuery:
             backend: Backend name (controls which params are supported).
             kwargs: The kwargs dict (images/tools/params/etc.).
         """
-        if backend == "llamacpp":
+        if backend in ("llamacpp", "strata"):
             params = ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]
         elif backend == "lmstudio":
             params = ["temperature", "top_p", "presence_penalty", "repeat_penalty"]
@@ -5862,7 +5902,7 @@ class ModelQuery:
         """
         if backend == "ollama":
             payload["options"] = {**payload.get("options", {}), "think": False}
-        elif backend in ("llamacpp", "lmstudio"):
+        elif backend in ("llamacpp", "strata", "lmstudio"):
             kwargs = dict(payload.get("chat_template_kwargs") or {})
             model = str(payload.get("model", "")).lower()
             if "gpt-oss" in model or "gpt_oss" in model:
@@ -5888,7 +5928,7 @@ class ModelQuery:
         """
         if backend == "ollama":
             payload["options"] = {**payload.get("options", {}), "reasoning_effort": effort}
-        elif backend in ("llamacpp", "lmstudio"):
+        elif backend in ("llamacpp", "strata", "lmstudio"):
             kwargs = dict(payload.get("chat_template_kwargs") or {})
             kwargs["reasoning_effort"] = effort
             payload["chat_template_kwargs"] = kwargs
@@ -5929,12 +5969,12 @@ class ModelQuery:
         if kwargs.get('is_warmup'):
             if backend == "ollama":
                 payload["options"] = {"num_predict": 1}
-            elif backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
                 payload["max_tokens"] = 1
         elif context_size := kwargs.get('context_size'):
             if backend == "ollama":
                 payload["options"] = {"num_ctx": context_size}
-            elif backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
                 payload["max_tokens"] = context_size
 
     def build_request_payload(self, messages: list, model: str, stream_enabled: bool = False, **kwargs: dict) -> dict:
@@ -6316,7 +6356,7 @@ class ModelQuery:
                         "load_duration": chunk.get("load_duration", 0),
                     }
             return thought, content, is_final, usage, tool_calls
-        elif backend in ("llamacpp", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+        elif backend in ("llamacpp", "strata", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
             choices = chunk.get("choices", [])
             is_final = bool(choices and choices[0].get("finish_reason") is not None)
             delta = choices[0].get("delta", {}) if choices else {}
@@ -6348,7 +6388,7 @@ class ModelQuery:
             decoded = line.decode('utf-8').strip()
             if not decoded:
                 continue
-            if backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            if backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
                 if decoded.startswith('data: '):
                     decoded = decoded[6:].strip()
             if decoded == '[DONE]':
@@ -6372,7 +6412,7 @@ class ModelQuery:
                     debug_log(self.ctx.debug_manager, 'context', 1,
                              f"Updated context tokens: {total_tokens}", prefix="CTX")
             refresh_ollama_context_window_size_from_ps(self.ctx)
-        elif backend in ("llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+        elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
             # llama.cpp with KV cache reports only newly-evaluated tokens as
             # prompt_tokens, NOT the full context size. Always recalculate from
             # the actual messages array for an accurate context bar.
@@ -6611,7 +6651,7 @@ class ChatCompleter:
 
     def fetch_models(self) -> None:
         """Fetch available models from the backend."""
-        if self.backend == "llamacpp":
+        if self.backend in ("llamacpp", "strata"):
             self.models = [m['name'] for m in fetch_models_llamacpp(self.base_url)]
         elif self.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
             self.models = [m['name'] for m in fetch_models_llamacpp(self.base_url, api_key=self.api_key)]
@@ -6932,6 +6972,8 @@ def _load_file_inclusion(expanded_path: str, filepath: str) -> Optional[str]:
                     token_count = get_message_token_count_ollama(ctx.base_url, file_content, ctx.model)
                 elif ctx.backend == "llamacpp":
                     token_count = get_message_token_count_llamacpp(ctx.base_url, file_content)
+                elif ctx.backend == "strata":
+                    token_count = get_message_token_count_strata(ctx.base_url, file_content)
 
         if token_count == 0:
             token_count = estimate_token_count(file_content)
@@ -7281,7 +7323,7 @@ class ChatLoop:
 
     def fetch_models(self) -> None:
         """Fetch available models from the backend."""
-        if self.ctx.backend in ("llamacpp", "lmstudio"):
+        if self.ctx.backend in ("llamacpp", "strata", "lmstudio"):
             self.ctx.models = [m['name'] for m in fetch_models_llamacpp(self.ctx.base_url)]
         elif self.ctx.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
             self.ctx.models = [m['name'] for m in fetch_models_llamacpp(self.ctx.base_url, api_key=self.ctx.api_key)]
@@ -7418,7 +7460,7 @@ class ChatLoop:
                 if val > MAX_CONTEXT_SIZE:
                     print(colorize(f"[ERROR] Context size {val} exceeds maximum {MAX_CONTEXT_SIZE}", 'error'), file=sys.stderr)
                     return
-                if self.ctx.backend in ("llamacpp", "lmstudio"):
+                if self.ctx.backend in ("llamacpp", "strata", "lmstudio"):
                     print(colorize(f"[contextsizeset is not supported on {self.ctx.backend} backend]", 'warning'), file=sys.stderr)
                     return
                 self.ctx.context_size = val
@@ -9467,7 +9509,9 @@ class ChatLoop:
             if final_messages:
                 final_messages[0] = {'role': 'system', 'content': self.ctx.system_prompt}
             if final_messages and final_messages[-1]['role'] != 'user':
-                final_messages.append({'role': 'user', 'content': final_content})
+                final_messages.append({'role': 'user', 'content':
+                    "Provide your final answer now, based on the tool results above. "
+                    "Do not repeat the original request or call any more tools."})
 
             stream_kwargs = dict(get_inference_params(self.ctx.model))
             stream_tool_calls_out = []
@@ -9830,9 +9874,14 @@ class ChatLoop:
         """
         combined = "\n---\n".join(observations) if observations else "[No tool output]"
         assistant_content = response_text
-        if api_tool_calls and not response_text and tool_calls:
-            tool_json = json.dumps(tool_calls[0])
-            assistant_content = tool_json
+        # Inline-mode fallback only: when a model returned a native tool call but
+        # carries no text, inline backends need the call echoed in the assistant
+        # text (they ignore the `tool_calls` field). Native-tools backends must
+        # NOT get this — it would render a fake `{"tool": ...}` JSON *alongside*
+        # the real `<tool_call>`, the exact hybrid JSON/XML garbage the native
+        # format block exists to prevent.
+        if api_tool_calls and not response_text and tool_calls and not send_tools_api:
+            assistant_content = json.dumps(tool_calls[0])
         assistant_msg = {'role': 'assistant', 'content': assistant_content}
         if api_tool_calls:
             assistant_msg['tool_calls'] = api_tool_calls
@@ -10033,13 +10082,19 @@ class ChatLoop:
             api_error: Set when the loop aborted on an API error.
             agentic_seed_len: Seed boundary for history persistence.
         """
+        # Merge the ReAct loop turns into self.messages BEFORE finalizing so the
+        # final answer stream (and its streaming re-entry) sees the completed
+        # tool work. `_persist_agentic_history` inserts at the seed boundary, so
+        # finalize-appended messages still land after the tool turns.
+        self._persist_agentic_history(messages, agentic_seed_len, compact=True)
+
         if api_error:
             # Backend unreachable (connection refused, 5xx, ...). Do NOT re-query
             # a dead endpoint for a final answer — the finalize path would launch
             # a second doomed streaming request (another 3 retries) and print a
-            # misleading "[Agentic: no answer produced]". Nothing is merged into
-            # the persistent history beyond the user's own message, so repeated
-            # attempts while the server is down don't pollute the context.
+            # misleading "[Agentic: no answer produced]". No final answer is
+            # merged, so repeated attempts while the server is down don't
+            # pollute the context.
             print(colorize(
                 f"\n[Agentic] Backend unreachable ({api_error}). "
                 "Aborted without a final answer; conversation history untouched.",
@@ -10049,10 +10104,6 @@ class ChatLoop:
                 final_answer = response_text
 
             self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text)
-
-        # Merge the ReAct loop turns back into self.messages for cross-turn
-        # memory (see `_persist_agentic_history` for ordering/nudge handling).
-        self._persist_agentic_history(messages, agentic_seed_len, compact=True)
 
         if logger:
             logger.write(type="end", total_iterations=iteration)
@@ -11007,6 +11058,27 @@ def check_lmstudio(url: str, timeout: float = 2) -> bool:
         return False
 
 
+def check_strata(url: str, timeout: float = 2) -> bool:
+    """Check if a Strata server is running by querying /health.
+
+    Strata uniquely identifies itself with `"service": "strata"` in the
+    /health JSON body (it sends a generic `Server: BaseHTTP/...` header, so it
+    cannot be recognized the way llama.cpp is). This marker distinguishes it
+    from llama.cpp, LM Studio and other OpenAI-compatible servers.
+
+    Args:
+        url: Base URL of the server.
+        timeout: Socket timeout in seconds.
+    """
+    try:
+        request = Request(f"{url}/health", headers={'User-Agent': 'Mozilla/5.0'})
+        with _request_with_retry(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return data.get("service") == "strata"
+    except Exception:
+        return False
+
+
 def check_gemini(url: str, api_key: Optional[str] = None, timeout: float = 2) -> bool:
     """Check if Gemini API is reachable by querying /v1/models.
 
@@ -11048,7 +11120,10 @@ def auto_detect_backend() -> tuple:
     # Check which backend is running
 
     sys.stderr.write(colorize("[INFO] AutoDetecting on : " + llama_cpp_url + " ", 'info'))
-    if check_backend_with_head(llama_cpp_url, 'llama.cpp'):
+    if check_strata(llama_cpp_url):
+        sys.stderr.write(colorize("Success (strata)\n", 'info'))
+        return True,'strata',llama_cpp_url
+    elif check_backend_with_head(llama_cpp_url, 'llama.cpp'):
         sys.stderr.write(colorize("Success\n", 'info'))
         return True,'llamacpp',llama_cpp_url
     else:
@@ -11078,7 +11153,10 @@ def auto_detect_backend() -> tuple:
 
         url="http://"+ip + ":" + str(DEFAULT_LLAMACPP_PORT)
         sys.stderr.write(colorize("[INFO] AutoDetecting on : " + url    + " ", 'info'))
-        if check_backend_with_head(url, 'llama.cpp', timeout=0.2):
+        if check_strata(url, timeout=0.2):
+            sys.stderr.write(colorize("Success (strata)\n", 'info'))
+            return True,'strata',url
+        elif check_backend_with_head(url, 'llama.cpp', timeout=0.2):
             sys.stderr.write(colorize("Success\n", 'info'))
             return True,'llamacpp',url
         else:
@@ -11158,6 +11236,8 @@ def _probe_backend(backend: str, host: str, api_key: Optional[str] = None) -> bo
     """
     if backend == "llamacpp":
         return check_backend_with_head(host, 'llama.cpp')
+    if backend == "strata":
+        return check_strata(host)
     if backend == "ollama":
         return check_backend_with_get(host, 'ollama')
     if backend == "lmstudio":
@@ -11189,7 +11269,9 @@ def _resolve_host_override(args: argparse.Namespace) -> tuple:
             if port == DEFAULT_OLLAMA_PORT:
                 selected_backend = "ollama"
             elif port == DEFAULT_LLAMACPP_PORT:
-                selected_backend = "llamacpp"
+                # Strata shares llama.cpp's default port and speaks the same
+                # OpenAI dialect; disambiguate via its /health marker.
+                selected_backend = "strata" if check_strata(base_url) else "llamacpp"
             elif port == DEFAULT_LMSTUDIO_PORT:
                 selected_backend = "lmstudio"
         if not selected_backend:
@@ -11222,6 +11304,13 @@ def _probe_saved_backends(args: argparse.Namespace, saved_backends: list) -> Opt
 
         is_valid = _probe_backend(s_backend, s_host, getattr(args, 'api_key', None))
 
+        # Strata answers the LM Studio probe (a non-empty /v1/models), so a stale
+        # lmstudio entry must not shadow the dedicated strata backend on the same
+        # host. An explicit `-b lmstudio` still works through _verify_server.
+        if is_valid and s_backend == "lmstudio" and check_strata(s_host):
+            sys.stderr.write(colorize("Strata (skipping lmstudio entry)\n", 'warning'))
+            continue
+
         if is_valid:
             sys.stderr.write(colorize("Success\n", 'success'))
             save_backend_config(s_backend, s_host)  # Bump to top of list
@@ -11242,6 +11331,8 @@ def _resolve_fallback(args: argparse.Namespace) -> tuple:
         fallback_host = os.environ.get(env_var, CLOUD_DEFAULT_HOST[fallback_backend])
     elif fallback_backend == "llamacpp":
         fallback_host = os.environ.get('LLAMACPP_HOST', DEFAULT_LLAMACPP_HOST)
+    elif fallback_backend == "strata":
+        fallback_host = os.environ.get('STRATA_HOST', DEFAULT_STRATA_HOST)
     elif fallback_backend == "lmstudio":
         fallback_host = os.environ.get('LMSTUDIO_HOST', DEFAULT_LMSTUDIO_HOST)
     else:
@@ -11303,7 +11394,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument_group('Backend')
-    parser.add_argument("-b", "--backend", choices=["ollama", "llamacpp", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"], default=None, help="API backend to use (auto-detected if omitted).")
+    parser.add_argument("-b", "--backend", choices=["ollama", "llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"], default=None, help="API backend to use (auto-detected if omitted).")
     parser.add_argument('-H', '--host', help='Custom API URL')
     parser.add_argument('-k', '--api-key', help='API key for cloud backends (Gemini, etc.)')
     parser.add_argument('--version', action='store_true', help='Show version and exit')
@@ -11354,11 +11445,12 @@ def _try_known_port(backend: str, base_url: str, args: argparse.Namespace) -> Op
     Returns:
         (backend, url_with_port) on success, or None.
     """
-    port_map = {"ollama": DEFAULT_OLLAMA_PORT, "llamacpp": DEFAULT_LLAMACPP_PORT, "lmstudio": DEFAULT_LMSTUDIO_PORT}
+    port_map = {"ollama": DEFAULT_OLLAMA_PORT, "llamacpp": DEFAULT_LLAMACPP_PORT, "strata": DEFAULT_STRATA_PORT, "lmstudio": DEFAULT_LMSTUDIO_PORT}
     port = port_map.get(backend, DEFAULT_OLLAMA_PORT)
     fallback = f"{base_url}:{port}"
     sys.stderr.write(colorize(f"[INFO] Checking {fallback}... ", 'muted'))
     ok = check_lmstudio(fallback) if backend == "lmstudio" else \
+         check_strata(fallback) if backend == "strata" else \
          check_backend_with_head(fallback, 'llama.cpp') if backend == "llamacpp" else \
          check_backend_with_get(fallback, 'ollama')
     if ok:
@@ -11379,6 +11471,7 @@ def _probe_all_default_ports(base_url: str) -> Optional[tuple]:
     """
     probes = [
         ("ollama", f"{base_url}:{DEFAULT_OLLAMA_PORT}", check_backend_with_get, 'ollama'),
+        ("strata", f"{base_url}:{DEFAULT_STRATA_PORT}", check_strata, None),
         ("llamacpp", f"{base_url}:{DEFAULT_LLAMACPP_PORT}", check_backend_with_head, 'llama.cpp'),
         ("lmstudio", f"{base_url}:{DEFAULT_LMSTUDIO_PORT}", check_lmstudio, None),
     ]
@@ -11434,6 +11527,8 @@ def _verify_server(backend: str, base_url: str, args: argparse.Namespace) -> tup
             hint = " (check your API key and internet connection)"
         elif backend == "llamacpp" and not has_port:
             hint = f" (try {base_url}:{DEFAULT_LLAMACPP_PORT})"
+        elif backend == "strata" and not has_port:
+            hint = f" (try {base_url}:{DEFAULT_STRATA_PORT})"
         elif backend == "lmstudio" and not has_port:
             hint = f" (try {base_url}:{DEFAULT_LMSTUDIO_PORT})"
         elif backend == "ollama" and not has_port:
@@ -11471,7 +11566,7 @@ def _select_model(backend: str, base_url: str, args: argparse.Namespace) -> str:
         sys.stderr.write(colorize("[WARNING] No models available on Ollama server.\n", 'warning'))
         return ""
 
-    LABELS = {"lmstudio": "LM Studio", "gemini": "Gemini", "opencodezen": "OpenCode Zen", "opencodego": "OpenCode Go", "mistral": "Mistral", "deepseek": "DeepSeek"}
+    LABELS = {"lmstudio": "LM Studio", "strata": "Strata", "gemini": "Gemini", "opencodezen": "OpenCode Zen", "opencodego": "OpenCode Go", "mistral": "Mistral", "deepseek": "DeepSeek"}
 
     api_key = args.api_key or os.environ.get(CLOUD_API_KEY_ENV.get(backend, ''), '')
     available = fetch_models_llamacpp(base_url, api_key=api_key if backend in CLOUD_BACKENDS else None)
@@ -11481,7 +11576,7 @@ def _select_model(backend: str, base_url: str, args: argparse.Namespace) -> str:
         sys.stderr.write(colorize(f"[INFO] Auto-selected hosted model: '{model}'\n", 'success'))
         return model
 
-    if backend in ("llamacpp", "lmstudio"):
+    if backend in ("llamacpp", "strata", "lmstudio"):
         label = LABELS.get(backend, "Llama.cpp")
         sys.stderr.write(colorize(f"[INFO] {label} endpoint reachable but no model list exposed; using placeholder 'hosted-model'\n", 'info'))
         return "hosted-model"
@@ -11560,7 +11655,7 @@ def _run_listing(backend: str, base_url: str, args: argparse.Namespace) -> None:
     if backend in CLOUD_BACKENDS:
         list_models_llamacpp(base_url, filter_arg=args.model,
                              api_key=_cloud_api_key(backend, args.api_key))
-    elif backend in ("llamacpp", "lmstudio"):
+    elif backend in ("llamacpp", "strata", "lmstudio"):
         list_models_llamacpp(base_url, filter_arg=args.model)
     elif args.list_all:
         list_models_ollama(base_url, filter_arg=args.model, include_capabilities=True)
