@@ -11,7 +11,9 @@ import sys
 import time
 import json
 import types
+import signal
 import socket
+import termios
 import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
@@ -1403,6 +1405,71 @@ class TestProcessInlineCommands(unittest.TestCase):
         """execute_os_command should accept timeout and return output string."""
         result = m.execute_os_command('echo hello', timeout=5)
         self.assertIn('hello', result)
+
+
+# ============================================================================
+# 16. stop/continue (Ctrl+Z + bg/fg) terminal repair
+# ============================================================================
+
+class TestStopResumeTerminalRepair(unittest.TestCase):
+    """The SIGCONT watchdog re-applies readline's raw input flags on resume.
+
+    Ctrl+Z while blocked in `input()` leaves the pending readline reading a
+    cooked terminal (the shell restores its settings on stop and nothing
+    re-preps on `fg`). Enter then arrives as '\\n' (ICRNL) — the same byte as
+    Ctrl+J, bound to "insert literal newline" — so Enter stops submitting.
+    """
+
+    def test_raw_readline_termios_clears_cooked_flags(self):
+        """ICRNL/ICANON/ECHO cleared; ISIG and unrelated flags survive; cc copied."""
+        iflag = termios.ICRNL | termios.IXON | termios.IGNPAR
+        lflag = termios.ICANON | termios.ECHO | termios.ISIG | termios.ECHOE
+        cc = [0] * 33
+        out = m._raw_readline_termios([iflag, 0, 0, lflag, 0, 0, cc])
+        self.assertEqual(out[0] & (termios.ICRNL | termios.IXON), 0)
+        self.assertEqual(out[3] & (termios.ICANON | termios.ECHO), 0)
+        self.assertTrue(out[3] & termios.ISIG)      # signals stay on (^C/^Z)
+        self.assertTrue(out[3] & termios.ECHOE)     # unrelated flag untouched
+        self.assertTrue(out[0] & termios.IGNPAR)    # unrelated flag untouched
+        self.assertEqual(out[6][termios.VMIN], 1)   # read char-by-char
+        self.assertEqual(out[6][termios.VTIME], 0)
+        self.assertIsNot(out[6], cc)                # cc copied, not mutated
+
+    def test_repair_skips_when_backgrounded(self):
+        """The tty is left to its owner while the job is backgrounded (bg)."""
+        with patch('os.tcgetpgrp', return_value=99999):
+            with patch('termios.tcgetattr') as mock_get, \
+                 patch('termios.tcsetattr') as mock_set:
+                self.assertFalse(m._repair_readline_terminal(0))
+        mock_get.assert_not_called()
+        mock_set.assert_not_called()
+
+    def test_repair_skips_when_tty_still_raw(self):
+        """Nothing to patch when the terminal is already in raw input mode."""
+        with patch('os.tcgetpgrp', return_value=os.getpgrp()):
+            with patch('termios.tcgetattr',
+                       return_value=[0, 0, 0, termios.ISIG, 0, 0, [0] * 33]), \
+                 patch('termios.tcsetattr') as mock_set, \
+                 patch('os.kill') as mock_kill:
+                self.assertFalse(m._repair_readline_terminal(0))
+        mock_set.assert_not_called()
+        mock_kill.assert_not_called()
+
+    def test_repair_patches_cooked_terminal(self):
+        """A cooked tty gets readline's raw flags re-applied + a SIGWINCH redraw."""
+        cooked = [termios.ICRNL, 0, 0, termios.ICANON | termios.ECHO | termios.ISIG,
+                  0, 0, [0] * 33]
+        with patch('os.tcgetpgrp', return_value=os.getpgrp()):
+            with patch('termios.tcgetattr', return_value=cooked), \
+                 patch('termios.tcsetattr') as mock_set, \
+                 patch('os.kill') as mock_kill:
+                self.assertTrue(m._repair_readline_terminal(0))
+        mock_set.assert_called_once()
+        applied = mock_set.call_args[0][2]
+        self.assertEqual(applied[0] & termios.ICRNL, 0)
+        self.assertEqual(applied[3] & (termios.ICANON | termios.ECHO), 0)
+        self.assertTrue(applied[3] & termios.ISIG)
+        mock_kill.assert_called_once_with(os.getpid(), signal.SIGWINCH)
 
 
 # ============================================================================

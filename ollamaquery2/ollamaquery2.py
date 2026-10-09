@@ -23,6 +23,8 @@ import argparse
 import subprocess
 import shlex
 import shutil
+import signal
+import termios
 import threading
 import time
 import traceback
@@ -7362,6 +7364,98 @@ class _ExitRequested(Exception):
     """Raised when the user asks to leave the chat loop (double Ctrl+C at the prompt)."""
 
 
+# --- stop/continue (Ctrl+Z + bg/fg) terminal repair -------------------------
+#
+# readline preps the terminal into raw mode for every `input()` line and
+# depreps it when SIGTSTP stops the process. The shell then restores its own
+# cooked settings, and on `fg` nothing re-preps the tty: the pending readline
+# keeps reading a canonical terminal where Enter arrives as '\n' (ICRNL) —
+# the same byte as Ctrl+J, bound to "insert literal newline" for multiline
+# recall. Enter silently stops submitting until the next signal aborts the
+# read. The watchdog below consumes SIGCONT via sigwait (synchronously, in a
+# thread) and re-applies readline's raw input flags so the blocked read
+# behaves again.
+
+
+def _raw_readline_termios(attrs: list) -> list:
+    """Return a copy of `attrs` shaped like readline's raw input mode.
+
+    Mirrors the input-side of rl_prep_terminal(): canonical processing, echo
+    and input translation off; signals (ISIG) and output processing left
+    untouched.
+
+    Args:
+        attrs: Attribute list as returned by termios.tcgetattr().
+
+    Returns:
+        The patched attribute list.
+    """
+    iflag, oflag, cflag, lflag, ispeed, ospeed, cc = attrs
+    iflag &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR |
+               termios.IXON | termios.IXANY)
+    lflag &= ~(termios.ICANON | termios.ECHO)
+    cc = list(cc)
+    if hasattr(termios, 'VMIN'):
+        cc[termios.VMIN] = 1
+    if hasattr(termios, 'VTIME'):
+        cc[termios.VTIME] = 0
+    return [iflag, oflag, cflag, lflag, ispeed, ospeed, cc]
+
+
+def _repair_readline_terminal(tty_fd: int) -> bool:
+    """Re-apply readline's raw input flags to a terminal left in cooked mode.
+
+    After a stop/continue cycle (Ctrl+Z, then bg/fg) the shell has restored
+    its cooked settings while the pending readline still expects raw mode;
+    re-applying readline's raw input flags makes the blocked read behave
+    again (Enter submits, Ctrl+J inserts a newline). A follow-up SIGWINCH
+    asks readline to redraw the line.
+
+    Args:
+        tty_fd: File descriptor of the controlling terminal.
+
+    Returns:
+        True when the terminal was patched, False when nothing was needed.
+    """
+    try:
+        if os.tcgetpgrp(tty_fd) != os.getpgrp():
+            return False  # still backgrounded (bg): the tty belongs to its owner
+        attrs = termios.tcgetattr(tty_fd)
+        if not attrs[3] & termios.ICANON:
+            return False  # tty still raw; nothing to repair
+        termios.tcsetattr(tty_fd, termios.TCSADRAIN, _raw_readline_termios(attrs))
+        os.kill(os.getpid(), signal.SIGWINCH)  # readline redraw on a clean tty
+        return True
+    except (termios.error, OSError):
+        return False
+
+
+def _sigcont_watchdog(tty_fd: int, in_read: 'threading.Event',
+                      stop_event: 'threading.Event') -> None:
+    """Consume SIGCONT via sigwait and repair the terminal after stop/resume.
+
+    Runs in a daemon thread while `gather_user_input` waits for input. The
+    signal is blocked in this thread so sigwait receives it synchronously.
+    When the process was stopped (Ctrl+Z) while blocked in `input()` and then
+    continued (`fg`), the shell has left the terminal in cooked mode while
+    the pending readline still expects raw mode; `_repair_readline_terminal`
+    re-applies readline's raw input flags so the blocked read behaves again.
+
+    Args:
+        tty_fd: File descriptor of the controlling terminal.
+        in_read: Set while the main thread is blocked inside an `input()` call.
+        stop_event: Set by the main thread to end the watchdog loop.
+    """
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCONT, signal.SIGWINCH})
+    while not stop_event.is_set():
+        signal.sigwait({signal.SIGCONT})
+        if stop_event.is_set():
+            break
+        if not in_read.is_set():
+            continue  # stopped outside input(); the next input() re-preps anyway
+        _repair_readline_terminal(tty_fd)
+
+
 def gather_user_input(prompt_prefix: str, show_multiline: bool = True) -> Optional[str]:
     """
     Gather user input with multiline support.
@@ -7375,6 +7469,11 @@ def gather_user_input(prompt_prefix: str, show_multiline: bool = True) -> Option
     `\\` block). A double Ctrl+C at the main prompt raises `_ExitRequested` so
     the chat loop can exit cleanly; a double Ctrl+D / EOF exits directly.
 
+    While waiting for input a SIGCONT watchdog thread repairs the terminal
+    after a stop/continue cycle (Ctrl+Z, then bg/fg): readline is left reading
+    a cooked terminal where Enter stops submitting, so the watchdog re-applies
+    readline's raw input flags on resume.
+
     Args:
         prompt_prefix: String shown before the input prompt.
         show_multiline: Whether to honor `\"\"\"` / `\\` multiline entry.
@@ -7385,56 +7484,96 @@ def gather_user_input(prompt_prefix: str, show_multiline: bool = True) -> Option
     ctrl_c_count = 0
     ctrl_d_count = 0
 
-    while True:
+    in_read = threading.Event()
+    stop_watchdog = threading.Event()
+    watchdog = None
+    old_mask = None
+    if (READLINE_AVAILABLE and sys.stdin.isatty()
+            and hasattr(signal, 'SIGCONT') and hasattr(signal, 'sigwait')):
         try:
-            prompt_str, cont_prompt_str = _make_input_prompts(prompt_prefix)
-            line = input(prompt_str)
-            ctrl_c_count = 0
+            old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCONT})
+            watchdog = threading.Thread(target=_sigcont_watchdog,
+                                        args=(sys.stdin.fileno(), in_read, stop_watchdog),
+                                        daemon=True)
+            watchdog.start()
+        except (ValueError, AttributeError, OSError):
+            watchdog = None
 
-            if not line.strip():
+    try:
+        while True:
+            try:
+                prompt_str, cont_prompt_str = _make_input_prompts(prompt_prefix)
+                in_read.set()
+                line = input(prompt_str)
+                in_read.clear()
+                ctrl_c_count = 0
+
+                if not line.strip():
+                    return line
+
+                # 1. Handle """ Block Multiline
+                if show_multiline and line.strip() == '"""':
+                    in_read.set()
+                    lines = _read_multiline_lines(cont_prompt_str,
+                                                  lambda ln: ln.strip() == '"""')
+                    in_read.clear()
+                    if lines is None:
+                        return None  # Escape out of multiline without quitting
+                    result = "\n".join(lines)
+                    _remove_last_history_item()  # drop the opening """ entry
+                    _add_history(result)
+                    return result
+
+                # 2. Handle \ Line Continuation
+                if line.endswith('\\'):
+                    lines = [line[:-1]]  # Strip the trailing backslash
+                    in_read.set()
+                    tail = _read_multiline_lines(
+                        cont_prompt_str,
+                        lambda ln: not ln.endswith('\\'),
+                        transform=lambda ln: ln[:-1] if ln.endswith('\\') else ln,
+                        include_terminator=True)
+                    in_read.clear()
+                    if tail is None:
+                        return None
+                    result = "\n".join(lines + tail)
+                    _remove_last_history_item()  # drop the opening "\" entry
+                    _add_history(result)
+                    return result
+
+                # 3. Standard Single Line
                 return line
 
-            # 1. Handle """ Block Multiline
-            if show_multiline and line.strip() == '"""':
-                lines = _read_multiline_lines(cont_prompt_str,
-                                              lambda ln: ln.strip() == '"""')
-                if lines is None:
-                    return None  # Escape out of multiline without quitting
-                result = "\n".join(lines)
-                _remove_last_history_item()  # drop the opening """ entry
-                _add_history(result)
-                return result
+            except KeyboardInterrupt:
+                in_read.clear()
+                ctrl_c_count += 1
+                if ctrl_c_count >= 2:
+                    raise _ExitRequested()
+                print("\n(Press Ctrl+C again to exit)", file=sys.stderr)
 
-            # 2. Handle \ Line Continuation
-            if line.endswith('\\'):
-                lines = [line[:-1]]  # Strip the trailing backslash
-                tail = _read_multiline_lines(
-                    cont_prompt_str,
-                    lambda ln: not ln.endswith('\\'),
-                    transform=lambda ln: ln[:-1] if ln.endswith('\\') else ln,
-                    include_terminator=True)
-                if tail is None:
-                    return None
-                result = "\n".join(lines + tail)
-                _remove_last_history_item()  # drop the opening "\" entry
-                _add_history(result)
-                return result
-
-            # 3. Standard Single Line
-            return line
-
-        except KeyboardInterrupt:
-            ctrl_c_count += 1
-            if ctrl_c_count >= 2:
-                raise _ExitRequested()
-            print("\n(Press Ctrl+C again to exit)", file=sys.stderr)
-
-        except EOFError:
-            print("\n[EOF received, one more and it exits]", file=sys.stderr)
-            ctrl_d_count += 1
-            if ctrl_d_count >= 2:
-                print("\n[Exiting]", file=sys.stderr)
-                sys.exit(1)
+            except EOFError:
+                in_read.clear()
+                print("\n[EOF received, one more and it exits]", file=sys.stderr)
+                ctrl_d_count += 1
+                if ctrl_d_count >= 2:
+                    print("\n[Exiting]", file=sys.stderr)
+                    sys.exit(1)
+    finally:
+        if watchdog is not None:
+            stop_watchdog.set()
+            try:
+                os.kill(os.getpid(), signal.SIGCONT)
+            except OSError:
+                pass
+            try:
+                watchdog.join(timeout=1)
+            except Exception:
+                pass
+        if old_mask is not None:
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+            except (ValueError, OSError):
+                pass
 
 def _confirm_sensitive_inclusion(filepath: str) -> bool:
     """Ask the user before including a sensitive file (sensitive path check + confirm).
