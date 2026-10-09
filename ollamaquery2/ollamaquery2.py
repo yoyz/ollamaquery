@@ -7332,8 +7332,29 @@ def _load_history_file(path: str) -> None:
                 readline.add_history(_decode_history_entry(raw))
 
 
+def _read_input_line(prompt: str, in_read: 'Optional[threading.Event]' = None) -> str:
+    """Read one input line, telling the SIGCONT watchdog the read is blocked.
+
+    Args:
+        prompt: Prompt string passed to input().
+        in_read: Event set while the main thread is blocked in input() (None
+            skips the notification).
+
+    Returns:
+        The entered line.
+    """
+    if in_read is not None:
+        in_read.set()
+    try:
+        return input(prompt)
+    finally:
+        if in_read is not None:
+            in_read.clear()
+
+
 def _read_multiline_lines(cont_prompt: str, is_terminator: object, transform: object = lambda ln: ln,
-                          include_terminator: bool = False) -> Optional[list]:
+                          include_terminator: bool = False,
+                          in_read: 'Optional[threading.Event]' = None) -> Optional[list]:
     """Read continuation lines until the terminator predicate fires.
 
     Args:
@@ -7341,6 +7362,7 @@ def _read_multiline_lines(cont_prompt: str, is_terminator: object, transform: ob
         is_terminator: Callable(line) -> bool; stops reading when True.
         transform: Applied to each appended line (e.g. strip a trailing backslash).
         include_terminator: If True, the terminating line is appended (transformed).
+        in_read: Optional Event for the SIGCONT watchdog notification.
 
     Returns:
         list of str, or None if the user pressed Ctrl+C (cancelled).
@@ -7348,7 +7370,7 @@ def _read_multiline_lines(cont_prompt: str, is_terminator: object, transform: ob
     lines = []
     while True:
         try:
-            m_line = input(cont_prompt)
+            m_line = _read_input_line(cont_prompt, in_read)
             _remove_last_history_item()
             if is_terminator(m_line):
                 if include_terminator:
@@ -7358,6 +7380,24 @@ def _read_multiline_lines(cont_prompt: str, is_terminator: object, transform: ob
         except KeyboardInterrupt:
             print(colorize("\n[Multiline entry cancelled]", 'warning'), file=sys.stderr)
             return None
+
+
+def _finish_multiline_entry(lines: list) -> str:
+    """Join multiline lines into one entry and refresh readline history.
+
+    Drops the just-read opening line (``\"\"\"`` or trailing backslash) from
+    history and adds the joined block as a single entry instead.
+
+    Args:
+        lines: The continuation lines (terminator excluded).
+
+    Returns:
+        The joined multiline text.
+    """
+    result = "\n".join(lines)
+    _remove_last_history_item()  # drop the opening """ or "\" entry
+    _add_history(result)
+    return result
 
 
 class _ExitRequested(Exception):
@@ -7456,6 +7496,75 @@ def _sigcont_watchdog(tty_fd: int, in_read: 'threading.Event',
         _repair_readline_terminal(tty_fd)
 
 
+def _restore_sigcont_mask(old_mask: object) -> None:
+    """Restore a signal mask saved around the SIGCONT watchdog (best effort).
+
+    Args:
+        old_mask: The mask saved before blocking SIGCONT (None skips).
+    """
+    if old_mask is None:
+        return
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+    except (ValueError, OSError):
+        pass
+
+
+def _start_sigcont_watchdog(in_read: 'threading.Event') -> tuple:
+    """Start the SIGCONT repair watchdog for an input session.
+
+    Blocks SIGCONT in the calling (main) thread so the watchdog's sigwait
+    receives it synchronously; see `_sigcont_watchdog`.
+
+    Args:
+        in_read: Event set while the main thread is blocked inside input().
+
+    Returns:
+        (watchdog_thread, stop_event, old_mask), or (None, None, None) when
+        the watchdog is unavailable (no readline / no tty / no sigwait / error).
+    """
+    if not (READLINE_AVAILABLE and sys.stdin.isatty()
+            and hasattr(signal, 'SIGCONT') and hasattr(signal, 'sigwait')):
+        return None, None, None
+    try:
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCONT})
+    except (ValueError, OSError):
+        return None, None, None
+    stop_event = threading.Event()
+    watchdog = threading.Thread(target=_sigcont_watchdog,
+                                args=(sys.stdin.fileno(), in_read, stop_event),
+                                daemon=True)
+    try:
+        watchdog.start()
+    except Exception:
+        _restore_sigcont_mask(old_mask)
+        return None, None, None
+    return watchdog, stop_event, old_mask
+
+
+def _stop_sigcont_watchdog(watchdog: 'Optional[threading.Thread]',
+                           stop_event: 'Optional[threading.Event]',
+                           old_mask: object) -> None:
+    """Stop the SIGCONT watchdog and restore the caller's signal mask.
+
+    Args:
+        watchdog: The watchdog thread (None when it was never started).
+        stop_event: Its stop signal (None when it was never started).
+        old_mask: The mask saved before blocking SIGCONT.
+    """
+    if watchdog is not None:
+        stop_event.set()
+        try:
+            os.kill(os.getpid(), signal.SIGCONT)
+        except OSError:
+            pass
+        try:
+            watchdog.join(timeout=1)
+        except Exception:
+            pass
+    _restore_sigcont_mask(old_mask)
+
+
 def gather_user_input(prompt_prefix: str, show_multiline: bool = True) -> Optional[str]:
     """
     Gather user input with multiline support.
@@ -7470,9 +7579,7 @@ def gather_user_input(prompt_prefix: str, show_multiline: bool = True) -> Option
     the chat loop can exit cleanly; a double Ctrl+D / EOF exits directly.
 
     While waiting for input a SIGCONT watchdog thread repairs the terminal
-    after a stop/continue cycle (Ctrl+Z, then bg/fg): readline is left reading
-    a cooked terminal where Enter stops submitting, so the watchdog re-applies
-    readline's raw input flags on resume.
+    after a stop/continue cycle (Ctrl+Z, then bg/fg) — see `_sigcont_watchdog`.
 
     Args:
         prompt_prefix: String shown before the input prompt.
@@ -7485,27 +7592,12 @@ def gather_user_input(prompt_prefix: str, show_multiline: bool = True) -> Option
     ctrl_d_count = 0
 
     in_read = threading.Event()
-    stop_watchdog = threading.Event()
-    watchdog = None
-    old_mask = None
-    if (READLINE_AVAILABLE and sys.stdin.isatty()
-            and hasattr(signal, 'SIGCONT') and hasattr(signal, 'sigwait')):
-        try:
-            old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCONT})
-            watchdog = threading.Thread(target=_sigcont_watchdog,
-                                        args=(sys.stdin.fileno(), in_read, stop_watchdog),
-                                        daemon=True)
-            watchdog.start()
-        except (ValueError, AttributeError, OSError):
-            watchdog = None
-
+    watchdog, stop_watchdog, old_mask = _start_sigcont_watchdog(in_read)
     try:
         while True:
             try:
                 prompt_str, cont_prompt_str = _make_input_prompts(prompt_prefix)
-                in_read.set()
-                line = input(prompt_str)
-                in_read.clear()
+                line = _read_input_line(prompt_str, in_read)
                 ctrl_c_count = 0
 
                 if not line.strip():
@@ -7513,67 +7605,43 @@ def gather_user_input(prompt_prefix: str, show_multiline: bool = True) -> Option
 
                 # 1. Handle """ Block Multiline
                 if show_multiline and line.strip() == '"""':
-                    in_read.set()
                     lines = _read_multiline_lines(cont_prompt_str,
-                                                  lambda ln: ln.strip() == '"""')
-                    in_read.clear()
+                                                  lambda ln: ln.strip() == '"""',
+                                                  in_read=in_read)
                     if lines is None:
                         return None  # Escape out of multiline without quitting
-                    result = "\n".join(lines)
-                    _remove_last_history_item()  # drop the opening """ entry
-                    _add_history(result)
-                    return result
+                    return _finish_multiline_entry(lines)
 
                 # 2. Handle \ Line Continuation
                 if line.endswith('\\'):
                     lines = [line[:-1]]  # Strip the trailing backslash
-                    in_read.set()
                     tail = _read_multiline_lines(
                         cont_prompt_str,
                         lambda ln: not ln.endswith('\\'),
                         transform=lambda ln: ln[:-1] if ln.endswith('\\') else ln,
-                        include_terminator=True)
-                    in_read.clear()
+                        include_terminator=True,
+                        in_read=in_read)
                     if tail is None:
                         return None
-                    result = "\n".join(lines + tail)
-                    _remove_last_history_item()  # drop the opening "\" entry
-                    _add_history(result)
-                    return result
+                    return _finish_multiline_entry(lines + tail)
 
                 # 3. Standard Single Line
                 return line
 
             except KeyboardInterrupt:
-                in_read.clear()
                 ctrl_c_count += 1
                 if ctrl_c_count >= 2:
                     raise _ExitRequested()
                 print("\n(Press Ctrl+C again to exit)", file=sys.stderr)
 
             except EOFError:
-                in_read.clear()
                 print("\n[EOF received, one more and it exits]", file=sys.stderr)
                 ctrl_d_count += 1
                 if ctrl_d_count >= 2:
                     print("\n[Exiting]", file=sys.stderr)
                     sys.exit(1)
     finally:
-        if watchdog is not None:
-            stop_watchdog.set()
-            try:
-                os.kill(os.getpid(), signal.SIGCONT)
-            except OSError:
-                pass
-            try:
-                watchdog.join(timeout=1)
-            except Exception:
-                pass
-        if old_mask is not None:
-            try:
-                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-            except (ValueError, OSError):
-                pass
+        _stop_sigcont_watchdog(watchdog, stop_watchdog, old_mask)
 
 def _confirm_sensitive_inclusion(filepath: str) -> bool:
     """Ask the user before including a sensitive file (sensitive path check + confirm).

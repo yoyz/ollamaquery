@@ -14,6 +14,8 @@ import types
 import signal
 import socket
 import termios
+import inspect
+import threading
 import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
@@ -1470,6 +1472,89 @@ class TestStopResumeTerminalRepair(unittest.TestCase):
         self.assertEqual(applied[3] & (termios.ICANON | termios.ECHO), 0)
         self.assertTrue(applied[3] & termios.ISIG)
         mock_kill.assert_called_once_with(os.getpid(), signal.SIGWINCH)
+
+
+# ============================================================================
+# 17. input helper extraction (read / watchdog lifecycle / multiline commit)
+# ============================================================================
+
+class TestInputHelpers(unittest.TestCase):
+    """The extracted gather_user_input helpers behave as the inline code did."""
+
+    def test_read_input_line_sets_and_clears_in_read(self):
+        """in_read is set while blocked and cleared after the read."""
+        ev = threading.Event()
+        with patch('builtins.input', return_value='hello'):
+            out = m._read_input_line('p', ev)
+        self.assertEqual(out, 'hello')
+        self.assertFalse(ev.is_set())
+        seen = []
+
+        def probe(prompt):
+            seen.append(ev.is_set())
+            return 'x'
+
+        with patch('builtins.input', side_effect=probe):
+            m._read_input_line('p', ev)
+        self.assertEqual(seen, [True])
+
+    def test_read_input_line_clears_on_interrupt(self):
+        """The finally clause clears in_read even when input() raises."""
+        ev = threading.Event()
+        with patch('builtins.input', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                m._read_input_line('p', ev)
+        self.assertFalse(ev.is_set())
+
+    def test_read_input_line_without_event(self):
+        """in_read=None is supported (plain input())."""
+        with patch('builtins.input', return_value='ok'):
+            self.assertEqual(m._read_input_line('p'), 'ok')
+
+    def test_finish_multiline_entry_joins_and_updates_history(self):
+        """Lines are joined; the opening line is replaced by the whole block."""
+        with patch.object(m, '_remove_last_history_item') as mock_rm, \
+             patch.object(m, '_add_history') as mock_add:
+            out = m._finish_multiline_entry(['a', 'b'])
+        self.assertEqual(out, 'a\nb')
+        mock_rm.assert_called_once_with()
+        mock_add.assert_called_once_with('a\nb')
+
+    def test_start_watchdog_skips_without_tty(self):
+        """No watchdog without a tty (tests / pipes): (None, None, None)."""
+        fake = MagicMock()
+        fake.isatty.return_value = False
+        with patch('sys.stdin', fake):
+            watchdog, stop_event, old_mask = m._start_sigcont_watchdog(threading.Event())
+        self.assertIsNone(watchdog)
+        self.assertIsNone(stop_event)
+        self.assertIsNone(old_mask)
+
+    @unittest.skipUnless(hasattr(m.signal, 'sigwait'), "no sigwait")
+    def test_start_stop_watchdog_lifecycle(self):
+        """The watchdog thread starts, runs, and is stopped cleanly."""
+        fake = MagicMock()
+        fake.isatty.return_value = True
+        fake.fileno.return_value = 0
+        in_read = threading.Event()
+        with patch('sys.stdin', fake):
+            watchdog, stop_event, old_mask = m._start_sigcont_watchdog(in_read)
+        try:
+            self.assertIsNotNone(watchdog)
+            self.assertTrue(watchdog.daemon)
+            self.assertTrue(watchdog.is_alive())
+        finally:
+            m._stop_sigcont_watchdog(watchdog, stop_event, old_mask)
+        self.assertFalse(watchdog.is_alive())
+
+    def test_stop_watchdog_noop_when_not_started(self):
+        """(None, None, None) from a skipped start must be a safe no-op."""
+        m._stop_sigcont_watchdog(None, None, None)
+
+    def test_gather_user_input_stays_under_80_lines(self):
+        """The repo's own function-size rule applies to the entry point too."""
+        src = inspect.getsource(m.gather_user_input)
+        self.assertLessEqual(len(src.splitlines()), 80)
 
 
 # ============================================================================
