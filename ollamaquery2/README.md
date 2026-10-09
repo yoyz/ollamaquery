@@ -107,12 +107,15 @@ spawnshell are disabled when unavailable.
 | `apply_patch` | Apply diff with file headers |
 | `kubernetes_cluster_query` | Read-only OpenShift/Kubernetes cluster consultation (online `oc`/`kubectl`, offline `omc` must-gather) |
 
-Subcommands: `/agentic auto`, `plan`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `iterations <N>`, `timeout <N>`.
+Subcommands: `/agentic auto`, `plan [on|off|run]`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `iterations <N>`, `timeout <N>`.
 
-`/agentic plan` enables read-only planner mode: the tool surface is restricted to
-`read_file`, `glob`, `grep`, `list_directory`, `fetch_url`, `diff`, `run_command`,
-and `kubernetes_cluster_query`; `run_command` always asks for confirmation
-(bypass-immune) — the model inspects and plans without ever mutating anything.
+`/agentic plan` enables read-only planner mode. The default (strict) tier restricts
+the tool surface to `read_file`, `glob`, `grep`, `list_directory`, `fetch_url`,
+`diff`, and `kubernetes_cluster_query`, with **no shell**, and confines every path
+to the current working directory — requests outside it (e.g. `read_file /home/...`)
+are refused outright, never prompted. `/agentic plan run` is the deeper tier: it
+re-adds `run_command`, which always asks for confirmation (bypass-immune), for
+shell-only inspection. In both tiers the model can only query, never modify.
 
 Safety features: destructive tool confirmation, path ACL (see below), shell approval gate, step timeout (default 300s), stuck detection, same-tool-loop abort (after 10 consecutive identical calls), optional container sandbox (podman/docker).
 

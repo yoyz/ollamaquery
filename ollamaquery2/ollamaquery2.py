@@ -59,7 +59,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.13"
+__version__ = "0.2.14"
 
 
 # ============================================================================
@@ -348,7 +348,7 @@ COMMANDS = {
         'aliases': ['/agentic'],
         'category': 'Settings',
         'description': 'Configure agentic mode and sub-options',
-        'usage': '/agentic [on|off|full|auto|sandbox|verbose|thinking|trace|log|acl|iterations|timeout|status]',
+        'usage': '/agentic [on|off|full|auto|plan [on|off|run]|sandbox|verbose|thinking|trace|log|acl|iterations|timeout|status]',
         'handler': None
     },
     'listtool': {
@@ -1155,6 +1155,7 @@ class CommandContext:
         self.agentic_last_tool_name: str = ""
         self.lazy_tool: bool = True  # Enabled by default: many models embed tool calls after thinking/preamble
         self.plan_mode: bool = False  # Read-only planning mode (restricts tools + prompts)
+        self.plan_run: bool = False  # Plan tier: True = `/agentic plan run` (allows run_command w/ confirm)
         self.supports_vision: Optional[bool] = None  # None = unknown (treated as capable)
 
         # Context window tracking
@@ -2099,11 +2100,23 @@ AGENTIC_RULES_BLOCK = """## General rules
 - Mirror the user's language — if they write in French, reply in French.
 - The user's message may already include file contents they referenced (marked `[Content of local file ...]`). If the information you need is already in the conversation, answer directly — do NOT call tools merely to confirm, re-read, or "explore" what you were already given."""
 
-# Read-only planning-mode block, appended when `/agentic plan` is active. The
-# model is told it may only inspect and plan — enforcement also happens at the
-# tool-surface and execution layers, so this is behavioral guidance, not the
-# only defense.
+# Strict read-only planning-mode block, appended when `/agentic plan` is active.
+# The model is told it may only inspect and plan, and that it is confined to the
+# current working directory — enforcement also happens at the tool-surface,
+# execution-backstop, and Path-ACL layers, so this is behavioral guidance, not
+# the only defense.
 AGENTIC_PLAN_BLOCK = """## Read-only planning mode
+You are operating in READ-ONLY PLANNING MODE. Your job is to INSPECT and PLAN, never to change anything.
+
+- You MUST NOT modify, create, delete, move, or overwrite any files, and you MUST NOT change any system state.
+- Only use the tools available to you to read and inspect: read_file, list_directory, glob, grep, fetch_url, diff, kubernetes_cluster_query.
+- You are confined to the project's current working directory. Requests for paths outside it are REFUSED automatically — do not attempt /home, /etc, /proc, /sys, or any absolute path outside the project.
+- Never attempt write_file, run_python, run_command, patch, edit_file, or apply_patch — they are disabled in this mode. There is no shell access.
+- When you have gathered enough information, present a clear, step-by-step plan to the user. Do NOT execute the plan yourself."""
+
+# Deeper `/agentic plan run` block: same read-only intent, but run_command is
+# available for shell-only inspection and asks for confirmation every time.
+AGENTIC_PLAN_RUN_BLOCK = """## Read-only planning mode (run)
 You are operating in READ-ONLY PLANNING MODE. Your job is to INSPECT and PLAN, never to change anything.
 
 - You MUST NOT modify, create, delete, move, or overwrite any files, and you MUST NOT change any system state.
@@ -2176,7 +2189,8 @@ def get_prompt_style(model_name: str) -> str:
 
 
 def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
-                       include_tool_defs: bool = True, plan_mode: bool = False) -> str:
+                       include_tool_defs: bool = True, plan_mode: bool = False,
+                       plan_run: bool = False) -> str:
     """Assemble the agentic system prompt from composable blocks.
 
     Args:
@@ -2186,6 +2200,8 @@ def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
         include_tool_defs: If False, skip tool_defs_block (for models using native tools API).
         plan_mode: If True, append the read-only planning-mode block so the
             model knows it may only inspect and plan (never modify state).
+        plan_run: If True (only meaningful with plan_mode), use the deeper
+            `/agentic plan run` block that allows run_command with confirmation.
 
     Format selection:
         - openai tool format (native tools API): AGENTIC_FORMAT_NATIVE — never
@@ -2204,7 +2220,7 @@ def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
         blocks.append(AGENTIC_FORMAT_REGISTRY[style])
         blocks.append(AGENTIC_EXAMPLE_REGISTRY[style])
     if plan_mode:
-        blocks.append(AGENTIC_PLAN_BLOCK)
+        blocks.append(AGENTIC_PLAN_RUN_BLOCK if plan_run else AGENTIC_PLAN_BLOCK)
     blocks.append(AGENTIC_RULES_BLOCK)
     return "\n\n".join(blocks)
 
@@ -3589,12 +3605,34 @@ DESTRUCTIVE_TOOLS = {"write_file", "run_python", "run_command", "patch", "edit_f
 
 # Read-only planning mode (/agentic plan) tool surface. The model may only
 # inspect: read files, search path/contents (glob + grep), list directories,
-# fetch URLs, diff files, run shell commands that always ask for confirmation
-# before executing, and query a Kubernetes/OpenShift cluster read-only.
-# Everything else (write_file, run_python, patch, edit_file, apply_patch) is
-# hidden from the prompt/tools API AND denied at the execution backstop.
+# fetch URLs, diff files, and query a Kubernetes/OpenShift cluster read-only.
+# There is NO shell access: run_command is not reachable. Paths are confined to
+# the current working directory (see _path_acl_decision) — requests outside it
+# are refused, not prompted. Everything else (write_file, run_python,
+# run_command, patch, edit_file, apply_patch) is hidden from the prompt/tools
+# API AND denied at the execution backstop.
 PLAN_MODE_TOOLS = {"read_file", "glob", "grep", "list_directory", "fetch_url",
-                   "diff", "run_command", "kubernetes_cluster_query"}
+                   "diff", "kubernetes_cluster_query"}
+
+# Deeper `/agentic plan run` tier: re-adds run_command, which still asks for
+# confirmation on every invocation (bypass-immune). The path confinement of the
+# strict tier is lifted so shell commands are governed by the shell gate/Path
+# ACL as usual.
+PLAN_MODE_RUN_TOOLS = PLAN_MODE_TOOLS | {"run_command"}
+
+
+def plan_active_tools(ctx) -> set:
+    """Return the plan-mode tool surface for `ctx` (strict vs run tier).
+
+    Args:
+        ctx: CommandContext (or None).
+
+    Returns:
+        PLAN_MODE_RUN_TOOLS for `/agentic plan run`, else PLAN_MODE_TOOLS.
+    """
+    if getattr(ctx, "plan_run", False):
+        return PLAN_MODE_RUN_TOOLS
+    return PLAN_MODE_TOOLS
 
 # Kubernetes / OpenShift read-only consultation (kubernetes_cluster_query tool).
 # cluster_type auto: KUBECONFIG env var set → online; else omc configured
@@ -4008,31 +4046,50 @@ def _path_acl_decision(ctx: Optional['CommandContext'], op: str, realpath: str, 
         acl.log_event(tool, realpath, "deny", None)
         return "deny", "System file blocked (sensitive virtual file)"
     decision, rule = acl.evaluate(op, realpath)
-    # Reject implicit home-read allowance for non-explicit home requests.
-    # CWD is always allowed — this only applies to $HOME paths OUTSIDE CWD,
-    # so relative `../` escapes that land in $HOME stay denied.
-    if decision == "allow" and rule is None and op == "read":
+    plan_strict = (ctx is not None and getattr(ctx, "plan_mode", False)
+                   and not getattr(ctx, "plan_run", False))
+    if plan_strict:
+        # Strict /agentic plan is confined to CWD: any implicit allow outside
+        # CWD (the $HOME read allowance) and every `ask` rule become a hard
+        # deny — no prompts. Explicit session allow rules (rule is not None)
+        # survive, so e.g. the cluster spill dir remains readable.
         cwd_real = os.path.realpath(os.getcwd())
         try:
             in_cwd = os.path.commonpath([cwd_real, realpath]) == cwd_real
         except ValueError:
             in_cwd = False
-        if not in_cwd:
-            home_real = os.path.realpath(os.path.expanduser("~"))
+        if decision == "allow" and rule is None and not in_cwd:
+            decision = "deny"
+        elif decision == "ask":
+            decision = "deny"
+    else:
+        # Reject implicit home-read allowance for non-explicit home requests.
+        # CWD is always allowed — this only applies to $HOME paths OUTSIDE CWD,
+        # so relative `../` escapes that land in $HOME stay denied.
+        if decision == "allow" and rule is None and op == "read":
+            cwd_real = os.path.realpath(os.getcwd())
             try:
-                in_home = os.path.commonpath([home_real, realpath]) == home_real
+                in_cwd = os.path.commonpath([cwd_real, realpath]) == cwd_real
             except ValueError:
-                in_home = False
-            if in_home and not _is_home_dotfile(realpath) and not _raw_is_home_explicit(raw_path):
-                decision = "deny"
-    if decision == "ask":
-        granted = acl.prompt(op, realpath, rule, tool=tool, context=context)
-        decision = "allow" if granted else "deny"
+                in_cwd = False
+            if not in_cwd:
+                home_real = os.path.realpath(os.path.expanduser("~"))
+                try:
+                    in_home = os.path.commonpath([home_real, realpath]) == home_real
+                except ValueError:
+                    in_home = False
+                if in_home and not _is_home_dotfile(realpath) and not _raw_is_home_explicit(raw_path):
+                    decision = "deny"
+        if decision == "ask":
+            granted = acl.prompt(op, realpath, rule, tool=tool, context=context)
+            decision = "allow" if granted else "deny"
     acl.log_event(tool, realpath, decision, rule)
     if decision == "deny":
         if rule is not None:
             shown = rule["path"] if rule.get("kind") == "prefix" else "home dotfile"
             return "deny", f"denied by path ACL rule: {rule['action']} {shown}"
+        if plan_strict:
+            return "deny", "Strict plan mode is confined to the current working directory"
         return "deny", "Path traversal denied"
     return "allow", None
 
@@ -5531,15 +5588,18 @@ class ToolRegistry:
     def _plan_allowed_tools(self) -> dict:
         """Return the visible tool definitions for the active mode.
 
-        Plan mode restricts the surface to PLAN_MODE_TOOLS so the model cannot
-        even see (or, via the schema, emit) write tools.
+        Plan mode restricts the surface to the active plan tier — the query
+        tools only for strict `/agentic plan`, plus run_command for
+        `/agentic plan run` — so the model cannot even see (or, via the schema,
+        emit) write tools.
 
         Returns:
             A dict of tool name -> definition for the current mode.
         """
         if self._ctx and getattr(self._ctx, 'plan_mode', False):
+            allowed = plan_active_tools(self._ctx)
             return {name: defn for name, defn in AGENTIC_TOOL_DEFS.items()
-                    if name in PLAN_MODE_TOOLS}
+                    if name in allowed}
         return dict(AGENTIC_TOOL_DEFS)
 
     def get_system_prompt_block(self) -> str:
@@ -5560,8 +5620,8 @@ class ToolRegistry:
     def openai_tools_spec(self) -> list:
         """Build the OpenAI `tools` API parameter list for the active mode.
 
-        Plan mode restricts the schema to PLAN_MODE_TOOLS so models using the
-        native tools API cannot even emit calls for the hidden write tools.
+        Plan mode restricts the schema to the active plan tier so models using
+        the native tools API cannot even emit calls for the hidden write tools.
 
         Returns:
             List of {"type": "function", "function": {...}} dicts.
@@ -5584,10 +5644,11 @@ class ToolRegistry:
     def _confirm(self, tool_name: str, args: dict) -> bool:
         """Ask the user before running a destructive tool.
 
-        Plan mode forces a confirmation for every destructive tool (only
-        run_command is destructive in the plan surface), bypassing auto-confirm
-        — exactly like the Path ACL's bypass-immune `ask` rules. Otherwise
-        destructive tools are confirmed unless auto-confirm is on.
+        Plan mode forces a confirmation for every destructive tool (run_command
+        is the only destructive tool reachable, and only in the `/agentic plan
+        run` tier), bypassing auto-confirm — exactly like the Path ACL's
+        bypass-immune `ask` rules. Otherwise destructive tools are confirmed
+        unless auto-confirm is on.
 
         Args:
             tool_name: Name of the tool to run.
@@ -5637,10 +5698,12 @@ class ToolRegistry:
         # Plan mode backstop: even if the model hallucinates a write tool (or a
         # hidden tool leaks through the surface filter), deny it here. Defense
         # in depth — the prompt and tool schema already hide these tools.
-        if self._ctx and getattr(self._ctx, 'plan_mode', False) and tool_name not in PLAN_MODE_TOOLS:
-            return {"success": False, "output": "",
-                    "error": f"Tool '{tool_name}' is disabled in read-only plan mode "
-                             f"(allowed: {', '.join(sorted(PLAN_MODE_TOOLS))})"}
+        if self._ctx and getattr(self._ctx, 'plan_mode', False):
+            allowed = plan_active_tools(self._ctx)
+            if tool_name not in allowed:
+                return {"success": False, "output": "",
+                        "error": f"Tool '{tool_name}' is disabled in read-only plan mode "
+                                 f"(allowed: {', '.join(sorted(allowed))})"}
         # Normalize argument name aliases (e.g. "path" -> "file")
         if tool_name in TOOL_ARG_ALIASES:
             for canonical, aliases in TOOL_ARG_ALIASES[tool_name].items():
@@ -8644,7 +8707,7 @@ class ChatLoop:
         if subcmd == "plan":
             return self._agentic_toggle_plan(parts)
 
-        print(colorize("[Usage: /agentic [on|off|full|auto|plan|sandbox|verbose|thinking|trace|log|lazytool|acl|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|status]]", 'warning'), file=sys.stderr)
+        print(colorize("[Usage: /agentic [on|off|full|auto|plan [on|off|run]|sandbox|verbose|thinking|trace|log|lazytool|acl|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|status]]", 'warning'), file=sys.stderr)
         return False
 
     # Named toggles (always toggle between on/off)
@@ -8666,8 +8729,13 @@ class ChatLoop:
         state = "ON" if self.ctx.agentic_mode else "OFF"
         if self.ctx.agentic_mode:
             self.ctx._saved_system_prompt = self.ctx.system_prompt
-            self.ctx.system_prompt = get_agentic_prompt(self.ctx.model, plan_mode=self.ctx.plan_mode)
+            self.ctx.system_prompt = get_agentic_prompt(
+                self.ctx.model, plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)
         else:
+            # Leaving agentic mode also clears plan mode; otherwise a later
+            # `/agentic on` would silently re-apply read-only plan restrictions.
+            self.ctx.plan_mode = False
+            self.ctx.plan_run = False
             if hasattr(self.ctx, '_saved_system_prompt'):
                 self.ctx.system_prompt = self.ctx._saved_system_prompt
         print(colorize(f"[Agentic mode: {state}]", 'success' if self.ctx.agentic_mode else 'warning'), file=sys.stderr)
@@ -8676,7 +8744,8 @@ class ChatLoop:
     def _agentic_set_full(self) -> bool:
         """Enable everything: agentic mode, verbose, thinking, trace, auto-confirm, lazy."""
         self.ctx._saved_system_prompt = self.ctx.system_prompt
-        self.ctx.system_prompt = get_agentic_prompt(self.ctx.model, plan_mode=self.ctx.plan_mode)
+        self.ctx.system_prompt = get_agentic_prompt(
+            self.ctx.model, plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)
         self.ctx.agentic_mode = True
         self.ctx.agentic_verbose = True
         self.ctx.agentic_show_thinking = True
@@ -8693,25 +8762,27 @@ class ChatLoop:
         return False
 
     def _agentic_toggle_plan(self, parts: list) -> bool:
-        """Toggle read-only planning mode (/agentic plan [on|off]).
+        """Toggle read-only planning mode (/agentic plan [on|off|run]).
 
-        Enabling forces agentic mode ON and restricts the tool surface to
-        PLAN_MODE_TOOLS (read_file, glob, grep, list_directory, fetch_url, diff,
-        run_command, kubernetes_cluster_query) at all three layers: the system
-        prompt block, the native tools API schema, and the execution backstop.
-        run_command always asks for confirmation in plan mode, even with
-        auto-confirm enabled (bypass-immune). Disabling restores the
-        agentic_mode that was active before plan mode was enabled.
+        Enabling forces agentic mode ON and restricts the tool surface at all
+        three layers (system prompt block, native tools API schema, execution
+        backstop). The default (`on`) is the strict read-only tier: the query
+        tools only (read_file, glob, grep, list_directory, fetch_url, diff,
+        kubernetes_cluster_query), with no shell, and paths confined to the
+        current working directory (anything outside is refused, not prompted).
+        `run` is the deeper tier that re-adds run_command, which always asks for
+        confirmation (bypass-immune). Disabling restores the agentic_mode that
+        was active before plan mode was enabled.
 
         Args:
-            parts: Split /agentic args (parts[2] is "on"/"off" or omitted).
+            parts: Split /agentic args (parts[2] is "on"/"off"/"run" or omitted).
 
         Returns:
             False to keep the chat loop running.
         """
         arg = parts[2] if len(parts) > 2 else "on"
-        if arg not in ("on", "off"):
-            print(colorize("[Usage: /agentic plan [on|off]]", 'warning'), file=sys.stderr)
+        if arg not in ("on", "off", "run"):
+            print(colorize("[Usage: /agentic plan [on|off|run]]", 'warning'), file=sys.stderr)
             return False
 
         if arg == "off":
@@ -8719,25 +8790,46 @@ class ChatLoop:
                 print(colorize("[Agentic plan mode already OFF]", 'muted'), file=sys.stderr)
                 return False
             self.ctx.plan_mode = False
+            self.ctx.plan_run = False
             self.ctx.agentic_mode = getattr(self.ctx, '_plan_prev_agentic', False)
             if hasattr(self.ctx, '_saved_system_prompt'):
                 self.ctx.system_prompt = self.ctx._saved_system_prompt
             print(colorize("[Agentic plan mode: OFF — read-only restrictions lifted]", 'warning'), file=sys.stderr)
             return False
 
-        # Enabling plan mode
+        want_run = (arg == "run")
         if self.ctx.plan_mode:
-            print(colorize("[Agentic plan mode already ON]", 'muted'), file=sys.stderr)
+            if want_run == bool(getattr(self.ctx, "plan_run", False)):
+                label = "run" if want_run else "strict"
+                print(colorize(f"[Agentic plan mode ({label}) already ON]", 'muted'), file=sys.stderr)
+                return False
+            # Switching tier while plan mode is already active.
+            self.ctx.plan_run = want_run
+            self.ctx.system_prompt = get_agentic_prompt(
+                self.ctx.model, plan_mode=True, plan_run=want_run)
+            self._print_plan_mode_status()
             return False
+
         self.ctx._plan_prev_agentic = self.ctx.agentic_mode
         self.ctx.plan_mode = True
+        self.ctx.plan_run = want_run
         self.ctx.agentic_mode = True
         self.ctx._saved_system_prompt = self.ctx.system_prompt
-        self.ctx.system_prompt = get_agentic_prompt(self.ctx.model, plan_mode=True)
-        print(colorize("[Agentic plan mode: ON — read-only planner]", 'success'), file=sys.stderr)
-        print(colorize("[Tools restricted to: read_file, glob, grep, list_directory, fetch_url, diff, run_command]", 'muted'), file=sys.stderr)
-        print(colorize("[run_command will ask for confirmation before executing]", 'info'), file=sys.stderr)
+        self.ctx.system_prompt = get_agentic_prompt(
+            self.ctx.model, plan_mode=True, plan_run=want_run)
+        self._print_plan_mode_status()
         return False
+
+    def _print_plan_mode_status(self) -> None:
+        """Print the active plan-mode tier and its enforced tool surface."""
+        if getattr(self.ctx, "plan_run", False):
+            print(colorize("[Agentic plan mode: ON — read-only planner (run)]", 'success'), file=sys.stderr)
+            print(colorize("[Tools restricted to: read_file, glob, grep, list_directory, fetch_url, diff, kubernetes_cluster_query, run_command]", 'muted'), file=sys.stderr)
+            print(colorize("[run_command will ask for confirmation before executing]", 'info'), file=sys.stderr)
+        else:
+            print(colorize("[Agentic plan mode: ON — read-only, confined to CWD]", 'success'), file=sys.stderr)
+            print(colorize("[Tools restricted to: read_file, glob, grep, list_directory, fetch_url, diff, kubernetes_cluster_query]", 'muted'), file=sys.stderr)
+            print(colorize("[No shell; paths outside the current directory are refused]", 'info'), file=sys.stderr)
 
     def _agentic_toggle_sandbox(self) -> bool:
         """Toggle the executor between container and host mode."""
@@ -8876,13 +8968,14 @@ class ChatLoop:
         """Display current agentic settings like /debug output."""
         c = self.ctx
         print(colorize("\n[Agentic Settings - Use /agentic <option> [value]]", 'info'), file=sys.stderr)
-        print("  Subcommands: on, off, full, auto, plan, sandbox, verbose, thinking, trace, log, lazytool,", file=sys.stderr)
+        print("  Subcommands: on, off, full, auto, plan [on|off|run], sandbox, verbose, thinking, trace, log, lazytool,", file=sys.stderr)
         print("               iterations <N>, timeout <N>, heartbeattokens <N>, compactthreshold <v>, acl, status", file=sys.stderr)
         print(file=sys.stderr)
 
+        plan_value = "off" if not c.plan_mode else ("run" if getattr(c, "plan_run", False) else "on")
         settings = [
             ("agentic",    "Master toggle",             str(c.agentic_mode).lower()),
-            ("plan",       "Read-only planner (read/glob/list/fetch/diff/run)", str(c.plan_mode).lower()),
+            ("plan",       "Read-only planner (on=query/CWD-confined, run=+shell)", plan_value),
             ("auto",       "Skip destructive tool confirmation", str(c.auto_confirm).lower()),
             ("sandbox",    "Run tool subprocesses in container", self.executor.mode),
             ("verbose",    "Show raw model responses during ReAct", str(c.agentic_verbose).lower()),
@@ -9812,7 +9905,7 @@ class ChatLoop:
         tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
         messages = [{'role': 'system', 'content': get_agentic_prompt(
             self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
-            plan_mode=self.ctx.plan_mode)}]
+            plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)}]
         if len(self.messages) > 1:
             messages.extend(self.messages[1:])
 
@@ -10207,7 +10300,7 @@ class ChatLoop:
             tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
             reentry_messages = [{'role': 'system', 'content': get_agentic_prompt(
                 self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
-                plan_mode=self.ctx.plan_mode)}]
+                plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)}]
             if len(self.messages) > 1:
                 reentry_messages.extend(self.messages[1:])
             sync_kwargs = dict(get_inference_params(self.ctx.model))
@@ -10533,7 +10626,7 @@ class ChatLoop:
             tool_defs_block = self.tool_registry.get_system_prompt_block()
             messages[0] = {'role': 'system', 'content': get_agentic_prompt(
                 self.ctx.model, tool_defs_block, include_tool_defs=True,
-                plan_mode=self.ctx.plan_mode)}
+                plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)}
             print(colorize("\n[WARNING] Model does not support native tools API. Falling back to inline tool definitions.", 'warning'), file=sys.stderr)
             return "tools", "", send_tools_api
         return "ok", "", send_tools_api

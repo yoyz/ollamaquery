@@ -228,16 +228,32 @@ class TestToolRegistry(unittest.TestCase):
         try:
             block = self.reg.get_system_prompt_block()
             self.assertIn("read_file", block)
-            self.assertIn("run_command", block)
             self.assertIn("list_directory", block)
             self.assertIn("glob", block)
             self.assertIn("fetch_url", block)
             self.assertIn("diff", block)
+            self.assertNotIn("### run_command", block)  # no shell in strict plan
             self.assertNotIn("write_file", block)
             self.assertNotIn("run_python", block)
             self.assertNotIn("apply_patch", block)
         finally:
             self.ctx.plan_mode = False
+
+    def test_plan_run_mode_surface_adds_run_command(self):
+        self.ctx.plan_mode = True
+        self.ctx.plan_run = True
+        try:
+            block = self.reg.get_system_prompt_block()
+            self.assertIn("read_file", block)
+            self.assertIn("### run_command", block)
+            self.assertNotIn("write_file", block)
+            self.assertNotIn("run_python", block)
+            spec = self.reg.openai_tools_spec()
+            names = {t["function"]["name"] for t in spec}
+            self.assertEqual(names, q.PLAN_MODE_RUN_TOOLS)
+        finally:
+            self.ctx.plan_mode = False
+            self.ctx.plan_run = False
 
     def test_plan_mode_openai_tools_spec_restricted(self):
         self.ctx.plan_mode = True
@@ -280,9 +296,23 @@ class TestToolRegistry(unittest.TestCase):
             if os.path.exists(testfile):
                 os.unlink(testfile)
 
-    def test_plan_mode_run_command_always_confirms(self):
-        """run_command must prompt even with auto_confirm (bypass-immune)."""
+    def test_plan_mode_run_command_denied_strict(self):
+        """Strict plan mode has no shell: run_command is denied, never prompted."""
         self.ctx.plan_mode = True
+        self.ctx.auto_confirm = True
+        try:
+            with patch("builtins.input", return_value="y") as mocked:
+                result = self.reg.execute("run_command", {"command": "echo plan-test"})
+            self.assertFalse(result["success"])
+            self.assertIn("read-only plan mode", result["error"])
+            mocked.assert_not_called()
+        finally:
+            self.ctx.plan_mode = False
+
+    def test_plan_run_command_confirms_even_auto(self):
+        """run_command in the `plan run` tier prompts even with auto_confirm."""
+        self.ctx.plan_mode = True
+        self.ctx.plan_run = True
         self.ctx.auto_confirm = True
         try:
             with patch("builtins.input", return_value="n"):
@@ -291,6 +321,52 @@ class TestToolRegistry(unittest.TestCase):
             self.assertIn("Cancelled by user", result["error"])
         finally:
             self.ctx.plan_mode = False
+            self.ctx.plan_run = False
+
+    def test_plan_strict_confines_reads_to_cwd(self):
+        """Strict plan refuses an absolute path outside CWD instead of prompting."""
+        with tempfile.TemporaryDirectory() as outside:
+            victim = os.path.join(outside, "secret.txt")
+            with open(victim, "w") as f:
+                f.write("top secret")
+            self.ctx.plan_mode = True
+            try:
+                with patch("builtins.input", return_value="y") as mocked:
+                    result = self.reg.execute("read_file", {"file": victim})
+                self.assertFalse(result["success"])
+                self.assertIn("confined", result["error"].lower())
+                mocked.assert_not_called()
+            finally:
+                self.ctx.plan_mode = False
+
+    def test_plan_strict_confines_list_directory_outside_cwd(self):
+        """Strict plan refuses listing a directory outside CWD (no prompt)."""
+        with tempfile.TemporaryDirectory() as outside:
+            self.ctx.plan_mode = True
+            try:
+                with patch("builtins.input", return_value="y") as mocked:
+                    result = self.reg.execute("list_directory", {"path": outside})
+                self.assertFalse(result["success"])
+                self.assertIn("confined", result["error"].lower())
+                mocked.assert_not_called()
+            finally:
+                self.ctx.plan_mode = False
+
+    def test_plan_strict_honors_session_allow(self):
+        """An explicit session allow rule still works in strict plan mode."""
+        with tempfile.TemporaryDirectory() as outside:
+            victim = os.path.join(outside, "notes.txt")
+            with open(victim, "w") as f:
+                f.write("allowed notes")
+            self.ctx.plan_mode = True
+            self.ctx.path_acl.add("read", "allow", outside, source="session")
+            try:
+                result = self.reg.execute("read_file", {"file": victim})
+                self.assertTrue(result["success"], msg=result.get("error"))
+                self.assertIn("allowed notes", result["output"])
+            finally:
+                self.ctx.plan_mode = False
+                self.ctx.path_acl.remove(outside)
 
     def test_read_file(self):
         """Test reading a file within CWD."""
@@ -481,8 +557,9 @@ class TestToolRegistry(unittest.TestCase):
             self.assertEqual(q._is_harmless_get_fetch(cmd), "", cmd)
 
     def test_run_command_curl_get_redirects_to_fetch_url(self):
-        """A harmless GET curl in plan mode is served by fetch_url, no Y/N."""
+        """A harmless GET curl in `plan run` mode is served by fetch_url, no Y/N."""
         self.ctx.plan_mode = True
+        self.ctx.plan_run = True
         self.ctx.auto_confirm = False  # would prompt if not redirected
         try:
             with patch("ollamaquery2.fetch_and_convert_url",
@@ -494,10 +571,12 @@ class TestToolRegistry(unittest.TestCase):
             self.assertIn("SERVED PAGES", result["output"])    # actual content
         finally:
             self.ctx.plan_mode = False
+            self.ctx.plan_run = False
 
     def test_run_command_curl_failure_redirect(self):
         """A redirected fetch still surfaces the failure instead of OK."""
         self.ctx.plan_mode = True
+        self.ctx.plan_run = True
         try:
             with patch("ollamaquery2.fetch_and_convert_url",
                        return_value=("[Failed to fetch URL: HTTP Error 403: Forbidden]", "None")):
@@ -508,10 +587,12 @@ class TestToolRegistry(unittest.TestCase):
             self.assertIn("403", result["error"])
         finally:
             self.ctx.plan_mode = False
+            self.ctx.plan_run = False
 
     def test_non_fetch_curl_still_gated(self):
-        """curl that writes to disk is not intercepted; plan mode still asks."""
+        """curl that writes to disk is not intercepted; `plan run` still asks."""
         self.ctx.plan_mode = True
+        self.ctx.plan_run = True
         self.ctx.auto_confirm = True
         try:
             with patch("ollamaquery2.fetch_and_convert_url",
@@ -524,6 +605,7 @@ class TestToolRegistry(unittest.TestCase):
             self.assertNotIn("SHOULD NOT BE USED", result.get("output", ""))
         finally:
             self.ctx.plan_mode = False
+            self.ctx.plan_run = False
 
     def test_fetch_url_surfaces_failure(self):
         """fetch_url must not report success while embedding a failure string."""
@@ -968,6 +1050,10 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
         self.ctx.backend = BACKEND
         self.ctx.model = MODEL
         self.ctx.agentic_mode = True
+        # Defensive: E2E does write/compile/run, which can never succeed in
+        # read-only plan mode. Never inherit a plan flag from another test.
+        self.ctx.plan_mode = False
+        self.ctx.plan_run = False
         self.ctx.agentic_logging = False
         self.ctx.auto_confirm = True  # skip prompts
         self.ctx.agentic_verbose = True
@@ -2096,11 +2182,13 @@ class TestAgenticPlanCommand(unittest.TestCase):
     def setUp(self):
         ctx = q.CommandContext()
         ctx.plan_mode = False
+        ctx.plan_run = False
         ctx.agentic_mode = False
 
     def tearDown(self):
         ctx = q.CommandContext()
         ctx.plan_mode = False
+        ctx.plan_run = False
         ctx.agentic_mode = False
 
     def _loop(self):
@@ -2113,7 +2201,38 @@ class TestAgenticPlanCommand(unittest.TestCase):
         self.assertFalse(loop._agentic_toggle_plan(['/agentic', 'plan']))
         self.assertTrue(loop.ctx.plan_mode)
         self.assertTrue(loop.ctx.agentic_mode)
+        self.assertFalse(loop.ctx.plan_run)
         self.assertIn("Read-only planning mode", loop.ctx.system_prompt)
+
+    def test_plan_strict_prompt_is_confined(self):
+        loop = self._loop()
+        loop._agentic_toggle_plan(['/agentic', 'plan'])
+        self.assertFalse(loop.ctx.plan_run)
+        self.assertIn("confined", loop.ctx.system_prompt.lower())
+        self.assertIn("no shell access", loop.ctx.system_prompt.lower())
+
+    def test_plan_run_sets_plan_run_flag(self):
+        loop = self._loop()
+        self.assertFalse(loop._agentic_toggle_plan(['/agentic', 'plan', 'run']))
+        self.assertTrue(loop.ctx.plan_mode)
+        self.assertTrue(loop.ctx.plan_run)
+        self.assertTrue(loop.ctx.agentic_mode)
+        self.assertIn("run_command", loop.ctx.system_prompt)
+        self.assertIn("confirm", loop.ctx.system_prompt.lower())
+        loop._agentic_toggle_plan(['/agentic', 'plan', 'off'])
+        self.assertFalse(loop.ctx.plan_mode)
+        self.assertFalse(loop.ctx.plan_run)
+
+    def test_plan_switch_tier_while_active(self):
+        loop = self._loop()
+        loop._agentic_toggle_plan(['/agentic', 'plan'])
+        self.assertFalse(loop.ctx.plan_run)
+        loop._agentic_toggle_plan(['/agentic', 'plan', 'run'])
+        self.assertTrue(loop.ctx.plan_mode)
+        self.assertTrue(loop.ctx.plan_run)
+        loop._agentic_toggle_plan(['/agentic', 'plan', 'on'])
+        self.assertTrue(loop.ctx.plan_mode)
+        self.assertFalse(loop.ctx.plan_run)
 
     def test_plan_off_restores_previous_agentic_mode(self):
         loop = self._loop()
@@ -2142,6 +2261,22 @@ class TestAgenticPlanCommand(unittest.TestCase):
         self.assertTrue(loop.ctx.plan_mode)
         loop.run_handle_agentic('/agentic plan off')
         self.assertFalse(loop.ctx.plan_mode)
+
+    def test_agentic_off_clears_plan_flags(self):
+        """Master `/agentic off` must not leave a stale plan flag behind."""
+        loop = self._loop()
+        loop.ctx.agentic_mode = True
+        loop._agentic_toggle_plan(['/agentic', 'plan', 'run'])
+        self.assertTrue(loop.ctx.plan_mode)
+        self.assertTrue(loop.ctx.plan_run)
+        loop._agentic_toggle_on_off(False)
+        self.assertFalse(loop.ctx.agentic_mode)
+        self.assertFalse(loop.ctx.plan_mode)
+        self.assertFalse(loop.ctx.plan_run)
+        # Re-enabling agentic must NOT silently restore plan restrictions.
+        loop._agentic_toggle_on_off(True)
+        self.assertFalse(loop.ctx.plan_mode)
+        self.assertFalse(loop.ctx.plan_run)
 
 
 class TestAppendToolMessages(unittest.TestCase):
