@@ -120,16 +120,19 @@ GKE, k3s, ... are all clusters), and the resource vocabulary differs per platfor
 
 ```
 kubernetes_cluster_query
-  cluster_type  enum: omc | openshift | kubernetes | auto   (default: auto)
-  verb          enum: get | logs | describe | events | current-context   (default: get)
-  resource      string   (required for get/logs/describe)
-  name          string   (optional, resource instance)
-  namespace     string   (optional, `-n`)
-  offline_dir   string   (optional; must-gather dir — defaults to the one in ~/.omc/omc.json)
-  tail          integer  (logs only, default 50)
-  output        enum: json | yaml | wide | custom-columns | jsonpath   (default: json)
-  fields        string   (required for custom-columns / jsonpath, e.g.
-                         NAME:.metadata.name or {.items[*].metadata.name})
+  cluster_type   enum: omc | openshift | kubernetes | auto   (default: auto)
+  verb           enum: get | logs | describe | events | current-context   (default: get)
+  resource       string   (required for get/logs/describe)
+  name           string   (optional, resource instance)
+  namespace      string   (optional, `-n`)
+  selector       string   (optional, `-l` label selector; get/logs/events, rejected for describe)
+  field_selector string   (optional, `--field-selector`; get only)
+  container      string   (optional, `-c` container name; logs only)
+  offline_dir    string   (optional; must-gather dir — defaults to the one in ~/.omc/omc.json)
+  tail           integer  (logs only, default 50)
+  output         enum: json | yaml | wide | custom-columns | jsonpath   (default: json)
+  fields         string   (required for custom-columns / jsonpath, e.g.
+                           NAME:.metadata.name or {.items[*].metadata.name})
 ```
 
 Handler behaviour:
@@ -149,12 +152,20 @@ Handler behaviour:
      omc has no per-query `--must-gather-dir` flag — selection is `omc use`.)
    - `openshift` → `oc <verb> ...`
    - `kubernetes` → `kubectl <verb> ...`
-4. Append `-n <namespace>`, `--tail=N` (logs), `-o <output>`.
-5. Run via `Executor.run()` (goes through the shell gate; allow-listed → no prompt).
-6. Prepend an observation header: `platform: <omc|openshift|kubernetes> |
+4. Append `-n <namespace>`, `-l <selector>` (get/logs), `--field-selector=<s>` (get),
+   `-c <container>` (logs), `--tail=N` (logs), `-o <output>`. Unsupported
+   verb/filter combinations raise a `ValueError` with a corrective message.
+5. Shell-quote EVERY token (`shlex.quote`) before joining into the command
+   string. The command runs with `shell=True`, so an unquoted LLM-controlled
+   value could smuggle a second command (`kubectl get pods; touch x`,
+   `pods $(id)` — both executed before the quoting fix). Quoting turns injected
+   values into literal operands the backend rejects. Safe tokens pass through
+   unchanged, so the allow-listed gate patterns still match.
+6. Run via `Executor.run()` (goes through the shell gate; allow-listed → no prompt).
+7. Prepend an observation header: `platform: <omc|openshift|kubernetes> |
    context: <current-context> | must-gather: <dir>` so the model (and logs) always
    record which cluster and vocabulary were consulted.
-7. Rely on the existing observation cap (`_cap_tool_observation`, ~4K chars);
+8. Rely on the existing observation cap (`_cap_tool_observation`, ~4K chars);
    `tail=50` keeps raw logs bounded at the source.
 
 ## 6. Security posture
@@ -166,6 +177,7 @@ Accepted for controlled, local use (documented decision — not a bug to fix sil
 | `oc get secret -o yaml` leaks secret values | Accepted: controlled local context + trusted model. No cluster-object ACL exists (only filesystem Path ACL). Deferred (see §7). |
 | kubeconfig credentials (`~/.kube/config`) | Already guarded: home-dotfile `ask` via Path ACL, unchanged. |
 | Mutating verbs                      | Unreachable structurally (tool whitelist) + not allow-listed (gate). |
+| Shell injection via tool args       | Fixed: every token is `shlex.quote`d before joining into the `shell=True` command — `;`, `$()`, backticks become literal operands the backend rejects. |
 | Pipeline escapes (`\| oc apply`)     | Per-component gate keeps non-allow-listed nodes at `ask`.  |
 | Offline dir outside CWD             | `omc` read verbs are allow-listed; flag-value path not ACL-scanned (accepted, documented). |
 

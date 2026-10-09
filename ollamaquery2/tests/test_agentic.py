@@ -2090,13 +2090,82 @@ class TestClusterQueryTool(unittest.TestCase):
             result = self._run(verb="get", resource="pv", output="jsonpath",
                                fields="{.items[*].metadata.name}")
         self.assertTrue(result["success"], msg=result.get("error"))
+        # The jsonpath token carries shell metacharacters -> shlex.quote'd.
         self.assertTrue(self.commands[1].startswith(
-            "oc get pv -o jsonpath={.items[*].metadata.name}"))
+            "oc get pv -o 'jsonpath={.items[*].metadata.name}'"))
 
     def test_jsonpath_requires_fields(self):
         result = self._run(verb="get", resource="pv", output="jsonpath")
         self.assertFalse(result["success"])
         self.assertIn("fields is required", result["error"])
+
+    def test_verb_args_are_shell_quoted(self):
+        """_cluster_query_verb_args returns shlex.quote'd tokens (injection defense)."""
+        parts = q._cluster_query_verb_args("get", {"resource": "pods; touch x"})
+        self.assertEqual(parts, ["get", "'pods; touch x'", "-o", "json"])
+        safe = q._cluster_query_verb_args("get", {"resource": "pods"})
+        self.assertEqual(safe, ["get", "pods", "-o", "json"])
+        ns = q._cluster_query_verb_args("get", {"resource": "pods", "namespace": "ns1 -o wide; id"})
+        self.assertEqual(ns, ["get", "pods", "-n", "'ns1 -o wide; id'", "-o", "json"])
+
+    def test_selector_filter(self):
+        """selector (-l) narrows get and lands unquoted for safe values."""
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="get", resource="pods", selector="app=nginx")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertTrue(self.commands[1].startswith("oc get pods -l app=nginx -o json"))
+
+    def test_selector_rejected_for_describe(self):
+        result = self._run(verb="describe", resource="pods", selector="app=nginx")
+        self.assertFalse(result["success"])
+        self.assertIn("selector", result["error"])
+
+    def test_field_selector_get(self):
+        """field_selector (--field-selector) narrows get."""
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="get", resource="pods",
+                               field_selector="status.phase=Running")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertTrue(self.commands[1].startswith(
+            "oc get pods --field-selector=status.phase=Running -o json"))
+
+    def test_field_selector_rejected_for_logs(self):
+        result = self._run(verb="logs", resource="pod/mypod",
+                           field_selector="status.phase=Running")
+        self.assertFalse(result["success"])
+        self.assertIn("field_selector", result["error"])
+
+    def test_container_logs(self):
+        """container (-c) selects one container for logs."""
+        with patch.object(q.shutil, "which", return_value="/usr/bin/omc"):
+            result = self._run(cluster_type="omc", verb="logs", resource="pod/mypod",
+                               container="sidecar", tail=10, offline_dir="/tmp/mg")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertTrue(self.commands[1].startswith("omc logs pod/mypod -c sidecar --tail=10"))
+
+    def test_container_rejected_for_get(self):
+        result = self._run(verb="get", resource="pods", container="sidecar")
+        self.assertFalse(result["success"])
+        self.assertIn("container", result["error"])
+
+    def test_injection_semicolon_is_quoted(self):
+        """A `;`-injected resource becomes a quoted literal operand, not a second command."""
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="get", resource="pods; touch /tmp/opencode/pwned")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertIn("'pods; touch /tmp/opencode/pwned'", self.commands[1])
+        self.assertNotIn("pods; touch /tmp/opencode/pwned -o", self.commands[1])
+
+    def test_injection_command_substitution_is_quoted(self):
+        """A `$()`-injected resource is quoted into a literal operand (was approved + executed pre-fix)."""
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="get", resource="pods $(id > /tmp/opencode/pwned2)")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertIn("'pods $(id > /tmp/opencode/pwned2)'", self.commands[1])
 
     def test_small_result_stays_inline(self):
         with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \

@@ -3584,7 +3584,7 @@ AGENTIC_TOOL_DEFS = {
         }
     },
     "kubernetes_cluster_query": {
-        "description": "Read-only query of a Kubernetes/OpenShift cluster. NEVER modifies anything. Online (oc/kubectl) talks to the live cluster via kubeconfig; offline (omc) inspects a local OpenShift must-gather directory. cluster_type auto: KUBECONFIG env var set → online; else omc configured (binary + ~/.omc/omc.json) → offline; else online via default kubeconfig. Resources differ by platform — OpenShift also has projects, routes, buildconfigs, deploymentconfigs. Use CANONICAL resource names: `persistentvolumes`/`persistentvolumeclaims` (or `pv`/`pvc`) — do NOT invent plural forms like `pvs`, `volumeclaims`, or `claims`, which the backend rejects. Object storage (ODF) uses `objectbucketclaim`/`objectbucket`; those may not be collected in a must-gather, so a 'resource type not known' error there means the data is not available offline — try the canonical name once, then report it rather than retrying other spellings. Logs are tailed (default 50 lines). For LISTING tasks (e.g. 'list all PVs and their sizes') prefer output='custom-columns' with fields= (compact, one line per object) or output='wide' over output='json' — json dumps whole objects and large results are spilled to a file you must read via read_file. When a result IS spilled, the file path returned in the observation is authoritative: read it directly with read_file(file_path=\"...\") and page with its `next` offset — do NOT list the parent directory (~/.ollamaquery.d) to locate it.",
+        "description": "Read-only query of a Kubernetes/OpenShift cluster. NEVER modifies anything. Online (oc/kubectl) talks to the live cluster via kubeconfig; offline (omc) inspects a local OpenShift must-gather directory. cluster_type auto: KUBECONFIG env var set → online; else omc configured (binary + ~/.omc/omc.json) → offline; else online via default kubeconfig. Resources differ by platform — OpenShift also has projects, routes, buildconfigs, deploymentconfigs. Use CANONICAL resource names: `persistentvolumes`/`persistentvolumeclaims` (or `pv`/`pvc`) — do NOT invent plural forms like `pvs`, `volumeclaims`, or `claims`, which the backend rejects. Object storage (ODF) uses `objectbucketclaim`/`objectbucket`; those may not be collected in a must-gather, so a 'resource type not known' error there means the data is not available offline — try the canonical name once, then report it rather than retrying other spellings. Logs are tailed (default 50 lines). Filtering: selector (-l label selector) narrows get/logs/events; field_selector (--field-selector) narrows get; container (-c) selects one container for logs. All argument values are shell-quoted before execution — pass plain single values, never shell operators or substitutions. For LISTING tasks (e.g. 'list all PVs and their sizes') prefer output='custom-columns' with fields= (compact, one line per object) or output='wide' over output='json' — json dumps whole objects and large results are spilled to a file you must read via read_file. When a result IS spilled, the file path returned in the observation is authoritative: read it directly with read_file(file_path=\"...\") and page with its `next` offset — do NOT list the parent directory (~/.ollamaquery.d) to locate it.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -3593,6 +3593,9 @@ AGENTIC_TOOL_DEFS = {
                 "resource": {"type": "string", "description": "Resource type to query, e.g. pods, deployments, nodes, namespaces (required for get/logs/describe)"},
                 "name": {"type": "string", "description": "Optional resource instance name, e.g. my-pod"},
                 "namespace": {"type": "string", "description": "Optional namespace (-n)"},
+                "selector": {"type": "string", "description": "Optional label selector to filter on, e.g. 'app=nginx' (-l). Supported by get and logs; rejected for describe."},
+                "field_selector": {"type": "string", "description": "Optional field selector, e.g. 'status.phase=Running' (--field-selector). Supported by get only."},
+                "container": {"type": "string", "description": "Optional container name for logs (-c), e.g. multi-container pods."},
                 "offline_dir": {"type": "string", "description": "Optional OpenShift must-gather directory for offline (omc) queries. Defaults to the dir selected in ~/.omc/omc.json."},
                 "tail": {"type": "integer", "description": "Logs only: last N lines (default 50)"},
                 "output": {"type": "string", "enum": ["json", "yaml", "wide", "custom-columns", "jsonpath"], "description": "get/events output format (default: json). custom-columns / jsonpath need `fields`."},
@@ -5227,15 +5230,27 @@ def _read_omc_config_must_gather_dir() -> Optional[str]:
 def _cluster_query_verb_args(verb: str, args: dict) -> list:
     """Build the verb-specific command tokens for a cluster query.
 
+    Every token is shell-quoted (shlex.quote) before returning: the token list
+    is joined into a single command string that Executor runs with shell=True,
+    so an unquoted LLM-controlled value (resource, name, namespace, selector,
+    fields, ...) could smuggle a second shell command (`kubectl get pods; touch
+    x` executed `touch`; `pods $(id)` executed `id` — both verified before the
+    quoting fix). Quoting turns injected values into literal operands that the
+    backend rejects instead of executing them. Safe tokens (pods, -o, json,
+    --tail=50) pass through unchanged, so the allow-listed gate patterns
+    (`kubectl get *`, ...) still match the quoted command.
+
     Args:
         verb: One of get/logs/describe/events.
-        args: Tool args (resource, name, namespace, tail, output).
+        args: Tool args (resource, name, namespace, tail, output, fields,
+            selector, field_selector, container).
 
     Returns:
-        Command token list following the verb.
+        Shell-quoted command token list following the verb.
 
     Raises:
-        ValueError: when a required resource is missing.
+        ValueError: when a required resource/fields is missing, or a filter is
+            used with a verb that does not support it.
     """
     parts = ["get", "events"] if verb == "events" else [verb]
     if verb != "events":
@@ -5249,6 +5264,22 @@ def _cluster_query_verb_args(verb: str, args: dict) -> list:
     namespace = str(args.get("namespace") or "").strip()
     if namespace:
         parts += ["-n", namespace]
+    selector = str(args.get("selector") or "").strip()
+    if selector:
+        if verb == "describe":
+            raise ValueError("selector (-l) is not supported for describe — use get")
+        parts += ["-l", selector]
+    field_selector = str(args.get("field_selector") or "").strip()
+    if field_selector:
+        if verb in ("describe", "logs"):
+            raise ValueError(
+                f"field_selector (--field-selector) is not supported for {verb} — use get")
+        parts += [f"--field-selector={field_selector}"]
+    container = str(args.get("container") or "").strip()
+    if container:
+        if verb != "logs":
+            raise ValueError(f"container (-c) is only supported for logs (verb='{verb}')")
+        parts += ["-c", container]
     if verb == "logs":
         tail = args.get("tail")
         if tail is not None:
@@ -5273,7 +5304,8 @@ def _cluster_query_verb_args(verb: str, args: dict) -> list:
             parts += ["-o", f"jsonpath={fields}"]
         else:
             parts += ["-o", output]
-    return parts
+    # Quote every token for the shell=True execution path (see docstring).
+    return [shlex.quote(part) for part in parts]
 
 
 def _cluster_current_context(executor: object, cli: str) -> str:
@@ -5358,7 +5390,8 @@ def _tool_handle_cluster_query(self, args: dict) -> dict:
     output = str(args.get("output", "json")).lower()
     if output not in CLUSTER_QUERY_OUTPUTS:
         return {"success": False, "output": "",
-                "error": f"Unsupported output format '{output}' (allowed: json, yaml, wide)"}
+                "error": f"Unsupported output format '{output}' "
+                         f"(allowed: {', '.join(sorted(CLUSTER_QUERY_OUTPUTS))})"}
     backend = _resolve_cluster_backend(args.get("cluster_type"))
     if backend is None:
         return {"success": False, "output": "",
@@ -5443,7 +5476,10 @@ TOOL_ARG_ALIASES = {
     "kubernetes_cluster_query": {"resource": ["kind", "type", "resource_type"],
                                  "offline_dir": ["must_gather_dir", "dir", "mgdir"],
                                  "verb": ["action"],
-                                 "fields": ["columns", "jsonpath_expr", "expr"]},
+                                 "fields": ["columns", "jsonpath_expr", "expr"],
+                                 "selector": ["label_selector", "label", "labels"],
+                                 "field_selector": ["fieldselector", "field-selector"],
+                                 "container": ["container_name", "ctr"]},
 }
 
 # curl/wget flags that keep a command a harmless read-only GET fetch (no body,
