@@ -9825,16 +9825,19 @@ class ChatLoop:
         streams model thinking to stderr in real time when `agentic_show_thinking`
         is enabled. Heartbeat dots are token-driven: one dot per
         `ctx.agentic_heartbeat_tokens` (default 10) streamed tokens, so the
-        cadence reflects real generation progress rather than wall-clock. Because
-        some generations deliver no chunks at all (e.g. llama.cpp buffering a
-        tool-call response for tens of seconds), a daemon watchdog thread also
-        emits a dot (~1/s) once the step has been silent for ~2s, resuming as
-        soon as tokens flow again. While thinking is being streamed live both
-        mechanisms hold off (the user already sees progress). `buffer` is a dict
-        with accumulated `content`/`thought` — used after a timeout to decide
-        abort-vs-continue. `finalize()` closes any open `<thinking>` block and
-        stops the watchdog + lingering worker thread (on timeout) from writing
-        further feedback.
+        cadence reflects real generation progress rather than wall-clock. Dots
+        fire in thinking-off mode only — with show_thinking the user already
+        sees reasoning stream live. Because some generations deliver no chunks
+        at all (e.g. llama.cpp buffering a tool-call response for tens of
+        seconds), a daemon watchdog thread also emits a dot (~1/s) once the
+        step has been silent for ~2s, resuming as soon as tokens flow again.
+        While thinking is being streamed live the watchdog holds off (the user
+        already sees progress) unless the step goes truly silent: then the
+        open `<thinking>` block is closed and the watchdog dots keep the user
+        informed. `buffer` is a dict with accumulated `content`/`thought` —
+        used after a timeout to decide abort-vs-continue. `finalize()` closes
+        any open `<thinking>` block and stops the watchdog + lingering worker
+        thread (on timeout) from writing further feedback.
 
         Returns:
             (on_chunk, finalize, buffer) tuple of callables + state dict.
@@ -9898,7 +9901,12 @@ class ChatLoop:
                 return
             self._accumulate_step_feedback(state, thought, content)
             self._render_step_feedback(state, thought, content, show_thinking)
-            if (thought or content) and not state["thinking_open"]:
+            # Token-driven dots are the liveness signal for thinking-off mode
+            # only. With show_thinking the user already sees reasoning stream
+            # live; dots after the block closes (while hidden content streams,
+            # re-rendered later by the final query_stream) read as noise.
+            if ((not show_thinking) and (thought or content)
+                    and not state["thinking_open"]):
                 state["tok_acc"] += max(1, len(thought) // 4) + max(1, len(content) // 4)
                 while state["tok_acc"] >= heartbeat_tokens:
                     state["tok_acc"] -= heartbeat_tokens

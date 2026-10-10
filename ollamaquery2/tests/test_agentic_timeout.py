@@ -398,6 +398,22 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
         self.assertIn("<thinking>", self._stderr.getvalue())
         finalize()
 
+    def test_token_dots_suppressed_when_thinking_streams(self):
+        """Token-driven dots must not fire when thinking is streamed live — even
+        after the <thinking> block closes on content arrival (regression: hidden
+        content streamed ~1 dot per 10 tokens while the user was in thinking
+        mode, reading as a dot wall after </thinking>)."""
+        self.ctx.agentic_show_thinking = True
+        on_chunk, finalize, state = self.loop._make_agentic_step_feedback()
+        on_chunk("reasoning text", "", False)          # opens the block
+        on_chunk("", "answer content " * 50, False)    # closes it, ~125 tokens
+        on_chunk("", "more content", False)            # more hidden content
+        self.assertFalse(self._wait_for(lambda: "." in self._stderr.getvalue(), timeout=1.5))
+        self.assertIn("</thinking>", self._stderr.getvalue())
+        finalize()
+        self.assertEqual(self._stderr.getvalue().count("."), 0,
+                         "no dot noise when the user chose live reasoning")
+
     def test_watchdog_closes_silent_thinking_and_shows_dots(self):
         """A quiet thinking phase (model switching to a native tool call, whose
         deltas carry no content) must not suppress the liveness dots: the
