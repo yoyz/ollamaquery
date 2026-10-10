@@ -919,6 +919,33 @@ class TestFetchAndConvertUrl(unittest.TestCase):
         text, tool = q.fetch_and_convert_url('')
         self.assertIn('Failed', text)
 
+    def test_fetch_and_convert_url_empty_stripped_text_falls_back_to_curl(self):
+        """Non-empty HTML that strips to no visible text must try the curl
+        fallback (regression: script-only body was reported as success with
+        an empty output instead of falling through)."""
+        resp = MagicMock()
+        resp.__enter__.return_value = resp
+        resp.info.return_value.get_content_charset.return_value = 'utf-8'
+        resp.read.return_value = b'<html><body><script>var x=1;</script></body></html>'
+        with patch("ollamaquery2._request_with_retry", return_value=resp):
+            with patch("ollamaquery2._curl_fetch_text",
+                       return_value="<html><body>curl rescued content</body></html>"):
+                text, tool = q.fetch_and_convert_url("https://js-only.example")
+        self.assertIn('curl rescued content', text)
+        self.assertEqual(tool, "htmlstrip")
+
+    def test_fetch_and_convert_url_all_empty_is_failure(self):
+        """Both transports yielding script-only HTML must return the failure
+        marker, never ("", "htmlstrip") (regression: success with empty output
+        made the model conclude fetch_url was broken and fall back to curl)."""
+        with patch("ollamaquery2._request_with_retry",
+                   side_effect=Exception("HTTP Error 500: Internal Server Error")):
+            with patch("ollamaquery2._curl_fetch_text",
+                       return_value="<html><body><script>var x=1;</script></body></html>"):
+                text, tool = q.fetch_and_convert_url("https://blocked.example")
+        self.assertTrue(text.startswith('[Failed to fetch URL:'))
+        self.assertEqual(tool, "None")
+
 
 class TestHTMLStripperExtras(unittest.TestCase):
     """Additional HTMLStripper regression tests."""
@@ -960,6 +987,39 @@ class TestHTMLStripperExtras(unittest.TestCase):
         self.assertNotIn('css', result)
         self.assertNotIn('js', result)
         self.assertIn('Visible', result)
+
+    def test_html_stripper_void_tags_do_not_swallow_body(self):
+        """Real-world HTML5 void tags (<meta>/<link>, no end tag) must not pin
+        skip_depth and swallow the body (regression: pages like example.com
+        and insee.fr served empty because <meta charset=utf-8> has no </meta>)."""
+        html = ('<html lang=en><head><meta charset=utf-8>'
+                '<link rel=icon href=data:,>'
+                '<meta name=viewport content="width=device-width,initial-scale=1">'
+                '<title>Example Domain</title>'
+                '<style>html{color-scheme:light dark}</style></head>'
+                '<body><p>This domain is for use in documentation examples.</p>'
+                '<script src=/s.js></script></body></html>')
+        stripper = q.CoreHTMLStripper()
+        stripper.feed(html)
+        result = stripper.get_text()
+        self.assertIn('This domain is for use in documentation examples.', result)
+        self.assertNotIn('color-scheme', result)     # style stays skipped
+        self.assertNotIn('Example Domain', result)   # title stays skipped
+
+    def test_html_stripper_void_tags_mixed_forms(self):
+        """Void tags in HTML5, XHTML and mid-body forms must never enter skip mode."""
+        html = ('<div><br><img src="x.png">After img<br/>After br</div>'
+                '<input type="text"><p>After input</p>'
+                '<meta charset="utf-8"><p>After meta</p>'
+                '<meta charset="utf-8"/><p>After self-closing meta</p>')
+        stripper = q.CoreHTMLStripper()
+        stripper.feed(html)
+        result = stripper.get_text()
+        self.assertIn('After img', result)
+        self.assertIn('After br', result)
+        self.assertIn('After input', result)
+        self.assertIn('After meta', result)
+        self.assertIn('After self-closing meta', result)
 
 
 # ============================================================================

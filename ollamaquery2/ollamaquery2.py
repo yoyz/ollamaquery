@@ -3714,8 +3714,9 @@ def _tool_handle_fetch_url(self, args: dict) -> dict:
     """
     url = args["url"]
     text, _tool = fetch_and_convert_url(url)
-    if text.startswith("[Failed to fetch URL:"):
-        return {"success": False, "output": "", "error": text}
+    if text.startswith("[Failed to fetch URL:") or not text.strip():
+        return {"success": False, "output": "",
+                "error": text or f"[Failed to fetch URL: no visible text for {url}]"}
     return {"success": True, "output": text, "error": None}
 
 
@@ -7957,7 +7958,7 @@ def _curl_fetch_text(url: str, timeout: int = 20) -> str:
           "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
     try:
         proc = subprocess.run(
-            ["curl", "-sL", "--max-time", str(timeout), "-A", ua, url],
+            ["curl", "-sL", "--compressed", "--fail", "--max-time", str(timeout), "-A", ua, url],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
     except (OSError, ValueError):
@@ -7967,38 +7968,61 @@ def _curl_fetch_text(url: str, timeout: int = 20) -> str:
     return proc.stdout
 
 
+def _strip_html_text(html: str) -> str:
+    """Strip HTML markup down to visible text.
+
+    Args:
+        html: Raw HTML document text.
+
+    Returns:
+        Extracted text joined by newlines, or "" when the document has no
+        visible text (empty input, script/style-only page, binary garbage).
+    """
+    if not html or not html.strip():
+        return ""
+    stripper = CoreHTMLStripper()
+    stripper.feed(html)
+    return stripper.get_text()
+
+
 def fetch_and_convert_url(url: str) -> tuple:
     """Fetch URL and extract clean text using core standard libraries only.
 
-    Uses urllib first; when that is blocked (HTTP 4xx, timeout, empty body)
-    falls back to a curl subprocess with a browser User-Agent.
+    Uses urllib first; when that is blocked (HTTP errors, timeout, or a body
+    that strips to no visible text) falls back to a curl subprocess with a
+    browser User-Agent. Single urllib attempt: a WAF TLS-fingerprint rejection
+    (e.g. insee.fr 500) is deterministic, so urllib retries are futile — the
+    curl transport is the real fallback and covers transient failures too.
 
     Args:
         url: The URL to fetch.
 
     Returns:
-        (text, tool) tuple where tool is "htmlstrip" or "None".
+        (text, tool) tuple where tool is "htmlstrip" or "None". Text is
+        never empty on success; a "[Failed to fetch URL: ...]" marker marks
+        a failed fetch so callers report success=False (never a misleading
+        success with an empty body).
     """
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     err = ""
     try:
         req = Request(url, headers=headers)
-        with _request_with_retry(req, timeout=15) as response:
+        with _request_with_retry(req, max_retries=1, timeout=15) as response:
             charset = response.info().get_content_charset() or 'utf-8'
             html_content = response.read().decode(charset, errors='ignore')
-        if html_content.strip():
-            stripper = CoreHTMLStripper()
-            stripper.feed(html_content)
-            return stripper.get_text(), "htmlstrip"
+        text = _strip_html_text(html_content)
+        if text:
+            return text, "htmlstrip"
         err = "empty response body"
     except Exception as e:
         err = str(e)
     # urllib blocked or empty — try curl (browser TLS/header fingerprint).
     html = _curl_fetch_text(url)
+    text = _strip_html_text(html)
+    if text:
+        return text, "htmlstrip"
     if html:
-        stripper = CoreHTMLStripper()
-        stripper.feed(html)
-        return stripper.get_text(), "htmlstrip"
+        err = "no visible text extracted from response"
     return f"[Failed to fetch URL: {err}]", "None"
 
 
@@ -8013,12 +8037,32 @@ class CoreHTMLStripper(HTMLParser):
       get_text() → returns accumulated text
     """
     skip_tags = {'script', 'style', 'head', 'meta', 'noscript', 'link', 'title'}
+    # HTML5 void elements: never closed, hold no text. They must NOT enter
+    # skip mode — a plain `<meta charset=utf-8>` or `<link rel=icon>` has no
+    # end tag, so counting it would pin skip_depth > 0 for the rest of the
+    # document and swallow every following body text (real-world pages,
+    # example.com included, emit void tags this way).
+    VOID_TAGS = frozenset({
+        'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+        'link', 'meta', 'param', 'source', 'track', 'wbr',
+    })
 
     def __init__(self) -> None:
         """Initialize the stripper with empty text parts and skip depth 0."""
         super().__init__()
         self.text_parts = []
         self.skip_depth = 0
+
+    def _is_skip_open(self, tag: str) -> bool:
+        """True when tag opens a skip block (excluded tag, not void).
+
+        Args:
+            tag: The tag name.
+
+        Returns:
+            True when the tag should increment the skip depth.
+        """
+        return tag.lower() in self.skip_tags and tag.lower() not in self.VOID_TAGS
 
     def handle_starttag(self, tag: str, attrs: list) -> None:
         """Increment skip depth for excluded block tags.
@@ -8027,7 +8071,7 @@ class CoreHTMLStripper(HTMLParser):
             tag: The start tag name.
             attrs: Tag attributes (ignored).
         """
-        if tag.lower() in self.skip_tags:
+        if self._is_skip_open(tag):
             self.skip_depth += 1
 
     def handle_endtag(self, tag: str) -> None:
@@ -8036,7 +8080,7 @@ class CoreHTMLStripper(HTMLParser):
         Args:
             tag: The end tag name.
         """
-        if tag.lower() in self.skip_tags:
+        if self._is_skip_open(tag):
             self.skip_depth = max(0, self.skip_depth - 1)
 
     def handle_data(self, data: str) -> None:

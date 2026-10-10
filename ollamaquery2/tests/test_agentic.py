@@ -615,6 +615,16 @@ class TestToolRegistry(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("403", result["error"])
 
+    def test_fetch_url_empty_output_is_failure(self):
+        """fetch_url must not report success with an empty output (regression:
+        success=True with output="" made models conclude the tool was broken
+        and fall back to shell curl)."""
+        with patch("ollamaquery2.fetch_and_convert_url",
+                   return_value=("", "htmlstrip")):
+            result = self.reg.execute("fetch_url", {"url": "https://empty.example"})
+        self.assertFalse(result["success"])
+        self.assertTrue(result["error"])
+
     def test_fetch_url_curl_fallback(self):
         """fetch_and_convert_url falls back to curl when urllib is blocked."""
         with patch("ollamaquery2._request_with_retry",
