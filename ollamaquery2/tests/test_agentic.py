@@ -625,6 +625,16 @@ class TestToolRegistry(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertTrue(result["error"])
 
+    def test_fetch_url_404_steers_to_follow_links(self):
+        """A 404 error steers the model to follow links from fetched pages
+        instead of guessing more non-existent URLs."""
+        with patch("ollamaquery2.fetch_and_convert_url",
+                   return_value=("[Failed to fetch URL: HTTP Error 404: Not Found]", "None")):
+            result = self.reg.execute("fetch_url", {"url": "https://www.insee.fr/fr/statistiques/2028001"})
+        self.assertFalse(result["success"])
+        self.assertIn("404", result["error"])
+        self.assertIn("follow links", result["error"])
+
     def test_fetch_url_curl_fallback(self):
         """fetch_and_convert_url falls back to curl when urllib is blocked."""
         with patch("ollamaquery2._request_with_retry",

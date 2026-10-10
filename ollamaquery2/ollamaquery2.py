@@ -3704,7 +3704,9 @@ def _tool_handle_fetch_url(self, args: dict) -> dict:
 
     Surfacing failures: a blocked/unreachable URL returns success=False so the
     agentic loop sees ERROR instead of silently treating "[Failed to fetch
-    URL: ...]" as real page content.
+    URL: ...]" as real page content. A 404 steers the model to follow links
+    from already-fetched pages — models otherwise burn turns guessing
+    non-existent IDs (e.g. repeated insee.fr /statistiques/<id> 404s).
 
     Args:
         args: Tool arguments dict with "url".
@@ -3715,8 +3717,11 @@ def _tool_handle_fetch_url(self, args: dict) -> dict:
     url = args["url"]
     text, _tool = fetch_and_convert_url(url)
     if text.startswith("[Failed to fetch URL:") or not text.strip():
-        return {"success": False, "output": "",
-                "error": text or f"[Failed to fetch URL: no visible text for {url}]"}
+        error = text or f"[Failed to fetch URL: no visible text for {url}]"
+        if "404" in error:
+            error += (" — this URL does not exist; follow links from "
+                      "already-fetched pages instead of guessing URLs.")
+        return {"success": False, "output": "", "error": error}
     return {"success": True, "output": text, "error": None}
 
 
