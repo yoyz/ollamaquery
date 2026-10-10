@@ -588,6 +588,35 @@ def colorize(text: str, role: str, theme: Optional[Dict] = None,
     return f"{start_code}{text}{reset_code}"
 
 
+def _thinking_open_tag() -> str:
+    """Opening `<thinking>` tag; the dim color spans the whole streamed block.
+
+    Uses the theme's `muted` color (the same dim as the `--- Stats: ---` line)
+    so reasoning is visually distinct from the answer. The color-on code is
+    emitted once at block open — streamed thought chunks render dim without
+    per-chunk escapes; `_thinking_close_tag` resets it.
+
+    Returns:
+        The tag with the color-on prefix (plain when colors are off).
+    """
+    theme = get_theme()
+    if not colors_enabled() or not theme.get('muted'):
+        return "\n<thinking>\n"
+    return f"{theme['muted']}\n<thinking>\n"
+
+
+def _thinking_close_tag() -> str:
+    """Closing `</thinking>` tag; resets the dim color span opened by `_thinking_open_tag`.
+
+    Returns:
+        The tag with the reset suffix (plain when colors are off).
+    """
+    theme = get_theme()
+    if not colors_enabled() or not theme.get('muted'):
+        return "\n</thinking>\n"
+    return f"\n</thinking>\n{theme['reset']}"
+
+
 # ============================================================================
 # ============= RETRY UTILITY ================================================
 # ============================================================================
@@ -7085,7 +7114,7 @@ class ModelQuery:
     def _close_thinking_block(start_thinking: bool, started_content: bool) -> bool:
         """Close an open `<thinking>` block, returning whether it was closed."""
         if start_thinking and not started_content:
-            sys.stderr.write("\n</thinking>\n")
+            sys.stderr.write(_thinking_close_tag())
             return True
         return False
 
@@ -7123,18 +7152,18 @@ class ModelQuery:
             formatted_json = json.dumps(chunk, indent=4)
             sys.stderr.write(colorize(f"\n[DEBUG] Final JSON chunk from server:\n{formatted_json}\n", 'muted'))
 
-        # Thinking display
+        # Thinking display (dim, like --- Stats: --- so it reads as diagnostics)
         if thought and show_thinking:
             if not display_state["start_thinking"]:
                 display_state["start_thinking"] = True
-                sys.stderr.write("\n<thinking>\n")
+                sys.stderr.write(_thinking_open_tag())
             sys.stderr.write(thought)
             sys.stderr.flush()
 
         # Content display
         if content:
             if display_state["start_thinking"] and not display_state["started_content"]:
-                sys.stderr.write("\n</thinking>\n")
+                sys.stderr.write(_thinking_close_tag())
 
             if not display_state["started_content"]:
                 print("\n[--- Response ---]", file=sys.stdout)
@@ -7261,12 +7290,28 @@ class ModelQuery:
 # ============= COMMAND HANDLING CLASS ======================================
 # ============================================================================
 
+# /agentic subcommands for tab completion (mirrors run_handle_agentic usage)
+AGENTIC_SUBCOMMANDS = [
+    'on', 'off', 'full', 'auto', 'plan', 'sandbox', 'verbose', 'thinking',
+    'trace', 'log', 'lazytool', 'iterations', 'timeout', 'heartbeattokens',
+    'compactthreshold', 'acl', 'status',
+]
+AGENTIC_PLAN_ARGS = ['on', 'off', 'run']
+AGENTIC_ACL_ACTIONS = ['list', 'status', 'log', 'allow', 'ask', 'deny', 'remove', 'reset']
+AGENTIC_SECOND_LEVEL = {'plan': AGENTIC_PLAN_ARGS, 'acl': AGENTIC_ACL_ACTIONS}
+
+# /compact subcommands for tab completion (mirrors run_handle_compact usage)
+COMPACT_SUBCOMMANDS = ['now', 'force', 'llm', 'threshold', 'list', 'status']
+
+
 class ChatCompleter:
     """
     Provides tab-completion for interactive chat sessions.
 
     Supports completion for:
     - Commands (/listmodel, /switchmodel, etc.)
+    - Dispatcher subcommands (/agentic, /compact) incl. plan/acl second level
+      and acl paths
     - Paths (for /cwd, /ls)
     - Model names
 
@@ -7315,41 +7360,20 @@ class ChatCompleter:
         if buffer.startswith('/switchmodel '):
             matches = [m for m in self.models if m.startswith(text)]
 
-        # 2. File Path Autocompletion (/cwd, /ls, /image and inline @)
+        # 2. /agentic subcommand completion (plan/acl have a second level)
+        elif buffer.startswith('/agentic '):
+            matches = self._complete_agentic(buffer, text)
+
+        # 3. /compact subcommand completion
+        elif buffer.startswith('/compact '):
+            matches = self._complete_compact(buffer, text)
+
+        # 4. File Path Autocompletion (/cwd, /ls, /image and inline @)
         # buffer is the full line, text could be in the middle of the line
         elif buffer.startswith('/cwd ') or buffer.startswith('/ls ') or buffer.startswith('/image ') or text.startswith('@'):
-            # Determine how much of the text is the actual path
-            if text.startswith('@'):
-                path_input = text[1:]
-            else:
-                path_input = text
+            matches = self._complete_path(text)
 
-            path = os.path.expanduser(path_input)
-            dirname = os.path.dirname(path)
-            basename = os.path.basename(path)
-            if not dirname:
-                dirname = '.'
-
-            matches = []
-            try:
-                if os.path.exists(dirname) and os.path.isdir(dirname):
-                    for item in os.listdir(dirname):
-                        if item.startswith(basename):
-                            full_path = os.path.join(dirname, item)
-                            prefix = os.path.dirname(path_input)
-
-                            if os.path.isdir(full_path):
-                                matches.append(os.path.join(prefix, item) + '/' if prefix else item + '/')
-                            else:
-                                matches.append(os.path.join(prefix, item) if prefix else item)
-            except PermissionError:
-                pass
-
-            # Re-attach the @ symbol if we are completing an @ file inclusion
-            if text.startswith('@'):
-                matches = ['@' + m for m in matches]
-
-        # 3. Command Autocompletion
+        # 5. Command Autocompletion
         elif not text or text.startswith('/') or text in ['e', 'ex', 'exi', 'q', 'qu', 'qui']:
             matches = [c for c in self.commands if c.startswith(text)]
 
@@ -7357,6 +7381,119 @@ class ChatCompleter:
             matches = []
 
         return matches[state] if state < len(matches) else None
+
+    def _complete_path(self, text: str) -> list:
+        """Complete a file-path token for path-aware commands and @ inclusion.
+
+        Args:
+            text: The token being completed (may start with '@').
+
+        Returns:
+            Matching paths, with the '@' re-attached for file inclusions.
+        """
+        # Determine how much of the text is the actual path
+        if text.startswith('@'):
+            path_input = text[1:]
+        else:
+            path_input = text
+
+        path = os.path.expanduser(path_input)
+        dirname = os.path.dirname(path)
+        basename = os.path.basename(path)
+        if not dirname:
+            dirname = '.'
+
+        matches = []
+        try:
+            if os.path.exists(dirname) and os.path.isdir(dirname):
+                for item in os.listdir(dirname):
+                    if item.startswith(basename):
+                        full_path = os.path.join(dirname, item)
+                        prefix = os.path.dirname(path_input)
+
+                        if os.path.isdir(full_path):
+                            matches.append(os.path.join(prefix, item) + '/' if prefix else item + '/')
+                        else:
+                            matches.append(os.path.join(prefix, item) if prefix else item)
+        except PermissionError:
+            pass
+
+        # Re-attach the @ symbol if we are completing an @ file inclusion
+        if text.startswith('@'):
+            matches = ['@' + m for m in matches]
+        return matches
+
+    @staticmethod
+    def _completion_word_index(buffer: str) -> int:
+        """Index of the word being completed in the buffer.
+
+        A trailing space means the word being completed is a new empty word.
+
+        Args:
+            buffer: The full readline line buffer.
+
+        Returns:
+            The 0-based index of the word being completed.
+        """
+        words = buffer.split()
+        return len(words) if buffer.endswith(' ') else len(words) - 1
+
+    def _complete_subcommands(self, buffer: str, text: str, level1: list,
+                              level2: Optional[dict] = None) -> list:
+        """Shared subcommand completion for dispatcher commands (/agentic, /compact).
+
+        Args:
+            buffer: The full readline line buffer.
+            text: The token being completed.
+            level1: Candidates for the first subcommand word.
+            level2: Optional mapping of level-1 word -> second-level candidates.
+
+        Returns:
+            Matching candidates for the word position, or [] when exhausted.
+        """
+        words = buffer.split()
+        word_index = self._completion_word_index(buffer)
+
+        # Level 1: /cmd <TAB> -> subcommands
+        if word_index == 1:
+            return [c for c in level1 if c.startswith(text)]
+
+        # Level 2: /cmd <subcmd> <TAB> -> second-level candidates
+        if word_index == 2 and level2:
+            second = level2.get(words[1], [])
+            return [c for c in second if c.startswith(text)]
+
+        return []
+
+    def _complete_agentic(self, buffer: str, text: str) -> list:
+        """Complete /agentic subcommands and their second-level arguments.
+
+        Args:
+            buffer: The full readline line buffer.
+            text: The token being completed.
+
+        Returns:
+            Matching /agentic subcommands, plan/acl arguments, or acl paths.
+        """
+        words = buffer.split()
+        # Level 3: /agentic acl allow|ask|deny <TAB> -> paths
+        if (self._completion_word_index(buffer) == 3 and len(words) >= 3
+                and words[1] == 'acl' and words[2] in ('allow', 'ask', 'deny')):
+            return self._complete_path(text)
+        return self._complete_subcommands(buffer, text, AGENTIC_SUBCOMMANDS,
+                                          AGENTIC_SECOND_LEVEL)
+
+    def _complete_compact(self, buffer: str, text: str) -> list:
+        """Complete /compact subcommands.
+
+        Args:
+            buffer: The full readline line buffer.
+            text: The token being completed.
+
+        Returns:
+            Matching /compact subcommands.
+        """
+        return self._complete_subcommands(buffer, text, COMPACT_SUBCOMMANDS)
 
 
 # ============================================================================
@@ -9809,13 +9946,13 @@ class ChatLoop:
                 with state["write_lock"]:
                     if not state["thinking_open"]:
                         state["thinking_open"] = True
-                        sys.stderr.write("\n<thinking>\n")
+                        sys.stderr.write(_thinking_open_tag())
                     sys.stderr.write(thought)
                     sys.stderr.flush()
             if content:
                 with state["write_lock"]:
                     if state["thinking_open"]:
-                        sys.stderr.write("\n</thinking>\n")
+                        sys.stderr.write(_thinking_close_tag())
                         state["thinking_open"] = False
                     # Stream the model's visible text live too (chat-style:
                     # the user chose to see thinking AND what the model says).
@@ -9890,7 +10027,7 @@ class ChatLoop:
                     if state["cancelled"]:
                         return
                     if state["thinking_open"]:
-                        sys.stderr.write("\n</thinking>\n")
+                        sys.stderr.write(_thinking_close_tag())
                         state["thinking_open"] = False
                     state["heartbeat_shown"] = True
                     sys.stderr.write(".")
@@ -9928,7 +10065,7 @@ class ChatLoop:
             """Close any open thinking block and stop further feedback output."""
             with state["write_lock"]:
                 if state["thinking_open"]:
-                    sys.stderr.write("\n</thinking>\n")
+                    sys.stderr.write(_thinking_close_tag())
                     sys.stderr.flush()
                     state["thinking_open"] = False
                 elif state["heartbeat_shown"]:
@@ -12789,7 +12926,7 @@ def _print_single_response(response: object, backend: str) -> None:
     else:
         content = str(response)
     if thinking:
-        sys.stderr.write(f"\n<thinking>\n{thinking}\n</thinking>\n")
+        sys.stderr.write(colorize(f"\n<thinking>\n{thinking}\n</thinking>\n", 'muted'))
     print(content)
 
 

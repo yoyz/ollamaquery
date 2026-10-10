@@ -24,6 +24,7 @@ import time
 import signal
 import socket
 import atexit
+import threading
 import textwrap
 import tempfile
 import unittest
@@ -335,6 +336,203 @@ class TestCommandRegistry(unittest.TestCase):
         by_cat = q.get_commands_by_category()
         self.assertIn('Core', by_cat)
         self.assertIn('Model', by_cat)
+
+
+# ============================================================================
+# 1b. Tab Completion (/agentic, /compact subcommands)
+# ============================================================================
+
+class TestSubcommandCompletion(unittest.TestCase):
+    """Tab completion for dispatcher subcommands (ChatCompleter)."""
+
+    def _completer(self):
+        c = q.ChatCompleter('http://localhost:11434', 'ollama')
+        c.models = ['llama3']
+        return c
+
+    def _candidates(self, completer, buffer, text):
+        """Collect all matches for a buffer/text pair via the readline hook."""
+        with patch.object(q.readline, 'get_line_buffer', return_value=buffer):
+            out = []
+            for state in range(64):
+                cand = completer.complete(text, state)
+                if cand is None:
+                    break
+                out.append(cand)
+        return out
+
+    def test_first_level_subcommands(self):
+        c = self._completer()
+        matches = self._candidates(c, '/agentic ', '')
+        for sub in ('on', 'off', 'full', 'auto', 'plan', 'sandbox', 'verbose',
+                    'thinking', 'trace', 'log', 'lazytool', 'iterations',
+                    'timeout', 'heartbeattokens', 'compactthreshold', 'acl',
+                    'status'):
+            self.assertIn(sub, matches)
+
+    def test_first_level_no_top_level_commands(self):
+        c = self._completer()
+        matches = self._candidates(c, '/agentic ', '')
+        self.assertNotIn('/help', matches)
+        self.assertNotIn('/quit', matches)
+
+    def test_first_level_prefix(self):
+        c = self._completer()
+        matches = self._candidates(c, '/agentic he', 'he')
+        self.assertEqual(matches, ['heartbeattokens'])
+
+    def test_plan_second_level(self):
+        c = self._completer()
+        matches = self._candidates(c, '/agentic plan ', '')
+        self.assertEqual(matches, ['on', 'off', 'run'])
+
+    def test_plan_prefix(self):
+        c = self._completer()
+        matches = self._candidates(c, '/agentic plan o', 'o')
+        self.assertEqual(matches, ['on', 'off'])
+
+    def test_acl_second_level(self):
+        c = self._completer()
+        matches = self._candidates(c, '/agentic acl ', '')
+        for action in ('list', 'status', 'log', 'allow', 'ask', 'deny',
+                       'remove', 'reset'):
+            self.assertIn(action, matches)
+
+    def test_acl_path_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, 'subdir'))
+            open(os.path.join(td, 'afile.txt'), 'w').close()
+            c = self._completer()
+            matches = self._candidates(
+                c, f'/agentic acl allow {td}/a', f'{td}/a')
+            self.assertEqual(matches, [f'{td}/afile.txt'])
+
+    def test_other_subcommand_no_third_level(self):
+        c = self._completer()
+        matches = self._candidates(c, '/agentic on ', '')
+        self.assertEqual(matches, [])
+
+    def test_plan_fourth_level_empty(self):
+        c = self._completer()
+        matches = self._candidates(c, '/agentic plan on ', '')
+        self.assertEqual(matches, [])
+
+    def test_switchmodel_still_completes_models(self):
+        c = self._completer()
+        matches = self._candidates(c, '/switchmodel ll', 'll')
+        self.assertEqual(matches, ['llama3'])
+
+    def test_compact_first_level_subcommands(self):
+        c = self._completer()
+        matches = self._candidates(c, '/compact ', '')
+        for sub in ('now', 'force', 'llm', 'threshold', 'list', 'status'):
+            self.assertIn(sub, matches)
+
+    def test_compact_first_level_no_top_level_commands(self):
+        c = self._completer()
+        matches = self._candidates(c, '/compact ', '')
+        self.assertNotIn('/help', matches)
+        self.assertNotIn('/compact', matches)
+
+    def test_compact_prefix(self):
+        c = self._completer()
+        matches = self._candidates(c, '/compact l', 'l')
+        self.assertEqual(matches, ['llm', 'list'])
+
+    def test_compact_no_second_level(self):
+        c = self._completer()
+        matches = self._candidates(c, '/compact now ', '')
+        self.assertEqual(matches, [])
+
+    def test_completion_word_index(self):
+        self.assertEqual(q.ChatCompleter._completion_word_index('/agentic '), 1)
+        self.assertEqual(q.ChatCompleter._completion_word_index('/agentic plan'), 1)
+        self.assertEqual(q.ChatCompleter._completion_word_index('/agentic plan '), 2)
+        self.assertEqual(q.ChatCompleter._completion_word_index('/agentic acl al'), 2)
+        self.assertEqual(q.ChatCompleter._completion_word_index('/agentic acl allow '), 3)
+
+
+# ============================================================================
+# 1c. Thinking display color
+# ============================================================================
+
+class TestThinkingColor(unittest.TestCase):
+    """Dim-colored <thinking> display (same color as --- Stats: ---)."""
+
+    MUTED = q.BUILTIN_THEMES['default']['muted']
+    RESET = q.BUILTIN_THEMES['default']['reset']
+
+    def _colored(self, fn):
+        with patch.object(q, 'colors_enabled', return_value=True):
+            return fn()
+
+    def test_open_tag_colored_spans_block(self):
+        tag = self._colored(q._thinking_open_tag)
+        self.assertTrue(tag.startswith(self.MUTED))
+        self.assertIn('<thinking>', tag)
+        # Span stays open for the streamed chunks: no trailing reset
+        self.assertFalse(tag.endswith(self.RESET))
+
+    def test_close_tag_resets(self):
+        tag = self._colored(q._thinking_close_tag)
+        self.assertTrue(tag.endswith(self.RESET))
+        self.assertIn('</thinking>', tag)
+
+    def test_tags_plain_without_colors(self):
+        with patch.object(q, 'colors_enabled', return_value=False):
+            self.assertEqual(q._thinking_open_tag(), "\n<thinking>\n")
+            self.assertEqual(q._thinking_close_tag(), "\n</thinking>\n")
+
+    def test_close_thinking_block_writes_reset(self):
+        with patch.object(q, 'colors_enabled', return_value=True), \
+             patch('sys.stderr', new_callable=io.StringIO) as err:
+            closed = q.ModelQuery._close_thinking_block(True, False)
+        self.assertTrue(closed)
+        self.assertIn('</thinking>', err.getvalue())
+        self.assertTrue(err.getvalue().endswith(self.RESET))
+
+    def test_chat_stream_thinking_dim(self):
+        mq = q.ModelQuery()
+        display_state = {"start_thinking": False, "started_content": False}
+        with patch.object(q, 'colors_enabled', return_value=True), \
+             patch('sys.stderr', new_callable=io.StringIO) as err, \
+             patch('sys.stdout', new_callable=io.StringIO):
+            mq._render_stream_chunk({}, 'deep reasoning', '', False,
+                                    False, True, display_state)
+        out = err.getvalue()
+        self.assertTrue(out.startswith(self.MUTED))
+        self.assertIn('<thinking>', out)
+        self.assertIn('deep reasoning', out)
+        self.assertNotIn('</thinking>', out)  # block still open
+
+        # Content arrival closes the block and resets the color
+        with patch.object(q, 'colors_enabled', return_value=True), \
+             patch('sys.stderr', new_callable=io.StringIO) as err, \
+             patch('sys.stdout', new_callable=io.StringIO) as sout:
+            mq._render_stream_chunk({}, '', 'the answer', True,
+                                    False, True, display_state)
+        out = err.getvalue()
+        self.assertIn('</thinking>', out)
+        self.assertTrue(out.endswith(self.RESET))
+        self.assertIn('the answer', sout.getvalue())
+
+    def test_agentic_step_thinking_dim(self):
+        loop = q.ChatLoop.__new__(q.ChatLoop)
+        state = {
+            "thinking_open": False, "last_activity": time.time(),
+            "cancelled": False, "heartbeat_shown": False, "content": "",
+            "thought": "", "thinking_tokens": 0, "thinking_capped": False,
+            "tok_acc": 0, "content_streamed": False,
+            "write_lock": threading.Lock(),
+        }
+        with patch.object(q, 'colors_enabled', return_value=True), \
+             patch('sys.stderr', new_callable=io.StringIO) as err, \
+             patch('sys.stdout', new_callable=io.StringIO):
+            loop._render_step_feedback(state, 'agentic reasoning', '', True)
+        out = err.getvalue()
+        self.assertTrue(out.startswith(self.MUTED))
+        self.assertIn('<thinking>', out)
+        self.assertIn('agentic reasoning', out)
 
 
 # ============================================================================
