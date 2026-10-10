@@ -8046,7 +8046,13 @@ class CoreHTMLStripper(HTMLParser):
       feed(text) → handle_starttag / handle_endtag / handle_data
       get_text() → returns accumulated text
     """
-    skip_tags = {'script', 'style', 'head', 'meta', 'noscript', 'link', 'title'}
+    skip_tags = {'script', 'style', 'head', 'meta', 'noscript', 'link', 'title',
+                 # Semantic page chrome: site-wide navigation, header/footer
+                 # boilerplate, sidebars and forms. Real-world pages (insee.fr)
+                 # front-load thousands of chars of chrome that would eat the
+                 # 4000-char observation cap before any page content — skipping
+                 # them puts the actual content first in the extracted text.
+                 'nav', 'header', 'footer', 'aside', 'form'}
     # HTML5 void elements: never closed, hold no text. They must NOT enter
     # skip mode — a plain `<meta charset=utf-8>` or `<link rel=icon>` has no
     # end tag, so counting it would pin skip_depth > 0 for the rest of the

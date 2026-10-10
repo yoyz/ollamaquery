@@ -1021,6 +1021,30 @@ class TestHTMLStripperExtras(unittest.TestCase):
         self.assertIn('After meta', result)
         self.assertIn('After self-closing meta', result)
 
+    def test_html_stripper_skips_semantic_chrome(self):
+        """Site chrome (<nav>/<header>/<footer>/<aside>/<form>) must be dropped so
+        page content lands first — chrome otherwise eats the 4000-char
+        observation cap before any real content (insee.fr homepage: 8842 -> 2452
+        chars with the content first)."""
+        html = ('<html><body><header><nav><ul><li>Menu</li><li>Accueil</li></ul>'
+                'Lancer la recherche</nav></header>'
+                '<main><h1>Naissances hors mariage</h1>'
+                '<p>Données annuelles de 1994 à 2025</p></main>'
+                '<aside>Liens sponsorisés</aside>'
+                '<form><label>Rechercher</label></form>'
+                '<footer>Mentions légales</footer></body></html>')
+        stripper = q.CoreHTMLStripper()
+        stripper.feed(html)
+        result = stripper.get_text()
+        self.assertIn('Naissances hors mariage', result)
+        self.assertIn('Données annuelles de 1994 à 2025', result)
+        self.assertNotIn('Menu', result)
+        self.assertNotIn('Lancer la recherche', result)
+        self.assertNotIn('Liens sponsorisés', result)
+        self.assertNotIn('Mentions légales', result)
+        # Content must come before any remaining text (content-first output)
+        self.assertTrue(result.startswith('Naissances hors mariage'))
+
 
 # ============================================================================
 # 8.  Token Counting & Context
