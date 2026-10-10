@@ -3449,7 +3449,7 @@ class Executor:
 
 AGENTIC_TOOL_DEFS = {
     "fetch_url": {
-        "description": "Fetch a URL and return its content as plain text.",
+        "description": "Fetch a URL and return its content as plain text. Small pages are returned inline; large pages are spilled to a file — the observation then carries the spill file path, the size and a one-line preview, and NO content. Decide from the preview whether the page is relevant; read it with read_file(file_path=\"...\") (pages large files via the `next` offset) rather than re-fetching.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -3655,6 +3655,14 @@ OMC_CONFIG_PATH = os.path.expanduser("~/.omc/omc.json")
 CLUSTER_SPILL_THRESHOLD = 3500  # spill results larger than this (chars)
 CLUSTER_SPILL_DIR = os.path.expanduser("~/.ollamaquery.d/spill")
 
+# Large `fetch_url` results spill to the same per-fetch spill dir so the model
+# can page them with `read_file` instead of the observation cap truncating them
+# mid-content. Filenames are scoped by the sanitized URL (fetch_result_<url>.txt)
+# so one fetch never clobbers another that is still being paged. The observation
+# carries the file path plus a short preview and NO content, so the payload is
+# not fed into context twice — the model decides whether to read it.
+FETCH_SPILL_THRESHOLD = 3500  # spill results larger than this (chars)
+
 
 def _cluster_spill_path(verb: str, resource: str) -> str:
     """Return the scoped spill file path for a (verb, resource) cluster query."""
@@ -3663,21 +3671,39 @@ def _cluster_spill_path(verb: str, resource: str) -> str:
     return os.path.join(CLUSTER_SPILL_DIR, f"cluster_result_{stem}.json")
 
 
-def _cleanup_cluster_spill_files() -> None:
-    """Remove all cluster spill files at process exit."""
+def _fetch_spill_path(url: str) -> str:
+    """Return the scoped spill file path for a fetched URL.
+
+    Args:
+        url: The fetched URL (sanitized into the filename stem).
+
+    Returns:
+        Spill file path under CLUSTER_SPILL_DIR.
+    """
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", url).strip("_")[:80].strip("_") or "page"
+    return os.path.join(CLUSTER_SPILL_DIR, f"fetch_result_{stem}.txt")
+
+
+def _cleanup_spill_files() -> None:
+    """Remove all cluster and fetch spill files at process exit."""
+    prefixes = (("cluster_result_", ".json"), ("fetch_result_", ".txt"))
     try:
         if os.path.isdir(CLUSTER_SPILL_DIR):
             for fname in os.listdir(CLUSTER_SPILL_DIR):
-                if fname.startswith("cluster_result_") and fname.endswith(".json"):
-                    try:
-                        os.unlink(os.path.join(CLUSTER_SPILL_DIR, fname))
-                    except OSError:
-                        pass
+                for prefix, suffix in prefixes:
+                    if fname.startswith(prefix) and fname.endswith(suffix):
+                        try:
+                            os.unlink(os.path.join(CLUSTER_SPILL_DIR, fname))
+                        except OSError:
+                            pass
     except OSError:
         pass
 
 
-atexit.register(_cleanup_cluster_spill_files)
+# Backward-compat alias
+_cleanup_cluster_spill_files = _cleanup_spill_files
+
+atexit.register(_cleanup_spill_files)
 
 # Tools whose re-execution can cause harm; used by the agentic timeout escalation
 # policy to abort (rather than extend) when the last executed tool was one of these.
@@ -3727,7 +3753,11 @@ def _tool_handle_fetch_url(self, args: dict) -> dict:
                       "already-fetched pages or use a search engine instead "
                       "of retrying it.")
         return {"success": False, "output": "", "error": error}
-    return {"success": True, "output": text, "error": None}
+    # Small pages are returned inline; large ones spill to a file with a pure
+    # pointer observation (path + preview, no content) so the payload is not
+    # fed into context twice — the model decides whether to read_file it.
+    return {"success": True, "output": _spill_fetch_result(self._ctx, text, url),
+            "error": None}
 
 
 # First path components that hint a missing-leading-slash system path
@@ -5380,6 +5410,54 @@ def _spill_cluster_result(ctx: object, output_text: str, verb: str = "get",
         )
     except Exception:
         return output_text
+
+
+def _spill_fetch_result(ctx: object, text: str, url: str) -> str:
+    """Spill a large fetch_url result to a spill file for paged reading.
+
+    Args:
+        ctx: The ToolRegistry context (for the path ACL).
+        text: The full extracted page text.
+        url: The fetched URL (scopes the spill filename).
+
+    Returns:
+        The observation text for the model. When the text exceeds
+        FETCH_SPILL_THRESHOLD the full content is written to a file scoped by
+        the sanitized URL (fetch_result_<url>.txt) and a pointer is returned —
+        size (chars/lines), a one-line preview and a `read_file` instruction —
+        with NO content inline, so the payload is not fed into context twice.
+        The model decides from the preview whether the page is worth reading
+        via `read_file` (observation-cap-exempt, pages via the `next` offset).
+        A session Path-ACL read-allow rule is added for the spill dir so
+        `read_file` on it doesn't prompt (home dotfile dir outside CWD). On
+        any failure the full text is returned unchanged (observation-capped).
+    """
+    if len(text) <= FETCH_SPILL_THRESHOLD:
+        return text
+    try:
+        os.makedirs(CLUSTER_SPILL_DIR, exist_ok=True)
+        acl = getattr(ctx, "path_acl", None)
+        if acl is not None:
+            acl.add("read", "allow", CLUSTER_SPILL_DIR, source="session")
+        spill_file = _fetch_spill_path(url)
+        with open(spill_file, "w", encoding="utf-8") as f:
+            f.write(text)
+        n_chars = len(text)
+        n_lines = len(text.splitlines())
+        stripped_lines = [line.strip() for line in text.splitlines()]
+        # First substantive line — junk openers ("false", "Menu", "Aller au
+        # contenu") would make the preview useless for deciding relevance.
+        preview = next((l for l in stripped_lines if len(l) >= 30),
+                       next((l for l in stripped_lines if l), ""))
+        return (
+            f"[fetch_url] Result is large ({n_chars} chars / {n_lines} lines) — the content "
+            f"is NOT included here to avoid duplicating it in context. Preview: {preview!r}. "
+            f"If the page is relevant, read it with read_file(file_path=\"{spill_file}\"); "
+            f"read_file pages large files automatically via the `next` offset "
+            f"(up to 2000 lines / 100KB per page)."
+        )
+    except Exception:
+        return text
 
 
 def _tool_handle_cluster_query(self, args: dict) -> dict:

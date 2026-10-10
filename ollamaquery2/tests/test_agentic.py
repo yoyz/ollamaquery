@@ -645,6 +645,62 @@ class TestToolRegistry(unittest.TestCase):
         self.assertIn("500", result["error"])
         self.assertIn("search engine", result["error"])
 
+    def test_fetch_url_large_result_spilled_to_file(self):
+        """fetch_url results over the spill threshold go to a file; the observation
+        is a pointer (path + preview, no content) and read_file can page it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            spill_dir = os.path.join(tmp, "spill")
+            spill_file = os.path.join(spill_dir, "fetch_result_https_xyz_example_page.txt")
+            with patch.object(q, "CLUSTER_SPILL_DIR", spill_dir):
+                big = ("PREVIEW-ONLY-HERE-PAGE-TITLE-LONG-ENOUGH\n"
+                       + ("PARAGRAPH-7f3a9c\n" * 800))  # ~13KB, over threshold
+                with patch("ollamaquery2.fetch_and_convert_url",
+                           return_value=(big, "htmlstrip")):
+                    result = self.reg.execute("fetch_url", {"url": "https://xyz.example/page"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn(spill_file, result["output"])
+            self.assertIn("chars", result["output"])
+            self.assertIn("Preview:", result["output"])
+            self.assertIn("PREVIEW-ONLY-HERE-PAGE-TITLE-LONG-ENOUGH", result["output"])
+            # No payload inline — pointer + preview only, so the content is not
+            # fed into context twice (only via read_file paging).
+            self.assertNotIn("PARAGRAPH-7f3a9c", result["output"])
+            self.assertLess(len(result["output"]), 600)
+            with open(spill_file, encoding="utf-8") as f:
+                self.assertEqual(f.read(), big)
+            # read_file can page the spill file (session ACL allow was added)
+            rd = self.reg.execute("read_file", {"file_path": spill_file})
+            self.assertTrue(rd["success"], msg=rd.get("error"))
+            self.assertIn("PARAGRAPH-7f3a9c", rd["output"])
+
+    def test_fetch_url_small_result_inline_no_spill(self):
+        """Results under the spill threshold are returned inline, nothing spilled."""
+        with tempfile.TemporaryDirectory() as tmp:
+            spill_dir = os.path.join(tmp, "spill")
+            with patch.object(q, "CLUSTER_SPILL_DIR", spill_dir):
+                small = "Hello page content"
+                with patch("ollamaquery2.fetch_and_convert_url",
+                           return_value=(small, "htmlstrip")):
+                    result = self.reg.execute("fetch_url", {"url": "https://xyz.example/small"})
+            self.assertTrue(result["success"])
+            self.assertEqual(result["output"], small)
+            self.assertFalse(os.path.exists(spill_dir))  # nothing spilled
+
+    def test_cleanup_spill_files_removes_fetch_results(self):
+        """Atexit cleanup removes fetch_result_*.txt and cluster_result_*.json."""
+        with tempfile.TemporaryDirectory() as tmp:
+            spill_dir = os.path.join(tmp, "spill")
+            os.makedirs(spill_dir)
+            names = ["cluster_result_get_pods.json", "fetch_result_https_x.txt",
+                     "fetch_result_other.log", "unrelated.txt"]
+            for name in names:
+                with open(os.path.join(spill_dir, name), "w") as f:
+                    f.write("x")
+            with patch.object(q, "CLUSTER_SPILL_DIR", spill_dir):
+                q._cleanup_spill_files()
+            remaining = sorted(os.listdir(spill_dir))
+            self.assertEqual(remaining, ["fetch_result_other.log", "unrelated.txt"])
+
     def test_fetch_url_curl_fallback(self):
         """fetch_and_convert_url falls back to curl when urllib is blocked."""
         with patch("ollamaquery2._request_with_retry",
