@@ -635,6 +635,16 @@ class TestToolRegistry(unittest.TestCase):
         self.assertIn("404", result["error"])
         self.assertIn("follow links", result["error"])
 
+    def test_fetch_url_5xx_steers_away_from_retrying(self):
+        """A 5xx error steers the model to links/search instead of retrying
+        (insee.fr serves 500 on search/RSS/sitemap to any programmatic client)."""
+        with patch("ollamaquery2.fetch_and_convert_url",
+                   return_value=("[Failed to fetch URL: HTTP Error 500: Internal Server Error]", "None")):
+            result = self.reg.execute("fetch_url", {"url": "https://www.insee.fr/fr/recherche/recherche"})
+        self.assertFalse(result["success"])
+        self.assertIn("500", result["error"])
+        self.assertIn("search engine", result["error"])
+
     def test_fetch_url_curl_fallback(self):
         """fetch_and_convert_url falls back to curl when urllib is blocked."""
         with patch("ollamaquery2._request_with_retry",
