@@ -9812,11 +9812,19 @@ class ChatLoop:
                         sys.stderr.write("\n<thinking>\n")
                     sys.stderr.write(thought)
                     sys.stderr.flush()
-            if content and state["thinking_open"]:
+            if content:
                 with state["write_lock"]:
-                    sys.stderr.write("\n</thinking>\n")
-                    sys.stderr.flush()
-                    state["thinking_open"] = False
+                    if state["thinking_open"]:
+                        sys.stderr.write("\n</thinking>\n")
+                        state["thinking_open"] = False
+                    # Stream the model's visible text live too (chat-style:
+                    # the user chose to see thinking AND what the model says).
+                    # stdout so the answer stays pipeable; the thinking stays
+                    # on stderr as diagnostics. `finalize` skips the final
+                    # re-stream when this already displayed the answer.
+                    sys.stdout.write(content)
+                    sys.stdout.flush()
+                    state["content_streamed"] = True
 
     def _make_agentic_step_feedback(self) -> tuple:
         """Build live feedback callbacks for an agentic ReAct step.
@@ -9852,6 +9860,7 @@ class ChatLoop:
             "thinking_tokens": 0,
             "thinking_capped": False,
             "tok_acc": 0,
+            "content_streamed": False,
             "write_lock": threading.Lock(),
         }
         show_thinking = self.ctx.agentic_show_thinking
@@ -10464,8 +10473,24 @@ class ChatLoop:
     def _finalize_agentic_query(self, messages: list, final_answer: str, final_content: str,
                                 send_tools_api: bool, openai_tools: list,
                                 logger: Optional['AgenticLogger'],
-                                iteration: int, response_text: str) -> None:
-        """Stream final answer or execute pending tool call, then update self.messages."""
+                                iteration: int, response_text: str,
+                                content_streamed: bool = False) -> None:
+        """Stream final answer or execute pending tool call, then update self.messages.
+
+        Args:
+            messages: The ephemeral ReAct message list.
+            final_answer: The answer produced by the loop (may be "").
+            final_content: The user's processed query text.
+            send_tools_api: Whether native tools are in use.
+            openai_tools: Native tool definitions.
+            logger: Optional AgenticLogger.
+            iteration: Final ReAct iteration count.
+            response_text: The last step's response text.
+            content_streamed: True when the step's answer was already streamed
+                live to the terminal (thinking mode) — skips the final
+                query_stream re-generation, which would display it twice and
+                burn a full re-generation.
+        """
         stream_tool_used = False
         if not final_answer:
             final_answer = response_text if response_text else "[Agentic: no answer produced]"
@@ -10482,41 +10507,48 @@ class ChatLoop:
         else:
             if not getattr(self, 'messages', None):
                 self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
-            final_messages = list(messages)
-            if final_messages:
-                final_messages[0] = {'role': 'system', 'content': self.ctx.system_prompt}
-            if final_messages and final_messages[-1]['role'] != 'user':
-                final_messages.append({'role': 'user', 'content':
-                    "Provide your final answer now, based on the tool results above. "
-                    "Do not repeat the original request or call any more tools."})
-
-            stream_kwargs = dict(get_inference_params(self.ctx.model))
-            stream_tool_calls_out = []
-            if send_tools_api:
-                stream_kwargs["tools"] = openai_tools
-
-            response = self.query_handler.query_stream(
-                final_messages, self.ctx.model,
-                stream_enabled=self.ctx.stream_enabled,
-                debug=self.ctx.debug_mode,
-                show_thinking=(not self.ctx.force_no_thinking),
-                context_size=self.ctx.context_size,
-                images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
-                tool_calls_out=stream_tool_calls_out,
-                no_thinking=self.ctx.force_no_thinking,
-                reasoning_effort=self.ctx.reasoning_effort,
-                **stream_kwargs
-            )
-            if response or stream_tool_calls_out:
-                stream_tool_calls = self._collect_stream_tool_calls(stream_tool_calls_out, response)
-                if stream_tool_calls:
-                    stream_tool_used = self._execute_stream_tool_calls(
-                        stream_tool_calls, stream_tool_calls_out, response, send_tools_api)
-                else:
-                    self.messages.append({'role': 'assistant', 'content': response})
-                    print()
+            if content_streamed:
+                # The answer was already streamed live (thinking mode) — the
+                # final query_stream re-generation would display it twice and
+                # burn a full re-generation. Just record it.
+                self.messages.append({'role': 'assistant', 'content': final_answer})
+                print()
             else:
-                print(colorize(f"\n{final_answer}", 'success'), file=sys.stdout)
+                final_messages = list(messages)
+                if final_messages:
+                    final_messages[0] = {'role': 'system', 'content': self.ctx.system_prompt}
+                if final_messages and final_messages[-1]['role'] != 'user':
+                    final_messages.append({'role': 'user', 'content':
+                        "Provide your final answer now, based on the tool results above. "
+                        "Do not repeat the original request or call any more tools."})
+
+                stream_kwargs = dict(get_inference_params(self.ctx.model))
+                stream_tool_calls_out = []
+                if send_tools_api:
+                    stream_kwargs["tools"] = openai_tools
+
+                response = self.query_handler.query_stream(
+                    final_messages, self.ctx.model,
+                    stream_enabled=self.ctx.stream_enabled,
+                    debug=self.ctx.debug_mode,
+                    show_thinking=(not self.ctx.force_no_thinking),
+                    context_size=self.ctx.context_size,
+                    images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
+                    tool_calls_out=stream_tool_calls_out,
+                    no_thinking=self.ctx.force_no_thinking,
+                    reasoning_effort=self.ctx.reasoning_effort,
+                    **stream_kwargs
+                )
+                if response or stream_tool_calls_out:
+                    stream_tool_calls = self._collect_stream_tool_calls(stream_tool_calls_out, response)
+                    if stream_tool_calls:
+                        stream_tool_used = self._execute_stream_tool_calls(
+                            stream_tool_calls, stream_tool_calls_out, response, send_tools_api)
+                    else:
+                        self.messages.append({'role': 'assistant', 'content': response})
+                        print()
+                else:
+                    print(colorize(f"\n{final_answer}", 'success'), file=sys.stdout)
 
         stream_tool_used = self._agentic_streaming_reentry(stream_tool_used, send_tools_api, openai_tools)
 
@@ -11043,7 +11075,8 @@ class ChatLoop:
     def _agentic_finish_query(self, messages: list, final_answer: str, final_content: str,
                               send_tools_api: bool, openai_tools: list, logger: Optional['AgenticLogger'],
                               iteration: int, max_iterations: int, response_text: str,
-                              api_error: str, agentic_seed_len: int) -> None:
+                              api_error: str, agentic_seed_len: int,
+                              content_streamed: bool = False) -> None:
         """Post-loop finalize: print the API-error banner or stream the final answer.
 
         Args:
@@ -11058,6 +11091,8 @@ class ChatLoop:
             response_text: The last response text.
             api_error: Set when the loop aborted on an API error.
             agentic_seed_len: Seed boundary for history persistence.
+            content_streamed: True when the final answer was already streamed
+                live to the terminal (thinking mode).
         """
         # Merge the ReAct loop turns into self.messages BEFORE finalizing so the
         # final answer stream (and its streaming re-entry) sees the completed
@@ -11080,7 +11115,8 @@ class ChatLoop:
             if iteration >= max_iterations and not final_answer:
                 final_answer = response_text
 
-            self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text)
+            self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text,
+                                         content_streamed=content_streamed)
 
         if logger:
             logger.write(type="end", total_iterations=iteration)
@@ -11112,6 +11148,7 @@ class ChatLoop:
             iteration = 0
             max_iterations = self.ctx.agentic_max_iterations
             final_answer = ""
+            final_answer_streamed = False
             last_tool_call = None
             last_tool_count = 0
             step_timeout = self.ctx.agentic_step_timeout
@@ -11191,6 +11228,10 @@ class ChatLoop:
 
                 if not tool_calls:
                     final_answer = response_text
+                    # The step's content may already be on the terminal
+                    # (thinking mode streams it live) — finalize must then
+                    # skip the final re-generation.
+                    final_answer_streamed = bool(step_buf.get("content_streamed"))
                     self.ctx.agentic_consecutive_timeouts = 0
                     break
 
@@ -11212,7 +11253,8 @@ class ChatLoop:
 
             self._agentic_finish_query(
                 messages, final_answer, final_content, send_tools_api, openai_tools,
-                logger, iteration, max_iterations, response_text, api_error, agentic_seed_len)
+                logger, iteration, max_iterations, response_text, api_error, agentic_seed_len,
+                content_streamed=final_answer_streamed)
 
         except KeyboardInterrupt:
             # F2: a ^C aborts the current step but must NOT erase the completed

@@ -1069,6 +1069,40 @@ class TestAgenticStreamObservations(unittest.TestCase):
         self.assertIn("fetch_url", tool_result_msgs[0]['content'],
                       "Tool result content missing tool name")
 
+    def test_finalize_skips_restream_when_content_streamed(self):
+        """content_streamed=True (thinking mode) must skip the final query_stream
+        re-generation — the answer was already streamed live — and just record it."""
+        self.loop.messages = []
+        messages = [{'role': 'system', 'content': 'test'}]
+        with patch.object(self.loop.query_handler, 'query_stream',
+                          return_value="Response") as mock_stream:
+            self.loop._finalize_agentic_query(
+                messages, final_answer="Hello world", final_content="test content",
+                send_tools_api=False, openai_tools=[], logger=None,
+                iteration=1, response_text="", content_streamed=True
+            )
+        mock_stream.assert_not_called()
+        assistant_msgs = [m for m in self.loop.messages if m['role'] == 'assistant']
+        self.assertEqual(len(assistant_msgs), 1)
+        self.assertEqual(assistant_msgs[0]['content'], "Hello world")
+
+    def test_finalize_restreams_when_content_not_streamed(self):
+        """Without content_streamed (thinking off) the final query_stream
+        re-generation still runs — the step content was never displayed."""
+        self.loop.messages = []
+        messages = [{'role': 'system', 'content': 'test'}]
+        with patch.object(self.loop.query_handler, 'query_stream',
+                          return_value="Streamed answer") as mock_stream:
+            self.loop._finalize_agentic_query(
+                messages, final_answer="", final_content="test content",
+                send_tools_api=False, openai_tools=[], logger=None,
+                iteration=1, response_text="step content"
+            )
+        mock_stream.assert_called_once()
+        assistant_msgs = [m for m in self.loop.messages if m['role'] == 'assistant']
+        self.assertEqual(len(assistant_msgs), 1)
+        self.assertEqual(assistant_msgs[0]['content'], "Streamed answer")
+
 
 class TestExecutor(unittest.TestCase):
     """Test Executor (host mode only — no container runtime required)."""

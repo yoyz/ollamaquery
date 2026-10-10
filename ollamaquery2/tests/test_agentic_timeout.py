@@ -414,6 +414,23 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
         self.assertEqual(self._stderr.getvalue().count("."), 0,
                          "no dot noise when the user chose live reasoning")
 
+    def test_content_streams_live_when_thinking_streams(self):
+        """With thinking on, content streams live to stdout (chat-style: the user
+        chose to see thinking AND what the model says), and the state flags
+        content_streamed so finalize can skip the re-generation."""
+        self.ctx.agentic_show_thinking = True
+        out = io.StringIO()
+        with mock.patch('sys.stdout', out):
+            on_chunk, finalize, state = self.loop._make_agentic_step_feedback()
+            on_chunk("reasoning text", "", False)
+            on_chunk("", "visible answer text", False)
+            on_chunk("", " and more", False)
+            finalize()
+        self.assertIn("<thinking>", self._stderr.getvalue())
+        self.assertIn("</thinking>", self._stderr.getvalue())
+        self.assertIn("visible answer text and more", out.getvalue())
+        self.assertTrue(state["content_streamed"])
+
     def test_watchdog_closes_silent_thinking_and_shows_dots(self):
         """A quiet thinking phase (model switching to a native tool call, whose
         deltas carry no content) must not suppress the liveness dots: the
