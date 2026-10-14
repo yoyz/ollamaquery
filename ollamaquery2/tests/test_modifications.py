@@ -1226,6 +1226,156 @@ class TestNoThinkingPayload(unittest.TestCase):
         self.assertEqual(p['chat_template_kwargs']['reasoning_effort'], 'high')
 
 
+class TestMaxOutputTokens(unittest.TestCase):
+    """Per-response output cap (/maxtokens): parsing, clamping, payload wiring."""
+
+    def setUp(self):
+        self.ctx = m.CommandContext()
+        self._saved = (self.ctx.context_window_size, self.ctx.max_output_tokens)
+
+    def tearDown(self):
+        self.ctx.context_window_size, self.ctx.max_output_tokens = self._saved
+
+    # --- parse_token_size ---
+    def test_parse_k_suffix_is_1024(self):
+        self.assertEqual(m.parse_token_size('64K'), 65536)
+        self.assertEqual(m.parse_token_size('64k'), 65536)
+        self.assertEqual(m.parse_token_size('1K'), 1024)
+
+    def test_parse_plain_integer(self):
+        self.assertEqual(m.parse_token_size('65536'), 65536)
+        self.assertEqual(m.parse_token_size('0'), 0)
+
+    def test_parse_invalid(self):
+        self.assertIsNone(m.parse_token_size('abc'))
+        self.assertIsNone(m.parse_token_size(''))
+        self.assertIsNone(m.parse_token_size('K'))
+
+    # --- resolve_output_budget ---
+    def test_unknown_window_returns_configured(self):
+        eff, reserve = m.resolve_output_budget(65536, 0, 1234)
+        self.assertEqual(eff, 65536)
+        self.assertEqual(reserve, 0)
+
+    def test_large_window_keeps_configured(self):
+        eff, reserve = m.resolve_output_budget(65536, 131072, 1000)
+        self.assertEqual(reserve, 4096)
+        self.assertEqual(eff, 65536)
+
+    def test_small_window_clamps_against_reserve(self):
+        # reserve = min(4096, 5% of 8192 = 409) = 409
+        eff, reserve = m.resolve_output_budget(65536, 8192, 5000)
+        self.assertEqual(reserve, 409)
+        self.assertEqual(eff, 8192 - 5000 - 409)
+
+    def test_no_room_returns_zero_sentinel(self):
+        eff, reserve = m.resolve_output_budget(65536, 8192, 8000)
+        self.assertEqual(eff, 0)
+        self.assertEqual(reserve, 409)
+
+    # --- build_request_payload wiring ---
+    def _msgs(self):
+        return [{'role': 'system', 'content': 'sys'}, {'role': 'user', 'content': 'hi'}]
+
+    def test_openai_backend_emits_max_tokens_and_cap_line(self):
+        self.ctx.context_window_size = 131072
+        self.ctx.max_output_tokens = 65536
+        mq = m.ModelQuery('http://x', 'llamacpp')
+        p = mq.build_request_payload(self._msgs(), 'qwen3', apply_output_cap=True)
+        self.assertEqual(p['max_tokens'], 65536)
+        self.assertIn('at most 65536 tokens', p['messages'][0]['content'])
+
+    def test_ollama_backend_emits_num_predict(self):
+        self.ctx.context_window_size = 131072
+        self.ctx.max_output_tokens = 65536
+        mq = m.ModelQuery('http://x', 'ollama')
+        p = mq.build_request_payload(self._msgs(), 'llama3', apply_output_cap=True)
+        self.assertEqual(p['options']['num_predict'], 65536)
+
+    def test_stored_messages_not_mutated_by_cap_line(self):
+        self.ctx.context_window_size = 131072
+        self.ctx.max_output_tokens = 65536
+        mq = m.ModelQuery('http://x', 'llamacpp')
+        msgs = self._msgs()
+        mq.build_request_payload(msgs, 'qwen3', apply_output_cap=True)
+        self.assertEqual(msgs[0]['content'], 'sys')
+
+    def test_no_cap_without_flag(self):
+        self.ctx.context_window_size = 131072
+        self.ctx.max_output_tokens = 65536
+        mq = m.ModelQuery('http://x', 'llamacpp')
+        p = mq.build_request_payload(self._msgs(), 'qwen3')
+        self.assertNotIn('max_tokens', p)
+        self.assertNotIn('at most', p['messages'][0]['content'])
+
+    def test_context_size_no_longer_sets_max_tokens(self):
+        self.ctx.context_window_size = 131072
+        mq = m.ModelQuery('http://x', 'llamacpp')
+        p = mq.build_request_payload(self._msgs(), 'qwen3', context_size=9999)
+        self.assertNotIn('max_tokens', p)
+
+    def test_context_size_sets_num_ctx_ollama(self):
+        mq = m.ModelQuery('http://x', 'ollama')
+        p = mq.build_request_payload(self._msgs(), 'llama3', context_size=9999)
+        self.assertEqual(p['options']['num_ctx'], 9999)
+
+    def test_floor_when_no_room(self):
+        self.ctx.context_window_size = 8192
+        self.ctx.max_output_tokens = 65536
+        mq = m.ModelQuery('http://x', 'llamacpp')
+        msgs = [{'role': 'system', 'content': 'sys'},
+                {'role': 'user', 'content': ' '.join(['word'] * 8000)}]
+        p = mq.build_request_payload(msgs, 'qwen3', apply_output_cap=True)
+        self.assertEqual(p['max_tokens'], m.MAX_OUTPUT_MIN_FLOOR)
+
+    # --- ChatLoop handler ---
+    def test_set_maxtokens_parses_k(self):
+        self.ctx.context_window_size = 131072
+        loop = m.ChatLoop(self.ctx)
+        loop.set_max_output_tokens('/maxtokens 32K')
+        self.assertEqual(self.ctx.max_output_tokens, 32768)
+
+    def test_set_maxtokens_invalid_keeps_value(self):
+        self.ctx.context_window_size = 131072
+        self.ctx.max_output_tokens = 1234
+        loop = m.ChatLoop(self.ctx)
+        loop.set_max_output_tokens('/maxtokens notanumber')
+        self.assertEqual(self.ctx.max_output_tokens, 1234)
+
+    def test_dispatch_returns_false_for_maxtokens(self):
+        self.ctx.context_window_size = 131072
+        loop = m.ChatLoop(self.ctx)
+        self.assertIs(loop.run_handle_maxtokens('/maxtokens 16K'), False)
+        self.assertEqual(self.ctx.max_output_tokens, 16384)
+
+    def test_dispatch_returns_none_for_other_command(self):
+        loop = m.ChatLoop(self.ctx)
+        self.assertIsNone(loop.run_handle_maxtokens('/help'))
+
+    # --- near-full nudge ---
+    def test_near_full_nudge_none_when_low(self):
+        self.ctx.context_window_size = 100000
+        loop = m.ChatLoop(self.ctx)
+        self.assertIsNone(loop._near_full_nudge_message([{'role': 'user', 'content': 'hi'}]))
+
+    def test_near_full_nudge_fires_and_is_tagged(self):
+        self.ctx.context_window_size = 100
+        loop = m.ChatLoop(self.ctx)
+        msg = loop._near_full_nudge_message([{'role': 'user', 'content': ' '.join(['word'] * 200)}])
+        self.assertIsNotNone(msg)
+        self.assertTrue(msg['_system_nudge'])
+        self.assertTrue(msg['_near_full_nudge'])
+        self.assertIn('context budget', msg['content'])
+
+    def test_refresh_replaces_not_accumulates(self):
+        self.ctx.context_window_size = 100
+        loop = m.ChatLoop(self.ctx)
+        msgs = [{'role': 'user', 'content': ' '.join(['word'] * 200)}]
+        msgs = loop._refresh_near_full_nudge(msgs)
+        msgs = loop._refresh_near_full_nudge(msgs)
+        self.assertEqual(len([x for x in msgs if x.get('_near_full_nudge')]), 1)
+
+
 class TestAgenticCompactThreshold(unittest.TestCase):
     """The agentic auto-compact threshold is a dedicated, tunable knob."""
 

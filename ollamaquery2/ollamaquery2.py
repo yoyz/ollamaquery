@@ -61,7 +61,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.16"
+__version__ = "0.2.17"
 
 
 # ============================================================================
@@ -155,6 +155,14 @@ MAX_GREP_LINE_LENGTH = 500     # per-line truncation in grep results
 GREP_SEARCH_TIMEOUT = 30       # seconds before a grep/rg subprocess is killed
 MAX_WRITE_FILE_SIZE = 1048576  # 1MB max for agentic write_file tool
 MAX_FILE_INCLUSION_SIZE = 5 * 1024 * 1024  # 5MB max for @file inclusions
+# Per-response output cap (always on; see /maxtokens). Sent to the backend as
+# Ollama `options.num_predict` or OpenAI-compatible `max_tokens`; it includes
+# reasoning/thinking tokens. The cap is lowered at request time so the prompt
+# plus output never exceed the context window, keeping room for compaction.
+DEFAULT_MAX_OUTPUT_TOKENS = 64 * 1024  # 64K default output cap
+MAX_OUTPUT_RESERVE = 4096              # max headroom kept free for compaction
+MAX_OUTPUT_MIN_FLOOR = 256             # hard floor when no output room remains
+NEAR_FULL_THRESHOLD = 0.90             # window fraction that triggers the "answer soon" nudge
 DEFAULT_OLLAMA_HOST    = 'http://127.0.0.1:11434'
 DEFAULT_LLAMACPP_HOST  = 'http://127.0.0.1:8080'
 DEFAULT_LMSTUDIO_HOST  = 'http://127.0.0.1:1234'
@@ -316,6 +324,13 @@ COMMANDS = {
         'category': 'Settings',
         'description': 'Set context window size (0 for default)',
         'usage': '/contextsizeset <tokens>',
+        'handler': None
+    },
+    'maxtokens': {
+        'aliases': ['/maxtokens'],
+        'category': 'Settings',
+        'description': 'Set max output tokens per response (default 64K, always on)',
+        'usage': '/maxtokens [<int>[K] | help]',
         'handler': None
     },
     'thinkingon': {
@@ -1056,6 +1071,88 @@ def parse_size(size_bytes: Optional[int]) -> str:
     return "N/A"
 
 
+def parse_token_size(value: str) -> Optional[int]:
+    """Parse a token-size token such as "64K", "64k", or "65536".
+
+    Args:
+        value: The raw size token (may carry a trailing K/k for 1024x).
+
+    Returns:
+        The integer token count, or None when the token is not a valid size.
+    """
+    v = (value or "").strip().lower()
+    if not v:
+        return None
+    mult = 1
+    if v.endswith("k"):
+        mult = 1024
+        v = v[:-1]
+    if not v.isdigit():
+        return None
+    return int(v) * mult
+
+
+def resolve_output_budget(configured: int, window: int, prompt_tokens: int) -> tuple:
+    """Compute the effective per-response output cap given the context window.
+
+    The cap is lowered so prompt + output never exceed the window, keeping a
+    reserve (min(4096, 5% of the window)) free for compaction. A window of 0
+    means "unknown" — the configured value is returned unchanged.
+
+    Args:
+        configured: The user-configured cap (`ctx.max_output_tokens`).
+        window: The context window size in tokens (0 when unknown).
+        prompt_tokens: Current token count of the outgoing prompt.
+
+    Returns:
+        (effective, reserve). `effective == 0` is a sentinel meaning "no room
+        after the reserve — the caller should force-compact before sending".
+    """
+    if window and window > 0:
+        reserve = min(MAX_OUTPUT_RESERVE, int(window * 0.05))
+        room = window - prompt_tokens - reserve
+        if room <= 0:
+            return 0, reserve
+        return min(configured, room), reserve
+    return configured, 0
+
+
+def max_output_cap_line(max_output_tokens: int) -> str:
+    """Return the static system-prompt sentence advertising the output cap.
+
+    Static by design: it only changes when the user runs /maxtokens, so it does
+    not churn the KV-cache prefix between turns.
+
+    Args:
+        max_output_tokens: The configured per-response output cap.
+
+    Returns:
+        A one-to-two sentence instruction appended to the system message.
+    """
+    return (f"You may generate at most {max_output_tokens} tokens per response. "
+            "If you approach that limit, stop and give your best final answer.")
+
+
+def context_budget_nudge(prompt_tokens: int, window: int) -> str:
+    """Return the dynamic near-full notice with the live context budget.
+
+    Injected only past NEAR_FULL_THRESHOLD as a transient `_system_nudge` so it
+    tells the model the current context size and the window, steering it to wrap
+    up — without rewriting the system prompt (which would invalidate the cache).
+
+    Args:
+        prompt_tokens: Current token count of the outgoing prompt.
+        window: The context window size in tokens.
+
+    Returns:
+        The notice text.
+    """
+    pct = (prompt_tokens / window) if window else 0.0
+    return (f"System note — context budget: {prompt_tokens}/{window} tokens "
+            f"({pct:.0%} used). You are near the context limit; wrap up and give "
+            "your final answer soon.")
+
+
 _TOKEN_COUNT_WARNED = False
 # Ollama's stock build does NOT ship /api/tokenize (never merged upstream), so
 # probing it on every message wastes an HTTP round-trip and a 404. Cache the
@@ -1066,6 +1163,9 @@ _OLLAMA_TOKENIZE_SUPPORTED = None
 # single user turn on the reference build). The baseline is measured once and
 # subtracted so per-message counts approximate content tokens.
 _STRATA_MSG_OVERHEAD = None
+# Warn once per session when the output cap is applied with an unknown window
+# (LM Studio, or not yet fetched) — otherwise every request would spam stderr.
+_MAX_OUTPUT_WINDOW_WARNED = False
 
 
 def estimate_token_count(text: str) -> int:
@@ -1150,6 +1250,7 @@ class CommandContext:
         # Session state
         self.system_prompt: str = DEFAULT_SYSTEM_PROMPT
         self.context_size: Optional[int] = None
+        self.max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS  # per-response output cap (/maxtokens)
         self.current_images: List[str] = []
         self.force_no_thinking: bool = False
         self.reasoning_effort: Optional[str] = None  # None | "low" | "medium" | "high"
@@ -6502,29 +6603,52 @@ class ModelQuery:
 
 
     @staticmethod
+    def _last_user_message_index(messages: list) -> int:
+        """Return the index of the last real user message, or -1.
+
+        Skips `_system_nudge` messages (loop-internal steering such as the
+        near-full notice) so image injection targets the actual user turn.
+
+        Args:
+            messages: Message list.
+
+        Returns:
+            Index of the last non-nudge user message, or -1 when none.
+        """
+        for i in range(len(messages) - 1, -1, -1):
+            m = messages[i]
+            if isinstance(m, dict) and m.get("role") == "user" and not m.get("_system_nudge"):
+                return i
+        return -1
+
+    @staticmethod
     def _inject_images_into_messages(messages: list, images: Optional[list], backend: str) -> None:
-        """Inject image data into the last user message, mutating in-place.
+        """Inject image data into the last real user message, mutating in-place.
 
         Args:
             messages: Message list (mutated in place).
             images: List of base64 image strings.
             backend: Backend name for shape selection.
 
-        Ollama backend: sets messages[-1]["images"] = images list.
-        OpenAI-compatible backends (llamacpp, lmstudio): embeds images as
-        content parts with data:image URIs.
+        Ollama backend: sets the message's `images` list.
+        OpenAI-compatible backends (llamacpp, lmstudio, strata): embeds images
+        as content parts with data:image URIs. `_system_nudge` messages are
+        skipped so a trailing nudge never steals the attachments.
         """
-        if not images or not messages or messages[-1].get("role") != "user":
+        if not images or not messages:
+            return
+        idx = ModelQuery._last_user_message_index(messages)
+        if idx < 0:
             return
         if backend == "ollama":
-            messages[-1]["images"] = images
+            messages[idx]["images"] = images
         else:
-            text = messages[-1].get("content", "")
+            text = messages[idx].get("content", "")
             content_parts = [{"type": "text", "text": text or "Describe this image"}]
             for img in images:
                 mime = guess_image_mime(img)
                 content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img}"}})
-            messages[-1]["content"] = content_parts
+            messages[idx]["content"] = content_parts
 
     @staticmethod
     def _apply_backend_inference_params(payload: dict, backend: str, kwargs: dict) -> None:
@@ -6628,7 +6752,7 @@ class ModelQuery:
         return {k: v for k, v in payload.items() if k != "model"}
 
     def _apply_size_options(self, payload: dict, backend: str, kwargs: dict) -> None:
-        """Apply warmup/context-size options to the payload.
+        """Apply warmup, context-size, and output-cap options to the payload.
 
         Args:
             payload: The payload dict (mutated in place).
@@ -6640,11 +6764,87 @@ class ModelQuery:
                 payload["options"] = {"num_predict": 1}
             elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
                 payload["max_tokens"] = 1
-        elif context_size := kwargs.get('context_size'):
+            return
+        # Ollama context window via num_ctx. OpenAI-compatible servers treat the
+        # window as a server-side setting, not a request field — the old
+        # `max_tokens = context_size` conflated the input window with the output
+        # cap, silently limiting (or 400-ing) generation on /contextsizeset.
+        if context_size := kwargs.get('context_size'):
             if backend == "ollama":
-                payload["options"] = {"num_ctx": context_size}
+                payload.setdefault("options", {})
+                payload["options"]["num_ctx"] = context_size
+        # Per-response output cap (/maxtokens); already clamped by
+        # build_request_payload. Includes reasoning/thinking tokens.
+        if max_output := kwargs.get('max_output_tokens'):
+            if backend == "ollama":
+                payload.setdefault("options", {})
+                payload["options"]["num_predict"] = max_output
             elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-                payload["max_tokens"] = context_size
+                payload["max_tokens"] = max_output
+
+    def _apply_output_cap(self, messages: list, kwargs: dict) -> tuple:
+        """Add the static cap line and resolve the effective (clamped) cap.
+
+        Args:
+            messages: The outbound message list.
+            kwargs: The request kwargs dict.
+
+        Returns:
+            (messages_with_cap_line, kwargs_with_max_output_tokens). The stored
+            conversation is never mutated.
+        """
+        configured = int(getattr(self.ctx, 'max_output_tokens', DEFAULT_MAX_OUTPUT_TOKENS)
+                         or DEFAULT_MAX_OUTPUT_TOKENS)
+        messages = self._with_output_cap_line(messages, configured)
+        window = self.ctx.context_window_size
+        prompt_tokens = self.ctx.calculate_context_tokens(messages)
+        effective, _reserve = resolve_output_budget(configured, window, prompt_tokens)
+        if window <= 0:
+            global _MAX_OUTPUT_WINDOW_WARNED
+            if not _MAX_OUTPUT_WINDOW_WARNED:
+                _MAX_OUTPUT_WINDOW_WARNED = True
+                sys.stderr.write(colorize(
+                    f"[maxtokens] Context window unknown; applying {configured} "
+                    "tokens without clamping.", 'warning') + "\n")
+        elif effective <= 0:
+            # No room after the reserve — the caller should have force-compacted.
+            # Backstop so the request still goes out instead of erroring.
+            effective = MAX_OUTPUT_MIN_FLOOR
+            sys.stderr.write(colorize(
+                f"[maxtokens] No output room ({prompt_tokens}/{window}); "
+                f"using floor {MAX_OUTPUT_MIN_FLOOR}.", 'warning') + "\n")
+        kwargs = dict(kwargs)
+        kwargs['max_output_tokens'] = effective
+        return messages, kwargs
+
+    @staticmethod
+    def _with_output_cap_line(messages: list, configured: int) -> list:
+        """Return a copy of `messages` with the static cap sentence in the system message.
+
+        Args:
+            messages: The outbound message list.
+            configured: The configured output cap.
+
+        Returns:
+            A new list whose system message carries the cap line. The stored
+            conversation objects are not mutated.
+        """
+        if not messages:
+            return messages
+        line = max_output_cap_line(configured)
+        new = list(messages)
+        first = new[0]
+        if first.get('role') != 'system':
+            return [{'role': 'system', 'content': line}] + new
+        new_first = dict(first)
+        content = new_first.get('content') or ''
+        if isinstance(content, list):
+            new_first['content'] = list(content) + [{"type": "text", "text": line}]
+        else:
+            new_first['content'] = (f"{content}\n\n{line}" if content else line)
+        new_first.pop('_tokens', None)  # content changed; cached count no longer valid
+        new[0] = new_first
+        return new
 
     def build_request_payload(self, messages: list, model: str, stream_enabled: bool = False, **kwargs: dict) -> dict:
         """Build request payload for the backend.
@@ -6654,11 +6854,17 @@ class ModelQuery:
             model: Model name.
             stream_enabled: Whether to request streaming.
             **kwargs: images, tools, context_size, is_warmup, inference params.
+                apply_output_cap: When True, apply the /maxtokens per-response
+                    output cap (clamped to the context window) and advertise it
+                    in the system message.
 
         Returns:
             The JSON payload dict.
         """
         self._inject_images_into_messages(messages, kwargs.get('images'), self.backend)
+
+        if kwargs.get('apply_output_cap'):
+            messages, kwargs = self._apply_output_cap(messages, kwargs)
 
         payload = {
             "model": model,
@@ -6894,8 +7100,9 @@ class ModelQuery:
         usage_out = kwargs.pop("usage_out", None)
         backend = self.backend
 
-        if images and messages and messages[-1].get("role") == "user":
-            messages[-1] = dict(messages[-1])
+        img_idx = self._last_user_message_index(messages) if images else -1
+        if img_idx >= 0:
+            messages[img_idx] = dict(messages[img_idx])
             self._inject_images_into_messages(messages, images, backend)
 
         api_url, payload, headers = self._build_stream_request(
@@ -7203,8 +7410,9 @@ class ModelQuery:
         first_content_time = None
         backend = self.backend
 
-        if images and messages and messages[-1].get("role") == "user":
-            messages[-1] = dict(messages[-1])
+        img_idx = self._last_user_message_index(messages) if images else -1
+        if img_idx >= 0:
+            messages[img_idx] = dict(messages[img_idx])
             self._inject_images_into_messages(messages, images, self.backend)
 
         api_url, payload, headers = self._build_stream_request(
@@ -8476,6 +8684,7 @@ class ChatLoop:
             self.run_handle_stats,
             self.run_handle_listmodel,
             self.run_handle_context_size,
+            self.run_handle_maxtokens,
             self.run_handle_clear,
             self.run_handle_image,
             self.run_handle_dumpcontext,
@@ -8541,6 +8750,60 @@ class ChatLoop:
                 print(f"[Context size set to {val}]", file=sys.stderr)
         else:
             print("[Usage: /contextsizeset <integer> (use 0 for default)]", file=sys.stderr)
+
+    def set_max_output_tokens(self, full_input: str) -> None:
+        """Parse and apply the /maxtokens command argument."""
+        parts = full_input.split()
+        arg = parts[1].lower() if len(parts) > 1 else ""
+        if arg in ("", "help", "-h", "--help"):
+            self.show_max_output_tokens_status()
+            return
+        val = parse_token_size(arg)
+        if val is None or val <= 0:
+            print(colorize(
+                f"[ERROR] Invalid size '{parts[1]}'. Use an integer, optionally "
+                "suffixed with K (K=1024).", 'error'), file=sys.stderr)
+            print("[Usage: /maxtokens <int>[K]  |  /maxtokens help]", file=sys.stderr)
+            return
+        if val > MAX_CONTEXT_SIZE:
+            print(colorize(f"[ERROR] Max output {val} exceeds maximum {MAX_CONTEXT_SIZE}", 'error'), file=sys.stderr)
+            return
+        if self.ctx.context_window_size <= 0:
+            refresh_context_window_size(self.ctx)
+        self.ctx.max_output_tokens = val
+        window = self.ctx.context_window_size
+        print(f"[Max output tokens set to {val} ({val // 1024}K)]", file=sys.stderr)
+        if window > 0 and val > window:
+            print(colorize(
+                f"[maxtokens] Cap {val} exceeds the {window}-token window; it will be clamped at request time.",
+                'warning'), file=sys.stderr)
+
+    def show_max_output_tokens_status(self) -> None:
+        """Print the current /maxtokens setting and a short help screen."""
+        configured = self.ctx.max_output_tokens
+        if self.ctx.context_window_size <= 0:
+            refresh_context_window_size(self.ctx)
+        window = self.ctx.context_window_size
+        messages = getattr(self, 'messages', None) or []
+        prompt_tokens = self.ctx.calculate_context_tokens(messages) if messages else 0
+        effective, reserve = resolve_output_budget(configured, window, prompt_tokens)
+        print(colorize("\n/maxtokens — per-response output cap (always on)", 'info'), file=sys.stderr)
+        print(f"  Configured cap : {configured} tokens ({configured // 1024}K)", file=sys.stderr)
+        if window > 0:
+            shown = effective if effective > 0 else f"no room (floor {MAX_OUTPUT_MIN_FLOOR})"
+            print(f"  Context window : {window} tokens", file=sys.stderr)
+            print(f"  Prompt now     : {prompt_tokens} tokens", file=sys.stderr)
+            print(f"  Reserve kept   : {reserve} tokens (for compaction)", file=sys.stderr)
+            print(f"  Effective cap  : {shown}", file=sys.stderr)
+        else:
+            print("  Context window : unknown (cap applied unclamped)", file=sys.stderr)
+        print(colorize(
+            "\n  Usage: /maxtokens <int>[K]   set the cap (K = 1024, e.g. 64K = 65536)\n"
+            "         /maxtokens help      show this help\n"
+            "  Sent as `num_predict` (Ollama) or `max_tokens` (OpenAI-compatible).\n"
+            "  Includes reasoning/thinking tokens; auto-lowered as the context fills.",
+            'muted'), file=sys.stderr)
+        print(file=sys.stderr)
 
     def handle_spawnshell(self) -> Optional[str]:
         """Spawn an interactive shell session."""
@@ -8885,6 +9148,13 @@ class ChatLoop:
         """Handle /contextsizeset command."""
         if full_input.startswith('/contextsizeset'):
             self.set_context_size(full_input)
+            return False
+        return None
+
+    def run_handle_maxtokens(self, full_input: str) -> Optional[bool]:
+        """Handle /maxtokens command."""
+        if full_input.startswith('/maxtokens'):
+            self.set_max_output_tokens(full_input)
             return False
         return None
 
@@ -10660,6 +10930,7 @@ class ChatLoop:
                         "Do not repeat the original request or call any more tools."})
 
                 stream_kwargs = dict(get_inference_params(self.ctx.model))
+                stream_kwargs["apply_output_cap"] = True
                 stream_tool_calls_out = []
                 if send_tools_api:
                     stream_kwargs["tools"] = openai_tools
@@ -10862,6 +11133,7 @@ class ChatLoop:
             if len(self.messages) > 1:
                 reentry_messages.extend(self.messages[1:])
             sync_kwargs = dict(get_inference_params(self.ctx.model))
+            sync_kwargs["apply_output_cap"] = True
             if send_tools_api:
                 sync_kwargs["tools"] = openai_tools
             reentry_response = self.query_handler.query_sync(
@@ -11059,6 +11331,8 @@ class ChatLoop:
         sys.stderr.flush()
 
         messages = self._maybe_auto_compact_agentic(messages)
+        messages = self._force_compact_if_no_output_room(messages)
+        messages = self._refresh_near_full_nudge(messages)
 
         # Verbose: show payload token count
         if self.ctx.agentic_verbose and self.ctx.context_window_size > 0:
@@ -11303,6 +11577,7 @@ class ChatLoop:
 
                 images_to_send = [] if self.ctx.supports_vision is False else self.ctx.current_images
                 sync_kwargs = dict(get_inference_params(self.ctx.model))
+                sync_kwargs["apply_output_cap"] = True
                 if send_tools_api:
                     sync_kwargs["tools"] = openai_tools
                 if self.ctx.force_no_thinking:
@@ -11835,6 +12110,71 @@ class ChatLoop:
             return False
         return None
 
+    def _force_compact_if_no_output_room(self, messages: list) -> list:
+        """Force-compact when the output reserve leaves no generation room.
+
+        The per-response cap keeps `min(4096, 5% window)` free for compaction;
+        when the prompt already fills the rest, generation has no room. Compact
+        harder (force=True) so the request can still produce a full answer. A
+        rare safety net — normal compaction triggers well before this.
+
+        Args:
+            messages: The conversation list.
+
+        Returns:
+            The (possibly force-compacted) message list.
+        """
+        window = self.ctx.context_window_size
+        if window <= 0:
+            return messages
+        reserve = min(MAX_OUTPUT_RESERVE, int(window * 0.05))
+        prompt_tokens = self.ctx.calculate_context_tokens(messages)
+        if window - prompt_tokens - reserve > 0:
+            return messages
+        before_len = len(messages)
+        messages = compact_messages(messages, self.ctx, force=True)
+        print(colorize(
+            f"[Auto-compact] Forced (no output room): {before_len} → {len(messages)} msgs",
+            'warning'), file=sys.stderr)
+        return messages
+
+    def _near_full_nudge_message(self, messages: list) -> Optional[dict]:
+        """Return a transient near-full `_system_nudge` message, or None.
+
+        Fires only past NEAR_FULL_THRESHOLD. Tagged `_system_nudge` so the
+        agentic history merge excludes it (and normal chat never stores it),
+        and `_near_full_nudge` so a prior copy can be replaced cleanly.
+
+        Args:
+            messages: The conversation list used to size the prompt.
+
+        Returns:
+            The nudge message dict, or None when not near full.
+        """
+        window = self.ctx.context_window_size
+        if window <= 0:
+            return None
+        prompt_tokens = self.ctx.calculate_context_tokens(messages)
+        if prompt_tokens < int(window * NEAR_FULL_THRESHOLD):
+            return None
+        return {'role': 'user', 'content': context_budget_nudge(prompt_tokens, window),
+                '_system_nudge': True, '_near_full_nudge': True}
+
+    def _refresh_near_full_nudge(self, messages: list) -> list:
+        """Replace any prior near-full nudge with a fresh one if still near full.
+
+        Args:
+            messages: The (agentic) conversation list.
+
+        Returns:
+            The message list with at most one current near-full nudge at the tail.
+        """
+        messages = [m for m in messages if not m.get('_near_full_nudge')]
+        nudge = self._near_full_nudge_message(messages)
+        if nudge:
+            messages.append(nudge)
+        return messages
+
     def run_process_query(self, full_input: str) -> None:
         """Process regular user query (non-command input)."""
         if self.ctx.agentic_mode:
@@ -11866,7 +12206,12 @@ class ChatLoop:
                     f"{msg_tokens} → {after_tokens} tokens",
                     'warning'), file=sys.stderr)
 
+        self.messages = self._force_compact_if_no_output_room(self.messages)
+
         payload_messages = list(self.messages)
+        near_full_nudge = self._near_full_nudge_message(payload_messages)
+        if near_full_nudge:
+            payload_messages.append(near_full_nudge)
 
         if payload_messages[-1]['role'] == 'user':
             if not self.ctx.model:
@@ -11882,7 +12227,8 @@ class ChatLoop:
                 context_size=self.ctx.context_size,
                 images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
                 no_thinking=self.ctx.force_no_thinking,
-                reasoning_effort=self.ctx.reasoning_effort
+                reasoning_effort=self.ctx.reasoning_effort,
+                apply_output_cap=True
             )
 
             if response:
