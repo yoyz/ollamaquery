@@ -1226,6 +1226,137 @@ class TestNoThinkingPayload(unittest.TestCase):
         self.assertEqual(p['chat_template_kwargs']['reasoning_effort'], 'high')
 
 
+class TestReasoningSupport(unittest.TestCase):
+    """Capability discovery for /reasoning (reasoning_support)."""
+
+    def test_llamacpp_full_options(self):
+        s = m.ModelQuery.reasoning_support('qwen3.8:27b', 'llamacpp')
+        self.assertTrue(s['supported'])
+        self.assertEqual(s['options'], ['off', 'on', 'low', 'medium', 'high'])
+        self.assertIn('chat_template_kwargs', s['transport'])
+
+    def test_strata_full_options(self):
+        s = m.ModelQuery.reasoning_support('qwen3.8-flash-next', 'strata')
+        self.assertTrue(s['supported'])
+        self.assertEqual(s['options'], ['off', 'on', 'low', 'medium', 'high'])
+
+    def test_ollama_uses_think_option(self):
+        s = m.ModelQuery.reasoning_support('qwen3:8b', 'ollama')
+        self.assertIn('options.think', s['transport'])
+
+    def test_base_qwen3_is_toggle_only(self):
+        s = m.ModelQuery.reasoning_support('qwen3:8b', 'llamacpp')
+        self.assertEqual(s['options'], ['off', 'on'])
+        self.assertIn('no effort', s['note'])
+
+    def test_qwen35_and_36_are_toggle_only(self):
+        for model in ('qwen3.5:9b', 'Qwen3.5-35B-A3B.gguf',
+                      'Qwen3.6-35B-A3B.gguf', 'qwen3.6-27b', 'qwen3.7:8b'):
+            s = m.ModelQuery.reasoning_support(model, 'llamacpp')
+            self.assertEqual(s['options'], ['off', 'on'], msg=model)
+            self.assertIn('no effort', s['note'])
+
+    def test_qwen38_family_has_effort(self):
+        for model in ('qwen3.8:27b', 'Qwen3.8-27B-Q4_K_M.gguf'):
+            s = m.ModelQuery.reasoning_support(model, 'llamacpp')
+            self.assertEqual(s['options'], ['off', 'on', 'low', 'medium', 'high'],
+                             msg=model)
+            self.assertIn('xhigh', s['note'])
+
+    def test_qwen38_flash_next_uses_specific_entry(self):
+        s = m.ModelQuery.reasoning_support(
+            'qwen3.8-flash-next-unsloth-ud-iq4_xs', 'strata')
+        self.assertEqual(s['options'], ['off', 'on', 'low', 'medium', 'high'])
+        self.assertIn('on by default', s['note'])
+        self.assertIn('xhigh', s['note'])
+
+    def test_qwen3_coder_is_non_thinking(self):
+        s = m.ModelQuery.reasoning_support('qwen3-coder:30b', 'ollama')
+        self.assertFalse(s['supported'])
+        self.assertEqual(s['options'], [])
+        self.assertIn('non-thinking', s['note'])
+
+    def test_qwq_always_thinking(self):
+        s = m.ModelQuery.reasoning_support('qwq:32b', 'llamacpp')
+        self.assertTrue(s['supported'])
+        self.assertEqual(s['options'], ['on'])
+        self.assertIn('always-thinking', s['note'])
+
+    def test_unknown_model_defaults_full(self):
+        s = m.ModelQuery.reasoning_support('granite4:350m', 'llamacpp')
+        self.assertEqual(s['options'], ['off', 'on', 'low', 'medium', 'high'])
+        self.assertEqual(s['note'], '')
+
+    def test_gpt_oss_has_no_off_switch(self):
+        for backend in ('ollama', 'llamacpp', 'strata', 'lmstudio'):
+            s = m.ModelQuery.reasoning_support('gpt-oss-20b.gguf', backend)
+            self.assertTrue(s['supported'])
+            self.assertNotIn('off', s['options'])
+            self.assertIn('no off-switch', s['note'])
+
+    def test_gpt_oss_underscore_matched(self):
+        s = m.ModelQuery.reasoning_support('/cache/gpt_oss-20b.gguf', 'llamacpp')
+        self.assertNotIn('off', s['options'])
+
+    def test_cloud_backend_unsupported(self):
+        for backend in ('gemini', 'opencodezen', 'opencodego', 'mistral', 'deepseek'):
+            s = m.ModelQuery.reasoning_support('any-model', backend)
+            self.assertFalse(s['supported'])
+            self.assertEqual(s['options'], [])
+            self.assertIn(backend, s['note'])
+
+
+class TestPreserveThinking(unittest.TestCase):
+    """preserve_thinking support (Qwen3.6/3.8) + payload wiring."""
+
+    def _payload(self, backend, model, value):
+        mq = m.ModelQuery('http://x', backend)
+        return mq.build_request_payload(
+            [{'role': 'user', 'content': 'hi'}], model, preserve_thinking=value)
+
+    def test_supports_qwen36_and_38(self):
+        self.assertTrue(m.supports_preserve_thinking('qwen3.6-27b'))
+        self.assertTrue(m.supports_preserve_thinking('Qwen3.8-27B'))
+        self.assertFalse(m.supports_preserve_thinking('qwen3.5-35b-a3b'))
+        self.assertFalse(m.supports_preserve_thinking('qwen3:8b'))
+
+    def test_model_defaults(self):
+        self.assertIs(m.preserve_thinking_default('Qwen3.8-27B'), True)
+        self.assertIs(m.preserve_thinking_default('qwen3.6-27b'), False)
+        self.assertIsNone(m.preserve_thinking_default('qwen3.5-9b'))
+
+    def test_llamacpp_sends_flag(self):
+        p = self._payload('llamacpp', 'qwen3.6-27b', True)
+        self.assertIs(p['chat_template_kwargs']['preserve_thinking'], True)
+
+    def test_strata_sends_flag_false(self):
+        p = self._payload('strata', 'qwen3.8-27b', False)
+        self.assertIs(p['chat_template_kwargs']['preserve_thinking'], False)
+
+    def test_ollama_has_no_field(self):
+        p = self._payload('ollama', 'qwen3.6-27b', True)
+        self.assertNotIn('chat_template_kwargs', p)
+
+    def test_unsupported_model_has_no_field(self):
+        p = self._payload('llamacpp', 'qwen3.5-9b', True)
+        self.assertNotIn('chat_template_kwargs', p)
+
+    def test_none_omits_flag(self):
+        mq = m.ModelQuery('http://x', 'llamacpp')
+        p = mq.build_request_payload(
+            [{'role': 'user', 'content': 'hi'}], 'qwen3.6-27b')
+        self.assertNotIn('chat_template_kwargs', p)
+
+    def test_stamp_tokens_counts_reasoning(self):
+        ctx = m.CommandContext()
+        plain = {'role': 'assistant', 'content': 'answer'}
+        ctx.stamp_tokens(plain)
+        with_reasoning = {'role': 'assistant', 'content': 'answer',
+                          'reasoning_content': 'x' * 400}
+        ctx.stamp_tokens(with_reasoning)
+        self.assertGreater(with_reasoning['_tokens'], plain['_tokens'])
+
+
 class TestMaxOutputTokens(unittest.TestCase):
     """Per-response output cap (/maxtokens): parsing, clamping, payload wiring."""
 

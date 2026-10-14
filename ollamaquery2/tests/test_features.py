@@ -444,6 +444,26 @@ class TestSubcommandCompletion(unittest.TestCase):
         matches = self._candidates(c, '/compact now ', '')
         self.assertEqual(matches, [])
 
+    def test_reasoning_subcommands(self):
+        c = self._completer()
+        matches = self._candidates(c, '/reasoning ', '')
+        self.assertEqual(matches, ['off', 'on', 'low', 'medium', 'high'])
+
+    def test_preservethinking_subcommands(self):
+        c = self._completer()
+        matches = self._candidates(c, '/preservethinking ', '')
+        self.assertEqual(matches, ['on', 'off', 'status'])
+
+    def test_preservethinking_prefix(self):
+        c = self._completer()
+        matches = self._candidates(c, '/preservethinking o', 'o')
+        self.assertEqual(matches, ['on', 'off'])
+
+    def test_preservethinking_no_second_level(self):
+        c = self._completer()
+        matches = self._candidates(c, '/preservethinking on ', '')
+        self.assertEqual(matches, [])
+
     def test_completion_word_index(self):
         self.assertEqual(q.ChatCompleter._completion_word_index('/agentic '), 1)
         self.assertEqual(q.ChatCompleter._completion_word_index('/agentic plan'), 1)
@@ -949,9 +969,59 @@ class TestCommandHandlers(unittest.TestCase):
         self.assertIs(result, False)
         self.assertIsNone(self.ctx.reasoning_effort)
 
+    def test_handle_reasoning_status_shows_supported(self):
+        buf = io.StringIO()
+        with patch('sys.stderr', buf):
+            result = self.loop.run_handle_reasoning('/reasoning')
+        self.assertIs(result, False)
+        out = buf.getvalue()
+        self.assertIn('Supported:', out)
+        self.assertIn('options.think', out)
+
+    def test_handle_reasoning_invalid_shows_usage_and_support(self):
+        buf = io.StringIO()
+        with patch('sys.stderr', buf):
+            result = self.loop.run_handle_reasoning('/reasoning turbo')
+        self.assertIs(result, False)
+        out = buf.getvalue()
+        self.assertIn('Usage: /reasoning', out)
+        self.assertIn('Supported:', out)
+
+    def test_handle_reasoning_unsupported_effort_warns(self):
+        ctx = _fresh_ctx(model='qwen3.6-27b')
+        loop = _chat_loop(ctx)
+        buf = io.StringIO()
+        with patch('sys.stderr', buf):
+            result = loop.run_handle_reasoning('/reasoning high')
+        self.assertIs(result, False)
+        self.assertIn('does not support effort', buf.getvalue())
+
     def test_handle_reasoning_returns_none_for_other_commands(self):
         result = self.loop.run_handle_reasoning('/clear')
         self.assertIsNone(result)
+
+    def test_handle_preserve_thinking_toggle(self):
+        ctx = _fresh_ctx(model='qwen3.6-27b')
+        loop = _chat_loop(ctx)
+        with patch('sys.stderr', io.StringIO()):
+            result = loop.run_handle_preserve_thinking('/preservethinking on')
+        self.assertIs(result, False)
+        self.assertIs(ctx.preserve_thinking, True)
+        with patch('sys.stderr', io.StringIO()):
+            loop.run_handle_preserve_thinking('/preservethinking off')
+        self.assertIs(ctx.preserve_thinking, False)
+
+    def test_handle_preserve_thinking_status_unsupported(self):
+        ctx = _fresh_ctx(model='qwen3.5-9b')
+        loop = _chat_loop(ctx)
+        buf = io.StringIO()
+        with patch('sys.stderr', buf):
+            result = loop.run_handle_preserve_thinking('/preservethinking status')
+        self.assertIs(result, False)
+        self.assertIn('does not support preserve_thinking', buf.getvalue())
+
+    def test_handle_preserve_thinking_returns_none_for_other_commands(self):
+        self.assertIsNone(self.loop.run_handle_preserve_thinking('/clear'))
 
     def test_tokencount_unfolds_message(self):
         self.loop.messages = [

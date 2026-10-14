@@ -2467,6 +2467,38 @@ class TestAgenticPlanCommand(unittest.TestCase):
         self.assertFalse(loop.ctx.plan_mode)
         self.assertFalse(loop.ctx.plan_run)
 
+    def test_full_after_plan_clears_plan_restrictions(self):
+        """`/agentic full` after plan must drop the read-only surface."""
+        loop = self._loop()
+        loop._agentic_toggle_plan(['/agentic', 'plan'])
+        self.assertTrue(loop.ctx.plan_mode)
+        loop._agentic_set_full()
+        self.assertFalse(loop.ctx.plan_mode)
+        self.assertFalse(loop.ctx.plan_run)
+        self.assertTrue(loop.ctx.agentic_mode)
+        self.assertTrue(loop.ctx.auto_confirm)
+        self.assertNotIn("Read-only planning mode", loop.ctx.system_prompt)
+
+    def test_full_after_plan_run_clears_plan_restrictions(self):
+        loop = self._loop()
+        loop._agentic_toggle_plan(['/agentic', 'plan', 'run'])
+        self.assertTrue(loop.ctx.plan_run)
+        loop.run_handle_agentic('/agentic full')
+        self.assertFalse(loop.ctx.plan_mode)
+        self.assertFalse(loop.ctx.plan_run)
+        self.assertTrue(loop.ctx.agentic_mode)
+        self.assertNotIn("Read-only planning mode", loop.ctx.system_prompt)
+
+    def test_on_after_plan_clears_plan_mode(self):
+        """`/agentic on` while in plan mode also leaves the read-only surface."""
+        loop = self._loop()
+        loop._agentic_toggle_plan(['/agentic', 'plan'])
+        loop._agentic_toggle_on_off(True)
+        self.assertFalse(loop.ctx.plan_mode)
+        self.assertFalse(loop.ctx.plan_run)
+        self.assertTrue(loop.ctx.agentic_mode)
+        self.assertNotIn("Read-only planning mode", loop.ctx.system_prompt)
+
 
 class TestAppendToolMessages(unittest.TestCase):
     """Assistant-turn shape after a tool call.

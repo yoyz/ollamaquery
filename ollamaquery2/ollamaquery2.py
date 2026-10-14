@@ -61,7 +61,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.17"
+__version__ = "0.2.18"
 
 
 # ============================================================================
@@ -352,6 +352,13 @@ COMMANDS = {
         'category': 'Settings',
         'description': 'Set model reasoning effort (low/medium/high) or off/on',
         'usage': '/reasoning [off|on|low|medium|high]',
+        'handler': None
+    },
+    'preservethinking': {
+        'aliases': ['/preservethinking'],
+        'category': 'Settings',
+        'description': 'Retain reasoning traces across turns (Qwen3.6/3.8)',
+        'usage': '/preservethinking [on|off|status]',
         'handler': None
     },
     'debug': {
@@ -1254,6 +1261,7 @@ class CommandContext:
         self.current_images: List[str] = []
         self.force_no_thinking: bool = False
         self.reasoning_effort: Optional[str] = None  # None | "low" | "medium" | "high"
+        self.preserve_thinking: Optional[bool] = None  # None = model default (/preservethinking)
         self.models: List[str] = []
 
         # Execution state
@@ -1429,6 +1437,8 @@ class CommandContext:
                         extracted += part.get("text", "")
             content = extracted
         tokens = self.tokenize(content)
+        if msg.get("reasoning_content"):
+            tokens += self.tokenize(msg["reasoning_content"])
         if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
             for tc in msg["tool_calls"]:
                 fn = tc.get("function", {})
@@ -1464,6 +1474,8 @@ class CommandContext:
                 if isinstance(msg.get("images"), list):
                     image_count += len(msg["images"])
                 total += self.estimate_tokens(content)
+                if msg.get("reasoning_content"):
+                    total += self.estimate_tokens(msg["reasoning_content"])
                 if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
                     for tc in msg["tool_calls"]:
                         fn = tc.get("function", {})
@@ -2522,6 +2534,86 @@ DEFAULT_INFERENCE_PARAMS = {
     "presence_penalty": 0.0,
     "repeat_penalty": 1.0,
 }
+
+# Reasoning capabilities per model family, keyed by substrings matched against
+# the lowercased model name (order matters — most specific key first). Each
+# value is (options, note): `options` is the subset of /reasoning tokens the
+# family honors, `note` is a short caveat. A local backend with no matching key
+# defaults to the full set. Effort levels are only as real as the *loaded* chat
+# template: one without a `reasoning_effort` hook silently ignores low/medium/
+# high, so `/reasoning` reports them optimistically with a caveat.
+REASONING_CAPABILITY_REGISTRY = {
+    "qwen3-coder": ([], "non-thinking coding model (no reasoning phase)"),
+    "qwq": (["on"], "always-thinking; cannot be disabled"),
+    "qwen3.8": (["off", "on", "low", "medium", "high"],
+                "thinking on by default; effort low/medium/high (high->xhigh); "
+                "preserve_thinking on"),
+    "qwen3.": (["off", "on"],
+               "boolean enable_thinking only; no effort levels (Qwen3.5/3.6/3.7)"),
+    "gpt-oss": (["on", "low", "medium", "high"],
+                "no off-switch; /thinkingoff -> effort 'low'"),
+    "gpt_oss": (["on", "low", "medium", "high"],
+                "no off-switch; /thinkingoff -> effort 'low'"),
+    "qwen3": (["off", "on"], "boolean enable_thinking; no effort levels"),
+}
+
+
+def get_reasoning_capability(model_name: str) -> Optional[tuple]:
+    """Look up a model family's (options, note) from the reasoning registry.
+
+    Args:
+        model_name: The active model name (matched as a lowercased substring).
+
+    Returns:
+        (options, note) tuple, or None when no family key matches.
+    """
+    lower = (model_name or "").lower()
+    for key, capability in REASONING_CAPABILITY_REGISTRY.items():
+        if key in lower:
+            options, note = capability
+            return list(options), note
+    return None
+
+
+# Model families that support `preserve_thinking` (retaining reasoning traces
+# from historical assistant turns). Qwen3.6 supports it as an opt-in; Qwen3.8
+# enables it by default server-side. Qwen3.5 and older do not expose it.
+PRESERVE_THINKING_FAMILIES = ("qwen3.6", "qwen3.7", "qwen3.8")
+
+
+def supports_preserve_thinking(model_name: str) -> bool:
+    """Return whether the model family supports the `preserve_thinking` option.
+
+    Args:
+        model_name: The active model name (matched as a lowercased substring).
+
+    Returns:
+        True if the family is known to accept `preserve_thinking`.
+    """
+    lower = (model_name or "").lower()
+    return any(key in lower for key in PRESERVE_THINKING_FAMILIES)
+
+
+def preserve_thinking_default(model_name: str) -> Optional[bool]:
+    """Return the model-side default for `preserve_thinking`, when known.
+
+    Qwen3.8 enables preserved thinking by default; Qwen3.6 exposes it as an
+    opt-in (default off). Other families do not implement it.
+
+    Args:
+        model_name: The active model name (matched as a lowercased substring).
+
+    Returns:
+        True (default on), False (default off), or None when unknown/unsupported.
+    """
+    lower = (model_name or "").lower()
+    if "qwen3.8" in lower:
+        return True
+    if "qwen3.6" in lower or "qwen3.7" in lower:
+        return False
+    return None
+
+
 
 
 def get_inference_params(model_name: str) -> dict:
@@ -6726,6 +6818,27 @@ class ModelQuery:
             kwargs["reasoning_effort"] = effort
             payload["chat_template_kwargs"] = kwargs
 
+    @staticmethod
+    def _apply_preserve_thinking(payload: dict, backend: str, value: bool) -> None:
+        """Set the `preserve_thinking` chat-template flag (OpenAI-compatible backends).
+
+        Qwen3.6/3.8 templates read `preserve_thinking` from `chat_template_kwargs`
+        to retain reasoning traces from historical assistant turns. Ollama has no
+        equivalent option, so the flag is only emitted for the OpenAI-compatible
+        local backends; callers must also keep reasoning in the message history
+        for it to have any effect.
+
+        Args:
+            payload: The payload dict (mutated in place).
+            backend: Backend name.
+            value: True to retain historical reasoning, False to keep only the
+                latest turn's reasoning.
+        """
+        if backend in ("llamacpp", "strata", "lmstudio"):
+            kwargs = dict(payload.get("chat_template_kwargs") or {})
+            kwargs["preserve_thinking"] = bool(value)
+            payload["chat_template_kwargs"] = kwargs
+
     def reasoning_flags(self, model: str, backend: str, force_no_thinking: bool,
                         reasoning_effort: Optional[str] = None) -> dict:
         """Return the payload fields that would be sent for a reasoning state.
@@ -6750,6 +6863,42 @@ class ModelQuery:
         elif force_no_thinking:
             self._apply_no_thinking(payload, backend)
         return {k: v for k, v in payload.items() if k != "model"}
+
+    @staticmethod
+    def reasoning_support(model: str, backend: str) -> dict:
+        """Describe which reasoning controls the backend/model honors.
+
+        Used by `/reasoning` so the user can see, before experimenting, which
+        `/reasoning` tokens actually map to a backend flag for the active model.
+
+        Args:
+            model: Model name (matched against the reasoning-capability registry
+                so families like base Qwen3, Qwen3.x, Qwen3-Coder, QwQ and
+                gpt-oss report their real options).
+            backend: Backend name ("ollama", "llamacpp", "strata", "lmstudio",
+                or a cloud backend without reasoning flags).
+
+        Returns:
+            dict with keys:
+                - ``supported``: whether /reasoning emits any backend flag
+                - ``options``: accepted /reasoning tokens in canonical order
+                - ``transport``: backend payload field(s) carrying the flags
+                - ``note``: short human-readable caveat (may be empty)
+        """
+        if backend == "ollama":
+            transport = "options.think / options.reasoning_effort"
+        elif backend in ("llamacpp", "strata", "lmstudio"):
+            transport = "chat_template_kwargs.enable_thinking / reasoning_effort"
+        else:
+            return {"supported": False, "options": [], "transport": "",
+                    "note": f"backend '{backend}' exposes no reasoning flags"}
+        matched = get_reasoning_capability(model)
+        if matched is None:
+            options, note = ["off", "on", "low", "medium", "high"], ""
+        else:
+            options, note = matched
+        return {"supported": bool(options), "options": options,
+                "transport": transport if options else "", "note": note}
 
     def _apply_size_options(self, payload: dict, backend: str, kwargs: dict) -> None:
         """Apply warmup, context-size, and output-cap options to the payload.
@@ -6884,6 +7033,10 @@ class ModelQuery:
 
         if effort := kwargs.get('reasoning_effort'):
             self._apply_reasoning_effort(payload, self.backend, str(effort))
+
+        preserve = kwargs.get('preserve_thinking')
+        if preserve is not None and supports_preserve_thinking(model):
+            self._apply_preserve_thinking(payload, self.backend, bool(preserve))
 
         return payload
 
@@ -7405,6 +7558,7 @@ class ModelQuery:
         """
         full_content = ""
         full_thought = ""
+        self.last_stream_thought = ""
         start_time = time.time()
         first_token_time = None
         first_content_time = None
@@ -7487,10 +7641,12 @@ class ModelQuery:
                                   usage.get("gen_sec") or total_time, usage["content_length"])
             self.print_stats_display(usage)
 
+            self.last_stream_thought = full_thought
             return full_content
 
         except Exception as e:
             sys.stderr.write(colorize(f"{self._stream_error_detail(e, backend, model)}\n", 'error'))
+            self.last_stream_thought = full_thought
             return full_content
 
 
@@ -7510,6 +7666,10 @@ AGENTIC_SECOND_LEVEL = {'plan': AGENTIC_PLAN_ARGS, 'acl': AGENTIC_ACL_ACTIONS}
 
 # /compact subcommands for tab completion (mirrors run_handle_compact usage)
 COMPACT_SUBCOMMANDS = ['now', 'force', 'llm', 'threshold', 'list', 'status']
+
+# /reasoning and /preservethinking subcommands for tab completion.
+REASONING_SUBCOMMANDS = ['off', 'on', 'low', 'medium', 'high']
+PRESERVE_THINKING_SUBCOMMANDS = ['on', 'off', 'status']
 
 
 class ChatCompleter:
@@ -7575,6 +7735,13 @@ class ChatCompleter:
         # 3. /compact subcommand completion
         elif buffer.startswith('/compact '):
             matches = self._complete_compact(buffer, text)
+
+        # 3b. /reasoning and /preservethinking subcommand completion
+        elif buffer.startswith('/reasoning '):
+            matches = self._complete_subcommands(buffer, text, REASONING_SUBCOMMANDS)
+
+        elif buffer.startswith('/preservethinking '):
+            matches = self._complete_subcommands(buffer, text, PRESERVE_THINKING_SUBCOMMANDS)
 
         # 4. File Path Autocompletion (/cwd, /ls, /image and inline @)
         # buffer is the full line, text could be in the middle of the line
@@ -8691,6 +8858,7 @@ class ChatLoop:
             self.run_handle_debug,
             self.run_handle_thinking,
             self.run_handle_reasoning,
+            self.run_handle_preserve_thinking,
             self.run_handle_cwd,
             self.run_handle_ls,
             self.run_handle_switchmodel,
@@ -9341,6 +9509,7 @@ class ChatLoop:
                 state_str = "Reasoning: on (model default effort)"
             print(colorize(f"[{state_str}]", 'info'), file=sys.stderr)
             self._print_reasoning_flag()
+            self._print_reasoning_support()
             return False
         val = parts[1].lower()
         if val == 'off':
@@ -9348,21 +9517,44 @@ class ChatLoop:
             self.ctx.reasoning_effort = None
             print(colorize("[Reasoning: off — model will skip reasoning phase]", 'warning'), file=sys.stderr)
             self._print_reasoning_flag()
+            self._print_reasoning_support()
             return False
         if val == 'on':
             self.ctx.force_no_thinking = False
             self.ctx.reasoning_effort = None
             print(colorize("[Reasoning: on — model default effort]", 'success'), file=sys.stderr)
             self._print_reasoning_flag()
+            self._print_reasoning_support()
             return False
         if val in ('low', 'medium', 'high'):
             self.ctx.force_no_thinking = False
             self.ctx.reasoning_effort = val
             print(colorize(f"[Reasoning effort: {val}]", 'info'), file=sys.stderr)
+            self._warn_if_reasoning_unsupported(val)
             self._print_reasoning_flag()
+            self._print_reasoning_support()
             return False
-        print(colorize("[Usage: /reasoning [off|on|low|medium|high]]", 'warning'), file=sys.stderr)
+        support = self.query_handler.reasoning_support(self.ctx.model, self.ctx.backend)
+        if support["supported"]:
+            opts = "|".join(support["options"])
+            print(colorize(f"[Usage: /reasoning [{opts}]]", 'warning'), file=sys.stderr)
+        self._print_reasoning_support()
         return False
+
+    def _warn_if_reasoning_unsupported(self, token: str) -> None:
+        """Warn when an effort token is not honored by the active backend/model."""
+        if token not in ('low', 'medium', 'high'):
+            return
+        support = self.query_handler.reasoning_support(self.ctx.model, self.ctx.backend)
+        if not support["supported"]:
+            print(colorize(
+                f"[{self.ctx.model}: reasoning controls not supported — "
+                f"{support['note']}]", 'warning'), file=sys.stderr)
+        elif token not in support["options"]:
+            print(colorize(
+                f"[{self.ctx.model} does not support effort '{token}' — ignored "
+                f"(supported: {', '.join(support['options'])})]", 'warning'),
+                file=sys.stderr)
 
     def _print_reasoning_flag(self) -> None:
         """Print the exact backend flag the next query will carry for reasoning."""
@@ -9371,6 +9563,60 @@ class ChatLoop:
             self.ctx.force_no_thinking, self.ctx.reasoning_effort)
         flag_str = ", ".join(f"{k}={json.dumps(v)}" for k, v in flags.items()) or "none"
         print(colorize(f"[Backend flag: {flag_str}]", 'muted'), file=sys.stderr)
+
+    def _print_reasoning_support(self) -> None:
+        """Print which /reasoning options the active backend/model honors."""
+        support = self.query_handler.reasoning_support(self.ctx.model, self.ctx.backend)
+        if not support["supported"]:
+            print(colorize(
+                f"[Reasoning controls: not supported — {support['note']}]",
+                'warning'), file=sys.stderr)
+            return
+        opts = ", ".join(support["options"])
+        note = f" ({support['note']})" if support["note"] else ""
+        print(colorize(
+            f"[Supported: {opts} via {support['transport']}{note}]",
+            'muted'), file=sys.stderr)
+
+    def run_handle_preserve_thinking(self, full_input: str) -> Optional[bool]:
+        """Handle /preservethinking [on|off|status]."""
+        if not full_input.startswith('/preservethinking'):
+            return None
+        parts = full_input.split()
+        model_ok = supports_preserve_thinking(self.ctx.model)
+        backend_ok = self.ctx.backend in ("llamacpp", "strata", "lmstudio")
+        if len(parts) == 1 or parts[1] in ('status', 'show'):
+            if self.ctx.preserve_thinking is None:
+                default = preserve_thinking_default(self.ctx.model)
+                if default is None:
+                    state = "default (model)"
+                else:
+                    state = f"default (model: {'on' if default else 'off'})"
+            else:
+                state = "on" if self.ctx.preserve_thinking else "off"
+            print(colorize(f"[Preserve thinking: {state}]", 'info'), file=sys.stderr)
+            self._warn_preserve_thinking(model_ok, backend_ok)
+            return False
+        val = parts[1].lower()
+        if val in ('on', 'off'):
+            self.ctx.preserve_thinking = (val == 'on')
+            print(colorize(f"[Preserve thinking: {val}]",
+                           'success' if val == 'on' else 'warning'), file=sys.stderr)
+            self._warn_preserve_thinking(model_ok, backend_ok)
+            return False
+        print(colorize("[Usage: /preservethinking [on|off|status]]", 'warning'), file=sys.stderr)
+        return False
+
+    def _warn_preserve_thinking(self, model_ok: bool, backend_ok: bool) -> None:
+        """Warn when preserve_thinking cannot take effect for model/backend."""
+        if not model_ok:
+            print(colorize(
+                f"[{self.ctx.model} does not support preserve_thinking]",
+                'warning'), file=sys.stderr)
+        elif not backend_ok:
+            print(colorize(
+                f"[backend '{self.ctx.backend}' cannot convey preserve_thinking "
+                "(needs chat_template_kwargs)]", 'warning'), file=sys.stderr)
 
     def run_handle_cwd(self, full_input: str) -> Optional[bool]:
         """Handle /cwd command."""
@@ -9510,13 +9756,20 @@ class ChatLoop:
 
     def _agentic_toggle_on_off(self, target: bool) -> bool:
         """Turn agentic mode explicitly on or off, swapping the system prompt."""
-        if self.ctx.agentic_mode == target:
+        leaving_plan = target and self.ctx.plan_mode
+        if self.ctx.agentic_mode == target and not leaving_plan:
             print(colorize(f"[Agentic mode already {'ON' if target else 'OFF'}]", 'muted'), file=sys.stderr)
             return False
+        if leaving_plan:
+            # `/agentic on` leaves read-only plan mode for normal agentic mode.
+            self.ctx.plan_mode = False
+            self.ctx.plan_run = False
+            print(colorize("[Agentic plan mode: OFF — read-only restrictions lifted]", 'warning'), file=sys.stderr)
         self.ctx.agentic_mode = target
         state = "ON" if self.ctx.agentic_mode else "OFF"
         if self.ctx.agentic_mode:
-            self.ctx._saved_system_prompt = self.ctx.system_prompt
+            if not getattr(self.ctx, '_saved_system_prompt', None):
+                self.ctx._saved_system_prompt = self.ctx.system_prompt
             self.ctx.system_prompt = get_agentic_prompt(
                 self.ctx.model, plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)
         else:
@@ -9531,9 +9784,16 @@ class ChatLoop:
 
     def _agentic_set_full(self) -> bool:
         """Enable everything: agentic mode, verbose, thinking, trace, auto-confirm, lazy."""
-        self.ctx._saved_system_prompt = self.ctx.system_prompt
+        if self.ctx.plan_mode:
+            # `/agentic full` means unrestricted agentic mode — leave plan mode so
+            # the read-only tool surface and planning prompt are not silently kept.
+            self.ctx.plan_mode = False
+            self.ctx.plan_run = False
+            print(colorize("[Agentic plan mode: OFF — read-only restrictions lifted]", 'warning'), file=sys.stderr)
+        if not getattr(self.ctx, '_saved_system_prompt', None):
+            self.ctx._saved_system_prompt = self.ctx.system_prompt
         self.ctx.system_prompt = get_agentic_prompt(
-            self.ctx.model, plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)
+            self.ctx.model, plan_mode=False, plan_run=False)
         self.ctx.agentic_mode = True
         self.ctx.agentic_verbose = True
         self.ctx.agentic_show_thinking = True
@@ -10945,6 +11205,7 @@ class ChatLoop:
                     tool_calls_out=stream_tool_calls_out,
                     no_thinking=self.ctx.force_no_thinking,
                     reasoning_effort=self.ctx.reasoning_effort,
+                    preserve_thinking=self.ctx.preserve_thinking,
                     **stream_kwargs
                 )
                 if response or stream_tool_calls_out:
@@ -11142,6 +11403,7 @@ class ChatLoop:
                 images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
                 no_thinking=self.ctx.force_no_thinking,
                 reasoning_effort=self.ctx.reasoning_effort,
+                preserve_thinking=self.ctx.preserve_thinking,
                 **sync_kwargs
             )
             reentry_text = _extract_sync_content(self.ctx, reentry_response)
@@ -11584,6 +11846,8 @@ class ChatLoop:
                     sync_kwargs["no_thinking"] = True
                 if self.ctx.reasoning_effort:
                     sync_kwargs["reasoning_effort"] = self.ctx.reasoning_effort
+                if self.ctx.preserve_thinking is not None:
+                    sync_kwargs["preserve_thinking"] = self.ctx.preserve_thinking
                 step_usage = []
                 sync_kwargs["usage_out"] = step_usage
                 on_chunk, finalize_step, step_buf = self._make_agentic_step_feedback()
@@ -12228,11 +12492,17 @@ class ChatLoop:
                 images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
                 no_thinking=self.ctx.force_no_thinking,
                 reasoning_effort=self.ctx.reasoning_effort,
+                preserve_thinking=self.ctx.preserve_thinking,
                 apply_output_cap=True
             )
 
             if response:
                 assistant_msg = {'role': 'assistant', 'content': response}
+                if (self.ctx.preserve_thinking
+                        and self.ctx.backend in ("llamacpp", "strata", "lmstudio")):
+                    thought = getattr(self.query_handler, 'last_stream_thought', '') or ''
+                    if thought:
+                        assistant_msg['reasoning_content'] = thought
                 self.ctx.stamp_tokens(assistant_msg)
                 self.messages.append(assistant_msg)
                 self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
