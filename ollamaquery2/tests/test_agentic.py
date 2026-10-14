@@ -2385,6 +2385,20 @@ class TestAgenticPlanCommand(unittest.TestCase):
         loop.ctx = q.CommandContext()
         return loop
 
+    def _isolate(self, loop):
+        """Reset the singleton state earlier tests in this class leave behind.
+
+        CommandContext is a process-wide singleton, so `_saved_system_prompt`
+        and the toggle flags leak between tests; a prompt-restore assertion
+        needs a deterministic starting point.
+        """
+        loop.ctx.system_prompt = "BASE PROMPT"
+        loop.ctx._saved_system_prompt = None
+        loop.ctx._plan_prev_prompt = None
+        loop.ctx.agentic_mode = False
+        loop.ctx.plan_mode = False
+        loop.ctx.plan_run = False
+
     def test_plan_on_sets_plan_mode_and_agentic(self):
         loop = self._loop()
         self.assertFalse(loop._agentic_toggle_plan(['/agentic', 'plan']))
@@ -2498,6 +2512,44 @@ class TestAgenticPlanCommand(unittest.TestCase):
         self.assertFalse(loop.ctx.plan_run)
         self.assertTrue(loop.ctx.agentic_mode)
         self.assertNotIn("Read-only planning mode", loop.ctx.system_prompt)
+
+    def test_full_then_off_after_plan_restores_pre_agentic_prompt(self):
+        """on -> plan -> full -> off must restore the pre-agentic (normal) prompt,
+        not the agentic or planning prompt. A known baseline prompt is set first:
+        CommandContext is a singleton, so leftover state from earlier tests in
+        this class must not leak into the assertion."""
+        loop = self._loop()
+        self._isolate(loop)
+        loop._agentic_toggle_on_off(True)
+        loop._agentic_toggle_plan(['/agentic', 'plan'])
+        loop._agentic_set_full()
+        self.assertNotIn("Read-only planning mode", loop.ctx.system_prompt)
+        loop._agentic_toggle_on_off(False)
+        self.assertFalse(loop.ctx.agentic_mode)
+        self.assertEqual(loop.ctx.system_prompt, "BASE PROMPT")
+
+    def test_full_then_off_after_plan_from_scratch_restores_pre_plan_prompt(self):
+        """plan -> full -> off (agentic never on before) must restore the
+        pre-plan prompt, not the planning prompt."""
+        loop = self._loop()
+        self._isolate(loop)
+        loop._agentic_toggle_plan(['/agentic', 'plan'])
+        loop._agentic_set_full()
+        loop._agentic_toggle_on_off(False)
+        self.assertFalse(loop.ctx.agentic_mode)
+        self.assertEqual(loop.ctx.system_prompt, "BASE PROMPT")
+
+    def test_plan_off_from_agentic_restores_agentic_prompt(self):
+        """on -> plan -> plan off returns to the agentic prompt with agentic ON."""
+        loop = self._loop()
+        self._isolate(loop)
+        loop._agentic_toggle_on_off(True)
+        agentic_prompt = loop.ctx.system_prompt
+        self.assertNotEqual(agentic_prompt, "BASE PROMPT")
+        loop._agentic_toggle_plan(['/agentic', 'plan'])
+        loop._agentic_toggle_plan(['/agentic', 'plan', 'off'])
+        self.assertTrue(loop.ctx.agentic_mode)
+        self.assertEqual(loop.ctx.system_prompt, agentic_prompt)
 
 
 class TestAppendToolMessages(unittest.TestCase):

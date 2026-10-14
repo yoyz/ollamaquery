@@ -1357,6 +1357,133 @@ class TestPreserveThinking(unittest.TestCase):
         self.assertGreater(with_reasoning['_tokens'], plain['_tokens'])
 
 
+class TestTimeoutToolSalvage(unittest.TestCase):
+    """Salvage of a complete tool call from a timed-out agentic step."""
+
+    def _loop(self):
+        loop = object.__new__(m.ChatLoop)
+        loop.ctx = m.CommandContext()
+        return loop
+
+    def test_complete_stream_tool_calls_filters(self):
+        """A tool call is complete when its args are a dict or parse as JSON."""
+        calls = [
+            {"function": {"name": "write_file", "arguments": {"path": "x"}}},
+            {"function": {"name": "run_command", "arguments": '{"command": "ls"}'}},
+            {"function": {"name": "write_file",
+                          "arguments": '{"path": "x", "content": "# hel'}},
+            {"function": {"name": "read_file", "arguments": ""}},
+        ]
+        complete = m.ChatLoop._complete_stream_tool_calls(calls)
+        self.assertEqual([c["function"]["name"] for c in complete],
+                         ["write_file", "run_command"])
+
+    def test_salvage_executes_complete_native_call(self):
+        """A fully-streamed native tool call is executed, not discarded."""
+        loop = self._loop()
+        exec_calls, appended = [], []
+
+        def fake_exec(tool_calls, last_tool_call, last_tool_count, iteration,
+                      logger, messages, response_text, api_tool_calls):
+            exec_calls.append([tc["tool"] for tc in tool_calls])
+            return (["[write_file] ok"], ["ok"], False, None, 0, None)
+
+        def fake_append(messages, response_text, api_tool_calls, tool_calls,
+                        observations, raw_observations, send_tools_api):
+            appended.append(([tc["tool"] for tc in tool_calls], bool(api_tool_calls)))
+
+        loop._execute_tool_calls = fake_exec
+        loop._append_tool_messages = fake_append
+        step_calls = [{"id": "t1", "type": "function",
+                       "function": {"name": "write_file",
+                                    "arguments": '{"path": "a.md", "content": "# hi"}'}}]
+        executed, tool_final = loop._salvage_timed_out_tool_call(
+            step_calls, {"content": ""}, [], True, 2, None)
+        self.assertTrue(executed)
+        self.assertIsNone(tool_final)
+        self.assertEqual(exec_calls, [["write_file"]])
+        self.assertEqual(appended, [(["write_file"], True)])
+        self.assertTrue(loop.ctx.agentic_has_executed_tool)
+        self.assertEqual(loop.ctx.agentic_last_tool_name, "write_file")
+        self.assertEqual(loop.ctx.agentic_consecutive_timeouts, 0)
+
+    def test_salvage_skips_partial_native_call(self):
+        """A mid-write argument fragment (unterminated JSON) is not executed."""
+        loop = self._loop()
+        loop._execute_tool_calls = MagicMock()
+        step_calls = [{"function": {"name": "write_file",
+                                    "arguments": '{"path": "a.md", "content": "# hel'}}]
+        executed, tool_final = loop._salvage_timed_out_tool_call(
+            step_calls, {"content": ""}, [], True, 2, None)
+        self.assertFalse(executed)
+        self.assertIsNone(tool_final)
+        loop._execute_tool_calls.assert_not_called()
+
+    def test_salvage_parses_inline_json_from_content(self):
+        """Inline-mode steps salvage the call JSON from the streamed content."""
+        loop = self._loop()
+        exec_calls = []
+
+        def fake_exec(tool_calls, last_tool_call, last_tool_count, iteration,
+                      logger, messages, response_text, api_tool_calls):
+            exec_calls.append([tc["tool"] for tc in tool_calls])
+            return (["[write_file] ok"], ["ok"], False, None, 0, None)
+
+        loop._execute_tool_calls = fake_exec
+        loop._append_tool_messages = MagicMock()
+        content = ('Let me write the file now.\n'
+                   '{"tool": "write_file", "arguments": {"path": "a.md", "content": "# hi"}}')
+        executed, _ = loop._salvage_timed_out_tool_call(
+            [], {"content": content}, [], False, 2, None)
+        self.assertTrue(executed)
+        self.assertEqual(exec_calls, [["write_file"]])
+
+    def test_salvage_nothing_complete_returns_false(self):
+        """Plain narration with no tool call falls back to the timeout policy."""
+        loop = self._loop()
+        loop._execute_tool_calls = MagicMock()
+        executed, tool_final = loop._salvage_timed_out_tool_call(
+            [], {"content": "plain narration, no tool call"}, [], True, 2, None)
+        self.assertFalse(executed)
+        self.assertIsNone(tool_final)
+        loop._execute_tool_calls.assert_not_called()
+
+    def test_salvage_tool_call_out_sync_during_stream(self):
+        """query_sync_stream keeps tool_calls_out in sync as deltas arrive,
+        including OpenAI-style index-keyed fragments (a timed-out step can
+        salvage the accumulated call)."""
+        mq = m.ModelQuery('http://x', 'llamacpp')
+        lines = [
+            json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "write_file",
+                                                          "arguments": '{"path": '}}]}}]}),
+            json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": '"a.md"}'}}]}}]}),
+        ]
+
+        def fake_iter(response, backend):
+            yield from lines
+
+        mq._iter_stream_lines = fake_iter
+
+        class FakeResponse:
+            def __enter__(self2):
+                return None
+
+            def __exit__(self2, *a):
+                pass
+
+        tool_calls_out = []
+        with patch.object(mq, '_build_stream_request',
+                          return_value=("http://localhost/fake", {}, {})), \
+             patch.object(m, '_request_with_retry', return_value=FakeResponse()):
+            mq.query_sync_stream([{"role": "user", "content": "hi"}], "m",
+                                 tool_calls_out=tool_calls_out)
+        self.assertEqual(len(tool_calls_out), 1)
+        self.assertEqual(tool_calls_out[0]["function"]["name"], "write_file")
+        self.assertTrue(m.ChatLoop._complete_stream_tool_calls(tool_calls_out))
+
+
 class TestMaxOutputTokens(unittest.TestCase):
     """Per-response output cap (/maxtokens): parsing, clamping, payload wiring."""
 

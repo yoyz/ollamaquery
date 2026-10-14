@@ -79,7 +79,7 @@ spawnshell are disabled when unavailable.
 | `/stats` `/usage` | Session statistics |
 | `/thinkingon` `/thinkingoff` | Toggle reasoning display |
 | `/reasoning [off\|on\|low\|medium\|high]` | Set reasoning effort (Qwen3.8/gpt-oss) |
-| `/preservethinking [on\|off]` | Retain reasoning traces across turns (Qwen3.6/3.8) |
+| `/preservethinking [on\|off\|status]` | Retain reasoning traces across turns (Qwen3.6/3.8) |
 | `/debug` | Per-category debug levels (`network`, `payload`, `response`, `stream`, `context`, `thinking`, `commands`, `urlfetch`, `all`) |
 | `/cwd <path>` | Change working directory |
 | `/ls` | List files locally |

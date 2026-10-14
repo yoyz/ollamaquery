@@ -61,7 +61,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.18"
+__version__ = "0.2.19"
 
 
 # ============================================================================
@@ -2612,8 +2612,6 @@ def preserve_thinking_default(model_name: str) -> Optional[bool]:
     if "qwen3.6" in lower or "qwen3.7" in lower:
         return False
     return None
-
-
 
 
 def get_inference_params(model_name: str) -> dict:
@@ -7175,7 +7173,8 @@ class ModelQuery:
         return resp
 
     def _aggregate_sync_stream(self, req: Request, backend: str, socket_timeout: float,
-                               on_chunk: object, cancel: Optional[dict] = None) -> tuple:
+                               on_chunk: object, cancel: Optional[dict] = None,
+                               tool_calls_out: Optional[list] = None) -> tuple:
         """Read a streaming response and aggregate content/thinking/tools/usage.
 
         Args:
@@ -7184,6 +7183,9 @@ class ModelQuery:
             socket_timeout: Socket timeout for the request.
             on_chunk: Optional per-chunk callback (thought, content, is_final).
             cancel: Optional {"event", "close"} cancel token dict.
+            tool_calls_out: Optional by-ref list kept in sync with the
+                accumulated tool calls (partial or complete) as they stream, so
+                a caller can salvage a finished tool call after a timeout.
 
         Returns:
             (full_content, full_thinking, tool_calls, tool_call_index, usage),
@@ -7214,6 +7216,13 @@ class ModelQuery:
                         full_content += content
                     if tcs:
                         self._accumulate_stream_tool_calls(tool_calls, tool_call_index, tcs)
+                        if tool_calls_out is not None:
+                            # By-ref view for timeout salvage: OpenAI-style
+                            # deltas live in tool_call_index until the loop
+                            # ends, so expose both collections as they grow.
+                            tool_calls_out[:] = (
+                                list(tool_calls)
+                                + [tool_call_index[k] for k in sorted(tool_call_index)])
                     if u:
                         usage.update(u)
                     if on_chunk:
@@ -7251,6 +7260,7 @@ class ModelQuery:
         socket_timeout = kwargs.pop("timeout", 120)
         cancel = kwargs.pop("cancel", None)
         usage_out = kwargs.pop("usage_out", None)
+        tool_calls_out = kwargs.pop("tool_calls_out", None)
         backend = self.backend
 
         img_idx = self._last_user_message_index(messages) if images else -1
@@ -7265,7 +7275,8 @@ class ModelQuery:
         req = Request(api_url, data=data, headers=headers)
         self._debug_request(api_url, payload)
 
-        result = self._aggregate_sync_stream(req, backend, socket_timeout, on_chunk, cancel)
+        result = self._aggregate_sync_stream(req, backend, socket_timeout, on_chunk, cancel,
+                                             tool_calls_out=tool_calls_out)
         if isinstance(result, dict):  # error dict
             return result
         if result is None:  # cancelled
@@ -9840,7 +9851,13 @@ class ChatLoop:
             self.ctx.plan_mode = False
             self.ctx.plan_run = False
             self.ctx.agentic_mode = getattr(self.ctx, '_plan_prev_agentic', False)
-            if hasattr(self.ctx, '_saved_system_prompt'):
+            # Restore the prompt that was active before plan mode was entered —
+            # it may legitimately be the agentic prompt when plan was entered
+            # from agentic-on. `_saved_system_prompt` is only the pre-agentic
+            # fallback for sessions that never saved one.
+            if getattr(self.ctx, '_plan_prev_prompt', None):
+                self.ctx.system_prompt = self.ctx._plan_prev_prompt
+            elif hasattr(self.ctx, '_saved_system_prompt'):
                 self.ctx.system_prompt = self.ctx._saved_system_prompt
             print(colorize("[Agentic plan mode: OFF — read-only restrictions lifted]", 'warning'), file=sys.stderr)
             return False
@@ -9862,7 +9879,15 @@ class ChatLoop:
         self.ctx.plan_mode = True
         self.ctx.plan_run = want_run
         self.ctx.agentic_mode = True
-        self.ctx._saved_system_prompt = self.ctx.system_prompt
+        # Plan keeps its own previous-prompt slot: unconditionally overwriting
+        # `_saved_system_prompt` here would make a later `/agentic off` restore
+        # whatever prompt was active before plan (the agentic one when plan was
+        # entered from agentic-on). Adopt the save duty only when no pre-agentic
+        # prompt was saved yet, so `/agentic full` -> off still restores a
+        # normal prompt for the never-agentic-before path.
+        self.ctx._plan_prev_prompt = self.ctx.system_prompt
+        if not getattr(self.ctx, '_saved_system_prompt', None):
+            self.ctx._saved_system_prompt = self.ctx._plan_prev_prompt
         self.ctx.system_prompt = get_agentic_prompt(
             self.ctx.model, plan_mode=True, plan_run=want_run)
         self._print_plan_mode_status()
@@ -10479,6 +10504,7 @@ class ChatLoop:
                         sys.stderr.write(_thinking_open_tag())
                     sys.stderr.write(thought)
                     sys.stderr.flush()
+                    state["last_visible"] = time.time()
             if content:
                 with state["write_lock"]:
                     if state["thinking_open"]:
@@ -10492,6 +10518,7 @@ class ChatLoop:
                     sys.stdout.write(content)
                     sys.stdout.flush()
                     state["content_streamed"] = True
+                    state["last_visible"] = time.time()
 
     def _make_agentic_step_feedback(self) -> tuple:
         """Build live feedback callbacks for an agentic ReAct step.
@@ -10520,6 +10547,7 @@ class ChatLoop:
         state = {
             "thinking_open": False,
             "last_activity": time.time(),
+            "last_visible": time.time(),
             "cancelled": False,
             "heartbeat_shown": False,
             "content": "",
@@ -10538,20 +10566,23 @@ class ChatLoop:
 
             Token-driven dots (see on_chunk) cover active streaming; generations
             that deliver no chunks at all would otherwise leave the terminal
-            silent, so after ~2s without token activity the watchdog ticks once
-            per second until tokens resume. This fires even while the
-            `<thinking>` block is open: a silent thinking phase usually means the
-            model has switched to a tool call (native tool-call deltas carry no
-            content, so the block never closes on its own) — the block is closed
-            and the dots keep the user informed. If thinking later resumes, the
-            block reopens.
+            silent, so after ~2s without VISIBLE output the watchdog ticks once
+            per second until something is rendered again. This fires even while
+            the `<thinking>` block is open: a silent thinking phase usually means
+            the model has switched to a tool call (native tool-call deltas carry
+            no content, so the block never closes on its own) — the block is
+            closed and the dots keep the user informed. If thinking later
+            resumes, the block reopens. The idle test tracks the last RENDERED
+            output (`last_visible`), not raw chunk arrival: native tool-call
+            deltas stream continuously but render nothing, so chunk activity
+            alone must not starve the heartbeat.
             """
             idle_grace = 2.0
             while not state["cancelled"]:
                 time.sleep(1.0)
                 if state["cancelled"]:
                     return
-                if time.time() - state["last_activity"] < idle_grace:
+                if time.time() - state["last_visible"] < idle_grace:
                     continue
                 with state["write_lock"]:
                     if state["cancelled"]:
@@ -10560,6 +10591,7 @@ class ChatLoop:
                         sys.stderr.write(_thinking_close_tag())
                         state["thinking_open"] = False
                     state["heartbeat_shown"] = True
+                    state["last_visible"] = time.time()
                     sys.stderr.write(".")
                     sys.stderr.flush()
 
@@ -10575,6 +10607,11 @@ class ChatLoop:
             """
             if state["cancelled"]:
                 return
+            # Any chunk counts as generation activity — including native
+            # tool-call deltas, which carry no thought/content. Without this,
+            # the timeout policy would see a busy tool-call write (120s of
+            # silent deltas at ~30 tok/s) as a stalled step and abort.
+            state["last_activity"] = time.time()
             self._accumulate_step_feedback(state, thought, content)
             self._render_step_feedback(state, thought, content, show_thinking)
             # Token-driven dots are the liveness signal for thinking-off mode
@@ -10588,6 +10625,7 @@ class ChatLoop:
                     state["tok_acc"] -= heartbeat_tokens
                     state["heartbeat_shown"] = True
                     with state["write_lock"]:
+                        state["last_visible"] = time.time()
                         sys.stderr.write(".")
                         sys.stderr.flush()
 
@@ -11397,29 +11435,41 @@ class ChatLoop:
             sync_kwargs["apply_output_cap"] = True
             if send_tools_api:
                 sync_kwargs["tools"] = openai_tools
-            reentry_response = self.query_handler.query_sync(
-                reentry_messages, self.ctx.model,
-                context_size=self.ctx.context_size,
-                images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
-                no_thinking=self.ctx.force_no_thinking,
-                reasoning_effort=self.ctx.reasoning_effort,
-                preserve_thinking=self.ctx.preserve_thinking,
-                **sync_kwargs
-            )
-            reentry_text = _extract_sync_content(self.ctx, reentry_response)
-            if not reentry_text:
+            # Stream the reentry like the ReAct steps: a bare query_sync is
+            # non-streaming (no bytes until the whole generation completes) and
+            # has no feedback closure, so a multi-minute reentry left the
+            # terminal silent and hit the 120s urlopen timeout on slow hosts.
+            on_chunk_r, finalize_r, r_buf = self._make_agentic_step_feedback()
+            try:
+                reentry_response = self.query_handler.query_sync_stream(
+                    reentry_messages, self.ctx.model,
+                    stream_enabled=True,
+                    on_chunk=on_chunk_r,
+                    timeout=(getattr(self.ctx, 'agentic_step_timeout', 300) or 300) + 30,
+                    context_size=self.ctx.context_size,
+                    images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
+                    no_thinking=self.ctx.force_no_thinking,
+                    reasoning_effort=self.ctx.reasoning_effort,
+                    preserve_thinking=self.ctx.preserve_thinking,
+                    **sync_kwargs
+                )
+            finally:
+                finalize_r()
+            reentry_text, reentry_api_calls = self._agentic_step_content(reentry_response)
+            if not reentry_text and not reentry_api_calls:
                 break
-            self.messages.append({'role': 'assistant', 'content': reentry_text})
-            reentry_tools = self.parse_tool_calls(reentry_text)
+            reentry_tools = self._parse_agentic_tool_calls(reentry_text, reentry_api_calls)
             if not reentry_tools:
-                single = self.parse_tool_call(reentry_text)
-                if single:
-                    reentry_tools = [single]
-            if not reentry_tools:
-                print(colorize(f"\n{reentry_text}", 'success'), file=sys.stdout)
-                print()
+                if reentry_text:
+                    self.messages.append({'role': 'assistant', 'content': reentry_text})
+                    print(colorize(f"\n{reentry_text}", 'success'), file=sys.stdout)
+                    print()
                 break
+            if not reentry_api_calls:
+                # Inline mode: keep the call JSON in the assistant text.
+                self.messages.append({'role': 'assistant', 'content': reentry_text})
             reentry_observations = []
+            reentry_raw = []
             for rt in reentry_tools:
                 rt_name = rt["tool"]
                 rt_args = rt.get("arguments", {})
@@ -11437,8 +11487,16 @@ class ChatLoop:
                 rt_obs = self._cap_tool_observation(rt_name, rt_obs)
                 print(colorize(f"\n{rt_obs}", 'info'), file=sys.stdout)
                 reentry_observations.append(f"[{rt_name}] {rt_obs}")
+                reentry_raw.append(rt_obs)
             if reentry_observations:
-                self.messages.append({'role': 'user', 'content': "Tool result:\n" + "\n---\n".join(reentry_observations)})
+                if reentry_api_calls:
+                    # Native reentry call — the loop's append machinery keeps
+                    # assistant tool_calls + tool-role pairing template-safe.
+                    self._append_tool_messages(
+                        self.messages, reentry_text, reentry_api_calls,
+                        reentry_tools, reentry_observations, reentry_raw, send_tools_api)
+                else:
+                    self.messages.append({'role': 'user', 'content': "Tool result:\n" + "\n---\n".join(reentry_observations)})
                 stream_tool_used = True
             else:
                 stream_tool_used = False
@@ -11604,7 +11662,8 @@ class ChatLoop:
         return messages
 
     def _agentic_call_step(self, messages: list, step_timeout: int, images_to_send: list,
-                           sync_kwargs: dict, on_chunk: object, finalize_step: object, step_cancel: dict) -> tuple:
+                           sync_kwargs: dict, on_chunk: object, finalize_step: object,
+                           step_cancel: dict, tool_calls_out: Optional[list] = None) -> tuple:
         """Run one ReAct model call under a wall-clock timeout.
 
         Args:
@@ -11615,6 +11674,10 @@ class ChatLoop:
             on_chunk: Feedback callback from _make_agentic_step_feedback.
             finalize_step: Closes feedback output on completion/interrupt.
             step_cancel: Cancel token dict for aborting the request.
+            tool_calls_out: Optional by-ref list kept in sync with the
+                in-flight generation's accumulated tool calls, so a timed-out
+                step can salvage a call that finished writing before the
+                deadline.
 
         Returns:
             (response, step_start) where response is the sync-shaped dict, or
@@ -11631,6 +11694,7 @@ class ChatLoop:
                 on_chunk=on_chunk,
                 timeout=step_timeout + 30,
                 cancel=step_cancel,
+                tool_calls_out=tool_calls_out,
                 **sync_kwargs
             )
         except KeyboardInterrupt:
@@ -11642,6 +11706,103 @@ class ChatLoop:
             raise
         finalize_step()
         return response, step_start
+
+    @staticmethod
+    def _complete_stream_tool_calls(step_tool_calls: list) -> list:
+        """Filter accumulated stream tool calls down to the complete ones.
+
+        A tool call is complete when its arguments are already a dict (Ollama
+        full-object deltas) or a string that parses as JSON (OpenAI-style
+        deltas, which arrive as argument fragments — a fragment stream that has
+        not closed yet does not parse).
+
+        Args:
+            step_tool_calls: Tool calls accumulated during a (timed-out) step.
+
+        Returns:
+            The subset whose arguments parse as complete JSON.
+        """
+        complete = []
+        for tc in step_tool_calls or []:
+            fn = tc.get("function") or {}
+            args = fn.get("arguments", "")
+            if isinstance(args, dict):
+                complete.append(tc)
+            elif isinstance(args, str) and args.strip():
+                try:
+                    json.loads(args)
+                    complete.append(tc)
+                except json.JSONDecodeError:
+                    pass  # still mid-write — not complete
+        return complete
+
+    def _salvage_timed_out_tool_call(self, step_tool_calls: list, step_buf: dict,
+                                     messages: list, send_tools_api: bool,
+                                     iteration: int,
+                                     logger: Optional['AgenticLogger']) -> tuple:
+        """Execute a complete tool call that finished writing before a step timeout.
+
+        A step that times out mid-generation often has a fully-streamed tool
+        call sitting in the accumulator. Discarding it and retrying burns
+        another full generation re-producing the same JSON — and frequently
+        re-hits the timeout. When the accumulated arguments parse as complete
+        JSON (native tool_calls) or the streamed content holds a parseable
+        inline call, execute it through the normal gates (destructive tools
+        still confirm) and append the observation, so the loop continues from
+        real work instead of restarting.
+
+        Args:
+            step_tool_calls: By-ref tool calls accumulated by the timed-out step.
+            step_buf: The step feedback buffer (partial narration for history).
+            messages: Conversation list (assistant turn + tool result appended).
+            send_tools_api: Whether native tools are in use.
+            iteration: Current iteration (for logging).
+            logger: Optional AgenticLogger.
+
+        Returns:
+            (executed, tool_final): executed is True when a complete tool call
+            was run (the caller continues the loop); tool_final is a
+            tool-produced final answer to record, or None. False/None falls
+            back to the normal timeout policy.
+        """
+        api_calls = self._complete_stream_tool_calls(step_tool_calls)
+        unified = []
+        if api_calls:
+            unified = self._parse_agentic_tool_calls("", api_calls)
+        else:
+            text = step_buf.get("content", "") or ""
+            if text:
+                parsed = self.parse_tool_calls(text)
+                if not parsed:
+                    single = self.parse_tool_call(text)
+                    parsed = [single] if single else []
+                unified = parsed
+        if not unified:
+            return False, None
+        tool_name = unified[0].get("tool", "?")
+        print(colorize(
+            f"\n[Agentic] Step {iteration} timed out but a complete tool call "
+            f"({tool_name}) was already streamed — executing it instead of "
+            "regenerating.", 'warning'), file=sys.stderr)
+        if logger:
+            logger.write(type="turn", iteration=iteration,
+                         model_response="(salvaged from timeout)",
+                         tool_call=unified[0])
+        response_text = "" if api_calls else (step_buf.get("content", "") or "")
+        observations, raw_observations, abort_loop, _last_call, _last_count, tool_final = self._execute_tool_calls(
+            unified, None, 0, iteration, logger, messages, response_text, api_calls)
+        if api_calls:
+            self.ctx.agentic_has_executed_tool = True
+            self.ctx.agentic_last_tool_name = tool_name
+        self.ctx.agentic_consecutive_timeouts = 0
+        if abort_loop:
+            # The gates refused/skipped the call — fall back to the normal
+            # timeout policy instead of continuing blindly.
+            return False, None
+        self._append_tool_messages(
+            messages, response_text, api_calls, unified,
+            observations, raw_observations, send_tools_api)
+        return True, tool_final
 
     def _agentic_timeout_continue(self, step_buf: dict, step_cancel: dict, step_start: float,
                                   iteration: int, step_timeout: int, messages: list) -> tuple:
@@ -11852,12 +12013,25 @@ class ChatLoop:
                 sync_kwargs["usage_out"] = step_usage
                 on_chunk, finalize_step, step_buf = self._make_agentic_step_feedback()
                 step_cancel = {"event": threading.Event(), "close": None}
+                step_tool_calls = []   # by-ref view of the in-flight generation's tool calls
 
                 response, step_start = self._agentic_call_step(
                     messages, step_timeout, images_to_send, sync_kwargs,
-                    on_chunk, finalize_step, step_cancel)
+                    on_chunk, finalize_step, step_cancel, step_tool_calls)
 
                 if response is None:
+                    # Timed out. If the generation had already finished writing a
+                    # complete tool call before the deadline, execute it now
+                    # instead of discarding it — a retry would burn another full
+                    # generation re-producing the same JSON and often re-hit the
+                    # timeout (a 20KB write_file takes ~2min at ~30 tok/s).
+                    salvaged, salvaged_final = self._salvage_timed_out_tool_call(
+                        step_tool_calls, step_buf, messages, send_tools_api,
+                        iteration, logger)
+                    if salvaged_final:
+                        final_answer = salvaged_final
+                    if salvaged:
+                        continue
                     # Timed out — escalate (extend while generating, else retry/abort).
                     should_break, step_timeout = self._agentic_timeout_continue(
                         step_buf, step_cancel, step_start, iteration, step_timeout, messages)

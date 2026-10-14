@@ -16,6 +16,7 @@ import io
 import os
 import sys
 import time
+import threading
 import unittest
 from unittest import mock
 
@@ -478,6 +479,98 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
     def test_looks_like_truncated_tool_call(self):
         self.assertTrue(m.ChatLoop._looks_like_truncated_tool_call('{"tool": "run_command"'))
         self.assertFalse(m.ChatLoop._looks_like_truncated_tool_call('{"tool": "run_command"}'))
+
+
+class TestStepFeedbackProgress(unittest.TestCase):
+    """Tool-call-only deltas count as generation activity; the watchdog tracks
+    visible output rather than raw chunk arrival.
+
+    Regression: native tool-call deltas carry no thought/content, so (a) the
+    timeout progress signal saw a busy tool-call write (~120s of silent deltas
+    at ~30 tok/s) as a stalled step and aborted, and (b) any chunk-driven
+    heartbeat would have starved. `last_activity` now tracks every chunk
+    (progress signal) while the watchdog idles on `last_visible` (rendered
+    output only).
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+        self.loop = object.__new__(m.ChatLoop)
+        self.loop.ctx = self.ctx
+        self._stderr = io.StringIO()
+        self._stdout = io.StringIO()
+        self._patched_err = mock.patch('sys.stderr', self._stderr)
+        self._patched_out = mock.patch('sys.stdout', self._stdout)
+        self._patched_err.start()
+        self._patched_out.start()
+
+    def tearDown(self):
+        self._patched_err.stop()
+        self._patched_out.stop()
+
+    def _wait_for(self, predicate, timeout=3.0):
+        """Poll `predicate()` until it returns truthy or `timeout` elapses."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_empty_tool_call_deltas_count_as_activity(self):
+        """on_chunk('', '', False) refreshes last_activity — the timeout policy
+        must see a busy tool-call write as active generation, not a stall."""
+        on_chunk, finalize, state = self.loop._make_agentic_step_feedback()
+        state["last_activity"] -= 5.0
+        stale = state["last_activity"]
+        on_chunk("", "", False)
+        self.assertGreater(state["last_activity"], stale)
+        finalize()
+
+    def test_watchdog_dots_continue_during_silent_tool_call_deltas(self):
+        """Empty deltas refresh activity but render nothing — the watchdog must
+        keep dotting while a tool call streams invisibly."""
+        on_chunk, finalize, state = self.loop._make_agentic_step_feedback()
+        seen = {"stop": False}
+
+        def feed():
+            # Simulate a Strata tool-call write: chunks every 0.2s, all empty.
+            while not seen["stop"]:
+                on_chunk("", "", False)
+                time.sleep(0.2)
+
+        feeder = threading.Thread(target=feed, daemon=True)
+        feeder.start()
+        try:
+            self.assertTrue(
+                self._wait_for(lambda: "." in self._stderr.getvalue(), timeout=5.0),
+                "watchdog stopped dotting during tool-call-only deltas")
+        finally:
+            seen["stop"] = True
+            finalize()
+            feeder.join(timeout=2.0)
+
+    def test_visible_output_blocks_watchdog(self):
+        """Rendered content keeps last_visible fresh — no watchdog dots while
+        the model streams visible text."""
+        self.ctx.agentic_show_thinking = True
+        on_chunk, finalize, state = self.loop._make_agentic_step_feedback()
+        seen = {"stop": False}
+
+        def feed():
+            while not seen["stop"]:
+                on_chunk("", "streaming visible text ", False)
+                time.sleep(0.2)
+
+        feeder = threading.Thread(target=feed, daemon=True)
+        feeder.start()
+        try:
+            time.sleep(3.0)   # > idle_grace: only rendered output keeps dots away
+            self.assertNotIn(".", self._stderr.getvalue())
+        finally:
+            seen["stop"] = True
+            finalize()
+            feeder.join(timeout=2.0)
 
 
 if __name__ == '__main__':
