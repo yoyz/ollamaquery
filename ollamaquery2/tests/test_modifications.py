@@ -1484,6 +1484,115 @@ class TestTimeoutToolSalvage(unittest.TestCase):
         self.assertTrue(m.ChatLoop._complete_stream_tool_calls(tool_calls_out))
 
 
+class TestUnfinishedWriteSpill(unittest.TestCase):
+    """Spill of an interrupted write_file content from a timed-out step."""
+
+    def _loop(self):
+        loop = object.__new__(m.ChatLoop)
+        loop.ctx = m.CommandContext()
+        return loop
+
+    def test_extract_string_field_complete(self):
+        raw = '{"file_path": "a.md", "content": "# hi\\nworld"}'
+        val, closed = m._extract_json_string_field(raw, "content")
+        self.assertEqual(val, "# hi\nworld")
+        self.assertTrue(closed)
+
+    def test_extract_string_field_truncated(self):
+        raw = '{"file_path": "a.md", "content": "# hel'
+        val, closed = m._extract_json_string_field(raw, "content")
+        self.assertEqual(val, "# hel")
+        self.assertFalse(closed)
+
+    def test_extract_string_field_escaped_quote(self):
+        raw = '{"content": "say \\"hi\\" now"}'
+        val, closed = m._extract_json_string_field(raw, "content")
+        self.assertEqual(val, 'say "hi" now')
+        self.assertTrue(closed)
+
+    def test_extract_string_field_literal_newline(self):
+        # Invalid JSON (literal newline in the string) but content recoverable.
+        raw = '{"content": "line1\nline2"}'
+        val, closed = m._extract_json_string_field(raw, "content")
+        self.assertEqual(val, "line1\nline2")
+        self.assertTrue(closed)
+
+    def test_extract_string_field_partial_unicode_escape(self):
+        raw = '{"content": "a\\u00'
+        val, closed = m._extract_json_string_field(raw, "content")
+        self.assertEqual(val, "a")
+        self.assertFalse(closed)
+
+    def test_extract_string_field_absent(self):
+        self.assertEqual(m._extract_json_string_field('{"x": 1}', "content"),
+                         ("", False))
+
+    def test_find_partial_write_native(self):
+        loop = self._loop()
+        step_calls = [{"function": {
+            "name": "write_file",
+            "arguments": '{"file_path": "a.md", "content": "# hello'}}]
+        content, file_path, closed = loop._find_partial_write(step_calls, {"content": ""})
+        self.assertEqual(content, "# hello")
+        self.assertEqual(file_path, "a.md")
+        self.assertFalse(closed)
+
+    def test_find_partial_write_inline(self):
+        loop = self._loop()
+        text = '{"tool": "write_file", "arguments": {"file_path": "a.md", "content": "# hi"}}'
+        content, file_path, closed = loop._find_partial_write([], {"content": text})
+        self.assertEqual(content, "# hi")
+        self.assertTrue(closed)
+
+    def test_spill_partial_write_writes_file(self):
+        loop = self._loop()
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(m, 'CLUSTER_SPILL_DIR', d):
+                step_calls = [{"function": {
+                    "name": "write_file",
+                    "arguments": '{"content": "' + "x" * 300}}]
+                note = loop._spill_partial_write(step_calls, {"content": ""}, 3)
+                self.assertIsNotNone(note)
+                self.assertIn("TRUNCATED", note)
+                path = os.path.join(d, m.UNFINISHED_WRITE_SPILL_NAME)
+                self.assertTrue(os.path.exists(path))
+                with open(path) as f:
+                    self.assertEqual(f.read(), "x" * 300)
+
+    def test_spill_partial_write_complete_offers_cp(self):
+        loop = self._loop()
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(m, 'CLUSTER_SPILL_DIR', d):
+                step_calls = [{"function": {
+                    "name": "write_file",
+                    "arguments": '{"file_path": "a.py", "content": "' + "y" * 300 + '"}'}}]
+                note = loop._spill_partial_write(step_calls, {"content": ""}, 2)
+                self.assertIn("cp", note)
+                self.assertIn("a.py", note)
+                self.assertNotIn("TRUNCATED", note)
+
+    def test_spill_partial_write_skips_small(self):
+        loop = self._loop()
+        step_calls = [{"function": {"name": "write_file",
+                                    "arguments": '{"content": "tiny'}}]
+        self.assertIsNone(loop._spill_partial_write(step_calls, {"content": ""}, 1))
+
+    def test_spill_partial_write_skips_non_write_tool(self):
+        loop = self._loop()
+        step_calls = [{"function": {"name": "run_command",
+                                    "arguments": '{"command": "' + "x" * 300}}]
+        self.assertIsNone(loop._spill_partial_write(step_calls, {"content": ""}, 1))
+
+    def test_cleanup_removes_unfinished_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, m.UNFINISHED_WRITE_SPILL_NAME)
+            with open(path, "w") as f:
+                f.write("x")
+            with patch.object(m, 'CLUSTER_SPILL_DIR', d):
+                m._cleanup_spill_files()
+            self.assertFalse(os.path.exists(path))
+
+
 class TestMaxOutputTokens(unittest.TestCase):
     """Per-response output cap (/maxtokens): parsing, clamping, payload wiring."""
 

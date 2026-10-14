@@ -61,7 +61,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.19"
+__version__ = "0.2.20"
 
 
 # ============================================================================
@@ -2754,6 +2754,10 @@ DEFAULT_SHELL_PERMISSION = {
         "unzip *": "allow",
         "diff *": "allow",
         "patch *": "allow",
+        # `cp` is allow-listed so an agent can place a spilled, recovered
+        # write_file content (`cp <spill> <target>`) without a prompt; the Path
+        # ACL operand scan still gates sensitive sources/destinations.
+        "cp *": "allow",
         "chmod *": "ask",
         "chown *": "ask",
         "rm *": "ask",
@@ -3883,6 +3887,63 @@ CLUSTER_SPILL_DIR = os.path.expanduser("~/.ollamaquery.d/spill")
 # not fed into context twice — the model decides whether to read it.
 FETCH_SPILL_THRESHOLD = 3500  # spill results larger than this (chars)
 
+# An interrupted (timed-out) `write_file` call often has its large `content`
+# argument fully or partially streamed before the deadline. The raw `arguments`
+# JSON is then unparsable (`json.loads` fails on the missing closing quote/brace),
+# so the value is decoded leniently and spilled to a fixed file the model can
+# `cp` (content complete) or read + finish (content truncated). Removed at exit.
+UNFINISHED_WRITE_SPILL_MIN = 200  # don't spill tiny fragments (chars)
+UNFINISHED_WRITE_SPILL_NAME = "unfinished_write_file"
+
+
+def _extract_json_string_field(raw: str, field: str) -> tuple:
+    """Extract a JSON string field's decoded value from possibly-truncated JSON.
+
+    Tolerant recovery for an interrupted tool-call `arguments` blob: the object
+    is usually unterminated (the deadline lands mid-`content`), so `json.loads`
+    fails. This scans the named field's string value, decoding JSON escapes
+    (`\\n`, `\\t`, `\\r`, `\\"`, `\\\\`, `\\/`, `\\b`, `\\f`, `\\uXXXX`) until the closing
+    quote or the end of the fragment.
+
+    Args:
+        raw: The (possibly truncated) JSON text.
+        field: The object key to extract (e.g. "content", "file_path").
+
+    Returns:
+        (value, closed): `closed` is True when the closing quote was reached
+        (the value is complete); False when the fragment was cut mid-value,
+        mid-escape, or mid-`\\uXXXX`. Returns ("", False) when the field is
+        absent or nothing decodes.
+    """
+    match = re.search(r'[,{]\s*"' + re.escape(field) + r'"\s*:\s*"', raw)
+    if not match:
+        return "", False
+    escape_map = {'n': '\n', 't': '\t', 'r': '\r', '"': '"',
+                  '\\': '\\', '/': '/', 'b': '\b', 'f': '\f'}
+    i = match.end()
+    out = []
+    while i < len(raw):
+        ch = raw[i]
+        if ch == '\\':
+            if i + 1 >= len(raw):
+                break  # trailing partial escape — treat as truncated
+            nxt = raw[i + 1]
+            if nxt == 'u':
+                hexs = raw[i + 2:i + 6]
+                if len(hexs) < 4 or not re.fullmatch(r'[0-9a-fA-F]{4}', hexs):
+                    break  # partial unicode escape
+                out.append(chr(int(hexs, 16)))
+                i += 6
+                continue
+            out.append(escape_map.get(nxt, nxt))
+            i += 2
+            continue
+        if ch == '"':
+            return "".join(out), True
+        out.append(ch)
+        i += 1
+    return "".join(out), False
+
 
 def _cluster_spill_path(verb: str, resource: str) -> str:
     """Return the scoped spill file path for a (verb, resource) cluster query."""
@@ -3906,7 +3967,8 @@ def _fetch_spill_path(url: str) -> str:
 
 def _cleanup_spill_files() -> None:
     """Remove all cluster and fetch spill files at process exit."""
-    prefixes = (("cluster_result_", ".json"), ("fetch_result_", ".txt"))
+    prefixes = (("cluster_result_", ".json"), ("fetch_result_", ".txt"),
+                (UNFINISHED_WRITE_SPILL_NAME, ""))
     try:
         if os.path.isdir(CLUSTER_SPILL_DIR):
             for fname in os.listdir(CLUSTER_SPILL_DIR):
@@ -11736,6 +11798,89 @@ class ChatLoop:
                     pass  # still mid-write — not complete
         return complete
 
+    def _find_partial_write(self, step_tool_calls: list, step_buf: dict) -> tuple:
+        """Locate an interrupted `write_file` call and recover its content.
+
+        Checks native tool-call fragments first (OpenAI-style `arguments`
+        accumulation), then the inline text buffer (JSON-in-content models). Only
+        `write_file` is handled — it is the tool whose argument is both huge and
+        directly reusable as a file.
+
+        Args:
+            step_tool_calls: By-ref native tool calls from the timed-out step.
+            step_buf: The step feedback buffer (partial content text).
+
+        Returns:
+            (content, file_path, content_closed): decoded content, the intended
+            target if it streamed, and whether the content string had closed.
+            ("", "", False) when no interrupted write_file was found.
+        """
+        for tc in step_tool_calls or []:
+            fn = tc.get("function") or {}
+            if fn.get("name") != "write_file":
+                continue
+            args = fn.get("arguments", "")
+            if not isinstance(args, str) or not args:
+                continue  # dict args = complete call (handled by salvage)
+            content, closed = _extract_json_string_field(args, "content")
+            if content:
+                file_path, _ = _extract_json_string_field(args, "file_path")
+                return content, file_path, closed
+        text = (step_buf or {}).get("content", "") or ""
+        if "write_file" in text and '"content"' in text:
+            content, closed = _extract_json_string_field(text, "content")
+            if content:
+                file_path, _ = _extract_json_string_field(text, "file_path")
+                return content, file_path, closed
+        return "", "", False
+
+    def _spill_partial_write(self, step_tool_calls: list, step_buf: dict,
+                             iteration: int) -> Optional[str]:
+        """Spill an interrupted `write_file` content and build the recovery nudge.
+
+        A timed-out `write_file` whose arguments never closed cannot be executed
+        (the JSON is unparsable and a partial file must not be written). Instead
+        the decoded content is saved to a fixed spill file the model can `cp`
+        when the content is complete, or read + finish when it was truncated.
+
+        Args:
+            step_tool_calls: By-ref native tool calls from the timed-out step.
+            step_buf: The step feedback buffer (partial content text).
+            iteration: Current ReAct iteration (for the log line).
+
+        Returns:
+            The nudge message to append, or None when there is nothing to spill.
+        """
+        content, file_path, closed = self._find_partial_write(step_tool_calls, step_buf)
+        if len(content) < UNFINISHED_WRITE_SPILL_MIN:
+            return None
+        try:
+            os.makedirs(CLUSTER_SPILL_DIR, exist_ok=True)
+            acl = getattr(self.ctx, "path_acl", None)
+            if acl is not None:
+                acl.add("read", "allow", CLUSTER_SPILL_DIR, source="session")
+            spill_file = os.path.join(CLUSTER_SPILL_DIR, UNFINISHED_WRITE_SPILL_NAME)
+            with open(spill_file, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError:
+            return None
+        target = f" (intended target: {file_path})" if file_path else ""
+        print(colorize(
+            f"\n[Agentic] Step {iteration} timed out mid-write_file — "
+            f"{'complete' if closed else 'partial'} content ({len(content)} chars) "
+            f"spilled to {spill_file}.", 'warning'), file=sys.stderr)
+        if closed:
+            return (f"[Agentic] The timed-out write_file{target} had fully streamed its "
+                    f"content — only the message was cut off. The complete content "
+                    f"({len(content)} chars) was saved to {spill_file}. Do NOT regenerate "
+                    f'it: place it with run_command("cp {spill_file} <target>"), or '
+                    f"read_file it to verify, then continue.")
+        return (f"[Agentic] The timed-out write_file{target} was cut off mid-content. The "
+                f"partial content decoded so far ({len(content)} chars) was saved to "
+                f"{spill_file} — it is TRUNCATED. Do NOT copy it as-is: read_file it, "
+                f"resume writing the remaining content, and re-issue write_file with the "
+                f"full content.")
+
     def _salvage_timed_out_tool_call(self, step_tool_calls: list, step_buf: dict,
                                      messages: list, send_tools_api: bool,
                                      iteration: int,
@@ -11893,12 +12038,17 @@ class ChatLoop:
             response: The sync-shaped response dict.
 
         Returns:
-            (response_text, api_tool_calls) tuple (verbose display printed here).
+            (response_text, api_tool_calls) tuple (verbose echo printed here
+            unless the text already streamed live under show_thinking).
         """
         response_text = _extract_sync_content(self.ctx, response)
         api_tool_calls = _extract_sync_tool_calls(self.ctx, response)
 
-        if self.ctx.agentic_verbose and response_text:
+        # The [Verbose] echo is for when the step text is NOT already on screen.
+        # With show_thinking enabled, `_render_step_feedback` streams the visible
+        # text live to stdout, so echoing it here again would duplicate it.
+        if (self.ctx.agentic_verbose and response_text
+                and not self.ctx.agentic_show_thinking):
             truncated = len(response_text) > 500
             display = response_text[:500] + ("..." if truncated else "")
             print(colorize(f"\n[Verbose] {display}", 'muted'), file=sys.stderr)
@@ -12020,6 +12170,16 @@ class ChatLoop:
                     on_chunk, finalize_step, step_cancel, step_tool_calls)
 
                 if response is None:
+                    # Abort the in-flight request FIRST, before any salvage /
+                    # escalation decision. `_call_with_timeout` returns None on
+                    # timeout without touching `step_cancel`, and the socket
+                    # timeout is per-read (it never fires while deltas keep
+                    # arriving), so without this the daemon worker keeps the
+                    # generation alive and hogging the server slot. On a
+                    # single-slot backend the next step would then queue behind
+                    # the zombie. `_signal_abort` closes the response (server
+                    # cancels) and sets the event so the worker loop exits.
+                    _signal_abort(step_cancel)
                     # Timed out. If the generation had already finished writing a
                     # complete tool call before the deadline, execute it now
                     # instead of discarding it — a retry would burn another full
@@ -12037,6 +12197,15 @@ class ChatLoop:
                         step_buf, step_cancel, step_start, iteration, step_timeout, messages)
                     if should_break:
                         break
+                    # Not salvageable and still running: if the interruption cut a
+                    # write_file, spill its (possibly partial) content so it isn't
+                    # discarded, and point the model at it. Appended after the
+                    # timeout nudge so it is the freshest instruction.
+                    spill_note = self._spill_partial_write(
+                        step_tool_calls, step_buf, iteration)
+                    if spill_note:
+                        messages.append({'role': 'user', 'content': spill_note,
+                                         '_system_nudge': True})
                     response_text = ""
                     continue
 
