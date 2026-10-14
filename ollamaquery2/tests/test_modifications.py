@@ -1083,7 +1083,12 @@ class TestClearPreservesPreferences(unittest.TestCase):
         self.assertEqual(self.ctx.current_context_tokens, 0)
         self.assertEqual(self.ctx.current_images, [])
         self.assertEqual(self.ctx.query_history, [])
-        self.assertGreater(self.ctx.context_window_size, 0)
+
+        # /clear re-fetches the context window from the backend. Offline it stays
+        # 0 (see test_release.test_set_context_size_preserves_bar_after_clear), so
+        # only assert the refetch when a backend is actually reachable.
+        if HAS_OLLAMA or HAS_LLAMACPP:
+            self.assertGreater(self.ctx.context_window_size, 0)
 
 
 # ============================================================================

@@ -35,7 +35,7 @@ import fnmatch
 from datetime import datetime
 
 from html.parser import HTMLParser
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Union, Literal, TypedDict
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -61,7 +61,90 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.20"
+__version__ = "0.2.21"
+
+
+# ============================================================================
+# ============= MESSAGE SCHEMA (TYPE ANNOTATIONS) ============================
+# ============================================================================
+# These TypedDicts document the shape of the plain dicts that flow through the
+# conversation history (`self.messages`, the agentic `messages` list, and the
+# session save/load boundary) and are handed to json.dumps() / json.dump().
+#
+# They are annotations only — a TypedDict *is* a dict at runtime, so runtime
+# behaviour is unchanged and there is no serialization cost. The point is to
+# make the keys, the role-conditional fields and the internal flags
+# self-documenting at every `msg["..."]` read site instead of having to
+# reverse-engineer the shape by example.
+#
+# Not expressed here: the *sequence-level* invariant that a `tool` message must
+# be immediately preceded by an `assistant` message carrying `tool_calls`. That
+# is a property of the message list across neighbouring items — not of any one
+# dict — and is enforced procedurally by `sanitize_tool_pairing` and the
+# compaction windowing (see `_split_compaction_window`).
+
+
+class ToolCallFunction(TypedDict):
+    """The `function` payload of a native tool call."""
+    name: str
+    arguments: Union[str, dict]  # JSON string (native) or parsed dict (normalized)
+
+
+class ToolCall(TypedDict):
+    """A native (OpenAI/Ollama-shaped) tool call attached to an assistant turn."""
+    id: str
+    type: Literal["function"]
+    function: ToolCallFunction
+
+
+class _MessageBase(TypedDict, total=False):
+    """Keys shared by every message; all optional (internal / role-conditional).
+
+    The role-conditional fields live here rather than on each subclass so the
+    schema stays compatible with Python 3.8+ (`NotRequired` needs 3.11):
+      - `reasoning_content`, `tool_calls` — may appear on an `assistant` message.
+      - `images` — may appear on a `user` message (Ollama base64 strings only).
+    """
+    _tokens: int            # cached exact token count (see CommandContext.stamp_tokens)
+    _system_nudge: bool     # loop-internal steering; excluded from persisted history
+    _near_full_nudge: bool  # transient near-full budget notice; replaced on refresh
+    reasoning_content: str  # retained thinking trace (see /preservethinking)
+    tool_calls: list[ToolCall]
+    images: list
+
+
+class SystemMessage(_MessageBase):
+    """A `system` message: the (possibly composed) system prompt."""
+    role: Literal["system"]
+    content: str
+
+
+class UserMessage(_MessageBase):
+    """A `user` message.
+
+    `content` is a str for plain text, or a list of content parts
+    (`{"type": "text", ...}` / `{"type": "image_url", ...}`) for multimodal
+    OpenAI-compatible backends. `images` holds base64 strings for Ollama only.
+    """
+    role: Literal["user"]
+    content: Union[str, list]
+
+
+class AssistantMessage(_MessageBase):
+    """An `assistant` message, optionally carrying tool calls / reasoning."""
+    role: Literal["assistant"]
+    content: str
+
+
+class ToolResultMessage(_MessageBase):
+    """A `tool` message: the observation answering a preceding assistant tool call."""
+    role: Literal["tool"]
+    tool_call_id: str
+    name: str
+    content: str
+
+
+Message = Union[SystemMessage, UserMessage, AssistantMessage, ToolResultMessage]
 
 
 # ============================================================================
@@ -1420,7 +1503,7 @@ class CommandContext:
             return get_message_token_count_ollama(self.base_url, text, self.model)
         return self.estimate_tokens(text)
 
-    def stamp_tokens(self, msg: dict) -> dict:
+    def stamp_tokens(self, msg: Message) -> Message:
         """Compute and cache the token count for a message dict.
 
         Stores the count in msg['_tokens'] so it only needs to be computed once.
@@ -1450,7 +1533,7 @@ class CommandContext:
         msg['_tokens'] = tokens
         return msg
 
-    def calculate_context_tokens(self, messages: list) -> int:
+    def calculate_context_tokens(self, messages: list[Message]) -> int:
         """Calculate total tokens in conversation context.
 
         Uses cached _tokens when available (exact), falls back to estimation.
@@ -1495,7 +1578,7 @@ COMPACTION_TARGET = 0.50     # Compact down to 50% of context window
 COMPACTION_KEEP_RECENT = 6   # Always keep last 6 messages (3 user/assistant turns)
 
 
-def sanitize_tool_pairing(messages: list) -> list:
+def sanitize_tool_pairing(messages: list[Message]) -> list[Message]:
     """Repair orphaned tool-role messages so strict chat templates don't 500.
 
     gpt-oss (and similar) chat templates hard-raise when a 'tool' role message
@@ -1535,7 +1618,7 @@ def sanitize_tool_pairing(messages: list) -> list:
     return messages
 
 
-def _split_compaction_window(messages: list, keep_recent: int) -> tuple:
+def _split_compaction_window(messages: list[Message], keep_recent: int) -> tuple:
     """Split messages into (system, middle, recent) for compaction.
 
     The keep-recent window is shifted left so it never *starts* on a tool
@@ -1553,7 +1636,7 @@ def _split_compaction_window(messages: list, keep_recent: int) -> tuple:
     return system_msg, messages[1:start], messages[start:]
 
 
-def _build_compaction_summary(middle: list) -> str:
+def _build_compaction_summary(middle: list[Message]) -> str:
     """Render the mechanical excerpt-based summary of the dropped middle turns.
 
     Tool results collapse to a status line; user/assistant messages keep a short
@@ -1589,8 +1672,8 @@ def _build_compaction_summary(middle: list) -> str:
     )
 
 
-def compact_messages(messages: list, ctx: 'CommandContext', target_tokens: int = 0,
-                     keep_recent: int = COMPACTION_KEEP_RECENT, force: bool = False) -> list:
+def compact_messages(messages: list[Message], ctx: 'CommandContext', target_tokens: int = 0,
+                     keep_recent: int = COMPACTION_KEEP_RECENT, force: bool = False) -> list[Message]:
     """Compact conversation history to fit within token budget.
 
     Strategy:
@@ -1681,7 +1764,7 @@ def _extract_sync_content(ctx: 'CommandContext', response: dict) -> str:
     return content or ""
 
 
-def _extract_sync_tool_calls(ctx: 'CommandContext', response: dict) -> list:
+def _extract_sync_tool_calls(ctx: 'CommandContext', response: dict) -> list[ToolCall]:
     """Extract native API tool calls from a sync response (backend-aware).
 
     Returns the raw `message.tool_calls` (ollama) or `choices[0].message
@@ -1815,7 +1898,7 @@ def _cap_line(text: str, max_len: int) -> str:
     return text
 
 
-def _render_token_breakdown(middle: list, ctx: 'CommandContext',
+def _render_token_breakdown(middle: list[Message], ctx: 'CommandContext',
                             max_chars: int = LLM_COMPACT_BREAKDOWN_CHARS) -> str:
     """Render a `/tokencount`-style breakdown of the messages being compacted.
 
@@ -1877,7 +1960,7 @@ def _extract_gen_tokens(ctx: 'CommandContext', response: object) -> int:
     return int(usage.get("completion_tokens", 0) or 0)
 
 
-def _render_conversation_transcript(middle: list,
+def _render_conversation_transcript(middle: list[Message],
                                     max_chars: int = LLM_COMPACT_TRANSCRIPT_CHARS) -> str:
     """Render a compact text transcript of older turns for the LLM summarizer.
 
@@ -1987,8 +2070,8 @@ def _extract_compaction_log(content: object) -> str:
     return '\n'.join(rest)
 
 
-def llm_compact_messages(messages: list, ctx: 'CommandContext', query_handler: 'ModelQuery',
-                         keep_recent: int = COMPACTION_KEEP_RECENT) -> list:
+def llm_compact_messages(messages: list[Message], ctx: 'CommandContext', query_handler: 'ModelQuery',
+                         keep_recent: int = COMPACTION_KEEP_RECENT) -> list[Message]:
     """Compress history with an LLM-generated narrative summary of the older turns.
 
     Unlike `compact_messages` (excerpt previews), the dropped middle is handed to
@@ -6526,7 +6609,7 @@ class ModelQuery:
         """Estimate token count. Delegates to CommandContext."""
         return self.ctx.estimate_tokens(text)
 
-    def calculate_context_tokens(self, messages: list) -> int:
+    def calculate_context_tokens(self, messages: list[Message]) -> int:
         """Calculate estimated total tokens in conversation context. Delegates to CommandContext."""
         return self.ctx.calculate_context_tokens(messages)
 
@@ -6755,7 +6838,7 @@ class ModelQuery:
 
 
     @staticmethod
-    def _last_user_message_index(messages: list) -> int:
+    def _last_user_message_index(messages: list[Message]) -> int:
         """Return the index of the last real user message, or -1.
 
         Skips `_system_nudge` messages (loop-internal steering such as the
@@ -6774,7 +6857,7 @@ class ModelQuery:
         return -1
 
     @staticmethod
-    def _inject_images_into_messages(messages: list, images: Optional[list], backend: str) -> None:
+    def _inject_images_into_messages(messages: list[Message], images: Optional[list], backend: str) -> None:
         """Inject image data into the last real user message, mutating in-place.
 
         Args:
@@ -6991,7 +7074,7 @@ class ModelQuery:
             elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
                 payload["max_tokens"] = max_output
 
-    def _apply_output_cap(self, messages: list, kwargs: dict) -> tuple:
+    def _apply_output_cap(self, messages: list[Message], kwargs: dict) -> tuple:
         """Add the static cap line and resolve the effective (clamped) cap.
 
         Args:
@@ -7055,7 +7138,7 @@ class ModelQuery:
         new[0] = new_first
         return new
 
-    def build_request_payload(self, messages: list, model: str, stream_enabled: bool = False, **kwargs: dict) -> dict:
+    def build_request_payload(self, messages: list[Message], model: str, stream_enabled: bool = False, **kwargs: dict) -> dict:
         """Build request payload for the backend.
 
         Args:
@@ -7108,7 +7191,7 @@ class ModelQuery:
         """
         return f"{self.base_url}/api/chat" if backend == "ollama" else f"{self.base_url}/v1/chat/completions"
 
-    def query_sync(self, messages: list, model: str, stream_enabled: bool = False, **kwargs: dict) -> dict:
+    def query_sync(self, messages: list[Message], model: str, stream_enabled: bool = False, **kwargs: dict) -> dict:
         """Non-streaming sync query wrapper.
 
         Args:
@@ -7143,7 +7226,7 @@ class ModelQuery:
             return {"error": {"message": str(e), "type": type(e).__name__}}
 
     @staticmethod
-    def _accumulate_stream_tool_calls(tool_calls: list, tool_call_index: dict, new_calls: list) -> None:
+    def _accumulate_stream_tool_calls(tool_calls: list[ToolCall], tool_call_index: dict, new_calls: list) -> None:
         """Merge incremental tool-call chunks into `tool_calls` and `tool_call_index`.
 
         Args:
@@ -7185,7 +7268,7 @@ class ModelQuery:
                 if "arguments" in fn_delta and fn_delta["arguments"]:
                     existing["function"]["arguments"] += fn_delta["arguments"]
 
-    def _synthesize_sync_response(self, content: str, thinking: str, tool_calls: list, usage: dict) -> dict:
+    def _synthesize_sync_response(self, content: str, thinking: str, tool_calls: list[ToolCall], usage: dict) -> dict:
         """Build a non-streaming-shaped response dict from aggregated stream chunks.
 
         Args:
@@ -7298,7 +7381,7 @@ class ModelQuery:
             return {"error": {"message": str(e), "type": type(e).__name__}}
         return full_content, full_thinking, tool_calls, tool_call_index, usage
 
-    def query_sync_stream(self, messages: list, model: str, stream_enabled: bool = True, **kwargs: dict) -> dict:
+    def query_sync_stream(self, messages: list[Message], model: str, stream_enabled: bool = True, **kwargs: dict) -> dict:
         """Streaming variant of `query_sync` that aggregates chunks into a single dict.
 
         Performs a streaming request and synthesizes a non-streaming-shaped response
@@ -7410,7 +7493,7 @@ class ModelQuery:
 
         return usage if usage else None
 
-    def _build_stream_request(self, backend: str, messages: list, model: str,
+    def _build_stream_request(self, backend: str, messages: list[Message], model: str,
                               stream_enabled: bool, context_size: Optional[int], **kwargs: dict) -> tuple:
         """Build URL, payload and headers for the backend.
 
@@ -7521,7 +7604,7 @@ class ModelQuery:
             if messages:
                 self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(messages)
 
-    def _finalize_stream_tool_calls(self, stream_tool_call_index: dict) -> list:
+    def _finalize_stream_tool_calls(self, stream_tool_call_index: dict) -> list[ToolCall]:
         """Consolidate incremental tool-call fragments into a list of complete calls.
 
         Args:
@@ -7608,7 +7691,7 @@ class ModelQuery:
 
     def query_stream(
         self,
-        messages: list, model: str, stream_enabled: bool = True, debug: bool = False,
+        messages: list[Message], model: str, stream_enabled: bool = True, debug: bool = False,
         show_thinking: bool = True, context_size: Optional[int] = None, images: Optional[list] = None,
         tool_calls_out: Optional[list] = None, **kwargs: dict
     ) -> str:
@@ -11564,7 +11647,7 @@ class ChatLoop:
                 stream_tool_used = False
         return stream_tool_used
 
-    def _maybe_auto_compact_agentic(self, messages: list) -> list:
+    def _maybe_auto_compact_agentic(self, messages: list[Message]) -> list[Message]:
         """Auto-compact the ReAct loop's local messages near the context limit.
 
         Agentic steps can balloon the local `messages` array (tool observations,
@@ -11586,7 +11669,7 @@ class ChatLoop:
                        'warning'), file=sys.stderr)
         return messages
 
-    def _persist_agentic_history(self, messages: list, agentic_seed_len: int, compact: bool = False) -> None:
+    def _persist_agentic_history(self, messages: list[Message], agentic_seed_len: int, compact: bool = False) -> None:
         """Merge the ReAct loop's local turns back into `self.messages`.
 
         The local `messages` array is seeded as [agentic system] + self.messages[1:],
@@ -11664,7 +11747,7 @@ class ChatLoop:
                     tool_calls = [single]
         return tool_calls
 
-    def _append_tool_messages(self, messages: list, response_text: str, api_tool_calls: list,
+    def _append_tool_messages(self, messages: list[Message], response_text: str, api_tool_calls: list,
                               tool_calls: list, observations: list, raw_observations: list,
                               send_tools_api: bool) -> None:
         """Append the assistant turn and tool-result messages after executing tools.

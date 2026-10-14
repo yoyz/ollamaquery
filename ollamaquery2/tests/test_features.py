@@ -269,12 +269,13 @@ class TestBackendDetection(unittest.TestCase):
         self.assertFalse(result)
 
     def test_resolve_connection_defaults(self):
-        """resolve_connection defaults to ollama."""
+        """resolve_connection returns a valid local backend and URL."""
         args = lambda: None  # noqa: E731
         args.backend = None
         args.host = None
         backend, url = q.resolve_connection(args)
-        self.assertIn(backend, ('ollama', 'llamacpp', 'lmstudio'))
+        self.assertIn(backend, ('ollama', 'llamacpp', 'lmstudio', 'strata'))
+        self.assertTrue(url)
 
     def test_auto_detect_backend_dns_failure(self):
         """auto_detect_backend must not crash when gethostbyname_ex fails (regression: DNS crash)."""
@@ -1629,11 +1630,11 @@ class TestBuildPrompt(unittest.TestCase):
 class TestUtilityFunctions(unittest.TestCase):
     """Standalone utility functions."""
 
-    def test_is_known_command(self):
-        self.assertTrue(q.is_known_command('/help'))
-        self.assertTrue(q.is_known_command('/quit'))
-        result = q.is_known_command('/nonexistent')
-        self.assertFalse(result[0])  # Returns (False, None)
+    def test_known_commands(self):
+        aliases = q.get_command_aliases()
+        self.assertIn('/help', aliases)
+        self.assertIn('/quit', aliases)
+        self.assertNotIn('/nonexistent', aliases)
 
     def test_format_help_text_compact(self):
         text = q.format_help_text(compact=True)
@@ -2024,25 +2025,29 @@ class TestEnvironmentVariables(unittest.TestCase):
     """Environment variable handling."""
 
     def test_ollama_host_env(self):
+        args = MagicMock(backend=None, host=None)
         with patch.dict(os.environ, {'OLLAMA_HOST': 'http://custom:8888'},
                         clear=True):
-            url = q.get_base_url(MagicMock(host=None), 'ollama')
+            backend, url = q._resolve_fallback(args)
+            self.assertEqual(backend, 'ollama')
             self.assertEqual(url, 'http://custom:8888')
 
     def test_llamacpp_host_env(self):
+        args = MagicMock(backend='llamacpp', host=None)
         with patch.dict(os.environ, {'LLAMACPP_HOST': 'http://custom:9999'},
                         clear=True):
-            url = q.get_base_url(MagicMock(host=None), 'llamacpp')
+            backend, url = q._resolve_fallback(args)
+            self.assertEqual(backend, 'llamacpp')
             self.assertEqual(url, 'http://custom:9999')
 
     def test_get_base_url_with_host_arg(self):
-        args = MagicMock(host='http://override:7777')
-        url = q.get_base_url(args, 'ollama')
+        args = MagicMock(host='http://override:7777', backend=None)
+        _backend, url = q._resolve_host_override(args)
         self.assertEqual(url, 'http://override:7777')
 
     def test_get_base_url_adds_prefix(self):
-        args = MagicMock(host='192.168.1.1:11434')
-        url = q.get_base_url(args, 'ollama')
+        args = MagicMock(host='192.168.1.1:11434', backend=None)
+        _backend, url = q._resolve_host_override(args)
         self.assertEqual(url, 'http://192.168.1.1:11434')
 
 
