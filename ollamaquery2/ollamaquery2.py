@@ -61,7 +61,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.21"
+__version__ = "0.2.22"
 
 
 # ============================================================================
@@ -1097,6 +1097,36 @@ def get_message_token_count_ollama(base_url: str, text: str, model: str) -> int:
         return estimate_token_count(text)
 
 
+def post_count_tokens(url: str, body: dict) -> int:
+    """POST an Anthropic-style count_tokens body and return the input token count.
+
+    Used to measure a whole outbound request (system prompt + messages + native
+    `tools` array + chat-template framing) in one call, without generating
+    anything. Strata implements this endpoint; the response carries
+    `input_tokens` at the top level.
+
+    Args:
+        url: Full count_tokens endpoint URL.
+        body: Request body (model, messages, optional system and tools).
+
+    Returns:
+        The reported input token count.
+
+    Raises:
+        Exception: Propagated to the caller, which decides whether to fall back.
+    """
+    data = json.dumps(body).encode('utf-8')
+    req = Request(url, data=data, headers={
+        'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
+    # Single attempt: this is a diagnostic measurement (used by /tokencount), so a
+    # dead backend should fail fast and fall back rather than retry three times.
+    with _request_with_retry(req, max_retries=1, timeout=10) as response:
+        payload = json.loads(response.read().decode('utf-8'))
+    if 'input_tokens' in payload:
+        return int(payload['input_tokens'])
+    return int(payload.get('usage', {}).get('input_tokens', 0))
+
+
 def is_available_ollama_model(base_url: str, model_name: str) -> bool:
     """
     Check if a model exists on the Ollama server.
@@ -1341,6 +1371,7 @@ class CommandContext:
         self.system_prompt: str = DEFAULT_SYSTEM_PROMPT
         self.context_size: Optional[int] = None
         self.max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS  # per-response output cap (/maxtokens)
+        self._tools_token_cache: Dict[str, int] = {}  # serialized tools array -> token count
         self.current_images: List[str] = []
         self.force_no_thinking: bool = False
         self.reasoning_effort: Optional[str] = None  # None | "low" | "medium" | "high"
@@ -1568,6 +1599,191 @@ class CommandContext:
                 total += 2
         return total
 
+    def count_tools_tokens(self, tools: Optional[list]) -> int:
+        """Return the token cost of the outbound `tools` array.
+
+        Serializes the array exactly as the payload will carry it, then runs it
+        through the backend tokenizer — so the number is a real tokenization of
+        the schemas rather than a chars/N estimate. Cached per distinct array:
+        the set is static within a mode, so this costs one call per mode change.
+
+        Caveat: this counts the serialized JSON, not the chat template's own
+        rendering of it (which may add framing tokens). `count_wire_tokens()`
+        returns the template-accurate contribution where the backend can measure
+        the whole request.
+
+        Args:
+            tools: The native `tools` array, or None/empty in chat mode.
+
+        Returns:
+            Token count (0 when there are no tools).
+        """
+        if not tools:
+            return 0
+        serialized = json.dumps(tools)
+        cached = self._tools_token_cache.get(serialized)
+        if cached is not None:
+            return cached
+        tokens = self.tokenize(serialized)
+        if len(self._tools_token_cache) >= 8:
+            self._tools_token_cache.clear()
+        self._tools_token_cache[serialized] = tokens
+        return tokens
+
+    @staticmethod
+    def _wire_messages(messages: list[Message]) -> list[dict]:
+        """Reduce messages to their wire shape for an outbound token count.
+
+        Harness bookkeeping (`_tokens`, `_system_nudge`, `_near_full_nudge`) is
+        dropped because it never reaches the server. Reasoning traces and images
+        are also dropped: the former is backend-conditional, the latter is
+        injected as content parts at request-build time and cannot be counted as
+        text.
+
+        Args:
+            messages: Conversation messages, possibly carrying private keys.
+
+        Returns:
+            A list of {role, content[, tool_calls, tool_call_id]} dicts.
+        """
+        out = []
+        for msg in messages:
+            role = msg.get('role')
+            if role not in ('system', 'user', 'assistant', 'tool'):
+                continue
+            clean: dict = {'role': role, 'content': msg.get('content', '') or ''}
+            if role == 'tool' and msg.get('tool_call_id'):
+                clean['tool_call_id'] = msg['tool_call_id']
+            if isinstance(msg.get('tool_calls'), list) and msg['tool_calls']:
+                clean['tool_calls'] = msg['tool_calls']
+            out.append(clean)
+        return out
+
+    @staticmethod
+    def _anthropic_tools(tools: list) -> list:
+        """Convert OpenAI-shaped tools to the Anthropic count_tokens shape.
+
+        The harness builds `{"type": "function", "function": {...}}` (OpenAI
+        dialect), while Anthropic-style counters expect
+        `{"name", "description", "input_schema"}`. Passing the OpenAI shape to
+        Strata's count_tokens is rejected, which would silently disable the exact
+        path.
+
+        Args:
+            tools: OpenAI-shaped tool specs.
+
+        Returns:
+            The equivalent Anthropic-shaped list.
+        """
+        converted = []
+        for tool in tools:
+            fn = tool.get('function', tool)
+            entry = {'name': fn.get('name', '')}
+            if fn.get('description'):
+                entry['description'] = fn['description']
+            entry['input_schema'] = fn.get('parameters') or {'type': 'object', 'properties': {}}
+            converted.append(entry)
+        return converted
+
+    def count_wire_tokens(self, system: str, messages: list[Message],
+                          tools: Optional[list] = None, decompose: bool = True) -> Dict:
+        """Count a whole outbound request exactly, where the backend supports it.
+
+        A chat request costs more than the sum of its message token counts: the
+        native `tools` array and the chat template's own framing both add tokens
+        that appear in no message. Strata exposes Anthropic's
+        `/v1/messages/count_tokens`, which accounts for all of it in one number
+        without generating anything; llama.cpp builds expose `/apply-template`
+        (render) + `/tokenize` (count). Ollama, LM Studio and the cloud backends
+        expose no whole-request counter, so `total` is None and the caller sums
+        the components instead.
+
+        Args:
+            system: The system message content that will actually be sent.
+            messages: Conversation messages, system message excluded.
+            tools: The native `tools` array, or None.
+            decompose: Also measure the tools contribution (a second round-trip
+                on Strata). Callers that only need `total` — the context bar —
+                pass False.
+
+        Returns:
+            dict with 'total' (exact count or None), 'tools' (template-accurate
+            tools contribution or None) and 'source' ('strata' | 'llamacpp' | 'none').
+        """
+        wire = self._wire_messages(messages)
+        if system:
+            wire = [{'role': 'system', 'content': system}] + wire
+        unsupported = {'total': None, 'tools': None, 'source': 'none'}
+
+        if self.backend == 'strata':
+            url = f"{self.base_url}/v1/messages/count_tokens"
+            body: dict = {'model': self.model or 'model', 'messages': wire}
+            anthropic_tools = self._anthropic_tools(tools) if tools else None
+            try:
+                total = (post_count_tokens(url, dict(body, tools=anthropic_tools))
+                         if anthropic_tools else post_count_tokens(url, body))
+                if not anthropic_tools:
+                    return {'total': total, 'tools': 0, 'source': 'strata'}
+                if not decompose:
+                    return {'total': total, 'tools': None, 'source': 'strata'}
+                without_tools = post_count_tokens(url, body)
+                return {'total': total, 'tools': total - without_tools, 'source': 'strata'}
+            except Exception:
+                return unsupported
+
+        if self.backend in ('llamacpp', 'lmstudio'):
+            body = {'messages': wire}
+            if tools:
+                body['tools'] = tools
+            try:
+                req = Request(f"{self.base_url}/apply-template",
+                              data=json.dumps(body).encode('utf-8'),
+                              headers={'Content-Type': 'application/json'})
+                with _request_with_retry(req, max_retries=1, timeout=10) as response:
+                    rendered = json.loads(response.read().decode('utf-8')).get('prompt', '')
+                total = get_message_token_count_llamacpp(self.base_url, rendered)
+                return {'total': total, 'tools': None, 'source': 'llamacpp'}
+            except Exception:
+                return unsupported
+
+        return unsupported
+
+    def outbound_tokens(self, system: str, messages: list[Message],
+                        tools: Optional[list] = None, exact: bool = False) -> int:
+        """Return the prompt size of a request as the backend will see it.
+
+        The authoritative number is the backend's whole-request counter, because
+        a rendered prompt is not the sum of its message token counts — the chat
+        template's framing and the `tools` array add tokens that live in no
+        message. Backends without such a counter (Ollama, LM Studio, cloud APIs)
+        fall back to components plus a per-message framing estimate.
+
+        This is the single definition of "how full is my context window" used by
+        the status bar, `/stats` and the compaction budget, so those views agree
+        with `/tokencount`.
+
+        Args:
+            system: The system message content that will actually be sent.
+            messages: Conversation messages; a system message is ignored (the
+                `system` argument is authoritative).
+            tools: The native `tools` array, or None.
+            exact: Ask the backend for the whole-request count (one round-trip on
+                Strata). False uses the component estimate only.
+
+        Returns:
+            Prompt tokens for the request, excluding the generated response.
+        """
+        conversation = [m for m in messages if m.get('role') != 'system']
+        if exact:
+            total = self.count_wire_tokens(
+                system, conversation, tools, decompose=False)['total']
+            if total is not None:
+                return total
+        return (self.tokenize(system) if system else 0) \
+            + self.calculate_context_tokens(conversation) \
+            + self.count_tools_tokens(tools) \
+            + 2 * len(conversation)
+
 
 # ============================================================================
 # ============= CONTEXT COMPACTION  ===========================================
@@ -1673,7 +1889,8 @@ def _build_compaction_summary(middle: list[Message]) -> str:
 
 
 def compact_messages(messages: list[Message], ctx: 'CommandContext', target_tokens: int = 0,
-                     keep_recent: int = COMPACTION_KEEP_RECENT, force: bool = False) -> list[Message]:
+                     keep_recent: int = COMPACTION_KEEP_RECENT, force: bool = False,
+                     overhead_tokens: int = 0) -> list[Message]:
     """Compact conversation history to fit within token budget.
 
     Strategy:
@@ -1688,6 +1905,10 @@ def compact_messages(messages: list[Message], ctx: 'CommandContext', target_toke
         target_tokens: Target token count after compaction (0 = use COMPACTION_TARGET)
         keep_recent: Number of recent messages to always preserve
         force: If True, compact even when already under the token budget
+        overhead_tokens: Tokens the request costs on top of the message sum
+            (system-prompt swap, native `tools` array, template framing). The
+            budget must include them, otherwise the wire prompt overflows the
+            window the bar warns about.
 
     Returns:
         A new compacted message list
@@ -1698,7 +1919,7 @@ def compact_messages(messages: list[Message], ctx: 'CommandContext', target_toke
     if target_tokens <= 0 and ctx.context_window_size > 0:
         target_tokens = int(ctx.context_window_size * COMPACTION_TARGET)
 
-    current_tokens = ctx.calculate_context_tokens(messages)
+    current_tokens = ctx.calculate_context_tokens(messages) + overhead_tokens
     if target_tokens > 0 and current_tokens <= target_tokens and not force:
         return list(messages)
 
@@ -1712,7 +1933,7 @@ def compact_messages(messages: list[Message], ctx: 'CommandContext', target_toke
     summary_tokens = ctx.estimate_tokens(summary_text)
     system_tokens = system_msg.get('_tokens', ctx.estimate_tokens(system_msg.get('content', '')))
     recent_tokens = sum(m.get('_tokens', ctx.estimate_tokens(m.get('content', ''))) for m in recent)
-    available = target_tokens - system_tokens - recent_tokens - 100
+    available = target_tokens - system_tokens - recent_tokens - 100 - overhead_tokens
 
     if available > 0 and summary_tokens > available:
         ratio = available / summary_tokens
@@ -7090,6 +7311,10 @@ class ModelQuery:
         messages = self._with_output_cap_line(messages, configured)
         window = self.ctx.context_window_size
         prompt_tokens = self.ctx.calculate_context_tokens(messages)
+        # The native `tools` array is serialized upstream of the conversation by
+        # every chat template, so it competes for the window too. Counting it
+        # here keeps the clamp honest in agentic mode (~1.4-2.9K tokens).
+        prompt_tokens += self.ctx.count_tools_tokens(kwargs.get('tools'))
         effective, _reserve = resolve_output_budget(configured, window, prompt_tokens)
         if window <= 0:
             global _MAX_OUTPUT_WINDOW_WARNED
@@ -7580,29 +7805,47 @@ class ModelQuery:
                 continue
             yield decoded
 
-    def _update_context_tokens(self, backend: str, aggregated_usage: dict, messages: list) -> None:
-        """Update context token tracking after stream completes.
+    def _update_context_tokens(self, backend: str, aggregated_usage: dict, messages: list,
+                               tools: Optional[list] = None) -> None:
+        """Update context token tracking after a stream completes.
+
+        The reported value is the request as the backend sees it (system prompt
+        incl. the /maxtokens cap line, conversation, native `tools`, template
+        framing) — the same definition the status bar, `/stats` and `/tokencount`
+        use. Server `prompt_tokens` is only trusted on Ollama: llama.cpp-family
+        servers report KV-cache deltas (only newly evaluated tokens), not the
+        prompt size, which used to make the bar drop at random.
 
         Args:
             backend: Backend name.
             aggregated_usage: Accumulated usage dict from chunks.
-            messages: The message list (for recalc on KV-cache backends).
+            messages: The outbound message list.
+            tools: The outbound `tools` array, when the request carried one.
         """
         if backend == "ollama":
             total_tokens = (aggregated_usage.get("total_tokens", 0) or
-                           aggregated_usage.get("prompt_eval_count", 0) + aggregated_usage.get("eval_count", 0))
+                            aggregated_usage.get("prompt_eval_count", 0) + aggregated_usage.get("eval_count", 0))
             if total_tokens > 0:
                 self.ctx.current_context_tokens = total_tokens
                 if self.ctx.debug_manager.is_enabled('context'):
                     debug_log(self.ctx.debug_manager, 'context', 1,
-                             f"Updated context tokens: {total_tokens}", prefix="CTX")
+                              f"Updated context tokens: {total_tokens}", prefix="CTX")
             refresh_ollama_context_window_size_from_ps(self.ctx)
-        elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-            # llama.cpp with KV cache reports only newly-evaluated tokens as
-            # prompt_tokens, NOT the full context size. Always recalculate from
-            # the actual messages array for an accurate context bar.
-            if messages:
-                self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(messages)
+            return
+        if not messages:
+            return
+        configured = int(getattr(self.ctx, 'max_output_tokens', DEFAULT_MAX_OUTPUT_TOKENS)
+                         or DEFAULT_MAX_OUTPUT_TOKENS)
+        outbound = self._with_output_cap_line(messages, configured)
+        system = outbound[0].get('content', '') if outbound[0].get('role') == 'system' else ''
+        if isinstance(system, list):
+            system = ' '.join(part.get('text', '') for part in system if isinstance(part, dict))
+        self.ctx.current_context_tokens = self.ctx.outbound_tokens(
+            system, outbound, tools, exact=True)
+        if self.ctx.debug_manager.is_enabled('context'):
+            debug_log(self.ctx.debug_manager, 'context', 1,
+                      f"Context tokens (outbound): {self.ctx.current_context_tokens}",
+                      prefix="CTX")
 
     def _finalize_stream_tool_calls(self, stream_tool_call_index: dict) -> list[ToolCall]:
         """Consolidate incremental tool-call fragments into a list of complete calls.
@@ -7783,7 +8026,8 @@ class ModelQuery:
 
             end_time = time.time()
             total_time = end_time - start_time
-            self._update_context_tokens(backend, aggregated_usage, messages)
+            self._update_context_tokens(backend, aggregated_usage, messages,
+                                        tools=kwargs.get('tools'))
             phase_times = {
                 "start": start_time,
                 "first_token": first_token_time,
@@ -9447,12 +9691,42 @@ class ChatLoop:
             print(f"  Avg throughput: {cum['avg_tps']:.2f} t/s", file=sys.stderr)
             print(f"  Avg tokens/query: {cum['avg_tokens_per_query']:.1f}", file=sys.stderr)
             print()
+            self._print_context_summary()
             if self.ctx.backend == "ollama":
                 model_ctx_list = fetch_loaded_models_context_ollama(self.ctx.base_url)
                 for m, c in model_ctx_list:
                     print(f"    model : {m} context : {c}", file=sys.stderr)
             return False
         return None
+
+    def _print_context_summary(self) -> None:
+        """Print the context section of `/stats`, matching the status bar.
+
+        The bar, the per-query `--- Stats:` line, `/stats` and `/tokencount` all
+        report the outbound request (system prompt + conversation + native tools
+        + template framing). The stored-history sum is shown next to it so the
+        difference is visible instead of surprising.
+        """
+        stored = self.ctx.calculate_context_tokens(getattr(self, 'messages', []) or [])
+        overhead = self._prompt_overhead_tokens()
+        wire_total = self._refresh_context_bar()
+        window = self.ctx.context_window_size
+        try:
+            mode = self._wire_system_and_tools()[2]
+        except Exception:
+            mode = "chat"
+        print(colorize("[Context]", 'info'), file=sys.stderr)
+        if window > 0:
+            print(f"  In use ({mode}): {wire_total:,}/{window:,} ({wire_total / window:.1%})",
+                  file=sys.stderr)
+            print(f"  Stored history: {stored:,} tokens ({stored / window:.1%})", file=sys.stderr)
+        else:
+            print(f"  In use ({mode}): {wire_total:,} tokens (window unknown)", file=sys.stderr)
+            print(f"  Stored history: {stored:,} tokens", file=sys.stderr)
+        print(f"  Request overhead: {overhead:,} tokens "
+              f"(system-prompt swap, tools array, template framing)", file=sys.stderr)
+        print("  [same definition as the status bar and /tokencount]", file=sys.stderr)
+        print()
 
     def run_handle_listmodel(self, full_input: str) -> Optional[bool]:
         """Handle /listmodel and /listmodelall commands."""
@@ -9820,7 +10094,7 @@ class ChatLoop:
                     self.ctx.context_window_size = 0
 
                     if hasattr(self, 'messages') and self.messages:
-                        self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
+                        self._refresh_context_bar()
                     else:
                         self.ctx.current_context_tokens = 0
 
@@ -9848,13 +10122,12 @@ class ChatLoop:
                             ping_messages = [{"role": "system", "content": self.ctx.system_prompt}]
                         res_ping = self.query_handler.query_sync(ping_messages, new_model, stream_enabled=False, is_warmup=True)
 
-                        if self.ctx.backend == "ollama":
-                            ptokens = res_ping.get("prompt_eval_count", 0)
-                        else:
-                            usage_block = res_ping.get("usage", {})
-                            ptokens = usage_block.get("prompt_tokens", 0)
-                        if ptokens > 0:
-                            self.ctx.current_context_tokens = ptokens
+                        # The ping is a chat-shaped request, not the next query's
+                        # payload (agentic mode swaps the system prompt and adds
+                        # `tools`), and llama.cpp reports a KV-cache delta — so
+                        # rebuild the bar from the outbound definition instead of
+                        # trusting the ping's usage block.
+                        self._refresh_context_bar()
 
                     print(colorize(f"[Switched to '{new_model}']", 'success'), file=sys.stderr)
                     return False
@@ -9936,6 +10209,9 @@ class ChatLoop:
             if hasattr(self.ctx, '_saved_system_prompt'):
                 self.ctx.system_prompt = self.ctx._saved_system_prompt
         print(colorize(f"[Agentic mode: {state}]", 'success' if self.ctx.agentic_mode else 'warning'), file=sys.stderr)
+        # The request shape changed (system prompt and/or tools array), so the
+        # bar must follow immediately instead of waiting for the next query.
+        self._refresh_context_bar()
         return False
 
     def _agentic_set_full(self) -> bool:
@@ -9963,6 +10239,7 @@ class ChatLoop:
         print(colorize("[Trace: ON]", 'info'), file=sys.stderr)
         print(colorize("[Auto-confirm: ON]", 'info'), file=sys.stderr)
         print(colorize("[Lazy tool extraction: ON]", 'info'), file=sys.stderr)
+        self._refresh_context_bar()
         return False
 
     def _agentic_toggle_plan(self, parts: list) -> bool:
@@ -10005,6 +10282,7 @@ class ChatLoop:
             elif hasattr(self.ctx, '_saved_system_prompt'):
                 self.ctx.system_prompt = self.ctx._saved_system_prompt
             print(colorize("[Agentic plan mode: OFF — read-only restrictions lifted]", 'warning'), file=sys.stderr)
+            self._refresh_context_bar()
             return False
 
         want_run = (arg == "run")
@@ -10018,6 +10296,7 @@ class ChatLoop:
             self.ctx.system_prompt = get_agentic_prompt(
                 self.ctx.model, plan_mode=True, plan_run=want_run)
             self._print_plan_mode_status()
+            self._refresh_context_bar()
             return False
 
         self.ctx._plan_prev_agentic = self.ctx.agentic_mode
@@ -10036,6 +10315,7 @@ class ChatLoop:
         self.ctx.system_prompt = get_agentic_prompt(
             self.ctx.model, plan_mode=True, plan_run=want_run)
         self._print_plan_mode_status()
+        self._refresh_context_bar()
         return False
 
     def _print_plan_mode_status(self) -> None:
@@ -11130,6 +11410,162 @@ class ChatLoop:
             iteration, expired, messages, step_timeout,
             partial_text, partial_thought, content_is_tool, _nudge_metrics)
 
+    def _agentic_prompt_and_tools(self) -> tuple:
+        """Build the agentic system prompt and native `tools` array for a query.
+
+        Single source of truth for `/tokencount`: whatever this returns is
+        exactly what `_init_agentic_query` puts on the wire, so the preview cannot
+        drift from the request.
+
+        Returns:
+            (system content, native tools array or None, send_tools_api flag).
+        """
+        include_tool_defs = get_tool_format(self.ctx.model) != "openai"
+        tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
+        content = get_agentic_prompt(
+            self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
+            plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)
+        tools = None if include_tool_defs else self.tool_registry.openai_tools_spec()
+        return content, tools, not include_tool_defs
+
+    def _wire_system_and_tools(self) -> tuple:
+        """Return (system content, native tools array, short mode label).
+
+        Mirrors what the next query will send: chat mode uses `ctx.system_prompt`,
+        agentic and plan modes rebuild the prompt the same way the ReAct loop does.
+
+        Returns:
+            (system content, tools array or None, label such as "agentic, plan").
+        """
+        if not self.ctx.agentic_mode and not self.ctx.plan_mode:
+            return self.ctx.system_prompt, None, "chat"
+        content, tools, _send_tools_api = self._agentic_prompt_and_tools()
+        if self.ctx.plan_mode:
+            label = "agentic, plan run" if getattr(self.ctx, 'plan_run', False) else "agentic, plan"
+        else:
+            label = "agentic"
+        return content, tools, label
+
+    def _refresh_context_bar(self, messages: Optional[list[Message]] = None,
+                             exact: bool = True) -> int:
+        """Recompute `ctx.current_context_tokens` from the outbound request.
+
+        Single definition for every context view: the status bar, the per-query
+        stats line, `/stats` and `/tokencount` all report the request as the
+        backend sees it — the wire system prompt (with the /maxtokens cap line),
+        the conversation, the native `tools` array and the template framing —
+        instead of the stored message sum, which omits the system-prompt swap and
+        the tools array entirely (measured: 113 stored vs 2770 sent in
+        `/agentic plan`).
+
+        Args:
+            messages: Message list to measure; defaults to the stored history.
+                A local ReAct list works too: its system message is replaced by
+                the wire prompt, never double-counted.
+            exact: Ask the backend for a whole-request count (one round-trip on
+                Strata). False uses the component estimate, for hot paths such as
+                the per-step ReAct bar refresh.
+
+        Returns:
+            The new `ctx.current_context_tokens`.
+        """
+        target = getattr(self, 'messages', None) if messages is None else messages
+        if not target:
+            self.ctx.current_context_tokens = 0
+            return 0
+        try:
+            system, tools, _mode = self._wire_system_and_tools()
+            configured = int(getattr(self.ctx, 'max_output_tokens', DEFAULT_MAX_OUTPUT_TOKENS)
+                             or DEFAULT_MAX_OUTPUT_TOKENS)
+            system = self.query_handler._with_output_cap_line(
+                [{'role': 'system', 'content': system}], configured)[0]['content']
+            if not isinstance(system, str):
+                system = ''
+            self.ctx.current_context_tokens = self.ctx.outbound_tokens(
+                system, target, tools, exact=exact)
+        except Exception:
+            # Never let a failed count break the loop; fall back to the stored sum.
+            self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(target)
+        return self.ctx.current_context_tokens
+
+    def _prompt_overhead_tokens(self, messages: Optional[list[Message]] = None) -> int:
+        """Tokens the request costs beyond the message sum in `messages`.
+
+        Compaction budgets must reserve room for whatever is sent but not stored
+        (system-prompt swap, `tools` array, framing), so the trigger point matches
+        the number the status bar shows.
+
+        Args:
+            messages: Message list to measure; defaults to the stored history.
+
+        Returns:
+            Non-negative overhead in tokens.
+        """
+        target = getattr(self, 'messages', None) if messages is None else messages
+        if not target:
+            return 0
+        stored = self.ctx.calculate_context_tokens(target)
+        return max(0, self._refresh_context_bar(target, exact=False) - stored)
+
+    def _wire_snapshot(self) -> Dict:
+        """Describe the request the next query would send, for `/tokencount`.
+
+        The system message and the `tools` array are built per query and never
+        stored in `self.messages`, which is why a stored-history token count
+        under-reports the prompt. Everything here mirrors the payload: the system
+        prompt for the active mode (with the /maxtokens cap line), the
+        conversation body, the tools array and the template framing.
+
+        Returns:
+            dict with mode, system, system_tokens, conversation_tokens,
+            tools, tools_tokens, overhead, total and source.
+        """
+        system, tools, mode = self._wire_system_and_tools()
+        configured = int(getattr(self.ctx, 'max_output_tokens', DEFAULT_MAX_OUTPUT_TOKENS)
+                         or DEFAULT_MAX_OUTPUT_TOKENS)
+        system = self.query_handler._with_output_cap_line(
+            [{'role': 'system', 'content': system}], configured)[0]['content']
+        stored = getattr(self, 'messages', None) or []
+        conversation = [m for m in stored if m.get('role') != 'system']
+        system_tokens = self.ctx.tokenize(system)
+        conversation_tokens = self.ctx.calculate_context_tokens(conversation)
+        counted = self.ctx.count_wire_tokens(system, conversation, tools)
+        total = counted['total']
+        source = counted['source']
+        tools_tokens = counted['tools']
+        if tools_tokens is None:
+            # No template-accurate measurement: fall back to tokenizing the
+            # serialized array (exact tokenizer, approximate rendering).
+            tools_tokens = self.ctx.count_tools_tokens(tools)
+        components = system_tokens + conversation_tokens + tools_tokens
+        if total is not None:
+            # Sanity-check the counter: a rendered prompt is not the sum of its
+            # parts (the template shares framing), so `total` may legitimately be
+            # slightly BELOW `components`. Only discard it when it clearly did not
+            # include the tools array (e.g. /apply-template on a build that drops
+            # `tools`), which is the case that would show negative framing.
+            included_tools = total - (system_tokens + conversation_tokens)
+            if (tools_tokens and included_tools < 0.5 * tools_tokens) or total < 0.5 * components:
+                total, source = None, 'none'
+        if total is None:
+            # No whole-request counter: each message carries ~2 role tokens.
+            overhead = 2 * len(conversation)
+            total = components + overhead
+        else:
+            overhead = total - components
+        return {
+            'mode': mode,
+            'system': system,
+            'system_tokens': system_tokens,
+            'conversation_messages': len(conversation),
+            'conversation_tokens': conversation_tokens,
+            'tools': tools,
+            'tools_tokens': tools_tokens,
+            'overhead': overhead,
+            'total': total,
+            'source': source,
+        }
+
     def _init_agentic_query(self, final_content: str) -> Optional[tuple]:
         """Initialize messages, logger, and tool format for an agentic query.
 
@@ -11142,26 +11578,14 @@ class ChatLoop:
         if not getattr(self, 'messages', None):
             self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
 
-        tool_format = get_tool_format(self.ctx.model)
-        if tool_format == "openai":
-            include_tool_defs = False
-            send_tools_api = True
-        else:
-            include_tool_defs = True
-            send_tools_api = False
-
-        tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
-        messages = [{'role': 'system', 'content': get_agentic_prompt(
-            self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
-            plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)}]
+        content, openai_tools, send_tools_api = self._agentic_prompt_and_tools()
+        messages = [{'role': 'system', 'content': content}]
         if len(self.messages) > 1:
             messages.extend(self.messages[1:])
 
         logger = AgenticLogger() if self.ctx.agentic_logging else None
         if logger:
             logger.write(type="start", user_input=final_content)
-
-        openai_tools = self.tool_registry.openai_tools_spec()
 
         return messages, logger, openai_tools, send_tools_api
 
@@ -11659,12 +12083,16 @@ class ChatLoop:
         """
         if self.ctx.context_window_size <= 0:
             return messages
-        msg_tokens = self.ctx.calculate_context_tokens(messages)
+        # The local list already carries the agentic system prompt, so the
+        # overhead here is the `tools` array plus template framing.
+        overhead = self._prompt_overhead_tokens(messages)
+        msg_tokens = self.ctx.calculate_context_tokens(messages) + overhead
         if msg_tokens <= int(self.ctx.context_window_size * self.ctx.agentic_compact_threshold):
             return messages
         before_len = len(messages)
         messages = compact_messages(messages, self.ctx,
-                                    keep_recent=max(8, COMPACTION_KEEP_RECENT))
+                                    keep_recent=max(8, COMPACTION_KEEP_RECENT),
+                                    overhead_tokens=overhead)
         print(colorize(f"\n[Auto-compact] Agentic context: {before_len} → {len(messages)} msgs",
                        'warning'), file=sys.stderr)
         return messages
@@ -11712,7 +12140,7 @@ class ChatLoop:
                     'warning'), file=sys.stderr)
 
         # Recalculate context tokens after merging agentic history
-        self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
+        self._refresh_context_bar()
 
     def _parse_agentic_tool_calls(self, response_text: str, api_tool_calls: list) -> list:
         """Build normalized tool calls from either native API calls or inline JSON text.
@@ -12088,9 +12516,11 @@ class ChatLoop:
                 if _pt > 0:
                     self.ctx.current_context_tokens = _pt + _et
             else:
-                # llama.cpp KV cache makes prompt_tokens unreliable;
-                # recalculate from actual messages for accuracy
-                self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(messages)
+                # Same definition as the post-query bar: system prompt +
+                # conversation + tools + framing. Estimate only — this runs once
+                # per ReAct step, and an exact count would add a round-trip per
+                # step (llama.cpp re-renders the whole prompt).
+                self._refresh_context_bar(messages, exact=False)
 
         # Check for API-level errors from query_sync
         if isinstance(response, dict) and "error" in response and not response.get("choices") and not response.get("message", {}).get("content"):
@@ -12184,6 +12614,12 @@ class ChatLoop:
 
             self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text,
                                          content_streamed=content_streamed)
+        # The finalize path appends the answer to `self.messages` after the last
+        # request was measured, so re-measure once: otherwise the bar keeps the
+        # pre-answer value and disagrees with /tokencount. Skipped on api_error —
+        # the backend is unreachable and a count round-trip would stall.
+        if not api_error:
+            self._refresh_context_bar()
 
         if logger:
             logger.write(type="end", total_iterations=iteration)
@@ -12364,6 +12800,7 @@ class ChatLoop:
             # ChatLoop.run prints the [Interrupted] banner and resumes the prompt.
             if 'messages' in locals() and 'agentic_seed_len' in locals():
                 self._persist_agentic_history(messages, agentic_seed_len)
+                self._refresh_context_bar(messages, exact=False)
             raise
         except Exception as e:
             print(colorize(f"\n[Agentic] Internal error: {e}", 'error'), file=sys.stderr)
@@ -12413,6 +12850,9 @@ class ChatLoop:
             return False
         before_len = len(self.messages)
         before_tokens = self.ctx.calculate_context_tokens(self.messages)
+        # Reserve room for what is sent but not stored (system swap, tools,
+        # framing) so the budget matches the number the status bar shows.
+        overhead = self._prompt_overhead_tokens()
 
         # Repair any orphaned tool messages before summarizing/compacting so
         # strict chat templates (gpt-oss) don't reject the resulting history.
@@ -12450,7 +12890,8 @@ class ChatLoop:
                     "[Compact] LLM summarization failed; fell back to mechanical compaction.",
                     'muted'), file=sys.stderr)
         else:
-            self.messages = compact_messages(self.messages, self.ctx, force=force)
+            self.messages = compact_messages(self.messages, self.ctx, force=force,
+                                             overhead_tokens=overhead)
         after_tokens = self.ctx.calculate_context_tokens(self.messages)
 
         # Phase 2: if still over the target budget (COMPACTION_TARGET) and
@@ -12460,7 +12901,7 @@ class ChatLoop:
             if after_tokens > target and len(self.messages) > 1:
                 after_tokens = self._compact_truncate_largest(target)
 
-        self.ctx.current_context_tokens = after_tokens
+        self._refresh_context_bar()
         print(colorize(
             f"[Compact] {before_len} → {len(self.messages)} messages, "
             f"{before_tokens} → {after_tokens} tokens "
@@ -12664,7 +13105,7 @@ class ChatLoop:
                 dropped_tokens += tokens
                 del self.messages[idx]
 
-            self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
+            self._refresh_context_bar()
             print(colorize(
                 f"[Drop] Removed {len(indices)} message(s), freed ~{dropped_tokens} tokens. "
                 f"Now: {len(self.messages)} msgs, {self.ctx.current_context_tokens} tokens.",
@@ -12673,31 +13114,39 @@ class ChatLoop:
         return None
 
     def run_handle_tokencount(self, full_input: str) -> Optional[bool]:
-        """Handle /tokencount command to show token breakdown.
+        """Handle /tokencount: stored-history table plus the real request cost.
 
-        ` /tokencount <index>` additionally unfolds the full content of that
-        message below the summary table.
+        The system prompt and the native `tools` array are built per query and
+        never stored in `self.messages`, so a stored-history count under-reports
+        what the server receives. This prints both: the per-message table, then
+        the totals for the request the next query would send (system prompt with
+        the /maxtokens cap line, conversation body, tools, template framing).
+
+        `/tokencount <index>` additionally unfolds the full content of that message.
         """
-        if full_input.startswith('/tokencount'):
-            if not hasattr(self, 'messages') or not self.messages:
+        if not full_input.startswith('/tokencount'):
+            return None
+        messages = getattr(self, 'messages', None) or []
+        parts = full_input.split()
+        unfold_index = None
+        if len(parts) > 1:
+            try:
+                unfold_index = int(parts[1])
+            except ValueError:
+                unfold_index = None
+            if unfold_index is not None and not messages:
                 print(colorize("[TokenCount] No messages in session.", 'warning'), file=sys.stderr)
                 return False
-            parts = full_input.split()
-            unfold_index = None
-            if len(parts) > 1:
-                try:
-                    unfold_index = int(parts[1])
-                except ValueError:
-                    unfold_index = None
-                if unfold_index is not None and not (0 <= unfold_index < len(self.messages)):
-                    print(colorize(
-                        f"[TokenCount] Index {unfold_index} out of range (0-{len(self.messages) - 1}).",
-                        'error'), file=sys.stderr)
-                    return False
+            if unfold_index is not None and not (0 <= unfold_index < len(messages)):
+                print(colorize(
+                    f"[TokenCount] Index {unfold_index} out of range (0-{len(messages) - 1}).",
+                    'error'), file=sys.stderr)
+                return False
+        print(colorize("\n--- Token Breakdown ---", 'info'), file=sys.stderr)
+        if messages:
             total = 0
             exact_count = 0
-            print(colorize("\n--- Token Breakdown ---", 'info'), file=sys.stderr)
-            for i, msg in enumerate(self.messages):
+            for i, msg in enumerate(messages):
                 role = msg.get('role', 'unknown')
                 content = msg.get('content', '')
                 if '_tokens' in msg:
@@ -12715,15 +13164,61 @@ class ChatLoop:
                     ok = 'OK' if 'ERROR' not in content[:100] else 'KO'
                     preview = f"[{ok}] {preview}"
                 print(colorize(f"  [{i:3d}] {role:10s} {marker}{tokens:6d} tok  {preview}", 'info'), file=sys.stderr)
-            print(colorize(f"\n  Total: {total} tokens ({exact_count}/{len(self.messages)} exact, · = exact, ~ = estimated)", 'info'), file=sys.stderr)
-            if self.ctx.context_window_size > 0:
-                pct = total / self.ctx.context_window_size
-                print(colorize(f"  Context: {total}/{self.ctx.context_window_size} ({pct:.1%})", 'info'), file=sys.stderr)
-            if unfold_index is not None:
-                self._print_full_message(unfold_index)
-            print(colorize("--- End Token Breakdown ---\n", 'info'), file=sys.stderr)
-            return False
-        return None
+            print(colorize(f"\n  Stored history: {total} tokens ({exact_count}/{len(messages)} exact, · = exact, ~ = estimated)", 'info'), file=sys.stderr)
+        else:
+            print(colorize("  (no stored history yet)", 'muted'), file=sys.stderr)
+        self._print_wire_totals()
+        if unfold_index is not None:
+            self._print_full_message(unfold_index)
+        print(colorize("--- End Token Breakdown ---\n", 'info'), file=sys.stderr)
+        return False
+
+    def _print_wire_totals(self) -> None:
+        """Print the token cost of the request the next query would send.
+
+        Components come from the backend tokenizer. Where the backend can count
+        the whole request, that count is authoritative and no framing line is
+        shown: a rendered prompt is not additive (the template shares framing
+        between messages and the tools block), so the components can differ from
+        the total by a few percent without either number being wrong.
+        """
+        try:
+            wire = self._wire_snapshot()
+        except Exception as e:
+            print(colorize(f"  [wire] unavailable: {e}", 'warning'), file=sys.stderr)
+            return
+        exact = wire['source'] != 'none'
+        mark = "·" if exact else "~"
+        print(colorize("\n--- Next Request (sent to the server) ---", 'info'), file=sys.stderr)
+        rows = [
+            (f"system prompt ({wire['mode']})", wire['system_tokens']),
+            (f"conversation ({wire['conversation_messages']} msgs)", wire['conversation_tokens']),
+        ]
+        if wire['tools']:
+            size_kb = len(json.dumps(wire['tools'])) / 1024
+            rows.append((f"tools ({len(wire['tools'])} schemas, {size_kb:.1f} KB)", wire['tools_tokens']))
+        else:
+            rows.append(("tools (none in this mode)", 0))
+        for label, tokens in rows:
+            print(colorize(f"  {label:<40} ·{tokens:6d} tok", 'info'), file=sys.stderr)
+        if not exact:
+            print(colorize(f"  {'role/template overhead':<40} ~{wire['overhead']:6d} tok", 'info'), file=sys.stderr)
+        print(colorize(f"  {'-' * 50}", 'muted'), file=sys.stderr)
+        print(colorize(f"  {'Total sent':<40} {mark}{wire['total']:6d} tok", 'info'), file=sys.stderr)
+        source = {
+            'strata': "exact total: server count_tokens; components are counted independently, "
+                      "so shared template framing may make them differ slightly",
+            'llamacpp': "exact total: apply-template + tokenize; same caveat on the components",
+        }.get(wire['source'], "estimate: sum of the components; this backend has no whole-request counter")
+        print(colorize(f"  [{source}]", 'muted'), file=sys.stderr)
+        # Keep the status bar in lockstep with the view just printed: it is the
+        # same request, so there is nothing to reconcile.
+        self.ctx.current_context_tokens = wire['total']
+        if self.ctx.context_window_size > 0:
+            pct = wire['total'] / self.ctx.context_window_size
+            print(colorize(
+                f"  Context: {wire['total']}/{self.ctx.context_window_size} ({pct:.1%})",
+                'info'), file=sys.stderr)
 
     def _print_full_message(self, index: int) -> None:
         """Print the complete content of message `index` to stderr."""
@@ -12779,7 +13274,7 @@ class ChatLoop:
                 return False
             self.messages = session_data.get('messages', [])
             msg_count = len(self.messages)
-            self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
+            self._refresh_context_bar()
             model = session_data.get('model', '')
             print(colorize(
                 f"[Resume] Loaded session {session_data['id']} ({msg_count} messages, "
@@ -12818,11 +13313,13 @@ class ChatLoop:
         if window <= 0:
             return messages
         reserve = min(MAX_OUTPUT_RESERVE, int(window * 0.05))
-        prompt_tokens = self.ctx.calculate_context_tokens(messages)
+        overhead = self._prompt_overhead_tokens(messages)
+        prompt_tokens = self.ctx.calculate_context_tokens(messages) + overhead
         if window - prompt_tokens - reserve > 0:
             return messages
         before_len = len(messages)
-        messages = compact_messages(messages, self.ctx, force=True)
+        messages = compact_messages(messages, self.ctx, force=True,
+                                    overhead_tokens=overhead)
         print(colorize(
             f"[Auto-compact] Forced (no output room): {before_len} → {len(messages)} msgs",
             'warning'), file=sys.stderr)
@@ -12844,7 +13341,10 @@ class ChatLoop:
         window = self.ctx.context_window_size
         if window <= 0:
             return None
-        prompt_tokens = self.ctx.calculate_context_tokens(messages)
+        # Include the tools array and system swap: at a 90% threshold a 2K
+        # `tools` block is 6% of a 32K window and the nudge would fire late.
+        prompt_tokens = (self.ctx.calculate_context_tokens(messages)
+                         + self._prompt_overhead_tokens(messages))
         if prompt_tokens < int(window * NEAR_FULL_THRESHOLD):
             return None
         return {'role': 'user', 'content': context_budget_nudge(prompt_tokens, window),
@@ -12883,18 +13383,24 @@ class ChatLoop:
         self.messages.append(user_msg)
         sanitize_tool_pairing(self.messages)
 
-        # Auto-compaction: compact if approaching context limit
+        # Auto-compaction: compact if approaching context limit. The trigger and
+        # the budget both include the wire-only overhead (system swap + tools +
+        # framing) so they match the status bar instead of firing late by that
+        # amount.
         if self.ctx.context_window_size > 0:
-            msg_tokens = self.ctx.calculate_context_tokens(self.messages)
+            overhead = self._prompt_overhead_tokens()
+            msg_tokens = self.ctx.calculate_context_tokens(self.messages) + overhead
             threshold = int(self.ctx.context_window_size * self.ctx.compaction_threshold)
             if msg_tokens > threshold:
                 before_len = len(self.messages)
-                self.messages = compact_messages(self.messages, self.ctx)
+                self.messages = compact_messages(self.messages, self.ctx,
+                                                 overhead_tokens=overhead)
                 after_tokens = self.ctx.calculate_context_tokens(self.messages)
                 print(colorize(
                     f"[Auto-compact] {before_len} → {len(self.messages)} msgs, "
-                    f"{msg_tokens} → {after_tokens} tokens",
+                    f"{msg_tokens} → {after_tokens + overhead} tokens (incl. {overhead} request overhead)",
                     'warning'), file=sys.stderr)
+                self._refresh_context_bar()
 
         self.messages = self._force_compact_if_no_output_room(self.messages)
 
@@ -12931,7 +13437,7 @@ class ChatLoop:
                         assistant_msg['reasoning_content'] = thought
                 self.ctx.stamp_tokens(assistant_msg)
                 self.messages.append(assistant_msg)
-                self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(self.messages)
+                self._refresh_context_bar()
                 print()
 
 

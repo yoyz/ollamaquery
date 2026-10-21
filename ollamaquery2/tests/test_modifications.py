@@ -2080,6 +2080,386 @@ class TestInputHelpers(unittest.TestCase):
 
 
 # ============================================================================
+# Wire token accounting (/tokencount mirrors the real request)
+# ============================================================================
+
+
+class TestWireTokenCount(unittest.TestCase):
+    """`/tokencount` must report the request the server actually receives.
+
+    The system prompt and the native `tools` array are built per query and never
+    stored in `self.messages`, so a stored-history count under-reports the prompt
+    (measured live on Strata: 113 stored vs 2770 sent in agentic plan mode).
+    """
+
+    def setUp(self):
+        self.ctx = m.CommandContext()
+        self._saved = (self.ctx.backend, self.ctx.base_url, self.ctx.model,
+                       self.ctx.agentic_mode, self.ctx.plan_mode, self.ctx.plan_run,
+                       self.ctx.context_window_size, self.ctx.max_output_tokens)
+        # llamacpp has no whole-request counter here, so the deterministic
+        # component-sum fallback is exercised unless a test says otherwise.
+        self.ctx.backend = 'llamacpp'
+        self.ctx.base_url = 'http://127.0.0.1:1'
+        self.ctx.context_window_size = 32768
+        self.ctx.max_output_tokens = m.DEFAULT_MAX_OUTPUT_TOKENS
+        self.ctx.agentic_mode = False
+        self.ctx.plan_mode = False
+        self.ctx.plan_run = False
+        self.ctx._tools_token_cache.clear()
+        self.loop = m.ChatLoop(self.ctx)
+        self.loop.messages = [
+            {'role': 'system', 'content': 'sys', '_tokens': 10},
+            {'role': 'user', 'content': 'hi', '_tokens': 2},
+        ]
+        # No network: these tests are about accounting, not about the backend.
+        # Individual tests override these with their own patch where needed.
+        self._patches = [
+            patch.object(m.CommandContext, 'tokenize',
+                         side_effect=lambda text: max(1, len(text) // 4)),
+            patch.object(m.CommandContext, 'count_wire_tokens',
+                         return_value={'total': None, 'tools': None, 'source': 'none'}),
+        ]
+        for patcher in self._patches:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in self._patches:
+            patcher.stop()
+        (self.ctx.backend, self.ctx.base_url, self.ctx.model,
+         self.ctx.agentic_mode, self.ctx.plan_mode, self.ctx.plan_run,
+         self.ctx.context_window_size, self.ctx.max_output_tokens) = self._saved
+        self.ctx._tools_token_cache.clear()
+
+    # --- count_tools_tokens ---
+
+    def test_no_tools_costs_nothing(self):
+        self.assertEqual(self.ctx.count_tools_tokens(None), 0)
+        self.assertEqual(self.ctx.count_tools_tokens([]), 0)
+
+    def test_tools_counted_with_tokenizer_not_heuristic(self):
+        tools = [{'type': 'function', 'function': {'name': 'read_file'}}]
+        with patch.object(m.CommandContext, 'tokenize', return_value=42) as tok:
+            self.assertEqual(self.ctx.count_tools_tokens(tools), 42)
+        self.assertEqual(tok.call_count, 1)
+        # The serialized array is what gets tokenized, not a chars/N guess.
+        self.assertIn('read_file', tok.call_args[0][0])
+
+    def test_tools_count_is_cached_per_array(self):
+        tools = [{'type': 'function', 'function': {'name': 'read_file'}}]
+        with patch.object(m.CommandContext, 'tokenize', return_value=42) as tok:
+            self.ctx.count_tools_tokens(tools)
+            self.ctx.count_tools_tokens(tools)
+            self.assertEqual(tok.call_count, 1)
+            self.ctx.count_tools_tokens([{'type': 'function', 'function': {'name': 'glob'}}])
+            self.assertEqual(tok.call_count, 2)
+
+    # --- wire message sanitizing ---
+
+    def test_wire_messages_drops_harness_keys(self):
+        wire = m.CommandContext._wire_messages([
+            {'role': 'user', 'content': 'hi', '_tokens': 2, '_system_nudge': True,
+             '_near_full_nudge': True, 'images': ['BASE64']},
+            {'role': 'assistant', 'content': '', 'tool_calls': [{'id': 'c1'}]},
+            {'role': 'tool', 'content': 'ok', 'tool_call_id': 'c1'},
+            {'role': 'bogus', 'content': 'x'},
+        ])
+        self.assertEqual([w['role'] for w in wire], ['user', 'assistant', 'tool'])
+        self.assertNotIn('_tokens', wire[0])
+        self.assertNotIn('_system_nudge', wire[0])
+        self.assertNotIn('_near_full_nudge', wire[0])
+        self.assertNotIn('images', wire[0])
+        self.assertEqual(wire[1]['tool_calls'][0]['id'], 'c1')
+        self.assertEqual(wire[2]['tool_call_id'], 'c1')
+
+    # --- prompt/tools construction ---
+
+    def test_native_model_gets_tools_array_not_inline_defs(self):
+        self.ctx.model = 'qwen3.5:9b'
+        content, tools, send_tools_api = self.loop._agentic_prompt_and_tools()
+        self.assertTrue(send_tools_api)
+        self.assertIsNotNone(tools)
+        self.assertEqual(len(tools), len(m.AGENTIC_TOOL_DEFS))
+        # Inline definitions must not be duplicated into the prompt.
+        self.assertNotIn('"name": "read_file"', content)
+
+    def test_inline_model_gets_defs_in_prompt_not_tools_array(self):
+        self.ctx.model = 'nemotron-cascade-2-30b'
+        content, tools, send_tools_api = self.loop._agentic_prompt_and_tools()
+        self.assertFalse(send_tools_api)
+        self.assertIsNone(tools)
+        self.assertIn('read_file', content)
+
+    def test_wire_system_and_tools_chat_mode_has_no_tools(self):
+        system, tools, mode = self.loop._wire_system_and_tools()
+        self.assertEqual(mode, 'chat')
+        self.assertIsNone(tools)
+        self.assertEqual(system, self.ctx.system_prompt)
+
+    def test_wire_system_and_tools_labels_agentic_tiers(self):
+        self.ctx.model = 'qwen3.5:9b'
+        self.ctx.agentic_mode = True
+        self.assertEqual(self.loop._wire_system_and_tools()[2], 'agentic')
+        self.ctx.plan_mode = True
+        self.assertEqual(self.loop._wire_system_and_tools()[2], 'agentic, plan')
+        self.ctx.plan_run = True
+        self.assertEqual(self.loop._wire_system_and_tools()[2], 'agentic, plan run')
+
+    # --- wire snapshot ---
+
+    def test_snapshot_includes_cap_line_in_system_prompt(self):
+        snap = self.loop._wire_snapshot()
+        self.assertIn(m.max_output_cap_line(self.ctx.max_output_tokens), snap['system'])
+        self.assertGreater(snap['system_tokens'], 0)
+
+    def test_snapshot_falls_back_to_component_sum(self):
+        self.ctx.model = 'qwen3.5:9b'
+        self.ctx.agentic_mode = True
+        with patch.object(m.CommandContext, 'count_wire_tokens',
+                          return_value={'total': None, 'tools': None, 'source': 'none'}), \
+             patch.object(m.CommandContext, 'tokenize', return_value=100), \
+             patch.object(m.CommandContext, 'count_tools_tokens', return_value=2000):
+            snap = self.loop._wire_snapshot()
+        self.assertEqual(snap['source'], 'none')
+        self.assertEqual(snap['system_tokens'], 100)
+        self.assertEqual(snap['conversation_tokens'], 2)  # cached _tokens of the one user msg
+        self.assertEqual(snap['tools_tokens'], 2000)
+        self.assertEqual(snap['total'],
+                         100 + snap['conversation_tokens'] + 2000 + snap['overhead'])
+        self.assertEqual(snap['overhead'], 2 * snap['conversation_messages'])
+
+    def test_snapshot_uses_exact_server_total_and_derives_framing(self):
+        self.ctx.model = 'qwen3.5:9b'
+        self.ctx.agentic_mode = True
+        with patch.object(m.CommandContext, 'count_wire_tokens',
+                          return_value={'total': 5000, 'tools': 2500, 'source': 'strata'}), \
+             patch.object(m.CommandContext, 'tokenize', return_value=300):
+            snap = self.loop._wire_snapshot()
+        self.assertEqual(snap['total'], 5000)
+        self.assertEqual(snap['tools_tokens'], 2500)
+        self.assertEqual(snap['overhead'],
+                         5000 - (snap['system_tokens'] + snap['conversation_tokens'] + 2500))
+
+    def test_snapshot_ignores_counter_that_drops_tools(self):
+        """A counter that ignores the tools array must not yield negative framing."""
+        self.ctx.model = 'qwen3.5:9b'
+        self.ctx.agentic_mode = True
+        with patch.object(m.CommandContext, 'count_wire_tokens',
+                          return_value={'total': 50, 'tools': None, 'source': 'llamacpp'}), \
+             patch.object(m.CommandContext, 'tokenize', return_value=100), \
+             patch.object(m.CommandContext, 'count_tools_tokens', return_value=2000):
+            snap = self.loop._wire_snapshot()
+        self.assertEqual(snap['source'], 'none')
+        self.assertGreaterEqual(snap['overhead'], 0)
+        self.assertGreaterEqual(snap['total'], 100 + 2000)
+
+    def test_snapshot_keeps_exact_total_below_component_sum(self):
+        """Independent component counts can exceed the exact total; keep the total.
+
+        Live regression: system 654 + conversation 259 + tools 2044 = 2957
+        components vs 2862 counted by the server, because the template shares
+        framing. An earlier guard (`total < components` ⇒ discard) silently threw
+        the exact number away after every agentic turn.
+        """
+        self.ctx.model = 'qwen3.5:9b'
+        self.ctx.agentic_mode = True
+        self.loop.messages = [
+            {'role': 'system', 'content': 'sys', '_tokens': 99},
+            {'role': 'user', 'content': 'hi', '_tokens': 3},
+            {'role': 'assistant', 'content': 'hello', '_tokens': 11},
+            {'role': 'user', 'content': 'hi', '_tokens': 3},
+            {'role': 'assistant', 'content': 'hello again', '_tokens': 242},
+        ]
+        with patch.object(m.CommandContext, 'count_wire_tokens',
+                          return_value={'total': 2862, 'tools': 2044, 'source': 'strata'}), \
+             patch.object(m.CommandContext, 'tokenize', return_value=654):
+            snap = self.loop._wire_snapshot()
+        self.assertEqual(snap['source'], 'strata')
+        self.assertEqual(snap['total'], 2862)
+        self.assertEqual(snap['tools_tokens'], 2044)
+        self.assertGreater(snap['system_tokens'] + snap['conversation_tokens'] + 2044, 2862)
+
+    def test_snapshot_works_without_history(self):
+        self.loop.messages = []
+        snap = self.loop._wire_snapshot()
+        self.assertEqual(snap['conversation_messages'], 0)
+        self.assertEqual(snap['conversation_tokens'], 0)
+        self.assertGreater(snap['total'], 0)
+
+    # --- output cap reserves room for tools ---
+
+    def test_apply_output_cap_reserves_room_for_tools(self):
+        self.ctx.context_window_size = 8192
+        msgs = [{'role': 'system', 'content': 'sys'}, {'role': 'user', 'content': 'hi'}]
+        with patch.object(m.CommandContext, 'count_tools_tokens', return_value=0):
+            _, without = self.loop.query_handler._apply_output_cap(msgs, {'tools': [{'a': 1}]})
+        with patch.object(m.CommandContext, 'count_tools_tokens', return_value=1000):
+            _, with_tools = self.loop.query_handler._apply_output_cap(msgs, {'tools': [{'a': 1}]})
+        self.assertEqual(without['max_output_tokens'] - with_tools['max_output_tokens'], 1000)
+
+    # --- strate tool dialect conversion ---
+
+    def test_anthropic_tools_conversion(self):
+        openai_tools = [{'type': 'function', 'function': {
+            'name': 'read_file', 'description': 'Read', 'parameters': {'type': 'object'}}}]
+        converted = m.CommandContext._anthropic_tools(openai_tools)
+        self.assertEqual(converted[0]['name'], 'read_file')
+        self.assertEqual(converted[0]['input_schema'], {'type': 'object'})
+        self.assertNotIn('type', converted[0])
+        self.assertNotIn('function', converted[0])
+
+    def test_anthropic_tools_tolerates_unwrapped_entries(self):
+        converted = m.CommandContext._anthropic_tools([{'name': 'glob'}])
+        self.assertEqual(converted[0]['name'], 'glob')
+        self.assertEqual(converted[0]['input_schema'], {'type': 'object', 'properties': {}})
+
+
+class TestContextBarConsistency(unittest.TestCase):
+    """The status bar, the stats line and `/tokencount` must tell one story.
+
+    Pre-fix the bar was `calculate_context_tokens(self.messages)` — the stored
+    sum — so it reported 113 while the request was 2770 in `/agentic plan` (the
+    system-prompt swap and the 2K tools array were invisible), and the value was
+    written from three different lists. `CommandContext.outbound_tokens()` is now
+    the single definition.
+    """
+
+    def setUp(self):
+        self.ctx = m.CommandContext()
+        self.ctx.backend = 'llamacpp'
+        self.ctx.base_url = 'http://127.0.0.1:1'
+        self.ctx.model = 'qwen3.5:9b'
+        self.ctx.context_window_size = 32768
+        self.ctx.max_output_tokens = m.DEFAULT_MAX_OUTPUT_TOKENS
+        self.ctx.agentic_mode = False
+        self.ctx.plan_mode = False
+        self.ctx.plan_run = False
+        self.ctx._tools_token_cache.clear()
+        self.loop = m.ChatLoop(self.ctx)
+        self.loop.messages = [
+            {'role': 'system', 'content': 'sys', '_tokens': 10},
+            {'role': 'user', 'content': 'hi', '_tokens': 2},
+        ]
+        self._patches = [
+            patch.object(m.CommandContext, 'tokenize',
+                         side_effect=lambda text: max(1, len(text) // 4)),
+            patch.object(m.CommandContext, 'count_wire_tokens',
+                         return_value={'total': None, 'tools': None, 'source': 'none'}),
+        ]
+        for patcher in self._patches:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in self._patches:
+            patcher.stop()
+
+    def test_outbound_tokens_counts_every_wire_component(self):
+        """System (cap line applied) + conversation + tools + 2 role tokens/msg."""
+        with patch.object(m.CommandContext, 'count_tools_tokens', return_value=1500):
+            total = self.ctx.outbound_tokens(
+                'abcd' * 10,  # 40 chars -> 10 tokens under the stubbed tokenizer
+                [
+                    {'role': 'system', 'content': 'stale local prompt', '_tokens': 999},
+                    {'role': 'user', 'content': 'x', '_tokens': 3},
+                    {'role': 'assistant', 'content': 'y', '_tokens': 5},
+                ],
+                tools=[{'type': 'function'}])
+        # 10 (system) + 8 (conversation) + 1500 (tools) + 2*2 (framing)
+        self.assertEqual(total, 10 + 8 + 1500 + 4)
+
+    def test_outbound_tokens_prefers_the_whole_request_counter(self):
+        with patch.object(m.CommandContext, 'count_wire_tokens',
+                          return_value={'total': 999, 'tools': None, 'source': 'strata'}) as counter:
+            total = self.ctx.outbound_tokens('s', [{'role': 'user', 'content': 'hi'}],
+                                             None, exact=True)
+        self.assertEqual(total, 999)
+        # The bar only needs the total: one round-trip, no tools decomposition.
+        self.assertFalse(counter.call_args.kwargs.get('decompose', True))
+
+    def test_bar_ignores_the_system_message_in_a_local_react_list(self):
+        """A ReAct list carries the agentic prompt at [0]; it must not be added twice."""
+        self.ctx.agentic_mode = True
+        captured = {}
+
+        def fake_wire_system_and_tools():
+            captured['system'] = 'AGENTIC PROMPT ' * 8
+            return captured['system'], None, 'agentic'
+
+        with patch.object(m.ChatLoop, '_wire_system_and_tools',
+                          side_effect=fake_wire_system_and_tools):
+            local = [
+                {'role': 'system', 'content': captured.get('system', ''), '_tokens': 1},
+                {'role': 'user', 'content': 'hi', '_tokens': 2},
+                {'role': 'tool', 'content': 'result', '_tokens': 40},
+            ]
+            bar = self.loop._refresh_context_bar(local)
+        expected_system = self.ctx.tokenize('AGENTIC PROMPT ' * 8
+                                            + '\n\n' + m.max_output_cap_line(
+                                                m.DEFAULT_MAX_OUTPUT_TOKENS))
+        self.assertEqual(bar, expected_system + 2 + 40 + 2 * 2)
+
+    def test_bar_matches_wire_snapshot(self):
+        """Both views share one definition, so they cannot drift apart."""
+        self.ctx.agentic_mode = True
+        with patch.object(m.ChatLoop, '_wire_system_and_tools',
+                          return_value=('prompt ' * 20, [{'type': 'function'}], 'agentic')), \
+             patch.object(m.CommandContext, 'count_tools_tokens', return_value=700):
+            snapshot_total = self.loop._wire_snapshot()['total']
+            bar = self.loop._refresh_context_bar()
+        self.assertEqual(bar, snapshot_total)
+        self.assertGreater(bar, 700)  # the tools array is in there
+
+    def test_bar_is_zero_without_messages(self):
+        self.loop.messages = []
+        self.assertEqual(self.loop._refresh_context_bar(), 0)
+
+    def test_bar_falls_back_to_stored_sum_when_the_system_build_fails(self):
+        with patch.object(m.ChatLoop, '_wire_system_and_tools', side_effect=RuntimeError('boom')):
+            bar = self.loop._refresh_context_bar()
+        self.assertEqual(bar, 12)  # 10 + 2, no crash
+
+    def test_compact_messages_reserves_request_overhead(self):
+        """A payload that fits on paper must still compact once tools are counted."""
+        msgs = [{'role': 'system', 'content': 's', '_tokens': 5}]
+        msgs += [{'role': 'user', 'content': f'm{i}', '_tokens': 40} for i in range(10)]
+        unchanged = m.compact_messages(msgs, self.ctx, target_tokens=500, keep_recent=2)
+        self.assertEqual(len(unchanged), len(msgs))  # 405 stored <= 500 target
+        compacted = m.compact_messages(msgs, self.ctx, target_tokens=500, keep_recent=2,
+                                       overhead_tokens=300)  # 705 > 500
+        self.assertLess(len(compacted), len(msgs))
+
+    def test_stats_reports_the_bar_value_and_the_overhead(self):
+        buf = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = buf
+        try:
+            with patch.object(m.ChatLoop, '_refresh_context_bar', return_value=4321), \
+                 patch.object(m.ChatLoop, '_prompt_overhead_tokens', return_value=321), \
+                 patch.object(m.ChatLoop, '_wire_system_and_tools',
+                              return_value=('sys', None, 'chat')):
+                self.loop.run_handle_stats('/stats')
+        finally:
+            sys.stderr = old_stderr
+        out = buf.getvalue()
+        self.assertIn('In use (chat): 4,321/32,768 (13.2%)', out)
+        self.assertIn('Request overhead: 321 tokens', out)
+        self.assertIn('Stored history: 12 tokens', out)
+
+    def test_tokencount_syncs_the_bar(self):
+        """/tokencount prints the next request, so the bar must adopt that number."""
+        buf = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = buf
+        try:
+            self.loop.run_handle_tokencount('/tokencount')
+        finally:
+            sys.stderr = old_stderr
+        self.assertEqual(self.ctx.current_context_tokens,
+                         self.loop._wire_snapshot()['total'])
+
+
+
+# ============================================================================
 # Run
 # ============================================================================
 
