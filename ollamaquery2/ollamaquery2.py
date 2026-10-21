@@ -29,6 +29,8 @@ import threading
 import time
 import traceback
 import glob
+import hashlib
+import queue
 import difflib
 import unicodedata
 import fnmatch
@@ -61,7 +63,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.2.22"
+__version__ = "0.3.0"
 
 
 # ============================================================================
@@ -463,6 +465,13 @@ COMMANDS = {
         'category': 'Model',
         'description': 'List available agentic tools',
         'usage': '/listtool',
+        'handler': None
+    },
+    'mcp': {
+        'aliases': ['/mcp'],
+        'category': 'Model',
+        'description': 'Inspect and control MCP tool servers',
+        'usage': '/mcp [status|tools [server] [--plan|--all]|connect <server>|disconnect <server>]',
         'handler': None
     },
     # === I/O Operations ===
@@ -1419,6 +1428,10 @@ class CommandContext:
 
         # Session-scoped path access policy (see /agentic acl)
         self.path_acl: PathAcl = PathAcl()
+
+        # MCP client (None unless a config was loaded; see --mcp-config)
+        self.mcp_config: Optional[MCPConfig] = None
+        self.mcp_manager: Optional[MCPManager] = None
 
     # === Properties ===
     @property
@@ -4157,15 +4170,26 @@ PLAN_MODE_RUN_TOOLS = PLAN_MODE_TOOLS | {"run_command"}
 def plan_active_tools(ctx) -> set:
     """Return the plan-mode tool surface for `ctx` (strict vs run tier).
 
+    MCP tools are unioned in when the manager has a catalog: only names whose
+    server declared readOnlyHint true AND that the config does not filter out.
+    The union is fail-safe — if the manager raises, the base surface is returned,
+    so a broken MCP layer can never *widen* plan mode.
+
     Args:
         ctx: CommandContext (or None).
 
     Returns:
-        PLAN_MODE_RUN_TOOLS for `/agentic plan run`, else PLAN_MODE_TOOLS.
+        PLAN_MODE_RUN_TOOLS for `/agentic plan run`, else PLAN_MODE_TOOLS, plus
+        any plan-eligible MCP tool names.
     """
-    if getattr(ctx, "plan_run", False):
-        return PLAN_MODE_RUN_TOOLS
-    return PLAN_MODE_TOOLS
+    base = PLAN_MODE_RUN_TOOLS if getattr(ctx, "plan_run", False) else PLAN_MODE_TOOLS
+    manager = getattr(ctx, "mcp_manager", None) if ctx is not None else None
+    if manager is None:
+        return base
+    try:
+        return base | set(manager.plan_read_only_names())
+    except Exception:
+        return base
 
 # Kubernetes / OpenShift read-only consultation (kubernetes_cluster_query tool).
 # cluster_type auto: KUBECONFIG env var set → online; else omc configured
@@ -4272,7 +4296,8 @@ def _fetch_spill_path(url: str) -> str:
 def _cleanup_spill_files() -> None:
     """Remove all cluster and fetch spill files at process exit."""
     prefixes = (("cluster_result_", ".json"), ("fetch_result_", ".txt"),
-                (UNFINISHED_WRITE_SPILL_NAME, ""))
+                (UNFINISHED_WRITE_SPILL_NAME, ""),
+                (MCP_SPILL_PREFIX, ".json"))
     try:
         if os.path.isdir(CLUSTER_SPILL_DIR):
             for fname in os.listdir(CLUSTER_SPILL_DIR):
@@ -6263,6 +6288,1428 @@ def _is_harmless_get_fetch(command: str) -> str:
         return ""
     return url
 
+# ============================================================================
+# MCP CLIENT (stdio transport)
+# ============================================================================
+# Local MCP servers, one slice at a time. Implemented here: config discovery,
+# stdio transport, JSON-RPC multiplexer, initialize/tools/list/tools/call, the
+# tool catalog, the `/mcp` command surface, and the plan-mode policy.
+#
+# NOT implemented (future slices, each additive): Streamable HTTP + OAuth,
+# prompts/resources/completion, server-initiated sampling/elicitation/roots,
+# notifications/tools/list_changed refresh, reload, circuit breaker. Anything
+# unimplemented fails closed — a server request we do not handle gets a
+# -32601 method-not-found reply, and an unsupported transport is refused at
+# connect time rather than silently spoken wrongly.
+#
+# Safety model: MCP annotations are hints (the spec says clients MUST treat them
+# as untrusted unless the server is trusted). We therefore never infer "safe"
+# from an absent hint: only an explicit readOnlyHint true, combined with a
+# non-contradictory destructiveHint, may enter /agentic plan.
+
+MCP_CONFIG_ENV = "OLLAMAQUERY_MCP_CONFIG"
+MCP_CONFIG_PROJECT = ".ollamaquery-mcp.json"
+MCP_CONFIG_USER = os.path.expanduser("~/.ollamaquery.d/mcp.json")
+
+MCP_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18",
+                         "2025-03-26", "2024-11-05")
+# Classic initialize lifecycle: the simplest interoperable choice, and the one
+# the Go SDK servers negotiate down to from 2026-07-28.
+MCP_PREFERRED_PROTOCOL_VERSION = "2025-11-25"
+MCP_CLIENT_NAME = "ollamaquery2"
+
+# Max inbound stdio frame, matching the Go SDK DefaultMaxLineLength (16 MiB).
+MCP_MAX_FRAME_BYTES = 16 * 1024 * 1024
+
+# Result caps: the configured max_result_chars is a ceiling; the live context
+# window may lower it (a fixed 100K chars is ~25K tokens).
+MCP_RESULT_CHARS_PER_TOKEN = 4
+MCP_RESULT_CONTEXT_FRACTION = 0.25
+MCP_SPILL_PREFIX = "mcp_result_"
+
+# Listing markers (see /mcp tools).
+MCP_MARK_READ_ONLY = "R"
+MCP_MARK_ADDITIVE = "+"
+MCP_MARK_DESTRUCTIVE = "!"
+MCP_MARK_UNDECLARED = "?"
+MCP_MARK_FILTERED = "x"
+MCP_LISTING_VIEWS = ("default", "plan", "all")
+
+MCP_ERR_PARSE = -32700
+MCP_ERR_INVALID_REQUEST = -32600
+MCP_ERR_METHOD_NOT_FOUND = -32601
+MCP_ERR_INVALID_PARAMS = -32602
+MCP_ERR_INTERNAL = -32603
+
+
+class MCPError(Exception):
+    """Base error for the MCP client."""
+
+
+class MCPTimeout(MCPError):
+    """A request did not receive a response before its deadline."""
+
+
+class MCPConnectionClosed(MCPError):
+    """The transport closed while a request was outstanding."""
+
+
+class MCPProtocolError(MCPError):
+    """The server answered with a JSON-RPC error object."""
+
+    def __init__(self, code: int, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"JSON-RPC error {code}: {message}")
+
+
+# -- config ------------------------------------------------------------------
+
+_MCP_ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _mcp_expand_env(value: object) -> object:
+    """Expand ${VAR} / ${VAR:-default} in strings, lists, and dict values."""
+    if isinstance(value, str):
+        def repl(match: "re.Match[str]") -> str:
+            name, default = match.group(1), match.group(2)
+            return os.environ.get(name, default if default is not None else "")
+        return _MCP_ENV_RE.sub(repl, value)
+    if isinstance(value, list):
+        return [_mcp_expand_env(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _mcp_expand_env(item) for key, item in value.items()}
+    return value
+
+
+class MCPServerConfig:
+    """One configured MCP server."""
+
+    def __init__(self, name: str, **kwargs: object) -> None:
+        """Build a server config, stashing unrecognized keys for validation.
+
+        Args:
+            name: Server name (used for namespacing and log lines).
+            **kwargs: Fields from the JSON config; unknown keys are collected.
+        """
+        self.name = name
+        self.transport = str(kwargs.pop("transport", "stdio"))
+        self.enabled = bool(kwargs.pop("enabled", True))
+        self.startup = str(kwargs.pop("startup", "lazy"))
+        self.command = list(kwargs.pop("command", []) or [])
+        self.env = dict(kwargs.pop("env", {}) or {})
+        self.cwd = kwargs.pop("cwd", None)
+        self.url = str(kwargs.pop("url", ""))
+        self.headers = dict(kwargs.pop("headers", {}) or {})
+        self.tool_prefix = kwargs.pop("tool_prefix", None)
+        self.expose_as = dict(kwargs.pop("expose_as", {}) or {})
+        self.allowed_tools = list(kwargs.pop("allowed_tools", []) or [])
+        self.denied_tools = list(kwargs.pop("denied_tools", []) or [])
+        self.read_only_only = bool(kwargs.pop("read_only_only", False))
+        self.confirm_tools = list(kwargs.pop("confirm_tools", []) or [])
+        # Server-initiated features and HTTP auth are accepted so an existing
+        # config (or the shipped example) parses cleanly, but they are NOT
+        # implemented in this build: validation warns when one is actually
+        # enabled, rather than silently pretending to support it.
+        self.allow_sampling = bool(kwargs.pop("allow_sampling", False))
+        self.allow_elicitation = bool(kwargs.pop("allow_elicitation", False))
+        self.allow_roots = bool(kwargs.pop("allow_roots", False))
+        self.roots = list(kwargs.pop("roots", []) or [])
+        self.oauth = dict(kwargs.pop("oauth", {}) or {})
+        self.verify_tls = bool(kwargs.pop("verify_tls", True))
+        self.init_timeout_seconds = float(kwargs.pop("init_timeout_seconds", 15.0))
+        self.call_timeout_seconds = float(kwargs.pop("call_timeout_seconds", 120.0))
+        self.list_timeout_seconds = float(kwargs.pop("list_timeout_seconds", 30.0))
+        self.max_result_chars = int(kwargs.pop("max_result_chars", 100_000))
+        self.retries = int(kwargs.pop("retries", 1))
+        self.backoff_seconds = float(kwargs.pop("backoff_seconds", 0.5))
+        self.protocol_version = str(
+            kwargs.pop("protocol_version", MCP_PREFERRED_PROTOCOL_VERSION))
+        self.ignored_keys = sorted(str(key) for key in kwargs)
+
+    def effective_prefix(self) -> str:
+        """Return the tool namespace prefix (explicit or sanitized name)."""
+        return self.tool_prefix or re.sub(r"[^a-zA-Z0-9_-]", "-", self.name)
+
+
+class MCPConfig:
+    """The whole client config: ordered server name -> config."""
+
+    def __init__(self, servers: "Optional[Dict[str, MCPServerConfig]]" = None,
+                 source_path: Optional[str] = None) -> None:
+        self.servers = servers or {}
+        self.source_path = source_path
+
+    def enabled(self) -> "List[MCPServerConfig]":
+        """Return the enabled server configs, in config order."""
+        return [cfg for cfg in self.servers.values() if cfg.enabled]
+
+
+def _mcp_coerce_server(name: str, raw: dict) -> MCPServerConfig:
+    """Accept both the extended shape and the Claude/VS Code `mcpServers` shape."""
+    data = dict(raw)
+    if "args" in data and isinstance(data.get("command"), str):
+        data["command"] = [data["command"], *data.get("args", [])]
+    data.pop("args", None)
+    if "type" in data:
+        if "transport" not in data:
+            data["transport"] = {
+                "http": "streamable-http",
+                "streamable-http": "streamable-http",
+                "sse": "sse",
+                "stdio": "stdio",
+            }.get(str(data["type"]).lower(), "stdio")
+        data.pop("type", None)
+    if "url" in data and "transport" not in data:
+        data["transport"] = "streamable-http"
+    return MCPServerConfig(name=name,
+                          **{k: _mcp_expand_env(v) for k, v in data.items()})
+
+
+def load_mcp_config(path: Optional[str] = None) -> MCPConfig:
+    """Load the MCP config, first hit wins.
+
+    Precedence: `path` (--mcp-config), $OLLAMAQUERY_MCP_CONFIG, ./.ollamaquery-mcp.json,
+    ~/.ollamaquery.d/mcp.json. Explicit sources must exist — a mistyped flag is an
+    error, not a silent fallback to a different config.
+
+    Args:
+        path: Explicit config path from the CLI.
+
+    Returns:
+        The parsed config (empty when nothing is found).
+
+    Raises:
+        FileNotFoundError: An explicitly named config does not exist.
+        ValueError: The file is not valid JSON or has the wrong shape.
+    """
+    explicit = [candidate for candidate in (path, os.environ.get(MCP_CONFIG_ENV))
+                if candidate]
+    for candidate in explicit:
+        expanded = os.path.expanduser(candidate)
+        if not os.path.isfile(expanded):
+            raise FileNotFoundError(f"MCP config not found: {expanded}")
+
+    candidates = explicit + [os.path.join(os.getcwd(), MCP_CONFIG_PROJECT),
+                             MCP_CONFIG_USER]
+    for candidate in candidates:
+        candidate = os.path.expanduser(candidate)
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"invalid MCP config {candidate}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ValueError(f"invalid MCP config {candidate}: top level must be an object")
+        raw_servers = raw.get("servers") or raw.get("mcpServers") or {}
+        if not isinstance(raw_servers, dict):
+            raise ValueError(f"invalid MCP config {candidate}: 'servers' must be an object")
+        servers = {}
+        for name, entry in raw_servers.items():
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"invalid MCP config {candidate}: server {name!r} must be an object")
+            servers[name] = _mcp_coerce_server(name, entry)
+        return MCPConfig(servers, candidate)
+    return MCPConfig({}, None)
+
+
+def _mcp_is_loopback_host(host: Optional[str]) -> bool:
+    """True only for localhost, 127.0.0.0/8, and IPv6 loopback."""
+    if not host:
+        return False
+    host = host.strip("[]").lower()
+    if host in ("localhost", "::1", "0:0:0:0:0:0:0:1"):
+        return True
+    return bool(re.fullmatch(r"127(?:\.\d{1,3}){3}", host))
+
+
+def validate_mcp_server(cfg: MCPServerConfig) -> "List[str]":
+    """Return human-readable config problems (empty == valid).
+
+    Args:
+        cfg: One server config.
+
+    Returns:
+        Problem strings; the caller decides whether to fail or warn.
+    """
+    problems: "List[str]" = []
+    if cfg.transport == "stdio":
+        if not cfg.command:
+            problems.append(f"{cfg.name}: stdio requires 'command'")
+        elif not all(isinstance(arg, str) and arg for arg in cfg.command):
+            problems.append(f"{cfg.name}: 'command' must be a non-empty string list")
+        if cfg.cwd is not None and not isinstance(cfg.cwd, str):
+            problems.append(f"{cfg.name}: 'cwd' must be a string or null")
+    elif cfg.transport in ("streamable-http", "sse"):
+        if not cfg.url:
+            problems.append(f"{cfg.name}: {cfg.transport} requires 'url'")
+        if cfg.transport == "sse" or cfg.transport == "streamable-http":
+            problems.append(f"{cfg.name}: {cfg.transport} transport is not implemented "
+                            f"in this build (stdio only)")
+    else:
+        problems.append(f"{cfg.name}: unknown transport {cfg.transport!r}")
+    if cfg.startup not in ("lazy", "eager"):
+        problems.append(f"{cfg.name}: 'startup' must be 'lazy' or 'eager' "
+                        f"(got {cfg.startup!r})")
+    if cfg.protocol_version not in MCP_PROTOCOL_VERSIONS:
+        problems.append(f"{cfg.name}: unknown protocol_version {cfg.protocol_version!r}")
+    if cfg.ignored_keys:
+        problems.append(f"{cfg.name}: unknown config key(s) ignored: "
+                        f"{', '.join(cfg.ignored_keys)}")
+    overlap = set(cfg.allowed_tools) & set(cfg.denied_tools)
+    if overlap:
+        problems.append(f"{cfg.name}: tool(s) in both allowed_tools and denied_tools: "
+                        f"{', '.join(sorted(overlap))}")
+    dead_confirm = set(cfg.denied_tools) & set(cfg.confirm_tools)
+    if dead_confirm:
+        problems.append(f"{cfg.name}: tool(s) denied and confirm-gated (deny wins): "
+                        f"{', '.join(sorted(dead_confirm))}")
+    for label, value in (("init_timeout_seconds", cfg.init_timeout_seconds),
+                         ("call_timeout_seconds", cfg.call_timeout_seconds),
+                         ("list_timeout_seconds", cfg.list_timeout_seconds)):
+        if value <= 0:
+            problems.append(f"{cfg.name}: '{label}' must be > 0")
+    if cfg.max_result_chars <= 0:
+        problems.append(f"{cfg.name}: 'max_result_chars' must be > 0")
+    for label, enabled in (("allow_sampling", cfg.allow_sampling),
+                           ("allow_elicitation", cfg.allow_elicitation),
+                           ("allow_roots", cfg.allow_roots)):
+        if enabled:
+            problems.append(f"{cfg.name}: {label} is enabled but not implemented in "
+                            f"this build (server-initiated features are refused)")
+    if cfg.oauth:
+        problems.append(f"{cfg.name}: 'oauth' is not implemented in this build")
+    return problems
+
+
+# -- wire --------------------------------------------------------------------
+
+def _mcp_encode_frame(message: dict) -> bytes:
+    """Serialize one JSON-RPC message as a newline-delimited stdio frame."""
+    return (json.dumps(message, separators=(",", ":"), ensure_ascii=False)
+            + "\n").encode("utf-8")
+
+
+def _mcp_decode_frame(line: bytes) -> Optional[dict]:
+    """Decode one frame; None when it is not a JSON object (never raises)."""
+    text = line.strip()
+    if not text:
+        return None
+    try:
+        obj = json.loads(text.decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _mcp_iter_json_lines(stream, max_frame_bytes: int = MCP_MAX_FRAME_BYTES) -> "object":
+    """Yield JSON objects from a newline-delimited stream.
+
+    Reads in chunks so the frame ceiling is enforceable: a `for line in stream`
+    loop hands over the whole line first, letting a buggy server exhaust memory
+    with one gigantic frame before any check runs.
+
+    Args:
+        stream: Binary stream (the child's stdout).
+        max_frame_bytes: Frame ceiling; oversize frames are dropped and the
+            reader resyncs on the next newline.
+
+    Yields:
+        Parsed JSON objects; malformed frames are skipped.
+    """
+    buf = bytearray()
+    oversize = False
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            break
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8")
+        buf.extend(chunk)
+        while True:
+            newline = buf.find(b"\n")
+            if newline < 0:
+                break
+            line = bytes(buf[:newline])
+            del buf[:newline + 1]
+            if oversize:
+                oversize = False
+                continue
+            if len(line) > max_frame_bytes:
+                continue
+            obj = _mcp_decode_frame(line)
+            if obj is not None:
+                yield obj
+        if len(buf) > max_frame_bytes:
+            oversize = True
+            buf.clear()
+    if buf and not oversize:
+        obj = _mcp_decode_frame(bytes(buf))
+        if obj is not None:
+            yield obj
+
+
+# -- annotations, naming, adaptation -----------------------------------------
+
+def _mcp_annotation(tool: dict, key: str) -> Optional[bool]:
+    """Read one boolean hint three-state: True / False / None(undeclared)."""
+    annotations = tool.get("annotations") or {}
+    if not isinstance(annotations, dict) or key not in annotations:
+        return None
+    return bool(annotations[key])
+
+
+def _mcp_is_read_only(tool: dict) -> Optional[bool]:
+    """Three-state readOnlyHint; None is NOT "safe" (spec default is false)."""
+    return _mcp_annotation(tool, "readOnlyHint")
+
+
+def _mcp_is_destructive(tool: dict) -> Optional[bool]:
+    """Three-state destructiveHint; None means "assume destructive"."""
+    return _mcp_annotation(tool, "destructiveHint")
+
+
+def _mcp_sanitize_tool_name(name: str) -> str:
+    """Force a name into ^[a-zA-Z0-9_-]{1,64}$ (native tools API constraint)."""
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    if len(cleaned) <= 64:
+        return cleaned or "tool"
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    return f"{cleaned[:55]}_{digest}"
+
+
+def _mcp_namespaced_tool_name(cfg: MCPServerConfig, tool_name: str) -> str:
+    """Model-visible name: explicit expose_as, else `<prefix>__<tool>`."""
+    if tool_name in cfg.expose_as:
+        return _mcp_sanitize_tool_name(str(cfg.expose_as[tool_name]))
+    return _mcp_sanitize_tool_name(f"{cfg.effective_prefix()}__{tool_name}")
+
+
+def _mcp_normalize_schema(schema: Optional[dict]) -> dict:
+    """Make a JSON Schema safe for the inline prompt renderer.
+
+    `ToolRegistry.get_system_prompt_block` hard-subscripts `pdef['type']` and
+    `pdef['description']` and assumes a flat `properties` object, which MCP
+    schemas are free to omit. The pass is additive: `oneOf`/`$ref` survive, so
+    the native tools API keeps full fidelity.
+
+    Args:
+        schema: The tool's inputSchema (may be None).
+
+    Returns:
+        A normalized copy.
+    """
+    schema = dict(schema or {})
+    schema.setdefault("type", "object")
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        props = {}
+    fixed = {}
+    for name, prop in props.items():
+        prop = dict(prop) if isinstance(prop, dict) else {}
+        if "type" not in prop:
+            if "enum" in prop:
+                prop["type"] = "string"
+            elif any(key in prop for key in ("$ref", "oneOf", "anyOf", "allOf")):
+                prop["type"] = "object"
+            else:
+                prop["type"] = "string"
+        prop.setdefault("description", "")
+        fixed[name] = prop
+    schema["properties"] = fixed
+    if not isinstance(schema.get("required"), list):
+        schema["required"] = []
+    return schema
+
+
+def _mcp_tool_to_agentic_def(cfg: MCPServerConfig, tool: dict, model_name: str) -> dict:
+    """Convert an MCP Tool into an AGENTIC_TOOL_DEFS entry."""
+    description = tool.get("description") or tool.get("title") or model_name
+    return {
+        "description": f"[mcp:{cfg.name}] {description}",
+        "parameters": _mcp_normalize_schema(tool.get("inputSchema")),
+        "_mcp": {"server": cfg.name, "tool": tool.get("name")},
+    }
+
+
+def _mcp_resolve_max_result_chars(ctx: object, configured: int) -> int:
+    """Effective result cap: configured ceiling, lowered to fit the live window."""
+    window = int(getattr(ctx, "context_window_size", 0) or 0)
+    if window <= 0:
+        return configured
+    budget = int(window * MCP_RESULT_CONTEXT_FRACTION) * MCP_RESULT_CHARS_PER_TOKEN
+    return max(2000, min(configured, budget))
+
+
+def _mcp_content_to_text(block: dict) -> str:
+    """Flatten one MCP content block to text."""
+    block_type = block.get("type")
+    if block_type == "text":
+        return block.get("text", "")
+    if block_type == "image":
+        return f"[image {block.get('mimeType', '?')}, {len(block.get('data', ''))} b64 chars]"
+    if block_type == "audio":
+        return f"[audio {block.get('mimeType', '?')}]"
+    if block_type == "resource_link":
+        return f"[resource_link {block.get('uri')} ({block.get('name', '')})]"
+    if block_type == "resource":
+        resource = block.get("resource") or {}
+        if isinstance(resource.get("text"), str):
+            return resource["text"]
+        return f"[resource {resource.get('uri')}]"
+    return json.dumps(block, ensure_ascii=False)
+
+
+def _mcp_spill_path(server_name: str, tool_name: str) -> str:
+    """Deterministic spill filename for one server/tool pair."""
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{server_name}_{tool_name}")[:100]
+    digest = hashlib.sha1(f"{server_name}/{tool_name}".encode("utf-8")).hexdigest()[:8]
+    return os.path.join(CLUSTER_SPILL_DIR, f"{MCP_SPILL_PREFIX}{stem}_{digest}.json")
+
+
+def _mcp_spill_result(ctx: object, text: str, server_name: str, tool_name: str) -> str:
+    """Write a large MCP result to the shared spill dir, return its path.
+
+    Registers the session Path-ACL read-allow rule first: the spill dir is a home
+    dotfile outside the CWD, and strict /agentic plan confines every path to the
+    CWD, so without the rule the model would receive a pointer it cannot follow.
+
+    Args:
+        ctx: CommandContext (optional `path_acl`).
+        text: Full result text.
+        server_name: Server name.
+        tool_name: Original MCP tool name.
+
+    Returns:
+        Absolute path.
+    """
+    os.makedirs(CLUSTER_SPILL_DIR, exist_ok=True)
+    acl = getattr(ctx, "path_acl", None)
+    if acl is not None:
+        acl.add("read", "allow", CLUSTER_SPILL_DIR, source="session")
+    path = _mcp_spill_path(server_name, tool_name)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return path
+
+
+def _mcp_result_to_output(ctx: object, result: dict, cfg: MCPServerConfig,
+                          tool_name: str) -> dict:
+    """Map a CallToolResult to {"success","output","error"}."""
+    parts = [_mcp_content_to_text(block) for block in (result.get("content") or [])]
+    text = "\n".join(part for part in parts if part)
+    if result.get("structuredContent") is not None:
+        text += "\n```json\n" + json.dumps(result["structuredContent"], indent=2) + "\n```"
+    is_error = bool(result.get("isError"))
+    max_chars = _mcp_resolve_max_result_chars(ctx, cfg.max_result_chars)
+    if len(text) > max_chars:
+        try:
+            path = _mcp_spill_result(ctx, text, cfg.name, tool_name)
+            preview = text[:400].replace("\n", " ")
+            text = (f"[mcp:{cfg.name}] Result is large ({len(text)} chars) - the output is "
+                    f"NOT included here to avoid duplicating it in context. Read it with "
+                    f"read_file(file_path=\"{path}\"); read_file pages large files "
+                    f"automatically via the `next` offset. Preview: {preview}...")
+        except OSError:
+            pass  # fall through with the truncated-in-context text
+    return {
+        "success": not is_error,
+        "output": text,
+        "error": None if not is_error else
+        f"[mcp:{cfg.name}/{tool_name}] tool returned isError",
+    }
+
+
+# -- tool catalog + listing ---------------------------------------------------
+
+class MCPToolEntry:
+    """One MCP tool plus its derived policy verdicts."""
+
+    def __init__(self, server: str, raw: dict, cfg: MCPServerConfig) -> None:
+        """Classify one raw MCP tool.
+
+        Args:
+            server: Server name.
+            raw: Raw Tool dict from tools/list.
+            cfg: Owning server config (for filters and naming).
+        """
+        self.server = server
+        self.raw = raw
+        self.mcp_name = raw.get("name") or ""
+        self.model_name = _mcp_namespaced_tool_name(cfg, self.mcp_name)
+        self.description = (raw.get("description") or raw.get("title") or "").strip()
+        self.read_only = _mcp_is_read_only(raw)
+        self.destructive = _mcp_is_destructive(raw)
+        self.idempotent = _mcp_annotation(raw, "idempotentHint")
+        self.open_world = _mcp_annotation(raw, "openWorldHint")
+        self.confirm = self.mcp_name in cfg.confirm_tools
+        self.filtered_reason = self._filter_reason(cfg)
+
+    def _filter_reason(self, cfg: MCPServerConfig) -> Optional[str]:
+        """Why this tool is never exposed, or None when config allows it."""
+        if not cfg.enabled:
+            return "server disabled"
+        if self.mcp_name in cfg.denied_tools:
+            return "denied_tools"
+        if cfg.allowed_tools and self.mcp_name not in cfg.allowed_tools:
+            return "not in allowed_tools"
+        if cfg.read_only_only and self.read_only is not True:
+            return "read_only_only"
+        return None
+
+    @property
+    def marker(self) -> str:
+        """One-character state marker for the listing."""
+        if self.filtered_reason:
+            return MCP_MARK_FILTERED
+        if self.read_only is True and self.destructive is not True:
+            return MCP_MARK_READ_ONLY
+        if self.destructive is False:
+            return MCP_MARK_ADDITIVE
+        if self.destructive is True:
+            return MCP_MARK_DESTRUCTIVE
+        return MCP_MARK_UNDECLARED
+
+    @property
+    def plan_eligible(self) -> bool:
+        """True only for a config-visible tool explicitly declared read-only."""
+        return (self.filtered_reason is None and self.read_only is True
+                and self.destructive is not True)
+
+
+def _mcp_sort_key(entry: MCPToolEntry) -> tuple:
+    """Order rows: plan-eligible, then other exposed, then hidden."""
+    if entry.plan_eligible:
+        rank = 0
+    elif entry.filtered_reason is None:
+        rank = 1
+    else:
+        rank = 2
+    return (rank, entry.model_name)
+
+
+def classify_mcp_tools(cfg: MCPServerConfig, tools: "List[dict]") -> "List[MCPToolEntry]":
+    """Classify one server's tools/list result.
+
+    Args:
+        cfg: Owning server config.
+        tools: Raw Tool dicts.
+
+    Returns:
+        Entries in display order (deterministic).
+    """
+    entries = [MCPToolEntry(cfg.name, tool, cfg) for tool in tools
+               if tool.get("name")]
+    entries.sort(key=_mcp_sort_key)
+    return entries
+
+
+def plan_mcp_tool_names(catalogs: "Dict[str, List[MCPToolEntry]]") -> "set":
+    """Model names `/agentic plan` may expose (config-visible + read-only)."""
+    return {entry.model_name for entries in catalogs.values() for entry in entries
+            if entry.plan_eligible}
+
+
+def _mcp_bool_label(value: Optional[bool]) -> str:
+    """Render a tri-state hint as true / false / unset."""
+    return {True: "true", False: "false", None: "unset"}[value]
+
+
+def _mcp_clip(text: str, width: int) -> str:
+    """Collapse whitespace and truncate to `width` chars with an ellipsis."""
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[:max(0, width - 1)] + "\u2026"
+
+
+def _mcp_entry_tag(entry: MCPToolEntry, view: str) -> str:
+    """Build the tag column: [plan], [confirm], filter reason, raw hints."""
+    if entry.filtered_reason:
+        return f"[{entry.filtered_reason}]"
+    tags = []
+    if entry.plan_eligible:
+        tags.append("[plan]")
+    if entry.confirm:
+        tags.append("[confirm]")
+    if view in ("plan", "all"):
+        flags = (f"ro={_mcp_bool_label(entry.read_only)} "
+                 f"ds={_mcp_bool_label(entry.destructive)}")
+        if view == "all":
+            flags += (f" ow={_mcp_bool_label(entry.open_world)}"
+                      f" idem={_mcp_bool_label(entry.idempotent)}")
+        tags.append(flags)
+    return " ".join(tags)
+
+
+def format_mcp_tool_listing(catalogs: "Dict[str, List[MCPToolEntry]]",
+                            view: str = "default",
+                            connected: "Optional[Dict[str, bool]]" = None,
+                            width: int = 78) -> "List[str]":
+    """Render `/mcp tools`, grouped per server.
+
+    Filtered tools are always shown with their reason (silent absence is how a
+    filter stops being trusted), and [plan] is printed in every view because plan
+    eligibility belongs to the config + annotations, not to the session.
+
+    Args:
+        catalogs: server -> entries, in config order.
+        view: "default", "plan" (eligible only, raw hints), or "all".
+        connected: server -> connected flag, for the group header.
+        width: separator width.
+
+    Returns:
+        Lines to print.
+    """
+    if view not in MCP_LISTING_VIEWS:
+        raise ValueError(f"unknown view {view!r} (expected {MCP_LISTING_VIEWS})")
+    connected = connected or {}
+    lines = [f"MCP tools ({len(catalogs)} server{'s' if len(catalogs) != 1 else ''} "
+             f"configured)", "\u2500" * width]
+    total_listed = total_plan = total_hidden = 0
+    for server, entries in catalogs.items():
+        visible = [entry for entry in entries if entry.filtered_reason is None]
+        plan = [entry for entry in visible if entry.plan_eligible]
+        hidden = len(entries) - len(visible)
+        total_listed += len(entries)
+        total_plan += len(plan)
+        total_hidden += hidden
+        state = connected.get(server)
+        label = "connected" if state else ("not connected" if state is False else "unknown")
+        lines.append("")
+        lines.append(f"{server} \u2014 {label}, {len(entries)} listed \u00b7 "
+                     f"{len(plan)} plan-eligible \u00b7 {hidden} hidden")
+        if state is False:
+            lines.append(f"  (connect it first: /mcp connect {server})")
+            continue
+        rows = plan if view == "plan" else entries
+        if not rows:
+            lines.append("  (no tools)")
+            continue
+        name_width = max(20, min(max(len(entry.model_name) for entry in rows), 40))
+        for entry in sorted(rows, key=_mcp_sort_key):
+            tag = _mcp_entry_tag(entry, view)
+            detail = "" if view == "plan" else "  " + _mcp_clip(entry.description, 50)
+            lines.append(f"  {entry.marker}  {entry.model_name:<{name_width}}  "
+                         f"{tag:<15}{detail}".rstrip())
+    lines.append("")
+    lines.append("\u2500" * width)
+    lines.append("  R read-only (plan-eligible)   + additive write   "
+                 "! destructive   ? undeclared")
+    lines.append("  x never exposed   [plan] visible in /agentic plan   "
+                 "[confirm] asks every call")
+    lines.append("  Undeclared is never plan-eligible: the spec defaults "
+                 "readOnlyHint=false, destructiveHint=true")
+    lines.append(f"  {total_listed} listed \u00b7 {total_plan} plan-eligible \u00b7 "
+                 f"{total_hidden} hidden across {len(catalogs)} server"
+                 f"{'s' if len(catalogs) != 1 else ''}")
+    return lines
+
+
+def format_mcp_server_summary(cfg: MCPServerConfig,
+                              entries: "List[MCPToolEntry]",
+                              connected: bool) -> str:
+    """One-line server status for `/mcp`."""
+    plan = sum(1 for entry in entries if entry.plan_eligible)
+    hidden = sum(1 for entry in entries if entry.filtered_reason)
+    state = "connected" if connected else "not connected"
+    return (f"{cfg.name:<14} {cfg.transport:<10} {state:<14} "
+            f"{len(entries)} tools \u00b7 {plan} plan \u00b7 {hidden} hidden")
+
+
+# -- transports ---------------------------------------------------------------
+
+class MCPTransport:
+    """Byte/JSON transport with one reader thread and one write lock."""
+
+    def start(self, timeout: float) -> None:
+        """Establish the pipe and start reader threads."""
+        raise NotImplementedError
+
+    def send(self, message: dict) -> None:
+        """Write one JSON-RPC message (thread-safe)."""
+        raise NotImplementedError
+
+    def receive(self, timeout: float) -> Optional[dict]:
+        """Block up to `timeout` for one inbound message; None on timeout."""
+        raise NotImplementedError
+
+    def close(self) -> None:
+        """Terminate the child process. Idempotent."""
+        raise NotImplementedError
+
+    def is_alive(self) -> bool:
+        """False once the child exited."""
+        raise NotImplementedError
+
+    def endpoint(self) -> str:
+        """Human-readable endpoint for status lines."""
+        return "?"
+
+
+class StdioMCPTransport(MCPTransport):
+    """Local MCP server launched as a subprocess (argv, no shell)."""
+
+    def __init__(self, cfg: MCPServerConfig) -> None:
+        """Bind the transport to a server config (nothing is started yet)."""
+        self.cfg = cfg
+        self._proc = None
+        self._inbound = queue.Queue()
+        self._write_lock = threading.Lock()
+        self._threads = []
+        self._stderr_tail = []
+        self._closed = False
+
+    def start(self, timeout: float) -> None:
+        """Spawn the child and start the stdout/stderr reader threads.
+
+        Args:
+            timeout: Unused for stdio (spawn is immediate); kept for interface
+                symmetry with network transports.
+
+        Raises:
+            MCPError: The command cannot be executed.
+        """
+        env = {key: os.environ[key] for key in ("PATH", "HOME", "LANG", "LC_ALL", "TERM")
+               if key in os.environ}
+        env.update({str(key): str(value) for key, value in self.cfg.env.items()})
+        try:
+            self._proc = subprocess.Popen(
+                self.cfg.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, shell=False, bufsize=0, env=env,
+                cwd=self.cfg.cwd, start_new_session=True)
+        except (OSError, ValueError) as exc:
+            raise MCPError(f"cannot start {self.cfg.command[0]!r}: {exc}") from exc
+        for target, name in ((self._read_stdout, "stdout"), (self._read_stderr, "stderr")):
+            thread = threading.Thread(target=target, name=f"mcp-{name}-{self.cfg.name}",
+                                      daemon=True)
+            thread.start()
+            self._threads.append(thread)
+
+    def _read_stdout(self) -> None:
+        """Reader thread: decode frames into the inbound queue."""
+        try:
+            for message in _mcp_iter_json_lines(self._proc.stdout):
+                self._inbound.put(message)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._closed = True
+
+    def _read_stderr(self) -> None:
+        """Reader thread: keep the tail of stderr for diagnostics only."""
+        try:
+            for line in self._proc.stderr:
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    self._stderr_tail.append(text)
+                    del self._stderr_tail[:-20]
+        except (OSError, ValueError):
+            pass
+
+    def send(self, message: dict) -> None:
+        """Write one frame to the child's stdin."""
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            raise MCPConnectionClosed(f"MCP server {self.cfg.name!r} is not running")
+        data = _mcp_encode_frame(message)
+        with self._write_lock:
+            try:
+                proc.stdin.write(data)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise MCPConnectionClosed(f"write to {self.cfg.name!r} failed: {exc}") from exc
+
+    def receive(self, timeout: float) -> Optional[dict]:
+        """Pop one inbound message, or None on timeout."""
+        try:
+            return self._inbound.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def close(self) -> None:
+        """Close pipes and terminate the child (SIGKILL on the process group).
+
+        The child gets its own session (start_new_session), so killing the group
+        also reaps anything it spawned (oc, kubectl) instead of leaking it.
+        """
+        self._closed = True
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except (subprocess.TimeoutExpired, OSError):
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            try:
+                proc.wait(timeout=2)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+    def is_alive(self) -> bool:
+        """True while the child is running and the transport is open."""
+        return not self._closed and self._proc is not None and self._proc.poll() is None
+
+    def endpoint(self) -> str:
+        """The command line, for status lines."""
+        return "stdio:" + " ".join(self.cfg.command)
+
+
+class InMemoryMCPTransport(MCPTransport):
+    """Test double: scripted replies plus injectable server-initiated traffic."""
+
+    def __init__(self, script: "Optional[List[dict]]" = None) -> None:
+        """Create a transport with an optional reply script.
+
+        Args:
+            script: Replies consumed in order. Entries carrying a `method` are
+                treated as server-initiated requests and delivered verbatim
+                (keeping their own id) before the reply to the client request.
+        """
+        self.script = list(script or [])
+        self.sent = []
+        self._inbound = queue.Queue()
+        self._alive = False
+
+    def start(self, timeout: float) -> None:
+        """Mark the transport alive."""
+        self._alive = True
+
+    def send(self, message: dict) -> None:
+        """Record the message and queue the next scripted reply."""
+        self.sent.append(message)
+        request_id = message.get("id")
+        if request_id is None:
+            return
+        while self.script and "method" in self.script[0]:
+            self._inbound.put(dict(self.script.pop(0)))
+        if self.script:
+            reply = dict(self.script.pop(0))
+            reply.setdefault("id", request_id)
+            self._inbound.put(reply)
+
+    def receive(self, timeout: float) -> Optional[dict]:
+        """Pop one queued message, or None on timeout."""
+        try:
+            return self._inbound.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def close(self) -> None:
+        """Mark the transport closed."""
+        self._alive = False
+
+    def is_alive(self) -> bool:
+        """Return the alive flag."""
+        return self._alive
+
+    def endpoint(self) -> str:
+        """Fixed label for status lines."""
+        return "memory"
+
+
+# -- JSON-RPC connection ------------------------------------------------------
+
+class MCPConnection:
+    """Correlate JSON-RPC requests/responses over one transport."""
+
+    def __init__(self, transport: MCPTransport) -> None:
+        """Create the multiplexer (nothing is started yet)."""
+        self.transport = transport
+        self._pending = {}
+        self._results = {}
+        self._lock = threading.Lock()
+        self._next_id = 0
+        self._reader = None
+        self._closed = False
+        self.on_request = None
+        self.on_notification = None
+
+    def start(self) -> None:
+        """Start the reader thread that routes inbound messages."""
+        self._reader = threading.Thread(target=self._read_loop, name="mcp-reader",
+                                        daemon=True)
+        self._reader.start()
+
+    def _read_loop(self) -> None:
+        """Reader thread: receive and route until closed or the child dies."""
+        while not self._closed:
+            try:
+                message = self.transport.receive(0.2)
+            except Exception:
+                break
+            if message is None:
+                if not self.transport.is_alive():
+                    break
+                continue
+            try:
+                self._route(message)
+            except Exception:
+                continue
+        self._closed = True
+        # Fail every outstanding request instead of letting callers sit on
+        # their full timeout after the server has already gone away.
+        with self._lock:
+            pending, self._pending = self._pending, {}
+        for event in pending.values():
+            event.set()
+
+    def _route(self, message: dict) -> None:
+        """Dispatch one inbound message by shape: response, request, notification."""
+        method = message.get("method")
+        message_id = message.get("id")
+        if method is None:
+            with self._lock:
+                event = self._pending.pop(message_id, None)
+                if event is not None:
+                    self._results[message_id] = message
+            if event is not None:
+                event.set()
+            return
+        if message_id is None:
+            if self.on_notification is not None:
+                try:
+                    self.on_notification(message)
+                except Exception:
+                    pass
+            return
+        reply = {"jsonrpc": "2.0", "id": message_id}
+        try:
+            result = self.on_request(message) if self.on_request else None
+            if result is None:
+                raise MCPProtocolError(MCP_ERR_METHOD_NOT_FOUND,
+                                       f"unsupported server request {method!r}")
+            reply["result"] = result
+        except MCPProtocolError as exc:
+            reply["error"] = {"code": exc.code, "message": exc.message}
+        except Exception as exc:
+            reply["error"] = {"code": MCP_ERR_INTERNAL, "message": str(exc)}
+        try:
+            self.transport.send(reply)
+        except Exception:
+            pass
+
+    def request(self, method: str, params: Optional[dict] = None,
+                timeout: float = 30.0) -> dict:
+        """Send a request and wait for its response.
+
+        Args:
+            method: JSON-RPC method name.
+            params: Optional params object.
+            timeout: Seconds to wait.
+
+        Returns:
+            The `result` object.
+
+        Raises:
+            MCPTimeout: No response in time (a notification/cancelled is sent).
+            MCPConnectionClosed: The transport died while waiting.
+            MCPProtocolError: The server returned an error object.
+        """
+        if self._closed:
+            raise MCPConnectionClosed(f"connection closed before {method}")
+        with self._lock:
+            self._next_id += 1
+            request_id = self._next_id
+            event = threading.Event()
+            self._pending[request_id] = event
+        message = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        try:
+            self.transport.send(message)
+        except Exception:
+            with self._lock:
+                self._pending.pop(request_id, None)
+            raise
+        if not event.wait(timeout):
+            with self._lock:
+                self._pending.pop(request_id, None)
+            try:
+                self.notify("notifications/cancelled",
+                            {"requestId": request_id, "reason": "timeout"})
+            except Exception:
+                pass
+            raise MCPTimeout(f"{method} timed out after {timeout:.0f}s")
+        with self._lock:
+            response = self._results.pop(request_id, None)
+        if response is None:
+            raise MCPConnectionClosed(f"connection closed during {method}")
+        if "error" in response:
+            error = response.get("error") or {}
+            raise MCPProtocolError(int(error.get("code", MCP_ERR_INTERNAL)),
+                                   str(error.get("message", "")))
+        return response.get("result") or {}
+
+    def notify(self, method: str, params: Optional[dict] = None) -> None:
+        """Send a fire-and-forget notification."""
+        if self._closed:
+            return
+        message = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        self.transport.send(message)
+
+    def close(self) -> None:
+        """Stop the reader and fail outstanding requests."""
+        self._closed = True
+        with self._lock:
+            pending, self._pending = self._pending, {}
+        for event in pending.values():
+            event.set()
+        try:
+            self.transport.close()
+        except Exception:
+            pass
+
+
+# -- client -------------------------------------------------------------------
+
+class MCPClient:
+    """One connected, initialized MCP server session (stdio)."""
+
+    def __init__(self, cfg: MCPServerConfig,
+                 transport: "Optional[MCPTransport]" = None) -> None:
+        """Create a client for one server (nothing is connected yet)."""
+        self.cfg = cfg
+        self.transport = transport
+        self.connection = None
+        self.server_info = {}
+        self.capabilities = {}
+        self.instructions = ""
+        self.protocol_version = cfg.protocol_version
+        self.tools = []
+        self.connected = False
+        self.errors = []
+
+    def connect(self) -> None:
+        """Spawn/attach, initialize, and fetch the tool catalog.
+
+        Raises:
+            MCPError: Any failure; the transport is closed before propagating.
+        """
+        if self.cfg.transport != "stdio":
+            raise MCPError(f"MCP server {self.cfg.name!r}: transport "
+                           f"{self.cfg.transport!r} is not implemented (stdio only)")
+        if self.transport is None:
+            self.transport = StdioMCPTransport(self.cfg)
+        self.transport.start(self.cfg.init_timeout_seconds)
+        self.connection = MCPConnection(self.transport)
+        self.connection.on_request = self._handle_server_request
+        self.connection.on_notification = self._handle_notification
+        self.connection.start()
+        try:
+            self._initialize()
+            self.list_tools()
+        except Exception:
+            self.close()
+            raise
+        self.connected = True
+
+    def _initialize(self) -> None:
+        """Perform the classic initialize handshake."""
+        result = self.connection.request("initialize", {
+            "protocolVersion": self.cfg.protocol_version,
+            # No roots/sampling/elicitation: this build implements none of the
+            # server-initiated features, so it must not advertise them.
+            "capabilities": {},
+            "clientInfo": {"name": MCP_CLIENT_NAME, "version": __version__},
+        }, timeout=self.cfg.init_timeout_seconds)
+        version = result.get("protocolVersion") or ""
+        if version and version not in MCP_PROTOCOL_VERSIONS:
+            raise MCPError(f"MCP server {self.cfg.name!r} selected unsupported "
+                           f"protocol version {version!r}")
+        self.protocol_version = version or self.cfg.protocol_version
+        self.capabilities = result.get("capabilities") or {}
+        self.server_info = result.get("serverInfo") or {}
+        self.instructions = result.get("instructions") or ""
+        self.connection.notify("notifications/initialized")
+
+    def _handle_server_request(self, message: dict) -> Optional[dict]:
+        """Answer the one server request this slice supports: ping."""
+        if message.get("method") == "ping":
+            return {}
+        return None  # route() turns None into a -32601 method-not-found reply
+
+    def _handle_notification(self, message: dict) -> None:
+        """Record notifications; list_changed refresh is a later slice."""
+        method = message.get("method") or ""
+        if method == "notifications/tools/list_changed":
+            self.errors.append("tools/list_changed received (refresh is not implemented)")
+
+    def list_tools(self) -> "List[dict]":
+        """Fetch the full catalog, following `nextCursor` pagination."""
+        tools = []
+        cursor = None
+        while True:
+            params = {"cursor": cursor} if cursor else {}
+            result = self.connection.request("tools/list", params,
+                                             timeout=self.cfg.list_timeout_seconds)
+            tools.extend(result.get("tools") or [])
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+        self.tools = tools
+        return tools
+
+    def call_tool(self, name: str, arguments: dict,
+                  timeout: Optional[float] = None) -> dict:
+        """Invoke one tool and return the raw CallToolResult."""
+        return self.connection.request(
+            "tools/call", {"name": name, "arguments": arguments or {}},
+            timeout=timeout or self.cfg.call_timeout_seconds)
+
+    def close(self) -> None:
+        """Close the connection and the transport (idempotent)."""
+        if self.connection is not None:
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+        elif self.transport is not None:
+            try:
+                self.transport.close()
+            except Exception:
+                pass
+        self.connected = False
+
+
+# -- manager ------------------------------------------------------------------
+
+class MCPManager:
+    """Own every configured server, aggregate tools, dispatch calls."""
+
+    def __init__(self, config: MCPConfig, ctx: object = None) -> None:
+        """Create the manager.
+
+        Args:
+            config: Parsed config.
+            ctx: CommandContext (used for the spill dir ACL and window-based caps).
+        """
+        self.config = config
+        self.ctx = ctx
+        self.clients = {}
+        self.errors = {}
+        self._listings = {}
+        self._reverse = {}
+        self._attempted = set()
+        self._lock = threading.RLock()
+
+    # -- lifecycle ----------------------------------------------------------
+    def start(self, server_name: str) -> MCPClient:
+        """Connect one server (idempotent) and classify its tools."""
+        with self._lock:
+            client = self.clients.get(server_name)
+            if client is not None and client.connected:
+                return client
+            cfg = self.config.servers.get(server_name)
+            if cfg is None:
+                raise MCPError(f"no MCP server named {server_name!r}")
+            client = MCPClient(cfg)
+            try:
+                client.connect()
+            except Exception as exc:
+                self.errors[server_name] = str(exc)
+                raise
+            self.clients[server_name] = client
+            self.errors.pop(server_name, None)
+            self._refresh(server_name)
+            return client
+
+    def start_eager(self) -> None:
+        """Connect servers configured with startup=eager; failures are recorded."""
+        for cfg in self.config.enabled():
+            if cfg.startup == "eager":
+                self._attempted.add(cfg.name)
+                try:
+                    self.start(cfg.name)
+                except Exception as exc:
+                    self.errors[cfg.name] = str(exc)
+
+    def ensure_started_all(self) -> None:
+        """Try once to connect every enabled server; never raises.
+
+        Called when agentic/plan mode is entered rather than at CLI startup, so a
+        slow or broken server cannot block the chat prompt (D9).
+        """
+        for cfg in self.config.enabled():
+            with self._lock:
+                if cfg.name in self._attempted:
+                    continue
+                self._attempted.add(cfg.name)
+            if self.clients.get(cfg.name) is not None:
+                continue
+            try:
+                self.start(cfg.name)
+            except Exception as exc:
+                self.errors[cfg.name] = str(exc)
+
+    def stop(self, server_name: str) -> None:
+        """Disconnect one server and forget its tools."""
+        with self._lock:
+            client = self.clients.pop(server_name, None)
+            self._listings.pop(server_name, None)
+        if client is not None:
+            client.close()
+        self._rebuild_reverse()
+
+    def shutdown(self) -> None:
+        """Disconnect every server (registered atexit in main)."""
+        for name in list(self.clients):
+            self.stop(name)
+
+    # -- catalog ------------------------------------------------------------
+    def _refresh(self, server_name: str) -> None:
+        """Reclassify one server's tools and rebuild the reverse map."""
+        client = self.clients.get(server_name)
+        if client is None:
+            return
+        self._listings[server_name] = classify_mcp_tools(client.cfg, client.tools)
+        self._rebuild_reverse()
+
+    def _rebuild_reverse(self) -> None:
+        """Rebuild model name -> (server, mcp tool) from all listings."""
+        reverse = {}
+        for server_name, entries in self._listings.items():
+            for entry in entries:
+                if entry.filtered_reason is None:
+                    reverse[entry.model_name] = (server_name, entry.mcp_name)
+        self._reverse = reverse
+
+    def classified_tools(self) -> "Dict[str, List[MCPToolEntry]]":
+        """Per-enabled-server classified entries (empty for unconnected ones)."""
+        with self._lock:
+            return {cfg.name: list(self._listings.get(cfg.name, []))
+                    for cfg in self.config.enabled()}
+
+    def aggregate_tools(self) -> "Dict[str, dict]":
+        """Merged AGENTIC_TOOL_DEFS-compatible definitions for exposed tools."""
+        definitions = {}
+        for entries in self.classified_tools().values():
+            for entry in entries:
+                if entry.filtered_reason is not None:
+                    continue
+                cfg = self.config.servers.get(entry.server)
+                if cfg is None:
+                    continue
+                definitions[entry.model_name] = _mcp_tool_to_agentic_def(
+                    cfg, entry.raw, entry.model_name)
+        return definitions
+
+    def build_openai_specs(self) -> "List[dict]":
+        """Native `tools` array for every exposed MCP tool."""
+        specs = []
+        for name, definition in self.aggregate_tools().items():
+            specs.append({"type": "function",
+                          "function": {"name": name,
+                                       "description": definition["description"],
+                                       "parameters": definition["parameters"]}})
+        return specs
+
+    # -- policy -------------------------------------------------------------
+    def plan_read_only_names(self) -> "set":
+        """Model names `/agentic plan` may expose."""
+        return plan_mcp_tool_names(self.classified_tools())
+
+    def read_only_names(self) -> "set":
+        """Names declared readOnlyHint true, ignoring config filters."""
+        return {entry.model_name for entries in self.classified_tools().values()
+                for entry in entries if entry.read_only is True}
+
+    def destructive_names(self) -> "set":
+        """Names that must go through the confirmation gate.
+
+        Fail-closed on unknown: an unannotated tool (`readOnlyHint` absent) is
+        treated as destructive, matching the spec default and D6. Only an
+        explicit `readOnlyHint: true` stays out of the gate.
+        """
+        names = set()
+        for entries in self.classified_tools().values():
+            for entry in entries:
+                if entry.destructive is True or entry.read_only is not True:
+                    names.add(entry.model_name)
+        return names
+
+    def confirm_names(self) -> "set":
+        """Names the config forces through the confirmation gate."""
+        return {entry.model_name for entries in self.classified_tools().values()
+                for entry in entries if entry.confirm}
+
+    # -- dispatch -----------------------------------------------------------
+    def resolve(self, model_name: str) -> "Optional[tuple]":
+        """Map a model-visible tool name to (server, mcp tool)."""
+        return self._reverse.get(model_name)
+
+    def call(self, model_name: str, arguments: dict) -> dict:
+        """Route one model tool call. Never raises into the ReAct loop.
+
+        Args:
+            model_name: Namespaced tool name from the catalog.
+            arguments: Tool arguments.
+
+        Returns:
+            {"success", "output", "error"}.
+        """
+        target = self._reverse.get(model_name)
+        if target is None:
+            return {"success": False, "output": "",
+                    "error": f"Unknown MCP tool {model_name!r} (catalog may be stale; "
+                             f"try /mcp connect)"}
+        server_name, tool_name = target
+        try:
+            client = self.start(server_name)
+        except Exception as exc:
+            return {"success": False, "output": "",
+                    "error": f"MCP server {server_name!r} unavailable: {exc}"}
+        cfg = client.cfg
+        try:
+            result = client.call_tool(tool_name, arguments or {},
+                                      timeout=cfg.call_timeout_seconds)
+        except Exception as exc:
+            return {"success": False, "output": "",
+                    "error": f"[mcp:{server_name}/{tool_name}] "
+                             f"{type(exc).__name__}: {exc}"}
+        return _mcp_result_to_output(self.ctx, result, cfg, tool_name)
+
+    def tool_registry_handlers(self) -> "Dict[str, object]":
+        """Return {model_name: handler} with the ToolRegistry calling convention.
+
+        Handlers are `handler(registry, args)` because ToolRegistry.execute calls
+        `self._handlers[name](self, args)`.
+        """
+        handlers = {}
+        for model_name in self._reverse:
+            def handler(_registry, args, _name=model_name):
+                return self.call(_name, args)
+            handlers[model_name] = handler
+        return handlers
+
+    def status_lines(self) -> "List[str]":
+        """One line per enabled server for `/mcp`."""
+        catalogs = self.classified_tools()
+        lines = []
+        for cfg in self.config.enabled():
+            client = self.clients.get(cfg.name)
+            connected = bool(client is not None and client.connected)
+            lines.append(format_mcp_server_summary(cfg, catalogs.get(cfg.name, []),
+                                                  connected))
+            if cfg.name in self.errors:
+                lines.append(f"  ! {self.errors[cfg.name]}")
+        return lines
+
 class ToolRegistry:
     """Registers and executes agentic tools with confirmation support.
 
@@ -6306,14 +7753,35 @@ class ToolRegistry:
         `/agentic plan run` — so the model cannot even see (or, via the schema,
         emit) write tools.
 
+        MCP tools are merged here because this is the single choke point shared by
+        get_system_prompt_block() and openai_tools_spec(): merging in one place
+        keeps the inline and native surfaces in sync. Plan mode then filters the
+        merged dict with the same plan_active_tools() the execution backstop uses,
+        so a tool cannot be visible but unreachable (or reachable but hidden).
+
         Returns:
             A dict of tool name -> definition for the current mode.
         """
+        definitions = dict(AGENTIC_TOOL_DEFS)
+        manager = getattr(self._ctx, "mcp_manager", None) if self._ctx else None
+        if manager is not None:
+            try:
+                # Connect lazy servers once, when the user is already in an
+                # agentic/plan session - never on a plain chat turn, and never
+                # more than one attempt per server.
+                if getattr(self._ctx, "agentic_mode", False) or \
+                        getattr(self._ctx, "plan_mode", False):
+                    manager.ensure_started_all()
+                definitions.update(manager.aggregate_tools())
+            except Exception as exc:
+                # A broken MCP layer must not take the tool surface down with it.
+                print(colorize(f"[MCP] tool catalog unavailable: {exc}", 'warning'),
+                      file=sys.stderr)
         if self._ctx and getattr(self._ctx, 'plan_mode', False):
             allowed = plan_active_tools(self._ctx)
-            return {name: defn for name, defn in AGENTIC_TOOL_DEFS.items()
+            return {name: defn for name, defn in definitions.items()
                     if name in allowed}
-        return dict(AGENTIC_TOOL_DEFS)
+        return definitions
 
     def get_system_prompt_block(self) -> str:
         """Build tool definitions section for embedding in the agentic system prompt."""
@@ -6348,11 +7816,50 @@ class ToolRegistry:
 
     def list_tools_str(self) -> str:
         """Format the tool list for /listtool display."""
+        manager = getattr(self._ctx, "mcp_manager", None) if self._ctx else None
+        mcp_destructive = set()
+        mcp_confirm = set()
+        if manager is not None:
+            try:
+                mcp_destructive = manager.destructive_names()
+                mcp_confirm = manager.confirm_names()
+            except Exception:
+                pass
         lines = []
         for name, defn in self._plan_allowed_tools().items():
-            destructive = "! " if name in DESTRUCTIVE_TOOLS else "  "
-            lines.append(f"{destructive}{name:<16} {defn['description']}")
+            destructive = "! " if (name in DESTRUCTIVE_TOOLS
+                                   or name in mcp_destructive) else "  "
+            server = (defn.get("_mcp") or {}).get("server")
+            tag = f"[mcp:{server}] " if server else ""
+            confirm = " (confirm)" if name in mcp_confirm else ""
+            lines.append(f"{destructive}{name:<24} {tag}{defn['description']}{confirm}")
         return "\n".join(lines)
+
+    def _is_destructive_tool(self, tool_name: str) -> bool:
+        """True when a tool must pass the confirmation gate.
+
+        MCP tools are classified by *their server's* annotations, which can change
+        between sessions, so the set is consulted live instead of being frozen
+        into DESTRUCTIVE_TOOLS at import time.
+
+        Args:
+            tool_name: Tool name as the model sees it.
+
+        Returns:
+            True when _confirm() must run.
+        """
+        if tool_name in DESTRUCTIVE_TOOLS:
+            return True
+        manager = getattr(self._ctx, "mcp_manager", None) if self._ctx else None
+        if manager is None:
+            return False
+        try:
+            if tool_name in manager.confirm_names():
+                return True
+            return tool_name in manager.destructive_names()
+        except Exception:
+            # Fail closed: an MCP tool we cannot classify is treated as destructive.
+            return manager.resolve(tool_name) is not None
 
     def _confirm(self, tool_name: str, args: dict) -> bool:
         """Ask the user before running a destructive tool.
@@ -6370,11 +7877,18 @@ class ToolRegistry:
         Returns:
             True if the tool may run.
         """
-        if tool_name not in DESTRUCTIVE_TOOLS:
+        if not self._is_destructive_tool(tool_name):
             return True
         if self._ctx and getattr(self._ctx, 'plan_mode', False):
             return self._prompt_confirm(tool_name, args)
-        if self._ctx and self._ctx.auto_confirm:
+        manager = getattr(self._ctx, "mcp_manager", None) if self._ctx else None
+        forced = False
+        if manager is not None:
+            try:
+                forced = tool_name in manager.confirm_names()
+            except Exception:
+                forced = True
+        if self._ctx and self._ctx.auto_confirm and not forced:
             return True
         return self._prompt_confirm(tool_name, args)
 
@@ -6406,7 +7920,13 @@ class ToolRegistry:
         Returns:
             {"success": bool, "output": str, "error": str|None}.
         """
-        if tool_name not in self._handlers:
+        # MCP tools are resolved live: the catalog can appear after a lazy
+        # connect, so a static handler table would miss tools that were not
+        # listed when this registry was constructed.
+        mcp_manager = getattr(self._ctx, "mcp_manager", None) if self._ctx else None
+        is_mcp = (mcp_manager is not None and tool_name not in self._handlers
+                  and mcp_manager.resolve(tool_name) is not None)
+        if tool_name not in self._handlers and not is_mcp:
             return {"success": False, "output": "", "error": f"Unknown tool '{tool_name}'"}
         # Plan mode backstop: even if the model hallucinates a write tool (or a
         # hidden tool leaks through the surface filter), deny it here. Defense
@@ -6435,6 +7955,8 @@ class ToolRegistry:
         if not self._confirm(tool_name, args):
             return {"success": False, "output": "", "error": "Cancelled by user"}
         try:
+            if is_mcp:
+                return mcp_manager.call(tool_name, args)
             return self._handlers[tool_name](self, args)
         except KeyError as e:
             return {"success": False, "output": "", "error": f"Missing required argument: {e}"}
@@ -9265,6 +10787,7 @@ class ChatLoop:
             self.run_handle_spawnshell,
             self.run_handle_agentic,
             self.run_handle_listtool,
+            self.run_handle_mcp,
             self.run_handle_compact,
             self.run_handle_drop,
             self.run_handle_tokencount,
@@ -10500,6 +12023,77 @@ class ChatLoop:
         print(colorize("\u2500" * 70, 'muted'), file=sys.stderr)
         print(self.tool_registry.list_tools_str(), file=sys.stderr)
         print(file=sys.stderr)
+        return False
+
+    def run_handle_mcp(self, full_input: str) -> Optional[bool]:
+        """Handle /mcp — status, tool listings, and connect/disconnect.
+
+        Args:
+            full_input: The raw command line.
+
+        Returns:
+            False when handled, None when the line is not an /mcp command.
+        """
+        stripped = full_input.strip()
+        if stripped != '/mcp' and not stripped.startswith('/mcp '):
+            return None
+        parts = stripped.split()
+        sub = parts[1] if len(parts) > 1 else "status"
+        manager = getattr(self.ctx, "mcp_manager", None)
+        if manager is None:
+            print(colorize("[MCP] no servers configured — pass --mcp-config <path> or "
+                           "create ~/.ollamaquery.d/mcp.json", 'warning'), file=sys.stderr)
+            return False
+        if sub in ("status", "list"):
+            print(colorize(f"\nMCP servers ({manager.config.source_path or 'no config file'})",
+                           'info'), file=sys.stderr)
+            print(colorize("\u2500" * 70, 'muted'), file=sys.stderr)
+            for line in manager.status_lines():
+                print(line, file=sys.stderr)
+            print(file=sys.stderr)
+        elif sub == "tools":
+            view = "plan" if "--plan" in parts else ("all" if "--all" in parts else "default")
+            wanted = [part for part in parts[2:] if not part.startswith("--")]
+            catalogs = manager.classified_tools()
+            if wanted:
+                catalogs = {name: entries for name, entries in catalogs.items()
+                            if name in wanted}
+                if not catalogs:
+                    print(colorize(f"[MCP] no such server: {', '.join(wanted)}",
+                                   'warning'), file=sys.stderr)
+                    return False
+            connected = {name: bool(manager.clients.get(name)
+                                    and manager.clients[name].connected)
+                         for name in catalogs}
+            print(file=sys.stderr)
+            for line in format_mcp_tool_listing(catalogs, view, connected):
+                print(line, file=sys.stderr)
+            print(file=sys.stderr)
+        elif sub == "connect":
+            if len(parts) < 3:
+                print(colorize("[Usage: /mcp connect <server>]", 'warning'), file=sys.stderr)
+                return False
+            name = parts[2]
+            print(colorize(f"[MCP] connecting {name}...", 'muted'), file=sys.stderr)
+            try:
+                client = manager.start(name)
+            except Exception as exc:
+                print(colorize(f"[MCP] {name}: {exc}", 'warning'), file=sys.stderr)
+                return False
+            print(colorize(f"[MCP] {name}: connected "
+                           f"({len(client.tools)} tools, protocol {client.protocol_version})",
+                           'success'), file=sys.stderr)
+        elif sub == "disconnect":
+            if len(parts) < 3:
+                print(colorize("[Usage: /mcp disconnect <server>]", 'warning'),
+                      file=sys.stderr)
+                return False
+            manager.stop(parts[2])
+            print(colorize(f"[MCP] {parts[2]}: disconnected", 'warning'), file=sys.stderr)
+        else:
+            print(colorize("[Usage: /mcp [status|tools [server] [--plan|--all]|"
+                           "connect <server>|disconnect <server>]", 'warning'),
+                  file=sys.stderr)
         return False
 
     @staticmethod
@@ -14133,6 +15727,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--format', choices=["json", "yaml"], default="json", help='Output format for model info (default: json)')
     parser.add_argument('--theme', default=None, choices=["default", "minimal", "emacs_dark", "vim_dark", "high_contrast"], help='Color theme for output')
     parser.add_argument('--no-color', action="store_true", help='Disable colored output')
+    parser.add_argument('--mcp-config', default=None, metavar='PATH',
+                        help='MCP server config (default: ./.ollamaquery-mcp.json or '
+                             '~/.ollamaquery.d/mcp.json)')
+    parser.add_argument('--no-mcp', action="store_true",
+                        help='Disable MCP tool servers for this session')
     parser.add_argument('--shell-timeout', type=int, default=5, help='Timeout in seconds for shell commands (default: 5)')
 
     return parser
@@ -14382,6 +15981,42 @@ def _run_model_info(base_url: str, target_model: str, args: argparse.Namespace) 
         show_model_details(base_url, target_model, args)
 
 
+def _attach_mcp_manager(ctx: CommandContext, args: argparse.Namespace) -> None:
+    """Load the MCP config and attach a manager to the context.
+
+    Never fatal: a missing/malformed config or an unreachable server disables or
+    partially disables MCP with a warning, because a tool provider must not be
+    able to prevent the chat session from starting.
+
+    Args:
+        ctx: The session context to attach to.
+        args: Parsed CLI arguments (--mcp-config / --no-mcp).
+    """
+    if getattr(args, "no_mcp", False):
+        return
+    config_path = getattr(args, "mcp_config", None)
+    try:
+        config = load_mcp_config(config_path)
+    except (FileNotFoundError, ValueError) as exc:
+        print(colorize(f"[MCP] {exc}", 'warning'), file=sys.stderr)
+        return
+    if not config.servers:
+        return
+    ctx.mcp_config = config
+    for cfg in config.servers.values():
+        for problem in validate_mcp_server(cfg):
+            print(colorize(f"[MCP] {problem}", 'warning'), file=sys.stderr)
+    manager = MCPManager(config, ctx)
+    ctx.mcp_manager = manager
+    eager = [cfg.name for cfg in config.enabled() if cfg.startup == "eager"]
+    manager.start_eager()
+    atexit.register(manager.shutdown)
+    detail = f", eager: {', '.join(eager)}" if eager else ""
+    print(colorize(f"[MCP] {len(config.enabled())} server(s) configured from "
+                   f"{config.source_path}{detail} — /mcp tools to inspect", 'muted'),
+          file=sys.stderr)
+
+
 def _run_chat(backend: str, base_url: str, target_model: str, args: argparse.Namespace) -> None:
     """Run the interactive chat loop and exit.
 
@@ -14398,6 +16033,7 @@ def _run_chat(backend: str, base_url: str, target_model: str, args: argparse.Nam
     ctx.system_prompt = args.prompt
     ctx.shell_timeout = args.shell_timeout
     ctx.api_key = _cloud_api_key(backend, args.api_key)
+    _attach_mcp_manager(ctx, args)
 
     images_list = _prepare_images_list(args)
     if images_list:
