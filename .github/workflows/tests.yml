@@ -1,0 +1,51 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    name: offline suites (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    env:
+      HOME: ${{ runner.temp }}/home
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Isolate HOME
+        run: mkdir -p "$HOME"
+
+      - name: Syntax check
+        working-directory: ollamaquery2
+        run: python3 -m py_compile ollamaquery2.py tests/*.py
+
+      # Network-free by construction: these seven modules never probe a backend
+      # or the internet. The backend-gated suites (test_features, test_agentic,
+      # test_modifications, test_release, test_strata, test_lmstudio,
+      # test_vision) are intentionally not discovered here — importing them
+      # scans localhost/LAN and would need a live LLM.
+      - name: Offline suites
+        working-directory: ollamaquery2
+        run: |
+          python3 -m unittest -v \
+            tests.test_acl \
+            tests.test_mcp \
+            tests.test_compaction \
+            tests.test_compact_command \
+            tests.test_agentic_timeout \
+            tests.test_tool_summarize \
+            tests.test_state_files
