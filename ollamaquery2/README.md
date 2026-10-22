@@ -107,7 +107,7 @@ spawnshell are disabled when unavailable.
 | `write_file`               | Write file                                                                                             |
 | `list_directory`           | List directory contents                                                                                |
 | `glob`                     | Find files by pattern                                                                                  |
-| `grep`                     | Search file contents with a regex (case-insensitive by default, optional path + include glob)          |
+| `grep`                     | Search file contents with a regex (case-insensitive; recursive searches skip `.git`; capped output)    |
 | `run_python`               | Execute Python 3 code                                                                                  |
 | `run_command`              | Execute shell command (120s timeout)                                                                   |
 | `diff`                     | Unified diff between files                                                                             |

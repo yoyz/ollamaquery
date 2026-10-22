@@ -64,7 +64,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 
 # ============================================================================
@@ -238,7 +238,8 @@ MAX_READ_LINES = 2000          # max lines per agentic read_file page
 MAX_READ_LINE_LENGTH = 2000    # per-line truncation in read_file pages
 MAX_GREP_RESULTS = 100         # max matches returned per grep tool call
 MAX_GREP_LINE_LENGTH = 500     # per-line truncation in grep results
-GREP_SEARCH_TIMEOUT = 30       # seconds before a grep/rg subprocess is killed
+MAX_GREP_OUTPUT_CHARS = 14000  # hard cap on rendered grep output (context safety)
+GREP_SEARCH_TIMEOUT = 30       # wall-clock seconds before a grep/rg subprocess is killed
 MAX_WRITE_FILE_SIZE = 1048576  # 1MB max for agentic write_file tool
 MAX_FILE_INCLUSION_SIZE = 5 * 1024 * 1024  # 5MB max for @file inclusions
 # Per-response output cap (always on; see /maxtokens). Sent to the backend as
@@ -1867,6 +1868,21 @@ def _split_compaction_window(messages: list[Message], keep_recent: int) -> tuple
     return system_msg, messages[1:start], messages[start:]
 
 
+def _needs_continuation_placeholder(recent: list[Message]) -> bool:
+    """True when the synthetic summary would collide with the window's first role.
+
+    The compacted summary is inserted with role `user`, so the retained window's
+    FIRST message is the boundary that matters: a `user` (or demoted `tool`)
+    there would produce two consecutive user turns. The previous check used the
+    LAST retained role, which is unrelated — with the common shape (history
+    ending with a user query, keep window starting with an assistant) it inserted
+    a placeholder assistant *before* a real assistant, i.e. two consecutive
+    assistant turns, and with a trailing assistant it inserted nothing before a
+    user turn.
+    """
+    return bool(recent) and recent[0].get('role') != 'assistant'
+
+
 def _build_compaction_summary(middle: list[Message]) -> str:
     """Render the mechanical excerpt-based summary of the dropped middle turns.
 
@@ -1958,7 +1974,7 @@ def compact_messages(messages: list[Message], ctx: 'CommandContext', target_toke
     compacted_msg = {'role': 'user', 'content': summary_text}
     ctx.stamp_tokens(compacted_msg)
     result = [system_msg, compacted_msg]
-    if recent and recent[-1].get('role') == 'user':
+    if _needs_continuation_placeholder(recent):
         result.append({'role': 'assistant', 'content': '[Context continued...]'})
     result.extend(recent)
     sanitize_tool_pairing(result)
@@ -2121,9 +2137,14 @@ def summarize_tool_results(messages: list, ctx: 'CommandContext',
 
 # LLM-assisted conversation summarization (opus6 item 2 / `/compact llm`).
 LLM_COMPACT_TRANSCRIPT_CHARS = 6000    # Cap the excerpt sent to the model
-LLM_COMPACT_BREAKDOWN_CHARS = 4000    # Cap the token breakdown kept in the summary message
+LLM_COMPACT_BREAKDOWN_CHARS = 4000    # Cap the token breakdown (diagnostics only)
 LLM_COMPACT_BREAKDOWN_TEXT = 80       # Per-line text excerpt in the breakdown
 LLM_COMPACT_SUMMARY_MARKER = "[CONVERSATION SUMMARY (LLM)]"
+# The summary message is a bounded working-memory block, not an append-only log.
+LLM_COMPACT_MEMORY_MIN_TOKENS = 256    # floor when the recent window is tight
+LLM_COMPACT_MEMORY_RESERVE = 100       # role/framing reserve around the memory
+LLM_COMPACT_DEFAULT_MEMORY_TOKENS = 1024  # used when the window size is unknown
+LLM_COMPACT_CHARS_PER_TOKEN = 4        # rough chars/token for prompt budgets
 
 
 def _cap_line(text: str, max_len: int) -> str:
@@ -2132,6 +2153,84 @@ def _cap_line(text: str, max_len: int) -> str:
     if len(text) > max_len:
         return text[:max_len] + "..."
     return text
+
+
+def _cap_text(text: str, max_chars: int) -> str:
+    """Truncate multi-line text to at most `max_chars` characters."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n[...]"
+
+
+def _compaction_memory_budget(ctx: 'CommandContext', system_msg: Message,
+                              recent: list[Message], target_tokens: int,
+                              overhead_tokens: int) -> tuple:
+    """Reserve room for the exact recent window and return the memory budget.
+
+    The summary is working memory: it may use whatever is left after the system
+    prompt, the verbatim recent turns and the request overhead. Recent turns are
+    never sacrificed to keep a larger summary.
+
+    Args:
+        ctx: CommandContext (context window + token estimation).
+        system_msg: The system prompt message that stays in the result.
+        recent: The exact turns kept verbatim.
+        target_tokens: Overall budget; 0 derives it from the context window.
+        overhead_tokens: Tokens the request adds beyond the stored messages.
+
+    Returns:
+        (target_tokens, memory_budget_tokens). `target_tokens` is 0 when the
+        window is unknown; the memory budget then falls back to a fixed default.
+    """
+    if target_tokens <= 0 and ctx.context_window_size > 0:
+        target_tokens = int(ctx.context_window_size * COMPACTION_TARGET)
+    if target_tokens <= 0:
+        return 0, LLM_COMPACT_DEFAULT_MEMORY_TOKENS
+    system_tokens = ctx.calculate_context_tokens([system_msg])
+    recent_tokens = ctx.calculate_context_tokens(recent)
+    room = (target_tokens - system_tokens - recent_tokens
+            - overhead_tokens - LLM_COMPACT_MEMORY_RESERVE)
+    return target_tokens, max(LLM_COMPACT_MEMORY_MIN_TOKENS, room)
+
+
+def _shrink_text_to_tokens(ctx: 'CommandContext', text: str, budget: int,
+                           marker: str = "\n[... memory trimmed to fit budget ...]\n") -> str:
+    """Deterministically shrink text to a token budget, keeping head and tail.
+
+    A consolidated memory states the task/constraints first and the newest
+    facts / next actions last, so a blind tail cut (the old phase-2 behaviour)
+    discarded the most current information. Keep both ends and drop the middle.
+    Uses the local estimate, not the backend tokenizer, so it is safe offline
+    and in hot paths.
+
+    Args:
+        ctx: CommandContext (estimate_tokens).
+        text: Text to shrink.
+        budget: Maximum estimated tokens (<= 0 yields an empty string).
+        marker: Inserted where the middle was dropped.
+
+    Returns:
+        The original text when it fits, else a head+tail truncation.
+    """
+    if budget <= 0:
+        return ''
+    if ctx.estimate_tokens(text) <= budget:
+        return text
+    if ctx.estimate_tokens(marker) >= budget:
+        marker = ''
+    lo, hi = 0, len(text)
+    best = ''
+    while lo <= hi:
+        keep = (lo + hi) // 2
+        head_len = keep * 3 // 5
+        tail_len = keep - head_len
+        candidate = text[:head_len] + marker + (text[-tail_len:] if tail_len else '')
+        if ctx.estimate_tokens(candidate) <= budget:
+            best = candidate
+            lo = keep + 1
+        else:
+            hi = keep - 1
+    return best or text[:max(0, budget)]
 
 
 def _render_token_breakdown(middle: list[Message], ctx: 'CommandContext',
@@ -2235,13 +2334,22 @@ def _render_conversation_transcript(middle: list[Message],
 
 
 def _llm_summarize_conversation(ctx: 'CommandContext', query_handler: 'ModelQuery',
-                                middle: list) -> tuple:
-    """Ask the model for a faithful narrative summary of older conversation turns.
+                                middle: list, old_memory: str = '',
+                                memory_budget: int = 0) -> tuple:
+    """Consolidate older turns and prior memory into ONE bounded memory block.
+
+    Repeated compactions must not append an ever-growing audit log: the prior
+    memory is an input to the replacement summary, so superseded details can be
+    dropped and the block stays bounded. The prompt states an explicit character
+    budget, and an over-long reply is shrunk deterministically (head+tail) before
+    it reaches the conversation.
 
     Args:
         ctx: CommandContext (uses model for the call).
         query_handler: ModelQuery for the summarization call.
-        middle: Older message list to summarize.
+        middle: The newly evicted turns (the prior memory already removed).
+        old_memory: Body of the previous consolidated memory, or ''.
+        memory_budget: Soft token budget for the replacement (0 = default).
 
     Returns:
         (summary, gen_tokens, elapsed_sec): the summary text (or None on
@@ -2249,18 +2357,27 @@ def _llm_summarize_conversation(ctx: 'CommandContext', query_handler: 'ModelQuer
         time of the summarization call.
     """
     transcript = _render_conversation_transcript(middle)
-    if not transcript.strip():
+    if not transcript.strip() and not old_memory.strip():
         return None, 0, 0.0
+    budget = memory_budget or LLM_COMPACT_DEFAULT_MEMORY_TOKENS
+    max_chars = max(256, budget * LLM_COMPACT_CHARS_PER_TOKEN)
+    prior = _cap_text(old_memory, LLM_COMPACT_TRANSCRIPT_CHARS)
     system = (
-        "You are a context optimizer for a CLI chat session. The conversation is "
-        "approaching the context limit, so the EARLIER turns below must be compacted "
-        "into a short, faithful summary. Retain everything that still matters for the "
-        "rest of the session: the user's requirements and preferences, decisions made, "
-        "file paths, commands run, errors, and open questions. A few sentences are "
-        "enough. Do not narrate the process — only keep information that would be lost "
-        "if the transcript were deleted."
+        "You maintain the persistent memory of a CLI chat session. Merge the "
+        "EXISTING MEMORY with the NEWLY EVICTED CONVERSATION into ONE replacement "
+        "memory. Keep only what still matters for the rest of the session: the "
+        "user's requirements and preferences, decisions and their rationale, the "
+        "current task state (file paths, commands, errors), and open questions / "
+        "next actions. Drop superseded details and verbose tool output. Reply with "
+        "the memory only — no preamble, no commentary."
     )
-    user = f"EARLIER CONVERSATION TO SUMMARIZE:\n\n{transcript}"
+    user = (
+        "EXISTING MEMORY:\n"
+        f"{prior or '(none)'}\n\n"
+        "NEWLY EVICTED CONVERSATION:\n"
+        f"{transcript}\n\n"
+        f"Return ONE updated memory of at most ~{max_chars} characters."
+    )
     start = time.time()
     try:
         response = query_handler.query_sync(
@@ -2273,31 +2390,33 @@ def _llm_summarize_conversation(ctx: 'CommandContext', query_handler: 'ModelQuer
         return None, 0, 0.0
     elapsed = time.time() - start
     summary = _extract_sync_content(ctx, response).strip()
+    if summary and ctx.estimate_tokens(summary) > budget:
+        summary = _shrink_text_to_tokens(ctx, summary, budget)
     return (summary or None), _extract_gen_tokens(ctx, response), elapsed
 
 
 def _extract_compaction_log(content: object) -> str:
-    """Return the body of a prior compaction summary message for re-embedding.
+    """Return the body of a prior memory block, for consolidation.
 
     A previous `llm_compact_messages` result starts with the summary marker and
-    an intro line; the dated entries after it are extracted so they can be kept
-    verbatim when a new compaction entry is appended — the log grows by roughly
-    one entry per `/compact llm`, but earlier entries are never re-summarized
-    away, so the session model keeps its full memory of what was achieved.
+    an intro line. The body after it is fed back to the summarizer as the
+    "existing memory" to merge — it is never re-embedded verbatim, so the block
+    cannot grow by one entry per `/compact llm`.
 
     Args:
         content: The prior compacted message content (or any non-string).
 
     Returns:
-        The entries block without the marker/intro, or '' when `content` is
-        not a prior compaction summary.
+        The memory body without the marker/intro, or '' when `content` is not a
+        prior compaction summary.
     """
     if not isinstance(content, str) or not content.startswith(LLM_COMPACT_SUMMARY_MARKER):
         return ''
     lines = content.split('\n')
     rest = lines[1:]
     if rest and (rest[0].startswith('Earlier conversation compacted')
-                 or rest[0].startswith('Compaction log')):
+                 or rest[0].startswith('Compaction log')
+                 or rest[0].startswith('Consolidated memory')):
         rest = rest[1:]
     while rest and not rest[0].strip():
         rest = rest[1:]
@@ -2307,26 +2426,37 @@ def _extract_compaction_log(content: object) -> str:
 
 
 def llm_compact_messages(messages: list[Message], ctx: 'CommandContext', query_handler: 'ModelQuery',
-                         keep_recent: int = COMPACTION_KEEP_RECENT) -> list[Message]:
-    """Compress history with an LLM-generated narrative summary of the older turns.
+                         keep_recent: int = COMPACTION_KEEP_RECENT,
+                         target_tokens: int = 0,
+                         overhead_tokens: int = 0) -> list[Message]:
+    """Consolidate the older conversation into one bounded LLM memory block.
 
     Unlike `compact_messages` (excerpt previews), the dropped middle is handed to
-    the model for a faithful summary, preserving facts the excerpt-based approach
-    would drop. The compacted message embeds the narrative summary followed by
-    the `/tokencount`-style breakdown of the compacted turns (roles, token
-    counts, OK/KO tool results, ~50 chars of text) plus the before/after context
-    size and the summarization token rate, so the session model can reconstruct
-    what was achieved. When a prior `/compact llm` summary message exists, its
-    dated entries are kept verbatim and the new entry is appended — the summary
-    becomes a dated log that grows by ~one entry per compaction. On LLM failure
-    (or when there is nothing to compact) falls back to the mechanical
-    `compact_messages`.
+    the model for a faithful summary. The result is a *working-memory* artifact,
+    not an append-only audit log: when a prior LLM summary exists, its body is an
+    input to the replacement summary, so superseded facts can be dropped and the
+    block stays bounded across repeated `/compact llm` runs.
+
+    The memory gets only the room left after the system prompt, the verbatim
+    recent window and the request overhead (`_compaction_memory_budget`). The
+    summarizer is told the character budget, an over-long reply is shrunk
+    deterministically (head+tail, keeping the newest facts), and the final
+    message is re-checked against the budget before returning. On LLM failure
+    (or when there is nothing to compact) falls back to mechanical compaction.
+
+    Diagnostics that used to be embedded in the context (the per-message token
+    breakdown and tok/s footer) are intentionally not part of the memory block;
+    `/compact`'s status line and `/compact list` still report sizes.
 
     Args:
         messages: Full message list (not mutated — returns a new list).
         ctx: CommandContext for token estimation/stamping.
         query_handler: ModelQuery used for the summarization call.
         keep_recent: Number of recent messages to always preserve.
+        target_tokens: Overall post-compaction budget; 0 derives it from the
+            context window (COMPACTION_TARGET).
+        overhead_tokens: Tokens the request adds beyond the stored messages
+            (system-prompt swap, `tools`, template framing).
 
     Returns:
         A new compacted message list.
@@ -2338,45 +2468,48 @@ def llm_compact_messages(messages: list[Message], ctx: 'CommandContext', query_h
     if not middle:
         return list(messages)
 
-    before_tokens = ctx.calculate_context_tokens(messages)
-    summary, gen_tokens, elapsed = _llm_summarize_conversation(ctx, query_handler, middle)
-    if not summary:
-        return compact_messages(messages, ctx, keep_recent=keep_recent)
+    target_tokens, memory_budget = _compaction_memory_budget(
+        ctx, system_msg, recent, target_tokens, overhead_tokens)
 
-    # Append to the dated compaction log if a prior summary message exists, so
-    # earlier entries survive verbatim instead of being re-summarized away.
-    prev_log = _extract_compaction_log(middle[0].get('content', '')) if middle else ''
+    # Consolidate: the prior memory is input, the newly evicted turns are the
+    # only new material. Never append the old block verbatim.
+    old_memory = _extract_compaction_log(middle[0].get('content', ''))
+    new_turns = middle[1:] if old_memory else middle
+    summary, _gen_tokens, _elapsed = _llm_summarize_conversation(
+        ctx, query_handler, new_turns, old_memory=old_memory,
+        memory_budget=memory_budget)
+    if not summary:
+        return compact_messages(messages, ctx, keep_recent=keep_recent,
+                                target_tokens=target_tokens,
+                                overhead_tokens=overhead_tokens)
+
     timestamp = time.strftime("%Y-%m-%d %H:%M")
-    entry = (
-        f"[{timestamp}]\n"
-        + summary
-        + "\n\nToken breakdown of the compacted turns:\n"
-        + _render_token_breakdown(middle, ctx)
-    )
-    body = prev_log + "\n\n" + entry if prev_log else entry
-    base_text = (
-        LLM_COMPACT_SUMMARY_MARKER + "\n"
-        "Compaction log (oldest first):\n\n"
-        + body
-    )
-    compacted_msg = {'role': 'user', 'content': base_text}
+    compacted_msg = {
+        'role': 'user',
+        'content': (LLM_COMPACT_SUMMARY_MARKER + "\n"
+                    f"Consolidated memory ({timestamp}):\n\n" + summary),
+    }
     ctx.stamp_tokens(compacted_msg)
     result = [system_msg, compacted_msg]
-    if recent and recent[-1].get('role') == 'user':
+    if _needs_continuation_placeholder(recent):
         result.append({'role': 'assistant', 'content': '[Context continued...]'})
     result.extend(recent)
     sanitize_tool_pairing(result)
-    after_tokens = ctx.calculate_context_tokens(result)
 
-    saved = before_tokens - after_tokens
-    pct = (saved / before_tokens * 100) if before_tokens else 0.0
-    speed = (gen_tokens / elapsed) if elapsed > 0 else 0.0
-    compacted_msg['content'] = (
-        base_text
-        + f"\n\nContext: {before_tokens} → {after_tokens} tokens ({pct:.0f}% saved)"
-        + f" | summary generation: {speed:.1f} tok/s ({gen_tokens} tok in {elapsed:.1f}s)"
-    )
-    ctx.stamp_tokens(compacted_msg)
+    # Explicit budget check. Shrink the memory, not the recent turns: the
+    # summary is the only component that should flex between compactions.
+    if target_tokens > 0:
+        total = ctx.calculate_context_tokens(result) + overhead_tokens
+        if total > target_tokens:
+            memory_tokens = compacted_msg.get(
+                '_tokens', ctx.estimate_tokens(compacted_msg['content']))
+            new_budget = memory_tokens - (total - target_tokens) - 16
+            if new_budget < memory_tokens:
+                compacted_msg['content'] = _shrink_text_to_tokens(
+                    ctx, compacted_msg['content'],
+                    max(LLM_COMPACT_MEMORY_MIN_TOKENS, new_budget))
+                compacted_msg.pop('_tokens', None)
+                ctx.stamp_tokens(compacted_msg)
     return result
 
 
@@ -4113,7 +4246,7 @@ AGENTIC_TOOL_DEFS = {
         }
     },
     "grep": {
-        "description": "Search file contents with a regex and return matches grouped by file with line numbers. Optionally restrict to a path and an include glob (e.g. '*.md'). Case-insensitive by default (pass case_insensitive=false for exact case). Returns up to max_results matches (default 100); when the cap is hit, narrow the pattern/path/include or pass a higher max_results. Path relative to CWD; searching outside CWD (e.g. /etc, home dotfiles) may prompt for approval. Direct content search, NOT a shell command — never wrap the pattern in shell metacharacters.",
+        "description": "Search file contents with a regex and return matches grouped by file with line numbers. Optionally restrict to a path and an include glob (e.g. '*.md'). Case-insensitive by default (pass case_insensitive=false for exact case). Recursive searches skip `.git` (an explicit path inside .git is still searched), and every matched file is re-checked against the path ACL — restricted matches are hidden and counted. Returns up to max_results matches (default 100) and the rendered output is hard-capped; when a cap is hit, narrow the pattern/path/include. Path relative to CWD; searching outside CWD (e.g. /etc, home dotfiles) may prompt for approval. Direct content search, NOT a shell command — never wrap the pattern in shell metacharacters.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -4201,8 +4334,8 @@ AGENTIC_TOOL_DEFS = {
             "properties": {
                 "cluster_type": {"type": "string", "enum": ["omc", "openshift", "kubernetes", "auto"], "description": "Consultation backend: omc=offline must-gather, openshift=oc, kubernetes=kubectl, auto=detect from environment (default)"},
                 "verb": {"type": "string", "enum": ["get", "logs", "describe", "events", "current-context"], "description": "Read-only action (default: get)"},
-                "resource": {"type": "string", "description": "Resource type to query, e.g. pods, deployments, nodes, namespaces (required for get/logs/describe)"},
-                "name": {"type": "string", "description": "Optional resource instance name, e.g. my-pod"},
+                "resource": {"type": "string", "description": "Resource type to query, e.g. pods, deployments, nodes, namespaces (required for get/logs/describe). For logs, pass resource='pods' with name='<pod>', or resource='pod/<pod>'."},
+                "name": {"type": "string", "description": "Optional resource instance name, e.g. my-pod. For logs this is the pod name and is folded into a single TYPE/NAME target."},
                 "namespace": {"type": "string", "description": "Optional namespace (-n)"},
                 "selector": {"type": "string", "description": "Optional label selector to filter on, e.g. 'app=nginx' (-l). Supported by get and logs; rejected for describe."},
                 "field_selector": {"type": "string", "description": "Optional field selector, e.g. 'status.phase=Running' (--field-selector). Supported by get only."},
@@ -4267,6 +4400,7 @@ def plan_active_tools(ctx) -> set:
 CLUSTER_QUERY_VERBS = {"get", "logs", "describe", "events", "current-context"}
 CLUSTER_QUERY_OUTPUTS = {"json", "yaml", "wide", "custom-columns", "jsonpath"}
 CLUSTER_QUERY_TIMEOUT = 60
+CLUSTER_LOG_TAIL_DEFAULT = 50  # logs are tailed by default (schema/prompt promise)
 OMC_CONFIG_PATH = os.path.expanduser("~/.omc/omc.json")
 
 # Large `kubernetes_cluster_query` results are spilled to per-query files in the
@@ -5027,8 +5161,73 @@ def _grep_parse_match(line: str):
         return None
 
 
+def _grep_drain_stdout(pipe, sink: list, cap: int, stop: threading.Event) -> None:
+    """Drain a search tool's stdout into `sink`, keeping at most cap+1 lines.
+
+    Runs in a daemon thread so the parent can enforce a wall-clock deadline and
+    terminate the tool. Stops early once the cap is exceeded (the parent then
+    kills the process, so the remaining output is irrelevant).
+
+    Args:
+        pipe: The child's text-mode stdout.
+        sink: List that receives the captured lines.
+        cap: Maximum matches to keep (plus one sentinel for truncation).
+        stop: Event set by the parent to ask the reader to exit.
+    """
+    try:
+        for line in pipe:
+            if stop.is_set() or len(sink) > cap:
+                break
+            line = line.rstrip("\n")
+            if line:
+                sink.append(line)
+            if len(sink) > cap:
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+
+
+def _grep_drain_stderr(pipe, sink: dict, limit: int = 4096) -> None:
+    """Drain a search tool's stderr, retaining only a bounded tail.
+
+    Reading stderr concurrently with stdout is what prevents the classic
+    deadlock: a child that fills the stderr pipe buffer blocks before it can
+    produce more stdout, and the parent would otherwise block forever waiting
+    for a stdout line.
+
+    Args:
+        pipe: The child's text-mode stderr.
+        sink: Dict receiving the retained tail under the "tail" key.
+        limit: Maximum characters of stderr to retain.
+    """
+    try:
+        while True:
+            chunk = pipe.readline()
+            if not chunk:
+                break
+            sink["tail"] = (sink.get("tail", "") + chunk)[-limit:]
+    except Exception:
+        pass
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+
+
 def _grep_run_external(argv: list, cap: int, timeout: int) -> tuple:
     """Run an rg/grep subprocess, capturing at most cap+1 matching lines.
+
+    Both pipes are drained concurrently by daemon threads, so a chatty stderr
+    can never fill the pipe buffer and deadlock the reader. The deadline is a
+    real wall-clock deadline: the parent polls the child, so a silent search
+    over a huge tree is killed after `timeout` seconds instead of hanging until
+    the next stdout line.
 
     Args:
         argv: Raw argv list (no shell interpolation).
@@ -5046,41 +5245,61 @@ def _grep_run_external(argv: list, cap: int, timeout: int) -> tuple:
                                 text=True, encoding="utf-8", errors="replace")
     except (OSError, ValueError) as e:
         return raw, f"could not start search tool: {e}"
+    stop = threading.Event()
+    err_sink = {}
+    out_thread = threading.Thread(target=_grep_drain_stdout,
+                                  args=(proc.stdout, raw, cap, stop), daemon=True)
+    err_thread = threading.Thread(target=_grep_drain_stderr,
+                                  args=(proc.stderr, err_sink), daemon=True)
+    out_thread.start()
+    err_thread.start()
     deadline = time.monotonic() + timeout
+    timed_out = False
+    capped = False
     try:
-        for line in proc.stdout:
-            if time.monotonic() > deadline:
-                err = f"search timed out after {timeout}s"
-                proc.terminate()
+        while proc.poll() is None:
+            if len(raw) > cap:
+                capped = True
                 break
-            line = line.rstrip("\n")
-            if line:
-                raw.append(line)
-                if len(raw) > cap:
-                    proc.terminate()
-                    break
-    except Exception as e:
-        err = str(e)
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-    except Exception:
-        pass
-    stderr_tail = ""
-    if proc.stderr:
-        try:
-            stderr_tail = proc.stderr.read().strip()
-        except Exception:
-            stderr_tail = ""
-    for pipe in (proc.stdout, proc.stderr):
-        if pipe is not None:
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
+            time.sleep(0.02)
+    finally:
+        if proc.poll() is None:
+            stop.set()
             try:
-                pipe.close()
+                proc.terminate()
             except Exception:
                 pass
-    if err is None and proc.returncode not in (0, 1):
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        else:
+            # Let the stdout reader reach EOF so buffered matches are not lost.
+            out_thread.join(timeout=1)
+            stop.set()
+        out_thread.join(timeout=1)
+        err_thread.join(timeout=1)
+    stderr_tail = err_sink.get("tail", "").strip()
+    if timed_out:
+        err = f"search timed out after {timeout}s"
+    # A cap-triggered stop kills the tool, either by our terminate (-SIGTERM) or
+    # by SIGPIPE once the reader closes stdout (-SIGPIPE). Both are expected
+    # when we already have cap+1 lines, so only judge the exit status when the
+    # process ran to completion on its own.
+    capped = capped or len(raw) > cap
+    if err is None and not capped and proc.returncode not in (0, 1):
         if stderr_tail:
             err = stderr_tail.splitlines()[-1]
         else:
@@ -5088,12 +5307,16 @@ def _grep_run_external(argv: list, cap: int, timeout: int) -> tuple:
     return raw, err
 
 
-def _grep_parse_hits(raw: list, cap: int) -> tuple:
+def _grep_parse_hits(raw: list, cap: int, read_allowed=None) -> tuple:
     """Convert raw match lines into (path, line, text) hits, dropping blocked files.
 
     Args:
         raw: Raw 'path:line:text' lines from the search tool (may exceed cap).
         cap: The configured match cap.
+        read_allowed: Optional predicate (realpath) -> bool. Matches it rejects
+            are dropped before rendering, so a recursive search under an allowed
+            root cannot leak files the path ACL would refuse per-file (e.g. home
+            dotfiles under `~`).
 
     Returns:
         (hits, truncated) tuple.
@@ -5110,11 +5333,14 @@ def _grep_parse_hits(raw: list, cap: int) -> tuple:
             continue
         if _is_blocked_system_file(real):
             continue
+        if read_allowed is not None and not read_allowed(real):
+            continue
         hits.append((real, lineno, text))
     return hits, len(raw) > cap
 
 
-def _grep_search_python(root: str, pattern: str, include: str, ci: bool, cap: int) -> tuple:
+def _grep_search_python(root: str, pattern: str, include: str, ci: bool, cap: int,
+                        read_allowed=None, skip_git: bool = True) -> tuple:
     """Pure-Python fallback content search (rg/grep unavailable).
 
     Args:
@@ -5123,6 +5349,9 @@ def _grep_search_python(root: str, pattern: str, include: str, ci: bool, cap: in
         include: Optional basename glob filter.
         ci: Case-insensitive flag.
         cap: Maximum matches.
+        read_allowed: Optional predicate (realpath) -> bool. Denied files are
+            never opened.
+        skip_git: Prune `.git` directories during the walk.
 
     Returns:
         ((path, line, text) hits, truncated, error|None).
@@ -5133,7 +5362,9 @@ def _grep_search_python(root: str, pattern: str, include: str, ci: bool, cap: in
         return [], False, f"invalid regex: {e}"
     targets = []
     if os.path.isdir(root):
-        for dirpath, _dirnames, filenames in os.walk(root):
+        for dirpath, dirnames, filenames in os.walk(root):
+            if skip_git:
+                dirnames[:] = [d for d in dirnames if d != ".git"]
             for name in sorted(filenames):
                 if include and not fnmatch.fnmatch(name, include):
                     continue
@@ -5146,6 +5377,8 @@ def _grep_search_python(root: str, pattern: str, include: str, ci: bool, cap: in
             real = os.path.realpath(target)
             if _is_blocked_system_file(real):
                 continue
+            if read_allowed is not None and not read_allowed(real):
+                continue
             with open(target, "r", encoding="utf-8", errors="replace") as f:
                 for lineno, line in enumerate(f, 1):
                     if rx.search(line.rstrip("\n")):
@@ -5157,8 +5390,33 @@ def _grep_search_python(root: str, pattern: str, include: str, ci: bool, cap: in
     return hits, False, None
 
 
-def _grep_search(root: str, pattern: str, include: str, ci: bool, cap: int) -> tuple:
+def _grep_root_inside_git(root: str) -> bool:
+    """True when the search root was explicitly pointed inside a `.git` tree.
+
+    An explicit request (`path=".git"`, `.git/config`, `.git/objects`) must not
+    be silently overridden — only recursive searches of a parent directory skip
+    `.git` by default.
+
+    Args:
+        root: The resolved search root.
+
+    Returns:
+        True when any path component is `.git`.
+    """
+    try:
+        parts = os.path.realpath(root).split(os.sep)
+    except (OSError, ValueError):
+        return False
+    return ".git" in parts
+
+
+def _grep_search(root: str, pattern: str, include: str, ci: bool, cap: int,
+                 read_allowed=None) -> tuple:
     """Search file contents, preferring ripgrep over grep over pure Python.
+
+    Recursive searches skip `.git` in every backend so results do not depend on
+    which binary is installed (rg skips it by default; grep -r and os.walk do
+    not). An explicit root inside `.git` is left alone.
 
     Args:
         root: Directory or single file to search.
@@ -5166,25 +5424,32 @@ def _grep_search(root: str, pattern: str, include: str, ci: bool, cap: int) -> t
         include: Optional glob file filter.
         ci: Case-insensitive flag.
         cap: Maximum matches.
+        read_allowed: Optional predicate (realpath) -> bool for per-file ACL
+            enforcement.
 
     Returns:
         ((path, line, text) hits, truncated, error|None).
     """
     rg = shutil.which("rg")
     single_file = os.path.isfile(root)
+    skip_git = not single_file and not _grep_root_inside_git(root)
     if rg:
         argv = [rg, "-n", "--no-heading"]
         if ci:
             argv.append("-i")
         if include:
             argv += ["--glob", include]
+        if skip_git:
+            # Explicit even though rg skips hidden dirs by default: makes the
+            # policy visible and survives a user/global ripgreprc override.
+            argv += ["--glob", "!.git/**"]
         if single_file:
             # rg omits the "path:" prefix when searching a single file.
             argv.append("--with-filename")
         argv += ["--", pattern, root]
         raw, err = _grep_run_external(argv, cap, GREP_SEARCH_TIMEOUT)
         if err is None:
-            hits, truncated = _grep_parse_hits(raw, cap)
+            hits, truncated = _grep_parse_hits(raw, cap, read_allowed)
             return hits, truncated, None
     grep = shutil.which("grep")
     if grep:
@@ -5193,15 +5458,18 @@ def _grep_search(root: str, pattern: str, include: str, ci: bool, cap: int) -> t
             argv.append("-i")
         if include:
             argv += [f"--include={include}"]
+        if skip_git:
+            argv.append("--exclude-dir=.git")
         if single_file:
             # grep -n alone prints "LINENUM:text" (no filename) for one file.
             argv.append("-H")
         argv += ["--", pattern, root]
         raw, err = _grep_run_external(argv, cap, GREP_SEARCH_TIMEOUT)
         if err is None:
-            hits, truncated = _grep_parse_hits(raw, cap)
+            hits, truncated = _grep_parse_hits(raw, cap, read_allowed)
             return hits, truncated, None
-    return _grep_search_python(root, pattern, include, ci, cap)
+    return _grep_search_python(root, pattern, include, ci, cap,
+                               read_allowed=read_allowed, skip_git=skip_git)
 
 
 def _grep_display_path(path_abs: str) -> str:
@@ -5222,19 +5490,27 @@ def _grep_display_path(path_abs: str) -> str:
     return path_abs
 
 
-def _grep_render(hits: list, truncated: bool, cap: int) -> str:
+def _grep_render(hits: list, truncated: bool, cap: int, blocked: int = 0) -> str:
     """Render hits opencode-style: grouped by file with line numbers.
+
+    The rendered text is hard-capped at MAX_GREP_OUTPUT_CHARS so a full match
+    set cannot put ~50 KB into the model context in one call.
 
     Args:
         hits: List of (path, line_no, text) tuples.
-        truncated: Whether results hit the cap.
+        truncated: Whether results hit the match cap.
         cap: The configured match cap (for the truncation note).
+        blocked: Number of results hidden by the per-file path ACL.
 
     Returns:
         Formatted output string.
     """
     if not hits:
-        return "No files found"
+        text = "No files found"
+        if blocked:
+            text += (f"\n({blocked} result(s) hidden by the path ACL — grant access "
+                     f"with /agentic acl allow <path> if intended.)")
+        return text
     lines = [f"Found {len(hits)} matches"]
     current = None
     for path_abs, lineno, text in hits:
@@ -5251,15 +5527,28 @@ def _grep_render(hits: list, truncated: bool, cap: int) -> str:
         lines.append("")
         lines.append(f"(Results capped at {cap} matches. Narrow the pattern/path/include "
                      f"or pass max_results={cap} for the same ceiling.)")
-    return "\n".join(lines)
+    if blocked:
+        lines.append(f"({blocked} result(s) hidden by the path ACL — grant access "
+                     f"with /agentic acl allow <path> if intended.)")
+    rendered = "\n".join(lines)
+    if len(rendered) > MAX_GREP_OUTPUT_CHARS:
+        note = (f"\n(Output capped at {MAX_GREP_OUTPUT_CHARS} chars; narrow "
+                f"pattern/path/include.)")
+        rendered = rendered[:MAX_GREP_OUTPUT_CHARS - len(note)] + note
+    return rendered
 
 
 def _tool_handle_grep(self, args: dict) -> dict:
     """Search file contents with a regex after a root-level path-ACL gate.
 
-    The ACL is consulted once for the search root (never per match), so a CWD
-    search is auto-allowed while a search rooted at e.g. /etc prompts once.
-    Matches are cap-bounded and per-line truncated before rendering.
+    The ACL is consulted once for the search root (so a CWD search is
+    auto-allowed while a search rooted at e.g. /etc prompts once) and then
+    again per matched file. Without the per-file check a recursive search under
+    an allowed root — notably `~` — would silently read home dotfiles such as
+    `~/.ssh/id_rsa` even though they are `ask` by default. Results the per-file
+    check refuses are dropped (never prompted, to avoid one prompt per match)
+    and counted in the output. Matches are cap-bounded, per-line truncated, and
+    the rendered text is hard-capped before rendering.
 
     Args:
         args: Tool arguments with "pattern"; optional "path", "include",
@@ -5289,10 +5578,49 @@ def _tool_handle_grep(self, args: dict) -> dict:
     if not os.path.lexists(root):
         return {"success": False, "output": "", "error": f"Path not found: {raw}"}
 
-    hits, truncated, err = _grep_search(root, pattern, include, ci, cap)
+    acl = getattr(ctx, "path_acl", None) if ctx is not None else None
+    blocked = {"n": 0}
+    plan_strict = (ctx is not None and getattr(ctx, "plan_mode", False)
+                   and not getattr(ctx, "plan_run", False))
+    cwd_real = os.path.realpath(os.getcwd())
+    home_explicit = _raw_is_home_explicit(raw)
+
+    def _read_allowed(realpath: str) -> bool:
+        """Per-matched-file ACL check (silent; no prompt spam).
+
+        `ask` is treated as deny so a recursive search cannot leak a file the
+        user would have been prompted for. An explicit session allow rule still
+        wins, which keeps `path=~/.ssh` (approved once at the root gate) working.
+        Implicit outside-CWD allows are only honoured when the search root was
+        an explicit home request, mirroring `_path_acl_decision`; this also
+        closes the symlink-inside-CWD escape.
+        """
+        if acl is None:
+            return True
+        try:
+            action, rule = acl.evaluate("read", realpath)
+        except Exception:
+            return False
+        if action != "allow":
+            blocked["n"] += 1
+            return False
+        if rule is None:
+            try:
+                in_cwd = os.path.commonpath([cwd_real, realpath]) == cwd_real
+            except ValueError:
+                in_cwd = False
+            if not in_cwd and (plan_strict or not home_explicit):
+                blocked["n"] += 1
+                return False
+        return True
+
+    hits, truncated, err = _grep_search(root, pattern, include, ci, cap,
+                                        read_allowed=_read_allowed)
     if err:
         return {"success": False, "output": "", "error": err}
-    return {"success": True, "output": _grep_render(hits, truncated, cap), "error": None}
+    return {"success": True,
+            "output": _grep_render(hits, truncated, cap, blocked=blocked["n"]),
+            "error": None}
 
 
 def _tool_handle_run_python(self, args: dict) -> dict:
@@ -5971,18 +6299,46 @@ def _cluster_query_verb_args(verb: str, args: dict) -> list:
         Shell-quoted command token list following the verb.
 
     Raises:
-        ValueError: when a required resource/fields is missing, or a filter is
-            used with a verb that does not support it.
+        ValueError: when a required resource/fields is missing, a filter is used
+            with a verb that does not support it, or `logs` is called without a
+            single pod target.
+
+    `logs` is special: kubectl/oc accept exactly one positional target
+    (`POD` or `TYPE/NAME`), so `resource` + `name` are folded into
+    `resource/name` rather than emitted as two operands. `logs` without a pod
+    name is rejected early instead of producing a command the backend refuses.
+    Logs are also tailed by default (CLUSTER_LOG_TAIL_DEFAULT) so a bare `logs`
+    call cannot pull an unbounded log into context.
     """
     parts = ["get", "events"] if verb == "events" else [verb]
     if verb != "events":
         resource = str(args.get("resource") or "").strip()
         if not resource:
             raise ValueError(f"resource is required for verb '{verb}'")
-        parts.append(resource)
         name = str(args.get("name") or "").strip()
-        if name:
-            parts.append(name)
+        if verb == "logs":
+            log_selector = str(args.get("selector") or "").strip()
+            if name and "/" in resource:
+                raise ValueError(
+                    "logs: pass either resource='pod/<name>' or resource + name, not both")
+            if log_selector:
+                # `logs -l <selector>` selects pods itself and takes no positional.
+                if name or "/" in resource:
+                    raise ValueError(
+                        "logs: selector cannot be combined with a pod name — pass "
+                        "selector alone or a single pod target")
+            elif name:
+                parts.append(f"{resource}/{name}")
+            elif "/" in resource:
+                parts.append(resource)
+            else:
+                raise ValueError(
+                    "logs requires a pod name: pass name='<pod>' with resource='pods', "
+                    "or resource='pod/<pod>'")
+        else:
+            parts.append(resource)
+            if name:
+                parts.append(name)
     namespace = str(args.get("namespace") or "").strip()
     if namespace:
         parts += ["-n", namespace]
@@ -6004,11 +6360,12 @@ def _cluster_query_verb_args(verb: str, args: dict) -> list:
         parts += ["-c", container]
     if verb == "logs":
         tail = args.get("tail")
-        if tail is not None:
-            try:
-                parts.append(f"--tail={max(1, int(tail))}")
-            except (TypeError, ValueError):
-                pass
+        if tail is None:
+            tail = CLUSTER_LOG_TAIL_DEFAULT
+        try:
+            parts.append(f"--tail={max(1, int(tail))}")
+        except (TypeError, ValueError):
+            parts.append(f"--tail={CLUSTER_LOG_TAIL_DEFAULT}")
     elif verb in ("get", "events"):
         output = str(args.get("output", "json")).lower()
         if output == "custom-columns":
@@ -7663,6 +8020,19 @@ class MCPConnection:
 
 # -- client -------------------------------------------------------------------
 
+# Pagination hardening. A malformed or hostile stdio server can keep returning
+# `nextCursor` forever: every page succeeds inside `list_timeout_seconds`, so a
+# per-request timeout never fires and `connect()` (holding the MCPManager lock)
+# never returns. A seen-cursor set stops cycles on the second page; the
+# page/catalog ceilings and the total deadline bound a server that invents an
+# endless stream of fresh cursors. Generous enough for any real catalog: 10k
+# tools at one tool per page still fits under both ceilings.
+MCP_LIST_MAX_PAGES = 10_000
+MCP_LIST_MAX_TOOLS = 10_000
+MCP_LIST_DEADLINE_FACTOR = 10.0  # x list_timeout_seconds...
+MCP_LIST_DEADLINE_MIN = 60.0     # ...but never less than this
+
+
 class MCPClient:
     """One connected, initialized MCP server session (stdio)."""
 
@@ -7736,17 +8106,53 @@ class MCPClient:
             self.errors.append("tools/list_changed received (refresh is not implemented)")
 
     def list_tools(self) -> "List[dict]":
-        """Fetch the full catalog, following `nextCursor` pagination."""
+        """Fetch the full catalog, following `nextCursor` defensively.
+
+        A compliant server returns a fresh cursor per page until the catalog is
+        exhausted. A malformed or hostile one can return the same cursor forever
+        (or an endless stream of unique ones): each page succeeds well inside
+        `list_timeout_seconds`, so a per-request timeout never fires, `connect()`
+        never returns, and `MCPManager.start()` blocks while holding its lock.
+
+        Guards (all fail closed):
+        - a repeated cursor raises on the second occurrence (stops cycles);
+        - a page ceiling and a catalog-size ceiling (a 1k-tool catalog is far
+          below both, so legitimate servers are unaffected);
+        - one deadline for the whole refresh, not just per page.
+
+        Raises:
+            MCPError: The server violates the pagination contract or the
+                refresh exceeds its bounds.
+        """
         tools = []
         cursor = None
+        seen_cursors = set()
+        pages = 0
+        deadline = time.monotonic() + max(
+            MCP_LIST_DEADLINE_MIN,
+            float(self.cfg.list_timeout_seconds) * MCP_LIST_DEADLINE_FACTOR)
         while True:
+            if pages >= MCP_LIST_MAX_PAGES:
+                raise MCPError(f"MCP server {self.cfg.name!r}: tools/list exceeded "
+                               f"{MCP_LIST_MAX_PAGES} pages")
+            if time.monotonic() > deadline:
+                raise MCPError(f"MCP server {self.cfg.name!r}: tools/list refresh "
+                               f"exceeded its total time budget")
             params = {"cursor": cursor} if cursor else {}
             result = self.connection.request("tools/list", params,
                                              timeout=self.cfg.list_timeout_seconds)
             tools.extend(result.get("tools") or [])
+            pages += 1
+            if len(tools) > MCP_LIST_MAX_TOOLS:
+                raise MCPError(f"MCP server {self.cfg.name!r}: tools/list returned "
+                               f"more than {MCP_LIST_MAX_TOOLS} tools")
             cursor = result.get("nextCursor")
             if not cursor:
                 break
+            if cursor in seen_cursors:
+                raise MCPError(f"MCP server {self.cfg.name!r}: tools/list repeated "
+                               f"cursor {cursor!r} after {pages} page(s)")
+            seen_cursors.add(cursor)
         self.tools = tools
         return tools
 
@@ -13812,8 +14218,18 @@ class ChatLoop:
                 print()
             else:
                 final_messages = list(messages)
-                if final_messages:
-                    final_messages[0] = {'role': 'system', 'content': self.ctx.system_prompt}
+                # Preserve the ReAct list's system message: `_init_agentic_query()`
+                # built it via `_agentic_prompt_and_tools()`, so it carries the
+                # active plan/full prose AND the inline tool-definition block for
+                # non-native models. Overwriting it with `ctx.system_prompt` (the
+                # chat prompt, built without `tool_defs_block`) silently dropped
+                # the tool schemas from the final stream, so a late tool call had
+                # no current schema to form a reliable call.
+                if not (final_messages and final_messages[0].get('role') == 'system'):
+                    # No usable system message (unexpected): rebuild exactly what
+                    # `_init_agentic_query()` would have sent.
+                    system_content, _tools, _send_tools_api = self._agentic_prompt_and_tools()
+                    final_messages.insert(0, {'role': 'system', 'content': system_content})
                 if final_messages and final_messages[-1]['role'] != 'user':
                     final_messages.append({'role': 'user', 'content':
                         "Provide your final answer now, based on the tool results above. "
@@ -14896,9 +15312,15 @@ class ChatLoop:
                     "[Compact] No eligible tool results to summarize.",
                     'muted'), file=sys.stderr)
 
-        # Phase 1: LLM narrative summary (when requested) or sliding-window compaction
+        # Overall post-compaction budget (0 = unknown context window).
+        target = (int(self.ctx.context_window_size * COMPACTION_TARGET)
+                  if self.ctx.context_window_size > 0 else 0)
+
+        # Phase 1: LLM memory consolidation (when requested) or sliding-window compaction
         if use_llm:
-            self.messages = llm_compact_messages(self.messages, self.ctx, self.query_handler)
+            self.messages = llm_compact_messages(
+                self.messages, self.ctx, self.query_handler,
+                target_tokens=target, overhead_tokens=overhead)
             llm_summary_used = (
                 len(self.messages) > 1
                 and isinstance(self.messages[1].get('content', ''), str)
@@ -14917,12 +15339,11 @@ class ChatLoop:
                                              overhead_tokens=overhead)
         after_tokens = self.ctx.calculate_context_tokens(self.messages)
 
-        # Phase 2: if still over the target budget (COMPACTION_TARGET) and
-        # there's a giant message, truncate it
-        if self.ctx.context_window_size > 0:
-            target = int(self.ctx.context_window_size * COMPACTION_TARGET)
-            if after_tokens > target and len(self.messages) > 1:
-                after_tokens = self._compact_truncate_largest(target)
+        # Phase 2 backstop: if LLM consolidation still could not fit the budget
+        # (e.g. the recent window alone is too large), truncate the largest
+        # message. The memory block itself is now bounded before this point.
+        if target and after_tokens > target and len(self.messages) > 1:
+            after_tokens = self._compact_truncate_largest(target)
 
         self._refresh_context_bar()
         print(colorize(

@@ -49,7 +49,10 @@ class FakeQueryHandler:
         self.called_with_conversation = False
 
     def query_sync(self, messages, model, **kwargs):
-        self.called_with_conversation = 'EARLIER CONVERSATION TO SUMMARIZE' in messages[-1]['content']
+        prompt = messages[-1]['content']
+        self.called_with_conversation = (
+            'EARLIER CONVERSATION TO SUMMARIZE' in prompt
+            or 'NEWLY EVICTED CONVERSATION' in prompt)
         return {'choices': [{'message': {'content': 'SUMMARY'}}]}
 
 

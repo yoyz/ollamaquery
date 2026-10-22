@@ -93,6 +93,63 @@ FAKE_SERVER = textwrap.dedent('''
 ''')
 
 
+REPEATING_CURSOR_SERVER = textwrap.dedent('''
+    #!/usr/bin/env python3
+    """Malformed MCP server: tools/list always returns the same nextCursor."""
+    import json
+    import sys
+
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\\n")
+        sys.stdout.flush()
+
+    for line in sys.stdin:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        method = msg.get("method")
+        mid = msg.get("id")
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "looper", "version": "1.0"}}})
+        elif method == "notifications/initialized":
+            continue
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "tools": [{"name": "t", "inputSchema": {"type": "object"}}],
+                "nextCursor": "again"}})
+        elif mid is not None:
+            send({"jsonrpc": "2.0", "id": mid, "result": {}})
+''')
+
+
+class _StubConnection:
+    """Minimal MCPConnection stand-in that serves synthetic tools/list pages."""
+
+    def __init__(self, page_factory):
+        self.page_factory = page_factory
+        self.requests = 0
+
+    def request(self, method, params, timeout=None):
+        self.requests += 1
+        return self.page_factory(self.requests)
+
+
+class _FakeClock:
+    """Monotonic clock that advances on every read."""
+
+    def __init__(self, step=100.0):
+        self.now = 0.0
+        self.step = step
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
+
+
 class FakeManager:
     """Minimal duck-typed manager for the registry/plan integration tests."""
 
@@ -366,6 +423,78 @@ class TestStdioServerEndToEnd(unittest.TestCase):
                 mcp_config="/nonexistent/mcp.json", no_mcp=False))
         self.assertIsNone(ctx.mcp_manager)
         self.assertIn("not found", captured.getvalue())
+
+
+class TestPaginationHardening(unittest.TestCase):
+    """A broken server must not hang connect() or grow the catalog forever."""
+
+    def _client_with_pages(self, page_factory):
+        cfg = m.MCPServerConfig(name="flood", transport="stdio", command=["x"])
+        client = m.MCPClient(cfg)
+        client.connection = _StubConnection(page_factory)
+        return client
+
+    def test_repeated_cursor_aborts_connect(self):
+        """End-to-end: a server that repeats its cursor must fail fast."""
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "looper.py")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(REPEATING_CURSOR_SERVER)
+            cfg = m.MCPServerConfig(name="looper", transport="stdio",
+                                    command=[sys.executable, path],
+                                    startup="lazy")
+            client = m.MCPClient(cfg)
+            try:
+                with self.assertRaises(m.MCPError) as caught:
+                    client.connect()
+                self.assertIn("repeated cursor", str(caught.exception))
+                self.assertFalse(client.connected)
+            finally:
+                client.close()
+
+    def test_repeated_cursor_stops_on_second_page(self):
+        client = self._client_with_pages(
+            lambda n: {"tools": [{"name": f"t{n}"}], "nextCursor": "again"})
+        with self.assertRaises(m.MCPError) as caught:
+            client.list_tools()
+        self.assertIn("repeated cursor", str(caught.exception))
+        self.assertEqual(client.connection.requests, 2)
+
+    def test_unique_cursor_flood_hits_page_cap(self):
+        client = self._client_with_pages(
+            lambda n: {"tools": [], "nextCursor": f"c{n}"})
+        with patch.object(m, "MCP_LIST_MAX_PAGES", 3):
+            with self.assertRaises(m.MCPError) as caught:
+                client.list_tools()
+        self.assertIn("pages", str(caught.exception))
+        self.assertEqual(client.connection.requests, 3)
+
+    def test_catalog_size_cap(self):
+        client = self._client_with_pages(
+            lambda n: {"tools": [{"name": f"a{n}"}, {"name": f"b{n}"}],
+                       "nextCursor": f"c{n}"})
+        with patch.object(m, "MCP_LIST_MAX_TOOLS", 3):
+            with self.assertRaises(m.MCPError) as caught:
+                client.list_tools()
+        self.assertIn("more than 3 tools", str(caught.exception))
+
+    def test_total_deadline_bounds_a_fresh_cursor_flood(self):
+        client = self._client_with_pages(
+            lambda n: {"tools": [], "nextCursor": f"c{n}"})
+        with patch.object(m.time, "monotonic", side_effect=_FakeClock()):
+            with self.assertRaises(m.MCPError) as caught:
+                client.list_tools()
+        self.assertIn("time budget", str(caught.exception))
+
+    def test_large_but_valid_catalog_still_completes(self):
+        """A 1,000-tool catalog served one tool per page must still load."""
+        total_pages = 1000
+        client = self._client_with_pages(
+            lambda n: {"tools": [{"name": f"t{n}"}],
+                       "nextCursor": None if n >= total_pages else f"c{n}"})
+        tools = client.list_tools()
+        self.assertEqual(len(tools), total_pages)
+        self.assertEqual(client.connection.requests, total_pages)
 
 
 class TestConnection(unittest.TestCase):

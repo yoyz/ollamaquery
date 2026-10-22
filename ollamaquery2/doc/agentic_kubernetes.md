@@ -122,8 +122,10 @@ GKE, k3s, ... are all clusters), and the resource vocabulary differs per platfor
 kubernetes_cluster_query
   cluster_type   enum: omc | openshift | kubernetes | auto   (default: auto)
   verb           enum: get | logs | describe | events | current-context   (default: get)
-  resource       string   (required for get/logs/describe)
-  name           string   (optional, resource instance)
+  resource       string   (required for get/logs/describe; logs: "pods" with
+                           name, or "pod/<pod>")
+  name           string   (optional, resource instance; logs: the pod name,
+                           folded into a single TYPE/NAME target)
   namespace      string   (optional, `-n`)
   selector       string   (optional, `-l` label selector; get/logs/events, rejected for describe)
   field_selector string   (optional, `--field-selector`; get only)
@@ -155,6 +157,12 @@ Handler behaviour:
 4. Append `-n <namespace>`, `-l <selector>` (get/logs), `--field-selector=<s>` (get),
    `-c <container>` (logs), `--tail=N` (logs), `-o <output>`. Unsupported
    verb/filter combinations raise a `ValueError` with a corrective message.
+   `logs` takes **one** positional target (`POD` or `TYPE/NAME`): `resource` +
+   `name` are folded into `resource/name`; with a selector no positional is
+   emitted (`logs -l ...` selects pods itself); a bare resource kind with neither
+   a name nor a selector is rejected. `logs` is always tailed — `tail` defaults
+   to `CLUSTER_LOG_TAIL_DEFAULT` (50) so a bare call cannot pull an unbounded
+   log into context.
 5. Shell-quote EVERY token (`shlex.quote`) before joining into the command
    string. The command runs with `shell=True`, so an unquoted LLM-controlled
    value could smuggle a second command (`kubectl get pods; touch x`,
@@ -180,6 +188,12 @@ Accepted for controlled, local use (documented decision — not a bug to fix sil
 | Shell injection via tool args       | Fixed: every token is `shlex.quote`d before joining into the `shell=True` command — `;`, `$()`, backticks become literal operands the backend rejects. |
 | Pipeline escapes (`\| oc apply`)     | Per-component gate keeps non-allow-listed nodes at `ask`.  |
 | Offline dir outside CWD             | `omc` read verbs are allow-listed; flag-value path not ACL-scanned (accepted, documented). |
+
+Kubeconfig exec credential plugins: `oc`/`kubectl` may invoke a locally
+configured `users[].user.exec` plugin before the read verb reaches the API
+server, even in strict `/agentic plan`. This is normal Kubernetes behavior and
+is not model-controlled, but it means the tool's guarantee is "no arbitrary
+*verb*", not "no local process". Treat the active kubeconfig as trusted.
 
 ## 7. Open questions (decide before implementation)
 

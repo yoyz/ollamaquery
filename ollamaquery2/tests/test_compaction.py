@@ -122,36 +122,56 @@ class TestQ4ExactTokensInBudget(unittest.TestCase):
 
 
 class TestQ7RoleAlternation(unittest.TestCase):
-    def _msgs_ending_with(self, last_role):
+    """The placeholder boundary is the FIRST retained role, not the last.
+
+    The synthetic summary is role `user`, so `recent[0]` decides whether it
+    would collide with another user turn. Checking `recent[-1]` (the old
+    behaviour) inserted a placeholder assistant before an already-assistant
+    turn in the common shape — history ending with a user query and a keep
+    window starting with an assistant — producing `system, user, assistant,
+    assistant, ...`.
+    """
+
+    @staticmethod
+    def _history(turns):
         msgs = [_msg('system', 'sys')]
-        msgs += [_msg('user', f'q{i}') for i in range(6)]
-        msgs += [_msg('assistant', 'answer')]
-        msgs.append(_msg(last_role, 'last message'))
+        for i in range(turns):
+            msgs.append(_msg('user', f'q{i}'))
+            msgs.append(_msg('assistant', f'a{i}'))
         return msgs
 
-    def test_user_tail_gets_assistant_placeholder(self):
-        ctx = FakeContext()
-        result = m.compact_messages(self._msgs_ending_with('user'), ctx, target_tokens=10, keep_recent=2)
+    @staticmethod
+    def _same_role_pairs(result):
+        roles = [msg.get('role') for msg in result]
+        return [(i - 1, i, roles[i]) for i in range(1, len(roles))
+                if roles[i] in ('user', 'assistant') and roles[i] == roles[i - 1]]
+
+    def test_window_starting_with_assistant_gets_no_placeholder(self):
+        # 7 turns + a newest user query: with keep_recent=6 the window starts
+        # with an assistant and ends with the user query (the normal shape).
+        msgs = self._history(7) + [_msg('user', 'newest question')]
+        result = m.compact_messages(msgs, FakeContext(), target_tokens=1, keep_recent=6)
+        self.assertEqual(result[1]['role'], 'user')          # summary
+        self.assertEqual(result[2]['role'], 'assistant')     # the real recent assistant
+        self.assertNotIn('[Context continued...]', result[2]['content'])
+        self.assertEqual(result[-1]['role'], 'user')         # tail preserved
+        self.assertEqual(self._same_role_pairs(result), [])
+
+    def test_window_starting_with_user_gets_placeholder(self):
+        # History ends with an assistant reply: with keep_recent=6 the window
+        # starts with a user turn, which would directly follow the user summary.
+        msgs = self._history(7)
+        result = m.compact_messages(msgs, FakeContext(), target_tokens=1, keep_recent=6)
         self.assertEqual(result[1]['role'], 'user')          # summary
         self.assertEqual(result[2]['role'], 'assistant')     # placeholder
         self.assertIn('[Context continued...]', result[2]['content'])
-        self.assertEqual(result[-1]['role'], 'user')         # original tail preserved
+        self.assertEqual(result[3]['role'], 'user')          # real recent user
+        self.assertEqual(self._same_role_pairs(result), [])
 
-    def test_assistant_tail_no_placeholder(self):
-        ctx = FakeContext()
-        result = m.compact_messages(self._msgs_ending_with('assistant'), ctx, target_tokens=10, keep_recent=2)
-        self.assertEqual(result[1]['role'], 'user')          # summary
-        self.assertEqual(result[2]['role'], 'assistant')     # the real recent assistant, no placeholder
-        self.assertNotIn('[Context continued...]', result[2]['content'])
-
-    def test_no_consecutive_user_roles(self):
-        ctx = FakeContext()
-        result = m.compact_messages(self._msgs_ending_with('user'), ctx, target_tokens=10, keep_recent=2)
-        roles = [msg.get('role') for msg in result]
-        for i in range(1, len(roles)):
-            if roles[i] == 'user':
-                self.assertNotEqual(roles[i], roles[i - 1],
-                                    f"consecutive user roles at {i-1},{i}: {roles}")
+    def test_no_consecutive_assistant_roles_in_tool_session(self):
+        result = m.compact_messages(_tool_session(), FakeContext(),
+                                    target_tokens=1, keep_recent=3)
+        self.assertEqual(self._same_role_pairs(result), [])
 
 
 def _tool_session():
@@ -199,9 +219,10 @@ class TestToolPairingBoundary(unittest.TestCase):
         result = m.compact_messages(_tool_session(), ctx,
                                     target_tokens=1, keep_recent=3)
         roles = [msg.get('role') for msg in result]
-        # summary + placeholder + the preserved tool_call/result pair + tail
+        # summary + the preserved tool_call/result pair + tail. No placeholder:
+        # the window starts with the assistant tool_call, not a user turn.
         self.assertEqual(roles, ['system', 'user', 'assistant',
-                                 'assistant', 'tool', 'assistant', 'user'])
+                                 'tool', 'assistant', 'user'])
         _assert_no_orphaned_tools(self, result)
 
 
@@ -433,26 +454,27 @@ class TestLlmCompactMessages(unittest.TestCase):
     def test_llm_summary_structure(self):
         ctx = FakeContext()
         handler = FakeQueryHandler(content='user wanted a summary of X.')
-        result = m.llm_compact_messages(self._session(), ctx, handler, keep_recent=2)
+        session = self._session()
+        result = m.llm_compact_messages(session, ctx, handler, keep_recent=2)
         self.assertEqual(result[0]['role'], 'system')
         self.assertEqual(result[1]['role'], 'user')
         content = result[1]['content']
         self.assertIn(m.LLM_COMPACT_SUMMARY_MARKER, content)
         self.assertIn('user wanted a summary of X.', content)
-        # The compacted message embeds the token breakdown of the compacted turns
-        # plus the before/after context size and the summarization token rate.
-        self.assertIn('Token breakdown of the compacted turns:', content)
-        self.assertIn('[  0] user', content)
-        self.assertIn('Context:', content)
-        self.assertIn('tok/s', content)
+        self.assertIn('Consolidated memory', content)
+        # Diagnostics are not part of the context any more.
+        self.assertNotIn('Token breakdown of the compacted turns:', content)
+        self.assertNotIn('tok/s', content)
         self.assertIn('_tokens', result[1])
-        self.assertEqual(result[-2:], self._session()[-2:])
-        # The summarizer actually got the older turns.
-        self.assertTrue(handler.calls)
+        self.assertEqual(result[-2:], session[-2:])
+        # The summarizer got the older turns plus an explicit budget.
         sent_user = handler.calls[0][0][1]['content']
         self.assertIn('q0', sent_user)
+        self.assertIn('EXISTING MEMORY:', sent_user)
+        self.assertIn('at most ~', sent_user)
+        self.assertIn('characters', sent_user)
 
-    def test_llm_summary_breakdown_marks_tool_results(self):
+    def test_tool_results_reach_summarizer_as_status_lines(self):
         ctx = FakeContext()
         handler = FakeQueryHandler(content='ok')
         session = [_msg('system', 'sys'),
@@ -461,9 +483,37 @@ class TestLlmCompactMessages(unittest.TestCase):
                    {'role': 'tool', 'name': 'cat', 'content': 'cat myfile\nNo such file', 'tool_call_id': 't1'},
                    {'role': 'user', 'content': 'tail'}]
         result = m.llm_compact_messages(session, ctx, handler, keep_recent=1)
+        prompt = handler.calls[0][0][1]['content']
+        self.assertIn('[tool cat: OK]', prompt)
+        self.assertIn('cat myfile', prompt)
+        # The verbose breakdown no longer rides along in the context message.
+        self.assertNotIn('[OK] cat myfile', result[1]['content'])
+
+    def test_memory_budget_is_reported_to_summarizer(self):
+        ctx = FakeContext(context_window_size=1000)  # target = 500 tokens
+        handler = FakeQueryHandler(content='short memory')
+        result = m.llm_compact_messages(self._session(), ctx, handler, keep_recent=2)
+        sent_user = handler.calls[0][0][1]['content']
+        self.assertIn('Return ONE updated memory of at most ~', sent_user)
+        self.assertIn('characters.', sent_user)
+        self.assertLessEqual(ctx.calculate_context_tokens(result), 500)
+
+    def test_over_budget_memory_is_shrunk_head_and_tail(self):
+        ctx = FakeContext(context_window_size=1000)  # target = 500 tokens
+        handler = FakeQueryHandler(content='HEAD ' + ('x' * 20000) + ' TAIL')
+        result = m.llm_compact_messages(self._session(), ctx, handler, keep_recent=2)
         content = result[1]['content']
-        self.assertIn('[OK] cat myfile', content)
-        self.assertIn('→', content)
+        self.assertIn('memory trimmed to fit budget', content)
+        self.assertIn('HEAD', content)
+        self.assertIn('TAIL', content, 'the newest facts/next actions must survive')
+        self.assertLessEqual(ctx.calculate_context_tokens(result), 500)
+
+    def test_zero_window_uses_default_memory_budget(self):
+        ctx = FakeContext()  # context_window_size = 0 (unknown)
+        handler = FakeQueryHandler(content='ok')
+        result = m.llm_compact_messages(self._session(), ctx, handler, keep_recent=2)
+        self.assertIn(m.LLM_COMPACT_SUMMARY_MARKER, result[1]['content'])
+        self.assertIn('at most ~', handler.calls[0][0][1]['content'])
 
     def test_fallback_to_mechanical_when_llm_fails(self):
         ctx = FakeContext()
@@ -491,6 +541,10 @@ class TestLlmCompactMessages(unittest.TestCase):
         result = m.llm_compact_messages(session, ctx, handler, keep_recent=3)
         _assert_no_orphaned_tools(self, result)
         roles = [msg['role'] for msg in result]
+        self.assertNotIn(('assistant', 'assistant'), list(zip(roles, roles[1:])),
+                         f"consecutive assistant roles: {roles}")
+        # The window starts with the assistant tool_call, so no placeholder.
+        self.assertNotIn('[Context continued...]', result[2]['content'])
         for i in range(1, len(roles)):
             if roles[i] == 'user':
                 self.assertNotEqual(roles[i], roles[i - 1])
@@ -502,31 +556,32 @@ class TestLlmCompactMessages(unittest.TestCase):
         session = [_msg('system', 'sys')] + [big] + [_msg('user', f'q{i}') for i in range(6)]
         m.llm_compact_messages(session, ctx, handler, keep_recent=1)
         sent = handler.calls[0][0][1]['content']
-        self.assertLessEqual(len(sent), m.LLM_COMPACT_TRANSCRIPT_CHARS + 64)
+        self.assertLessEqual(len(sent), m.LLM_COMPACT_TRANSCRIPT_CHARS + 512)
         self.assertIn('user: q3', sent)
 
-    def test_llm_summary_appends_to_prior_log(self):
-        """A second /compact llm keeps the prior dated entry verbatim and appends
-        a new one instead of re-summarizing the old away."""
+    def test_prior_memory_is_consolidated_not_appended(self):
+        """A second /compact llm merges the old memory instead of appending it."""
         ctx = FakeContext()
         first = m.llm_compact_messages(self._session(), ctx,
                                        FakeQueryHandler(content='SUMMARY ONE.'), keep_recent=2)
         first_content = first[1]['content']
-        self.assertIn('Compaction log', first_content)
         self.assertIn('SUMMARY ONE.', first_content)
+        self.assertEqual(first_content.count(m.LLM_COMPACT_SUMMARY_MARKER), 1)
 
-        # Continue the session: prior summary stays at index 1, then new turns.
+        # Continue the session: prior memory stays at index 1, then new turns.
         continued = first[:2] + [_msg('user', 'new question'),
                                  _msg('assistant', 'new answer')]
-        second = m.llm_compact_messages(continued, ctx,
-                                        FakeQueryHandler(content='SUMMARY TWO.'), keep_recent=1)
+        handler = FakeQueryHandler(content='SUMMARY TWO.')
+        second = m.llm_compact_messages(continued, ctx, handler, keep_recent=1)
         content = second[1]['content']
-        self.assertIn('SUMMARY ONE.', content, 'prior entry must be preserved verbatim')
         self.assertIn('SUMMARY TWO.', content)
-        self.assertIn(first_content, content, 'prior entry must survive untruncated')
-        self.assertEqual(content.count('Token breakdown of the compacted turns:'), 2)
-        # Each dated entry carries a [YYYY-MM-DD HH:MM] timestamp.
-        self.assertGreaterEqual(content.count('['), 4)
+        self.assertNotIn('SUMMARY ONE.', content,
+                         'the old memory must be an input, not a second entry')
+        self.assertEqual(content.count(m.LLM_COMPACT_SUMMARY_MARKER), 1)
+        # ...and it really was fed to the consolidation call.
+        prompt = handler.calls[0][0][1]['content']
+        self.assertIn('EXISTING MEMORY:', prompt)
+        self.assertIn('SUMMARY ONE.', prompt)
 
     def test_extract_compaction_log_strips_header(self):
         body = m._extract_compaction_log('x')

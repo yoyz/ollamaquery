@@ -526,6 +526,98 @@ class TestToolRegistry(unittest.TestCase):
         finally:
             self._grep_cleanup()
 
+    def test_grep_skips_dot_git_recursively(self):
+        """Recursive search skips .git in every backend (rg/grep/Python)."""
+        self._grep_fixture()
+        try:
+            os.makedirs(os.path.join(".git", "objects"))
+            open(os.path.join(".git", "config"), "w").write("NESTED_GIT_TOKEN\n")
+            open(os.path.join(".git", "HEAD"), "w").write("NESTED_GIT_TOKEN\n")
+            result = self.reg.execute("grep", {"pattern": "NESTED_GIT_TOKEN"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertEqual("No files found", result["output"])
+            # Same guarantee through the pure-Python walk.
+            with patch("ollamaquery2.shutil.which", return_value=None):
+                result = self.reg.execute("grep", {"pattern": "NESTED_GIT_TOKEN"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertEqual("No files found", result["output"])
+        finally:
+            self._grep_cleanup()
+
+    def test_grep_explicit_git_file_is_searched(self):
+        """An explicit path inside .git is honoured, not silently excluded."""
+        self._grep_fixture()
+        try:
+            os.makedirs(".git")
+            open(os.path.join(".git", "config"), "w").write("EXPLICIT_GIT_TOKEN\n")
+            result = self.reg.execute("grep", {"pattern": "EXPLICIT_GIT_TOKEN",
+                                               "path": os.path.join(".git", "config")})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn("EXPLICIT_GIT_TOKEN", result["output"])
+        finally:
+            self._grep_cleanup()
+
+    def test_grep_per_file_acl_hides_restricted_matches(self):
+        """A match the per-file ACL would ask for is hidden, not leaked.
+
+        The root-level gate stays permissive (CWD), so without the per-file
+        check a recursive search would return this file's contents silently.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                open("normal.txt", "w").write("SHARED_TOKEN\n")
+                open("secret.txt", "w").write("SHARED_TOKEN\n")
+                with patch("ollamaquery2._is_home_dotfile",
+                           side_effect=lambda p: os.path.basename(p) == "secret.txt"):
+                    result = self.reg.execute("grep", {"pattern": "SHARED_TOKEN"})
+                self.assertTrue(result["success"], msg=result.get("error"))
+                self.assertIn("normal.txt", result["output"])
+                self.assertNotIn("secret.txt", result["output"])
+                self.assertIn("hidden by the path ACL", result["output"])
+            finally:
+                os.chdir(old_cwd)
+
+    def test_grep_explicit_home_keeps_non_dotfiles(self):
+        """An explicit ~ search still returns normal files but not home dotfiles."""
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            old_cwd = os.getcwd()
+            old_acl = self.ctx.path_acl
+            os.chdir(cwd)
+            try:
+                # Force the Python backend: rg skips hidden files on its own, so
+                # only grep/os.walk would ever surface the dotfile to filter.
+                with patch.dict(os.environ, {"HOME": home}), \
+                     patch("ollamaquery2.shutil.which", return_value=None):
+                    self.ctx.path_acl = q.PathAcl()  # defaults resolve against patched HOME
+                    open(os.path.join(home, "visible.txt"), "w").write("HOME_TOKEN\n")
+                    open(os.path.join(home, ".hidden.txt"), "w").write("HOME_TOKEN\n")
+                    result = self.reg.execute("grep", {"pattern": "HOME_TOKEN", "path": home})
+                self.assertTrue(result["success"], msg=result.get("error"))
+                self.assertIn("visible.txt", result["output"])
+                self.assertNotIn(".hidden.txt", result["output"])
+                self.assertIn("hidden by the path ACL", result["output"])
+            finally:
+                self.ctx.path_acl = old_acl
+                os.chdir(old_cwd)
+
+    def test_grep_output_char_cap(self):
+        """Rendered output is hard-capped so one call cannot flood context."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with open("big.txt", "w") as f:
+                    for _ in range(120):
+                        f.write("CAP_TOKEN " + "x" * 600 + "\n")
+                result = self.reg.execute("grep", {"pattern": "CAP_TOKEN"})
+                self.assertTrue(result["success"], msg=result.get("error"))
+                self.assertLessEqual(len(result["output"]), q.MAX_GREP_OUTPUT_CHARS)
+                self.assertIn("Output capped", result["output"])
+            finally:
+                os.chdir(old_cwd)
+
     def test_grep_cap_observation_exempt(self):
         """grep results bypass the generic observation cap (self-bounding)."""
         big = "x" * 9000
@@ -1032,7 +1124,8 @@ class TestAgenticStreamObservations(unittest.TestCase):
         self.ctx = q.CommandContext()
         self.ctx.auto_confirm = True
         self.ctx.base_url = "http://localhost:9999"
-        self.ctx.backend = "ollama"
+        # No tokenize endpoint / whole-request counter: keep the test offline.
+        self.ctx.backend = "opencodezen"
         self.ctx.model = "test-model"
         self.loop = q.ChatLoop(self.ctx)
 
@@ -1040,6 +1133,9 @@ class TestAgenticStreamObservations(unittest.TestCase):
         """_finalize_agentic_query must append tool observations after stream tool calls."""
         self.loop.messages = []
         messages = [{'role': 'system', 'content': 'test'}]
+        # The finalize path can re-enter through query_sync_stream; keep it offline.
+        self.loop.query_handler.query_sync_stream = MagicMock(
+            return_value={"choices": [{"message": {"role": "assistant", "content": ""}}]})
         # Mock query_stream to populate tool_calls_out
         with patch.object(self.loop.query_handler, 'query_stream',
                           return_value="") as mock_stream:
@@ -1102,6 +1198,96 @@ class TestAgenticStreamObservations(unittest.TestCase):
         assistant_msgs = [m for m in self.loop.messages if m['role'] == 'assistant']
         self.assertEqual(len(assistant_msgs), 1)
         self.assertEqual(assistant_msgs[0]['content'], "Streamed answer")
+
+
+class TestAgenticFinalStreamSystemPrompt(unittest.TestCase):
+    """The final stream must reuse the wire prompt the ReAct step saw.
+
+    Regression: `_finalize_agentic_query()` replaced the ReAct list's system
+    message with `ctx.system_prompt`, which `/agentic plan` and `/agentic full`
+    set without `tool_defs_block`. Inline-tool models therefore streamed their
+    final answer with the mode prose only — no tool JSON schemas — so a late
+    tool call in that stream had no current schema to form a reliable call.
+    Several mode transitions in one session made the behaviour look
+    model-dependent.
+    """
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.auto_confirm = True
+        self.ctx.base_url = "http://localhost:9999"
+        # No tokenize endpoint / whole-request counter: keep the test offline.
+        self.ctx.backend = "opencodezen"
+        self.ctx.model = "test-model"  # not in the registry -> inline delivery
+        self.ctx.system_prompt = "CHAT PROMPT"
+        self.ctx._saved_system_prompt = None
+        self.ctx._plan_prev_prompt = None
+        self.ctx.agentic_mode = False
+        self.ctx.plan_mode = False
+        self.ctx.plan_run = False
+        self.loop = q.ChatLoop(self.ctx)
+
+    def tearDown(self):
+        self.ctx.agentic_mode = False
+        self.ctx.plan_mode = False
+        self.ctx.plan_run = False
+        self.ctx.system_prompt = "CHAT PROMPT"
+        self.ctx._saved_system_prompt = None
+        self.ctx._plan_prev_prompt = None
+
+    def _capture_final_stream(self):
+        """Init a ReAct query, then finalize; return (step system, final payload, kwargs)."""
+        self.loop.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
+        messages, _logger, openai_tools, send_tools_api = self.loop._init_agentic_query("ask")
+        step_system = messages[0]['content']
+        with patch.object(self.loop.query_handler, 'query_stream',
+                          return_value="Final answer") as mock_stream:
+            self.loop._finalize_agentic_query(
+                messages, final_answer="Final answer", final_content="ask",
+                send_tools_api=send_tools_api, openai_tools=openai_tools,
+                logger=None, iteration=1, response_text="")
+        mock_stream.assert_called_once()
+        return step_system, mock_stream.call_args[0][0], mock_stream.call_args[1]
+
+    def test_plan_mode_final_stream_keeps_inline_tool_defs(self):
+        """`/agentic plan`: the final stream keeps the step's restricted schemas."""
+        self.loop._agentic_toggle_plan(['/agentic', 'plan'])
+        step_system, payload, kwargs = self._capture_final_stream()
+        # Sanity: the ReAct prompt carries the inline tool-definition block,
+        # while ctx.system_prompt (the mode prose) does not.
+        self.assertIn("## Available tools", step_system)
+        self.assertNotIn("## Available tools", self.ctx.system_prompt)
+        self.assertEqual(payload[0]['role'], 'system')
+        self.assertEqual(
+            payload[0]['content'], step_system,
+            "final stream must send the same system prompt as the ReAct step")
+        self.assertNotEqual(payload[0]['content'], self.ctx.system_prompt)
+        self.assertNotIn('tools', kwargs, "inline models must not get a native tools array")
+
+    def test_full_mode_final_stream_keeps_inline_tool_defs(self):
+        """`/agentic full`: the final stream keeps the step's unrestricted schemas."""
+        self.loop._agentic_set_full()
+        step_system, payload, kwargs = self._capture_final_stream()
+        self.assertIn("## Available tools", step_system)
+        self.assertNotIn("## Available tools", self.ctx.system_prompt)
+        self.assertEqual(
+            payload[0]['content'], step_system,
+            "final stream must send the same system prompt as the ReAct step")
+        self.assertNotEqual(payload[0]['content'], self.ctx.system_prompt)
+        self.assertNotIn('tools', kwargs)
+
+    def test_final_stream_rebuilds_prompt_when_step_list_has_no_system(self):
+        """An unexpected system-less step list still gets the agentic wire prompt."""
+        self.loop._agentic_toggle_plan(['/agentic', 'plan'])
+        with patch.object(self.loop.query_handler, 'query_stream',
+                          return_value="Final answer") as mock_stream:
+            self.loop._finalize_agentic_query(
+                [], final_answer="Final answer", final_content="ask",
+                send_tools_api=False, openai_tools=[], logger=None,
+                iteration=1, response_text="")
+        payload = mock_stream.call_args[0][0]
+        self.assertEqual(payload[0]['role'], 'system')
+        self.assertIn("## Available tools", payload[0]['content'])
 
 
 class TestExecutor(unittest.TestCase):
@@ -1420,6 +1606,25 @@ class TestReActLoopUnit(unittest.TestCase):
         self.ctx.model = "test-model"
         self.ctx.agentic_mode = True
         self.ctx.auto_confirm = True
+        # These are unit tests: the LLM is mocked, so token stamping must not
+        # reach the fake backend either. Without this every run_agentic_query
+        # stamps system+user via _request_with_retry, which retries 3x with a
+        # 1s delay against an unresolvable host and dominates the test log.
+        self._stamp_patch = patch.object(
+            q.CommandContext, "stamp_tokens", lambda _ctx, msg: msg)
+        self._stamp_patch.start()
+        self.addCleanup(self._stamp_patch.stop)
+        # The context bar also tokenizes: keep it on the local estimator and
+        # skip the backend's whole-request counter (both would hit the fake URL).
+        self._tokenize_patch = patch.object(
+            q.CommandContext, "tokenize",
+            lambda _ctx, text: _ctx.estimate_tokens(text))
+        self._tokenize_patch.start()
+        self.addCleanup(self._tokenize_patch.stop)
+        self._wire_patch = patch.object(
+            q.CommandContext, "count_wire_tokens", lambda *_a, **_k: None)
+        self._wire_patch.start()
+        self.addCleanup(self._wire_patch.stop)
         self.loop = q.ChatLoop(self.ctx)
 
     def _make_sync_response(self, content):
@@ -2264,6 +2469,52 @@ class TestClusterQueryTool(unittest.TestCase):
                                container="sidecar", tail=10, offline_dir="/tmp/mg")
         self.assertTrue(result["success"], msg=result.get("error"))
         self.assertTrue(self.commands[1].startswith("omc logs pod/mypod -c sidecar --tail=10"))
+
+    def test_logs_resource_and_name_folded_into_one_target(self):
+        """logs takes ONE positional target: resource + name -> TYPE/NAME."""
+        with patch.object(q.shutil, "which", return_value="/usr/bin/omc"):
+            result = self._run(cluster_type="omc", verb="logs", resource="pods",
+                               name="mypod", offline_dir="/tmp/mg")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertTrue(self.commands[1].startswith("omc logs pods/mypod --tail=50"))
+        self.assertNotIn("pods mypod", self.commands[1])
+
+    def test_logs_requires_a_pod_target(self):
+        """logs with only a resource kind is rejected before execution."""
+        result = self._run(cluster_type="omc", verb="logs", resource="pods",
+                           offline_dir="/tmp/mg")
+        self.assertFalse(result["success"])
+        self.assertIn("logs requires a pod name", result["error"])
+        self.assertEqual(self.commands, [])
+
+    def test_logs_default_tail_is_50(self):
+        """Bare logs is tailed by default (schema/prompt promise)."""
+        with patch.object(q.shutil, "which", return_value="/usr/bin/omc"):
+            result = self._run(cluster_type="omc", verb="logs", resource="pod/mypod",
+                               offline_dir="/tmp/mg")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertTrue(self.commands[1].startswith("omc logs pod/mypod --tail=50"))
+
+    def test_logs_rejects_ambiguous_resource_and_name(self):
+        """resource already carrying TYPE/NAME cannot also take a name."""
+        result = self._run(cluster_type="omc", verb="logs", resource="pod/mypod",
+                           name="other", offline_dir="/tmp/mg")
+        self.assertFalse(result["success"])
+        self.assertIn("not both", result["error"])
+
+    def test_logs_selector_omits_positional_target(self):
+        """logs -l selects pods itself; a resource positional would be invalid."""
+        with patch.object(q.shutil, "which", return_value="/usr/bin/omc"):
+            result = self._run(cluster_type="omc", verb="logs", resource="pods",
+                               selector="app=nginx", offline_dir="/tmp/mg")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertTrue(self.commands[1].startswith("omc logs -l app=nginx --tail=50"))
+
+    def test_logs_selector_rejects_pod_name(self):
+        result = self._run(cluster_type="omc", verb="logs", resource="pods",
+                           name="mypod", selector="app=nginx", offline_dir="/tmp/mg")
+        self.assertFalse(result["success"])
+        self.assertIn("selector cannot be combined", result["error"])
 
     def test_container_rejected_for_get(self):
         result = self._run(verb="get", resource="pods", container="sidecar")
