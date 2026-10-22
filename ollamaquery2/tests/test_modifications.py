@@ -1149,7 +1149,7 @@ class TestShellTimeout(unittest.TestCase):
 
 
 # ============================================================================
-# 13. AGENTS.md line number consistency
+# 13. Model parameters, reasoning, and output controls
 # ============================================================================
 
 class TestInferenceParamsRegistry(unittest.TestCase):
@@ -1830,24 +1830,6 @@ class TestMultilineRecallEditing(unittest.TestCase):
             if os.path.exists(path):
                 os.unlink(path)
             readline.clear_history()
-
-
-class TestAgentsMdConsistency(unittest.TestCase):
-    """Verify AGENTS.md line-number references are still accurate."""
-
-    def test_agents_md_mentions_current_file_length(self):
-        with open(m.__file__) as f:
-            lines = f.readlines()
-        # AGENTS.md says "ollamaquery2.py (line 3462)" — verify roughly close
-        with open('AGENTS.md') as f:
-            agents = f.read()
-        match = re.search(r'ollamaquery2\.py.*?\(line (\d+)\)', agents)
-        if match:
-            expected_len = int(match.group(1))
-            # Allow ±20 lines (padding for minor edits)
-            self.assertAlmostEqual(len(lines), expected_len, delta=20,
-                                   msg=f"AGENTS.md says {expected_len} lines "
-                                       f"but file has {len(lines)}")
 
 
 # ============================================================================

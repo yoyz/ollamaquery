@@ -459,13 +459,38 @@ class TestConfig(unittest.TestCase):
             m.load_mcp_config("/nonexistent/mcp.json")
 
     def test_example_config_is_valid(self):
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "mcp.json.example")
-        config = m.load_mcp_config(path)
+        """The documented example shape parses; HTTP is the only refusal."""
+        example = {
+            "version": 1,
+            "servers": {
+                "kubernetes": {
+                    "transport": "stdio",
+                    "command": ["kubernetes-mcp-server", "--config", "/path/to/config.toml"],
+                    "env": {"KUBECONFIG": "${KUBECONFIG:-/path/to/kubeconfig}"},
+                    "startup": "lazy",
+                    "tool_prefix": "k8s",
+                    "denied_tools": ["pods_exec", "resources_delete"],
+                },
+                "kubernetes-http": {
+                    "transport": "streamable-http",
+                    "url": "http://127.0.0.1:10080/mcp",
+                    "enabled": False,
+                    "startup": "lazy",
+                    "tool_prefix": "k8shttp",
+                    "read_only_only": True,
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "mcp.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(example, fh)
+            config = m.load_mcp_config(path)
         self.assertIn("kubernetes", config.servers)
         problems = [problem for cfg in config.servers.values()
                     for problem in m.validate_mcp_server(cfg)]
         # The example ships an HTTP entry, which this build refuses explicitly.
+        self.assertTrue(problems, "the HTTP example entry must be reported")
         self.assertTrue(all("not implemented" in problem for problem in problems),
                         problems)
 

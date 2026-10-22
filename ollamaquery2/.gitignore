@@ -1,0 +1,12 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+
+# Local-only agent brief: intentionally not tracked (it drifts with the code)
+AGENTS.md
+
+# Local MCP config examples: tests generate their own in temp dirs
+mcp.json.example
+
+# Editor/agent tool state (not part of the program)
+.opencode/

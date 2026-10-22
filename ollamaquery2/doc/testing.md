@@ -1,180 +1,133 @@
-# Testing Guide — ollamaquery2
+# Testing guide — ollamaquery2
 
-## Test Suites
+The canonical command list, per-file matrix and contributor rules live in
+[`tests/README.md`](../tests/README.md). This page covers the coverage map, the
+release checklist and result interpretation.
 
-Two test files in `tests/`:
+## Quick commands
 
-| File | Tests | Focus |
-|------|-------|-------|
-| `test_features.py` | ~95 | Feature coverage: config, retry, themes, inline processing, commands, HTML parsing, tokens, debug, images, utilities, errors |
-| `test_modifications.py` | ~35 | Regression: retry utility, context reset, exception handling, streaming, stats, URL-open replacements |
-
-## Running Tests
+Run from `ollamaquery2/` (not the repo root, not `tests/`):
 
 ```bash
-# Full suite
+# Everything (backend-gated tests skip when no server answers)
 python3 -m unittest discover tests -v
 
-# Single file
-python3 -m unittest tests.test_features -v
+# One file
+python3 -m unittest tests.test_acl -v
 
-# Single test class
-python3 -m unittest tests.test_features.TestInlineProcessing -v
+# One class
+python3 -m unittest tests.test_acl.TestShellApprovalPrompt -v
 
-# Single test
-python3 -m unittest tests.test_features.TestInlineProcessing.test_shell_command_execution -v
+# One test
+python3 -m unittest tests.test_acl.TestShellApprovalPrompt.test_prompt_label_does_not_claim_always -v
 ```
 
-### Against a specific backend
+Offline suites (no backend, no network — what CI runs):
 
 ```bash
-# Ollama
-OLLAMA_HOST=http://192.168.1.20:11434 python3 -m unittest discover tests -v
-
-# Llama.cpp
-LLAMACPP_HOST=http://127.0.0.1:8080 python3 -m unittest discover tests -v
-
-# Custom model (default: auto-picked smallest model < 9 GB)
-TEST_MODEL=qwen3:8b OLLAMA_HOST=http://192.168.1.20:11434 python3 -m unittest discover tests -v
+python3 -m unittest -v \
+  tests.test_acl \
+  tests.test_mcp \
+  tests.test_compaction \
+  tests.test_compact_command \
+  tests.test_agentic_timeout \
+  tests.test_tool_summarize \
+  tests.test_state_files
 ```
 
-## Backend Detection
+## Backend detection
 
-Tests auto-detect available backends at import time:
+Test modules that need a live model probe at import time, in this order:
 
-1. HEAD request to `OLLAMA_HOST` (default `http://127.0.0.1:11434`)
-2. HEAD request to `LLAMACPP_HOST` (default `http://127.0.0.1:8080`)
-3. Tests decorated with `@ollama_only` / `@llamacpp_only` / `@any_backend` are skipped when the backend is unreachable
+1. `OLLAMA_HOST` (default `http://127.0.0.1:11434`), then
+2. `LLAMACPP_HOST` (default `http://127.0.0.1:8080`), then
+3. addresses returned by `gethostbyname_ex(gethostname())` on the standard ports.
 
-If Ollama is detected, the test suite automatically:
-- Picks the smallest available model under 9 GB (excluding API proxies and embedding models)
-- Loads it into memory via a minimal sync query
-- Uses that model for all live-backend tests
+`test_vision` uses `VISION_MODEL` when set; otherwise it picks the first model
+whose name contains `vl`, `vision`, `llava`, `gemma3` or `glm4v`.
 
-## Test Coverage Matrix
+Backend-dependent tests are decorated with `@ollama_only` / `@llamacpp_only` /
+`@any_backend` and skip when the backend is unreachable. A skipped live test is
+not a failure.
 
-### Unit Tests (no backend needed, always run)
+When Ollama is detected the suite picks the smallest model under 9 GB
+(excluding API proxies and embedding models) and loads it with a minimal sync
+query, unless `TEST_MODEL` names one explicitly.
 
-| Area | Tests | What it checks |
-|------|-------|----------------|
-| **Configuration** | 5 | Default host/port values, prompt keys, max context size |
-| **Command Registry** | 3 | Required commands exist, aliases resolved, categories correct |
-| **Theme System** | 6 | Theme keys, colorize output, NO_COLOR env, preset names |
-| **Retry Logic** | 5 | _request_with_retry: success, transient errors, 4xx no-retry, stderr message |
-| **Shell Safety** | 6 | sanitize blocks `$()`, `;`, `&&`; validate rejects dangerous patterns |
-| **Multiline Input** | 2 | Triple-quote detection, backslash continuation |
-| **HTML Parsing** | 6 | HTMLStripper: text extraction, script skipping, word spacing |
-| **Token Counting** | 4 | estimate_token_count: basic, empty, None; calculate_context_tokens |
-| **Debug Manager** | 10 | Levels, categories, is_enabled, should_log, get_status |
-| **Debug Log** | 3 | Log writes to stderr, suppressed when off, custom prefix |
-| **Image Handling** | 3 | prepare_image_data: nonexistent, empty, valid PNG |
-| **Image Command** | 2 | /image clear, /image no-arg |
-| **Utility Functions** | 3 | is_known_command, format_help_text_compact, format_help_text_full |
-| **Argument Parser** | 3 | Backend choices, model opt, mutual exclusion |
-| **Error Handling** | 7 | fetch failures, token count with no model, image with bad path |
-| **Format Help** | 3 | Compact and full help text contains categories |
+## Coverage map
 
-### Integration Tests (need a live backend)
+| Area                                    | Where                                                                      |
+| --------------------------------------- | -------------------------------------------------------------------------- |
+| Config, themes, commands, help          | `test_features.py`                                                         |
+| Retry, URL fetch, token counting        | `test_features.py`, `test_modifications.py`                                |
+| Shell gate, path ACL, fetch schemes     | `test_acl.py`                                                              |
+| State-file privacy (`0700`/`0600`)      | `test_state_files.py`                                                      |
+| Session save/resume, `/drop`            | `test_features.py`, `test_modifications.py` (thinner than the rest)        |
+| Compaction (mechanical + LLM)           | `test_compaction.py`, `test_compact_command.py`                            |
+| Agentic ReAct, tool parsing, timeouts   | `test_agentic.py`, `test_agentic_timeout.py`                               |
+| Tool-result summarization               | `test_tool_summarize.py`                                                   |
+| MCP client, plan policy, spill          | `test_mcp.py`                                                              |
+| Backend dialects                        | `test_features.py`, `test_strata.py`, `test_lmstudio.py`, `test_vision.py` |
+| Release checks                          | `test_release.py`                                                          |
 
-| Area | Tests | What it checks |
-|------|-------|----------------|
-| **Backend Detection** | 3 | check_backend_with_get/head, live model fetch |
-| **Model Listing** | 3 | fetch_models returns list, model names exist |
-| **Basic Queries** | 5 | model query creation, sync query returns dict, stream returns content, empty input handling |
-| **Query Stats** | 2 | context_bar renders with %, handles zero window |
-| **Command Handlers** | 12 | exit, help, clear, debug, thinking on/off, listmodel, stats, cwd, ls, switchmodel |
-| **Switch Model** | 2 | messages preserved after switch, stats accumulated |
-| **Full Workflow** | 1 | query → switch → query → clear → query |
-| **Model Info** | 2 | show_model_info, show_model_details return valid JSON |
-| **Token Count (API)** | 1 | get_message_token_count_ollama > 0 (skipped if `/api/tokenize` unavailable) |
-| **Live Query** | 4 | stream returns content, stats accumulate, context tokens updated, chat history preserved |
-| **Sync Query via main** | 1 | main() with -I -o writes output file |
-| **Spawn Shell** | 3 | /spawnshell returns without error, output is not individual characters |
-| **Dump Context** | 3 | /dumpcontext writes JSON file |
+Known thin spots: session save/resume and `/drop` have direct coverage but few
+cases; the shell tokenizer is mostly exercised through `check_shell_approval`
+rather than directly.
 
-### Regression Tests (modifications file)
-
-| Area | Tests | What it checks |
-|------|-------|----------------|
-| **Retry Utility** | 11 | Success, retries, 503 retry, 404 no-retry, ConnectionError, timeout passthrough, live fetch |
-| **Reset Preferences** | 3 | reset() preserves force_no_thinking, debug_mode, system_prompt; wipes conversation |
-| **Bare Exception** | 1 | No bare `except:` blocks |
-| **CRemoved** | 2 | Dead `c()` function removed |
-| **HTMLStripper** | 4 | Module-level class, parses HTML, skips script, strips tags |
-| **Calculate Stats** | 4 | Side-effect-free, expected keys, no duplicate methods |
-| **Show Model Flags** | 2 | --show and --show-details reachable |
-| **URL open** | 1 | All urlopen calls go through _request_with_retry |
-| **Clear Preferences** | 1 | /clear preserves preferences in live loop |
-| **Switch Model** | 1 | /switchmodel preserves self.messages |
-| **Shell Timeout** | 1 | Default shell_timeout is 5 |
-| **AGENTS.md** | 1 | Line-number references roughly match file length |
-| **Live Query** | 2 | Stream returns assistant response, stats accumulate |
-| **Inline Commands** | 1 | execute_os_command with timeout |
-
-## Release Checklist
-
-Before a release, run the full suite against both backends:
+## Release checklist
 
 ```bash
-# 1. Syntax check
-python3 -m py_compile ollamaquery2.py
+# 1. Syntax
+python3 -m py_compile ollamaquery2.py tests/*.py
 
-# 2. Unit tests (no backend needed)
-python3 -m unittest tests.test_features.TestConfiguration \
-  tests.test_features.TestCommandRegistry \
-  tests.test_features.TestThemeSystem \
-  tests.test_features.TestRetry \
-  tests.test_features.TestInlineProcessing \
-  tests.test_features.TestMultilineInput \
-  tests.test_features.TestHTMLParsing \
-  tests.test_features.TestTokenCounting \
-  tests.test_features.TestDebugManager \
-  tests.test_features.TestDebugLog \
-  tests.test_features.TestImageHandling \
-  tests.test_features.TestUtilityFunctions \
-  tests.test_features.TestArgumentParser \
-  tests.test_features.TestFormatHelp \
-  tests.test_features.TestErrorHandling \
-  tests.test_features.TestCommandHandlers \
-  tests.test_features.TestSpawnShell \
-  tests.test_features.TestDumpContext \
-  tests.test_modifications.TestRetryUtility \
-  tests.test_modifications.TestResetPreservesPreferences \
-  tests.test_modifications.TestNoBareExcept \
-  tests.test_modifications.TestCRemoved \
-  tests.test_modifications.TestHTMLStripper \
-  tests.test_modifications.TestCalculateStatsSideEffectFree \
-  tests.test_modifications.TestShowModelFlags \
-  tests.test_modifications.TestUrlopenReplaced \
-  tests.test_modifications.TestShellTimeout \
-  tests.test_modifications.TestAgentsMdConsistency \
-  tests.test_modifications.TestProcessInlineCommands \
-  -v
+# 2. Offline suites (must be green with no backend)
+python3 -m unittest -v \
+  tests.test_acl \
+  tests.test_mcp \
+  tests.test_compaction \
+  tests.test_compact_command \
+  tests.test_agentic_timeout \
+  tests.test_tool_summarize \
+  tests.test_state_files
 
-# 3a. Integration tests with Ollama
-OLLAMA_HOST=http://192.168.1.20:11434 python3 -m unittest discover tests -v
+# 3. Full suite against each backend you support
+OLLAMA_HOST=http://127.0.0.1:11434   python3 -m unittest discover tests -v
+LLAMACPP_HOST=http://127.0.0.1:8080  python3 -m unittest discover tests -v
+STRATA_HOST=http://127.0.0.1:8080    python3 -m unittest discover tests -v
 
-# 3b. Integration tests with Llama.cpp
-LLAMACPP_HOST=http://127.0.0.1:8080 python3 -m unittest discover tests -v
-
-# 4. Check no unexpected failures
-# Expected skips (Ollama): tokenizer test if /api/tokenize unavailable
-# Expected skips (llama.cpp): Ollama-specific tests (switchmodel, model info, etc.)
+# 4. Inspect the log; a clean run is OK with skips, not FAIL/ERROR
 ```
 
-## Interpreting Results
+Redirect long runs to a file (per the test-output rule in `AGENTS.md`), then
+grep the file:
 
-- **OK (skipped=N)** — All tests passed, N skipped because backend unavailable
-- **FAIL** — A test failed. Check the assertion and traceback. Common causes:
-  - Backend unreachable or wrong URL
-  - Model not found on server
-  - API response format changed
-- **ERROR** — A test raised an unexpected exception. Check for import errors, missing attributes.
+```bash
+python3 -m unittest discover tests -v > /tmp/opencode/full_suite.log 2>&1
+grep -E "^(Ran|OK|FAILED|ERROR)" /tmp/opencode/full_suite.log
+```
 
-### Typical skip counts
+## Interpreting results
 
-| Scenario | Skipped | Notes |
-|----------|---------|-------|
-| No backend | 32 | All integration tests skipped |
-| Ollama only | 1 | Only tokenizer test if unavailable |
-| Llama.cpp only | 27 | All Ollama-specific tests skipped |
+| Output                   | Meaning                                                              |
+| ------------------------ | -------------------------------------------------------------------- |
+| `OK`                     | Every executed test passed                                           |
+| `OK (skipped=N)`         | Passed; N tests skipped because no backend/feature was available     |
+| `FAIL`                   | Assertion failed — inspect the first failure, not the last           |
+| `ERROR`                  | Unexpected exception (import error, missing attribute, IO error)     |
+
+Common causes of skips and errors:
+
+- Backend not running, wrong URL, or wrong model name.
+- `readline`/`pty` unavailable for terminal tests.
+- `convert` (ImageMagick) missing for the vision resize path.
+- No `gcc` for the agentic write-compile-run end-to-end tests.
+- Writes to the real `~/.ollamaquery.d` — tests that care patch the module
+  globals; if you add one, do the same.
+
+## CI
+
+`.github/workflows/tests.yml` runs the seven offline suites on Python 3.10 and
+3.12 with an isolated `HOME`. It intentionally does not use `discover`, because
+importing the backend-gated modules probes localhost/LAN and the free runners
+have no LLM. See `tests/README.md` for the contributor rules that keep the
+offline half offline.

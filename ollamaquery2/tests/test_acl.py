@@ -10,11 +10,15 @@ Covers:
 - Shell command operand scan (run_command path awareness): cat /etc, cat /proc
   now require approval; CWD paths and rule-less paths are unaffected.
 - The /agentic acl command dispatch (list / allow / deny / remove / reset).
+- fetch_url scheme guard: non-http(s) URLs (file://, ftp://, data:) are
+  rejected so fetch cannot read local files and bypass the ACL.
 """
 
 import os
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ollamaquery2 as m
@@ -205,6 +209,86 @@ class TestShellAclScan(unittest.TestCase):
         self.ctx.path_acl.add("read", "allow", "/etc", source="session")
         res = m.check_shell_approval("cat /etc/hosts", ctx=self.ctx)
         self.assertTrue(res["approved"])
+
+
+class TestShellApprovalPrompt(unittest.TestCase):
+    """The `a` answer is session-scoped (nothing persisted) and broader than `s`."""
+
+    def setUp(self) -> None:
+        m._SHELL_SESSION_APPROVED.clear()
+
+    def tearDown(self) -> None:
+        m._SHELL_SESSION_APPROVED.clear()
+
+    def _verdict(self) -> dict:
+        verdict = m.shell_check_command("ssh host", m.DEFAULT_SHELL_PERMISSION)
+        self.assertEqual(verdict["effect"], "ask")
+        self.assertEqual(verdict["patterns"], ["ssh host"])
+        self.assertEqual(verdict["always"], ["ssh *"])
+        return verdict
+
+    def test_prompt_label_does_not_claim_always(self):
+        with patch("builtins.input", return_value="a") as fake_input:
+            m._shell_prompt_approval("ssh host", self._verdict())
+        prompt = fake_input.call_args[0][0]
+        self.assertIn("a=session", prompt)
+        self.assertNotIn("a=always", prompt)
+
+    def test_always_answer_adds_exact_and_broader_patterns(self):
+        with patch("builtins.input", return_value="a"):
+            res = m._shell_prompt_approval("ssh host", self._verdict())
+        self.assertTrue(res["approved"])
+        added = [rule["pattern"] for rule in m._SHELL_SESSION_APPROVED]
+        self.assertIn("ssh host", added)
+        self.assertIn("ssh *", added)
+
+    def test_session_answer_adds_only_exact_pattern(self):
+        with patch("builtins.input", return_value="s"):
+            m._shell_prompt_approval("ssh host", self._verdict())
+        added = [rule["pattern"] for rule in m._SHELL_SESSION_APPROVED]
+        self.assertEqual(added, ["ssh host"])
+
+
+class TestFetchUrlSchemeGuard(unittest.TestCase):
+    """fetch_url must not become a local-read primitive (Path ACL bypass)."""
+
+    def test_file_scheme_does_not_read_local_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write("SENTINEL-LOCAL-READ")
+            path = f.name
+        try:
+            text, tool = m.fetch_and_convert_url("file://" + path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(tool, "None")
+        self.assertTrue(text.startswith("[Failed to fetch URL:"), text)
+        self.assertNotIn("SENTINEL-LOCAL-READ", text)
+
+    def test_rejected_schemes_and_malformed_urls(self):
+        for url in ("file:///etc/hostname", "ftp://example.com/x",
+                    "data:text/plain,hi", "gopher://example.com/",
+                    "/etc/passwd", "http://", "http:/example.com"):
+            with self.subTest(url=url):
+                text, tool = m.fetch_and_convert_url(url)
+                self.assertEqual(tool, "None")
+                self.assertTrue(text.startswith("[Failed to fetch URL:"), text)
+
+    def test_curl_fallback_rejects_file_scheme(self):
+        self.assertEqual(m._curl_fetch_text("file:///etc/hostname"), "")
+
+    def test_fetch_tool_reports_scheme_rejection(self):
+        out = m._tool_handle_fetch_url(None, {"url": "file:///etc/hostname"})
+        self.assertFalse(out["success"])
+        self.assertIn("only http", out["error"])
+
+    def test_http_and_https_pass_the_guard(self):
+        for url in ("http://example.com/x", "HTTPS://example.com/y"):
+            with self.subTest(url=url):
+                with patch("ollamaquery2._request_with_retry",
+                           side_effect=Exception("transport-reached")), \
+                     patch("ollamaquery2._curl_fetch_text", return_value=""):
+                    text, tool = m.fetch_and_convert_url(url)
+                self.assertIn("transport-reached", text)
 
 
 def _loop():

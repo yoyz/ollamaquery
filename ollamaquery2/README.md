@@ -1,17 +1,24 @@
 # ollamaquery2
 
-A feature-rich CLI for local LLMs via Ollama, Llama.cpp, LM Studio, and Strata backends. Single Python file, no pip install needed.
+A feature-rich CLI for LLMs via local Ollama, Llama.cpp, LM Studio and Strata servers, plus cloud OpenAI-compatible APIs (Gemini, OpenCode Zen/Go, Mistral, DeepSeek). Single Python file, no pip install needed.
 
 ## Backends
 
-| Backend | Default URL | Detection |
-|---------|-------------|-----------|
-| Ollama | `http://127.0.0.1:11434` | HEAD `/` + body scan |
-| Llama.cpp | `http://127.0.0.1:8080` | HEAD `Server:` header |
-| Strata | `http://127.0.0.1:8080` | GET `/health` → `"service": "strata"` |
-| LM Studio | `http://127.0.0.1:1234` | GET `/v1/models` |
+| Backend        | Default URL                                                 | Detection / auth                        |
+| -------------- | ----------------------------------------------------------- | --------------------------------------- |
+| Ollama         | `http://127.0.0.1:11434`                                    | HEAD `/` + body scan                    |
+| Llama.cpp      | `http://127.0.0.1:8080`                                     | HEAD `Server:` header                   |
+| Strata         | `http://127.0.0.1:8080`                                     | GET `/health` → `"service": "strata"`   |
+| LM Studio      | `http://127.0.0.1:1234`                                     | GET `/v1/models`                        |
+| Gemini         | `https://generativelanguage.googleapis.com/v1beta/openai`   | `GEMINI_API_KEY`                        |
+| OpenCode Zen   | `https://opencode.ai/zen`                                   | `OPENCODEZEN_API_KEY`                   |
+| OpenCode Go    | `https://opencode.ai/zen/go`                                | `OPENCODEGO_API_KEY`                    |
+| Mistral        | `https://api.mistral.ai`                                    | `MISTRAL_API_KEY`                       |
+| DeepSeek       | `https://api.deepseek.com`                                  | `DEEPSEEK_API_KEY`                      |
 
-Auto-detects available backends. Set `OLLAMA_HOST`, `LLAMACPP_HOST`, `STRATA_HOST` env vars to override.
+Auto-detects available **local** backends. Cloud backends are selected with
+`-b` and read their API key from the environment (`GEMINI_HOST`,
+`OPENCODEGO_HOST`, etc. override the host).
 
 Strata shares Llama.cpp's default port (8080) and OpenAI dialect but streams
 reasoning via `delta.reasoning_content` and exposes Anthropic
@@ -29,7 +36,7 @@ python3 ollamaquery2.py -c
 ```text
 -c                  Interactive chat mode
 -m <model>          Model name
--b <backend>        Backend: ollama, llamacpp, strata, lmstudio
+-b <backend>        Backend: ollama, llamacpp, strata, lmstudio, gemini, opencodezen, opencodego, mistral, deepseek
 -H <url>            Backend URL override
 -I "query"          Single-shot query
 -i <file>           Input file for batch
@@ -69,44 +76,44 @@ spawnshell are disabled when unavailable.
 - `@filepath` — Include file content mid-sentence
 
 ### Interactive Commands
-| Command | Description |
-|---------|-------------|
-| `/?` `/help` | Help menu |
-| `/listmodel` | List available models |
-| `/listmodelall` | List models with capabilities |
-| `/switchmodel <name>` | Change model, preserve history |
-| `/clear` | Wipe conversation |
-| `/stats` `/usage` | Session statistics |
-| `/thinkingon` `/thinkingoff` | Toggle reasoning display |
-| `/reasoning [off\|on\|low\|medium\|high]` | Set reasoning effort (Qwen3.8/gpt-oss) |
-| `/preservethinking [on\|off\|status]` | Retain reasoning traces across turns (Qwen3.6/3.8) |
-| `/debug` | Per-category debug levels (`network`, `payload`, `response`, `stream`, `context`, `thinking`, `commands`, `urlfetch`, `all`) |
-| `/cwd <path>` | Change working directory |
-| `/ls` | List files locally |
-| `/image <path>` | Attach an image to conversation |
-| `/spawnshell` | Drop into interactive shell (output sent to LLM on exit) |
-| `/dumpcontext` | Save conversation to JSON |
-| `/contextsizeset <N>` | Override context window |
-| `/quit` `/exit` | End session (`Ctrl+C` twice / `Ctrl+D` also works) |
+| Command                      | Description                                                                                                                  |          |                                                    |        |                                        |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | -------- | -------------------------------------------------- | ------ | -------------------------------------- |
+| `/?` `/help`                 | Help menu                                                                                                                    |          |                                                    |        |                                        |
+| `/listmodel`                 | List available models                                                                                                        |          |                                                    |        |                                        |
+| `/listmodelall`              | List models with capabilities                                                                                                |          |                                                    |        |                                        |
+| `/switchmodel <name>`        | Change model, preserve history                                                                                               |          |                                                    |        |                                        |
+| `/clear`                     | Wipe conversation                                                                                                            |          |                                                    |        |                                        |
+| `/stats` `/usage`            | Session statistics                                                                                                           |          |                                                    |        |                                        |
+| `/thinkingon` `/thinkingoff` | Toggle reasoning display                                                                                                     |          |                                                    |        |                                        |
+| `/reasoning [off\            | on\                                                                                                                          | low\     | medium\                                            | high]` | Set reasoning effort (Qwen3.8/gpt-oss) |
+| `/preservethinking [on\      | off\                                                                                                                         | status]` | Retain reasoning traces across turns (Qwen3.6/3.8) |        |                                        |
+| `/debug`                     | Per-category debug levels (`network`, `payload`, `response`, `stream`, `context`, `thinking`, `commands`, `urlfetch`, `all`) |          |                                                    |        |                                        |
+| `/cwd <path>`                | Change working directory                                                                                                     |          |                                                    |        |                                        |
+| `/ls`                        | List files locally                                                                                                           |          |                                                    |        |                                        |
+| `/image <path>`              | Attach an image to conversation                                                                                              |          |                                                    |        |                                        |
+| `/spawnshell`                | Drop into interactive shell (output sent to LLM on exit)                                                                     |          |                                                    |        |                                        |
+| `/dumpcontext`               | Save conversation to JSON                                                                                                    |          |                                                    |        |                                        |
+| `/contextsizeset <N>`        | Override context window                                                                                                      |          |                                                    |        |                                        |
+| `/quit` `/exit`              | End session (`Ctrl+C` twice / `Ctrl+D` also works)                                                                           |          |                                                    |        |                                        |
 
 ### Agentic Mode
 
 `/agentic on` enables a ReAct loop with tool access:
 
-| Tool | Description |
-|------|-------------|
-| `fetch_url` | Fetch URL to text |
-| `read_file` | Read file (max 100KB) |
-| `write_file` | Write file |
-| `list_directory` | List directory contents |
-| `glob` | Find files by pattern |
-| `grep` | Search file contents with a regex (case-insensitive by default, optional path + include glob) |
-| `run_python` | Execute Python 3 code |
-| `run_command` | Execute shell command (120s timeout) |
-| `diff` | Unified diff between files |
-| `patch` | Apply unified diff |
-| `edit_file` | Precise string replacement |
-| `apply_patch` | Apply diff with file headers |
+| Tool                       | Description                                                                                            |
+| -------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `fetch_url`                | Fetch URL to text                                                                                      |
+| `read_file`                | Read file (max 100KB)                                                                                  |
+| `write_file`               | Write file                                                                                             |
+| `list_directory`           | List directory contents                                                                                |
+| `glob`                     | Find files by pattern                                                                                  |
+| `grep`                     | Search file contents with a regex (case-insensitive by default, optional path + include glob)          |
+| `run_python`               | Execute Python 3 code                                                                                  |
+| `run_command`              | Execute shell command (120s timeout)                                                                   |
+| `diff`                     | Unified diff between files                                                                             |
+| `patch`                    | Apply unified diff                                                                                     |
+| `edit_file`                | Precise string replacement                                                                             |
+| `apply_patch`              | Apply diff with file headers                                                                           |
 | `kubernetes_cluster_query` | Read-only OpenShift/Kubernetes cluster consultation (online `oc`/`kubectl`, offline `omc` must-gather) |
 
 Subcommands: `/agentic auto`, `plan [on|off|run]`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `iterations <N>`, `timeout <N>`.
@@ -126,13 +133,13 @@ Safety features: destructive tool confirmation, path ACL (see below), shell appr
 File tools (`read_file`, `write_file`, `edit_file`, `list_directory`) and
 `run_command` operands are governed by a session-scoped Path ACL:
 
-| Path | read | write |
-|------|------|-------|
-| Current working directory | allow | allow |
-| `$HOME` (explicit `~` / absolute) | allow | deny |
-| `$HOME` dotfiles (`~/.*`) | ask | ask |
-| `/proc`, `/sys`, `/etc` | ask | deny |
-| anything else outside CWD/`$HOME` | deny | deny |
+| Path                              | read   | write   |
+| --------------------------------- | ------ | ------- |
+| Current working directory         | allow  | allow   |
+| `$HOME` (explicit `~` / absolute) | allow  | deny    |
+| `$HOME` dotfiles (`~/.*`)         | ask    | ask     |
+| `/proc`, `/sys`, `/etc`           | ask    | deny    |
+| anything else outside CWD/`$HOME` | deny   | deny    |
 
 - `ask` prompts per access and is never auto-approved (bypass-immune to
   `/agentic auto`); non-TTY runs deny and log it.
@@ -232,20 +239,92 @@ Notes:
 - Requires a working podman/docker setup and network to pull the image on
   first use.
 
+### MCP servers (tool providers)
+
+Local [Model Context Protocol](https://modelcontextprotocol.io) servers can
+contribute tools over stdio. Point at a config with `--mcp-config <path>`, or
+place `.ollamaquery-mcp.json` in the working directory (or
+`~/.ollamaquery.d/mcp.json`):
+
+```json
+{
+  "version": 1,
+  "servers": {
+    "calc": {
+      "transport": "stdio",
+      "command": ["/absolute/path/to/mcp_test_server"],
+      "tool_prefix": "calc"
+    }
+  }
+}
+```
+
+```text
+/mcp status                     # configured servers and connection state
+/mcp tools                      # tools this build would expose
+/mcp tools --plan               # only tools eligible for /agentic plan
+/mcp connect calc               # start it now (lazy servers start on first call)
+```
+
+Tools are namespaced `<prefix>__<tool>` (e.g. `calc__add`). Only the **stdio**
+transport and the **tools** capability are implemented; HTTP/OAuth,
+prompts/resources, sampling/elicitation/roots and `list_changed` fail closed.
+In plan mode an MCP tool is eligible only when the server explicitly declares
+`readOnlyHint: true` — an absent annotation is never treated as safe.
+
+See `doc/mcp.md` for the full field reference, the security model, and a guide
+to building a local test server with the `Neumann-Labs/mcp-cpp` SDK.
+
+## Security model
+
+Trust boundaries at a glance; the sections above give the details.
+
+- **Shell gate.** Per-component allow/ask/deny, `rm ~/` / `rm /` hard-blocked
+  (bypass-immune), CWD leniency, and a path-ACL operand scan. The `s` and `a`
+  approval answers are **session-scoped**; nothing is written to disk.
+- **`/agentic auto` is host-bash trust.** It auto-approves ask-level shell
+  commands and skips destructive-tool confirmations. Home/root hard-denies and
+  Path-ACL `ask` rules still apply, but the model can otherwise execute on the
+  host without a prompt.
+- **Container sandbox is a different, looser boundary.** `run_command` /
+  `run_python` execute inside the container and skip the host shell gate and
+  ACL operand scan. The working directory is bind-mounted read-write; the file
+  tools still run on the host and stay under the Path ACL.
+- **Path ACL coverage.** File tools and shell operands are governed (see
+  "Access Control" above). `run_python` inline code, `diff`/`apply_patch`
+  contents, and `glob` are not scanned.
+- **Network.** `fetch_url` and `/curl` accept `http://` and `https://` only —
+  `file://`, `ftp://` and `data:` are rejected, so URL fetch cannot read local
+  files. Private/link-local address blocking is **not** implemented; the client
+  can reach whatever the host can.
+- **On disk.** Sessions, readline history, agentic JSONL logs and spill files
+  are created `0600` in `0700` directories. They can contain anything the model
+  or a `!` command saw, including secrets.
+- **Plan mode.** `/agentic plan` (strict) exposes inspection tools only, with
+  no shell and every path confined to the CWD. `/agentic plan run` re-adds
+  `run_command`, which always confirms.
+
 ## Testing
+
+Run from this directory:
 
 ```bash
 python3 -m unittest discover tests -v
 ```
 
-~130 unit tests (no backend needed) + ~60 integration tests (require live backend).
+Offline suites need no backend and no network: `test_acl`, `test_mcp`,
+`test_compaction`, `test_compact_command`, `test_agentic_timeout`,
+`test_tool_summarize`, `test_state_files`. The backend-gated suites skip
+automatically when no server is reachable.
 
-Test coverage: configuration, retry logic, theme system, command registry, shell safety, path ACL, compaction role-integrity, HTML parsing, token counting, debug manager, image handling, backend detection, model listing, basic queries, stats, command handlers, switch model, spawn shell, dump context, full workflow. Agentic: ReAct loop, tool execution, JSON normalization, multi-tool parsing, argument aliases, lazy mode, stuck detection, timeout, end-to-end DNS resolver pipeline.
+- Per-file matrix, env vars and contributor rules: `tests/README.md`
+- Coverage map, release checklist and result interpretation: `doc/testing.md`
 
 ## Requirements
 
 - Python 3.x
-- A running LLM backend (Ollama / Llama.cpp / Strata / LM Studio)
+- A running LLM backend: a local Ollama / Llama.cpp / Strata / LM Studio server,
+  or an API key for Gemini, OpenCode Zen/Go, Mistral or DeepSeek
 - Tested on Fedora 43 and Ubuntu 24
 
 ## System Prompt
@@ -253,15 +332,15 @@ Test coverage: configuration, retry logic, theme system, command registry, shell
 Default prompt: accurate chatbot mirroring the user's language, formatting
 responses with markdown. Built-in profiles (select via `-P` / `--profile`):
 
-| Profile | Focus |
-|---------|-------|
-| `default` | General-purpose, language-mirroring chatbot |
-| `coder` | Python/C++ specialist with system engineering knowledge |
-| `sysadmin` | Linux admin, short and direct answers |
-| `concise` | No filler, skip pleasantries |
-| `doctor` | Medical info with disclaimer (not a licensed professional) |
-| `teacher` | Patient educator with analogies and adaptable depth |
-| `politic` | Neutral analyst, multiple perspectives, no endorsements |
+| Profile    | Focus                                                      |
+| ---------- | ---------------------------------------------------------- |
+| `default`  | General-purpose, language-mirroring chatbot                |
+| `coder`    | Python/C++ specialist with system engineering knowledge    |
+| `sysadmin` | Linux admin, short and direct answers                      |
+| `concise`  | No filler, skip pleasantries                               |
+| `doctor`   | Medical info with disclaimer (not a licensed professional) |
+| `teacher`  | Patient educator with analogies and adaptable depth        |
+| `politic`  | Neutral analyst, multiple perspectives, no endorsements    |
 
 ```bash
 python3 ollamaquery2.py -c -P coder
@@ -273,13 +352,19 @@ from composable blocks (role, tool definitions, format, examples, rules).
 
 ## Environment
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama API URL |
-| `LLAMACPP_HOST` | `http://127.0.0.1:8080` | Llama.cpp API URL |
-| `STRATA_HOST` | `http://127.0.0.1:8080` | Strata API URL |
-| `OLLAMAQUERY_THEME` | `default` | Color theme name |
-| `NO_COLOR` | (unset) | Disable colors |
+| Variable                 | Default                  | Description                        |
+| ------------------------ | ------------------------ | ---------------------------------- |
+| `OLLAMA_HOST`            | `http://127.0.0.1:11434` | Ollama API URL                     |
+| `LLAMACPP_HOST`          | `http://127.0.0.1:8080`  | Llama.cpp API URL                  |
+| `STRATA_HOST`            | `http://127.0.0.1:8080`  | Strata API URL                     |
+| `OLLAMAQUERY_THEME`      | `default`                | Color theme name                   |
+| `NO_COLOR`               | (unset)                  | Disable colors                     |
+| `GEMINI_API_KEY`         | (unset)                  | Gemini cloud backend key           |
+| `OPENCODEZEN_API_KEY`    | (unset)                  | OpenCode Zen cloud backend key     |
+| `OPENCODEGO_API_KEY`     | (unset)                  | OpenCode Go cloud backend key      |
+| `MISTRAL_API_KEY`        | (unset)                  | Mistral cloud backend key          |
+| `DEEPSEEK_API_KEY`       | (unset)                  | DeepSeek cloud backend key         |
+| `OLLAMAQUERY_MCP_CONFIG` | (unset)                  | MCP config path (see `doc/mcp.md`) |
 
 ## Similar Projects
 
@@ -290,5 +375,10 @@ See `doc/similar_project.md` for a detailed comparison with Aider, Open Interpre
 | Reference                                                       | What it is                                                                                                                           |
 | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | [MCP specification](https://modelcontextprotocol.io)            | Protocol source of truth; the built-in MCP client targets revision `2025-11-25`                                                      |
-| [Neumann-Labs/mcp-cpp](https://github.com/Neumann-Labs/mcp-cpp) | Spec-faithful C++20 MCP SDK. Trusted as a wire-format oracle and test fixture; GPL-3.0, so reference only — do not vendor its source |
+| [Neumann-Labs/mcp-cpp](https://github.com/Neumann-Labs/mcp-cpp) | Spec-faithful C++20 MCP SDK. Used as a wire-format oracle; check its license before vendoring source                                 |
+| `doc/mcp.md`                                                    | MCP configuration reference, security model, and local test-server guide                                                             |
 | `doc/mcp-conformance.md`                                        | Conformance review of the built-in MCP client against mcp-cpp: findings, capability matrix, fix plan                                 |
+
+## License
+
+GPL-3.0. See the `LICENSE` file at the repository root.

@@ -49,7 +49,7 @@ agent command (whole string)
 ├─────────────────────────────────────────────────────────────────────┤
 │  L4  auto-confirm           ctx.auto_confirm → allow (respects L1/L2 deny)│
 ├─────────────────────────────────────────────────────────────────────┤
-│  L5  interactive prompt     TTY → y/N/s/a/d  (s=session, a=always)   │
+│  L5  interactive prompt     TTY → y/N/s/a/d  (s/a = this session)   │
 │      non-TTY               → deny (fail-closed, hint /agentic auto) │
 └─────────────────────────────────────────────────────────────────────┘
     │ allow → subprocess.run(shell=True)
@@ -203,9 +203,10 @@ pipelines. `cat /etc/passwd` (outside) stays `ask` → `auto_confirm` or prompt.
     `allow` (still respects L1/L2 deny).
 7.  non-TTY → `deny` with hint `use /agentic auto`.
 8.  TTY → prompt `Allow? [y/N/s/a/d]` (`ollamaquery2.py:2411`); `s` appends
-    `patterns` to `_SHELL_SESSION_APPROVED:1887`, `a` appends `always`
-    (`arity *`) patterns too — mirrors opencode `always` session persistence
-    (`opencode_implementation_detail_shell_permission_parser.md:292`).
+    `patterns` to `_SHELL_SESSION_APPROVED:1887`, `a` additionally appends the
+    broader `always` (`arity *`) patterns to the same list. Both are
+    session-scoped and nothing is written to disk (unlike opencode's
+    `always` session persistence).
 
 Call sites `ollamaquery2.py:2471,2723,4331`:
 

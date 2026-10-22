@@ -4,8 +4,8 @@
 # Design choices:
 #   - Single file: maximally portable (cp/scp and run), zero install, no packaging
 #   - CLI-only: no GUI dependencies, works over SSH, headless servers
-#   - Tests: tests/test_features.py (138+), tests/test_modifications.py (34+),
-#     tests/test_agentic.py (55+) — over 200 unit + end-to-end tests total
+#   - Tests: unittest suites under tests/ (offline and backend-gated; see
+#     tests/README.md and doc/testing.md)
 #     Run: python3 -m unittest discover tests -v
 #   - 3rd-party deps: none required (yaml, html2text, pandoc, lynx optional)
 #   - Print/callbacks in business logic: intentional for CLI; would decouple for GUI port
@@ -37,7 +37,7 @@ import fnmatch
 from datetime import datetime
 
 from html.parser import HTMLParser
-from typing import Optional, Dict, List, Union, Literal, TypedDict
+from typing import Optional, Dict, List, Union, Literal, TypedDict, IO
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -2379,6 +2379,57 @@ def llm_compact_messages(messages: list[Message], ctx: 'CommandContext', query_h
 
 
 # ============================================================================
+# ============= PRIVATE FILE MODES  ==========================================
+# ============================================================================
+
+_PRIVATE_DIR_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
+
+
+def _ensure_private_dir(path: str) -> None:
+    """Create `path` when missing and force it to mode 0700.
+
+    Args:
+        path: Directory to create and/or tighten.
+
+    Returns:
+        None. makedirs/chmod failures are swallowed — a permission problem
+        must never stop the CLI from starting.
+    """
+    try:
+        os.makedirs(path, mode=_PRIVATE_DIR_MODE, exist_ok=True)
+        os.chmod(path, _PRIVATE_DIR_MODE)
+    except OSError:
+        pass
+
+
+def _open_private(path: str, mode: str = "w", **kwargs: object) -> IO:
+    """Open a text file for writing with mode 0600 from creation.
+
+    Uses os.open(..., 0o600) plus fchmod so the file is never observable with
+    umask-derived permissions, not even in the instant between creat() and a
+    later chmod(path).
+
+    Args:
+        path: File to open (parent directory must already exist).
+        mode: "w" (truncate) or "a" (append) — the only modes used by writers.
+        **kwargs: Passed to os.fdopen (encoding, errors, ...).
+
+    Returns:
+        A writable text stream.
+    """
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= os.O_APPEND if "a" in mode else os.O_TRUNC
+    fd = os.open(path, flags, _PRIVATE_FILE_MODE)
+    if hasattr(os, "fchmod"):
+        try:
+            os.fchmod(fd, _PRIVATE_FILE_MODE)
+        except OSError:
+            pass
+    return os.fdopen(fd, mode, **kwargs)
+
+
+# ============================================================================
 # ============= SESSION PERSISTENCE  ==========================================
 # ============================================================================
 
@@ -2392,8 +2443,18 @@ class SessionManager:
 
     def __init__(self) -> None:
         """Ensure the session directory exists and load the session index."""
-        os.makedirs(SESSION_DIR, exist_ok=True)
+        _ensure_private_dir(os.path.dirname(SESSION_DIR))
+        _ensure_private_dir(SESSION_DIR)
+        self._tighten_existing_sessions()
         self._index = self._load_index()
+
+    def _tighten_existing_sessions(self) -> None:
+        """Best-effort chmod of transcripts written before 0600 enforcement."""
+        for path in [SESSION_INDEX] + glob.glob(os.path.join(SESSION_DIR, "*.json")):
+            try:
+                os.chmod(path, _PRIVATE_FILE_MODE)
+            except OSError:
+                pass
 
     def _load_index(self) -> list:
         """Load the saved session index JSON, or [] when missing/invalid."""
@@ -2407,7 +2468,7 @@ class SessionManager:
 
     def _save_index(self) -> None:
         """Persist the current session index JSON to disk."""
-        with open(SESSION_INDEX, 'w') as f:
+        with _open_private(SESSION_INDEX, 'w') as f:
             json.dump(self._index, f, indent=2)
 
     def save_session(self, messages: list, ctx: 'CommandContext') -> str:
@@ -2436,7 +2497,7 @@ class SessionManager:
             "messages": messages
         }
 
-        with open(filepath, 'w', encoding='utf-8') as f:
+        with _open_private(filepath, 'w', encoding='utf-8') as f:
             json.dump(session_data, f, ensure_ascii=False)
 
         self._index = [e for e in self._index if e['id'] != session_id]
@@ -3806,7 +3867,10 @@ def _shell_hard_block(command: str, verdict: dict) -> Optional[Dict]:
 
 
 def _shell_prompt_approval(command: str, verdict: dict) -> Dict:
-    """Interactively ask the user to approve a command (once/session/always/deny).
+    """Interactively ask the user to approve a command (once/session/deny).
+
+    The `a` answer also approves the broader arity pattern (e.g. `git *`) and,
+    like `s`, lasts only for this process — nothing is written to disk.
 
     Args:
         command: The raw command string.
@@ -3815,13 +3879,15 @@ def _shell_prompt_approval(command: str, verdict: dict) -> Dict:
     Returns:
         {"approved", "effect", "message", "verdict"} result dict.
     """
-    # Prompt user: once / session / always / deny
+    # Prompt user: once / session / broader-session / deny
     print(colorize(f"\n[Shell approval] `{command}`", 'warning'), file=sys.stderr)
     for d in verdict["details"]:
         if d["action"] == "ask":
             print(colorize(f"  → {d['pattern']} needs approval (rule: {d['rule']})", 'muted'), file=sys.stderr)
     try:
-        reply = input(colorize("Allow? [y/N/s/a/d] (y=once, s=session, a=always, d=deny): ", 'warning')).strip().lower()
+        reply = input(colorize(
+            "Allow? [y/N/s/a/d] (y=once, s=session, a=session, broader pattern, d=deny): ",
+            'warning')).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return {"approved": False, "effect": "ask", "message": "Denied (no input)", "verdict": verdict}
     if reply in ("y", "yes", "o", "once"):
@@ -3833,7 +3899,9 @@ def _shell_prompt_approval(command: str, verdict: dict) -> Dict:
     if reply in ("a", "always"):
         for pat in verdict["patterns"]:
             _SHELL_SESSION_APPROVED.append({"permission": "bash", "pattern": pat, "action": "allow"})
-        # Also store always pattern for future sessions (same list, session-scoped)
+        # Also approve the broader arity pattern (e.g. "ssh *"). Same
+        # session-scoped list: there is no on-disk always-list and nothing is
+        # loaded at startup.
         for pat in verdict["always"]:
             _SHELL_SESSION_APPROVED.append({"permission": "bash", "pattern": pat, "action": "allow"})
         return {"approved": True, "effect": "allow", "message": None, "verdict": verdict}
@@ -3990,7 +4058,7 @@ class Executor:
 
 AGENTIC_TOOL_DEFS = {
     "fetch_url": {
-        "description": "Fetch a URL and return its content as plain text. Small pages are returned inline; large pages are spilled to a file — the observation then carries the spill file path, the size and a one-line preview, and NO content. Decide from the preview whether the page is relevant; read it with read_file(file_path=\"...\") (pages large files via the `next` offset) rather than re-fetching.",
+        "description": "Fetch a URL and return its content as plain text. Only http:// and https:// URLs are accepted. Small pages are returned inline; large pages are spilled to a file — the observation then carries the spill file path, the size and a one-line preview, and NO content. Decide from the preview whether the page is relevant; read it with read_file(file_path=\"...\") (pages large files via the `next` offset) rather than re-fetching.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -6004,12 +6072,12 @@ def _spill_cluster_result(ctx: object, output_text: str, verb: str = "get",
     if len(output_text) <= CLUSTER_SPILL_THRESHOLD:
         return output_text
     try:
-        os.makedirs(CLUSTER_SPILL_DIR, exist_ok=True)
+        _ensure_private_dir(CLUSTER_SPILL_DIR)
         acl = getattr(ctx, "path_acl", None)
         if acl is not None:
             acl.add("read", "allow", CLUSTER_SPILL_DIR, source="session")
         spill_file = _cluster_spill_path(verb, resource)
-        with open(spill_file, "w", encoding="utf-8") as f:
+        with _open_private(spill_file, "w", encoding="utf-8") as f:
             f.write(output_text)
         n_chars = len(output_text)
         n_lines = len(output_text.splitlines())
@@ -6046,12 +6114,12 @@ def _spill_fetch_result(ctx: object, text: str, url: str) -> str:
     if len(text) <= FETCH_SPILL_THRESHOLD:
         return text
     try:
-        os.makedirs(CLUSTER_SPILL_DIR, exist_ok=True)
+        _ensure_private_dir(CLUSTER_SPILL_DIR)
         acl = getattr(ctx, "path_acl", None)
         if acl is not None:
             acl.add("read", "allow", CLUSTER_SPILL_DIR, source="session")
         spill_file = _fetch_spill_path(url)
-        with open(spill_file, "w", encoding="utf-8") as f:
+        with _open_private(spill_file, "w", encoding="utf-8") as f:
             f.write(text)
         n_chars = len(text)
         n_lines = len(text.splitlines())
@@ -6786,12 +6854,12 @@ def _mcp_spill_result(ctx: object, text: str, server_name: str, tool_name: str) 
     Returns:
         Absolute path.
     """
-    os.makedirs(CLUSTER_SPILL_DIR, exist_ok=True)
+    _ensure_private_dir(CLUSTER_SPILL_DIR)
     acl = getattr(ctx, "path_acl", None)
     if acl is not None:
         acl.add("read", "allow", CLUSTER_SPILL_DIR, source="session")
     path = _mcp_spill_path(server_name, tool_name)
-    with open(path, "w", encoding="utf-8") as fh:
+    with _open_private(path, "w", encoding="utf-8") as fh:
         fh.write(text)
     return path
 
@@ -8004,11 +8072,11 @@ class AgenticLogger:
     def __init__(self) -> None:
         """Open a fresh timestamped JSONL log after pruning old ones."""
         log_dir = os.path.expanduser("~/.ollamaquery.d/agentic")
-        os.makedirs(log_dir, exist_ok=True)
+        _ensure_private_dir(log_dir)
         self._cleanup_old_logs(log_dir)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.path = os.path.join(log_dir, f"{timestamp}.jsonl")
-        self.file = open(self.path, "w", encoding="utf-8")
+        self.file = _open_private(self.path, "w", encoding="utf-8")
 
     def _cleanup_old_logs(self, log_dir: str) -> None:
         """Remove log files older than AGENTIC_LOG_RETENTION_DAYS."""
@@ -9872,7 +9940,7 @@ def _save_history_file(path: str) -> None:
     current = readline.get_current_history_length()
     limit = readline.get_history_length()
     start = current - limit + 1 if limit and limit > 0 and current > limit else 1
-    with open(path, 'w', encoding='utf-8') as f:
+    with _open_private(path, 'w', encoding='utf-8') as f:
         for i in range(start, current + 1):
             item = readline.get_history_item(i)
             if item is None:
@@ -10474,6 +10542,9 @@ def _curl_fetch_text(url: str, timeout: int = 20) -> str:
     Returns:
         Decoded response body, or empty string when curl is unavailable/fails.
     """
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        return ""
     if shutil.which("curl") is None:
         return ""
     ua = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -10523,8 +10594,14 @@ def fetch_and_convert_url(url: str) -> tuple:
         (text, tool) tuple where tool is "htmlstrip" or "None". Text is
         never empty on success; a "[Failed to fetch URL: ...]" marker marks
         a failed fetch so callers report success=False (never a misleading
-        success with an empty body).
+        success with an empty body). Non-http(s) URLs (file://, ftp://,
+        data:, bare paths) are rejected up front: urllib would otherwise
+        read a local file, turning fetch_url into a Path-ACL bypass.
     """
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        return (f"[Failed to fetch URL: unsupported URL {url!r} — only "
+                f"http:// and https:// are allowed]", "None")
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     err = ""
     try:
@@ -11119,8 +11196,12 @@ class ChatLoop:
 
                 histfile = os.path.expanduser("~/.ollamaquery.d/session")
                 histdir = os.path.dirname(histfile)
-                if not os.path.exists(histdir):
-                    os.makedirs(histdir, exist_ok=True)
+                _ensure_private_dir(histdir)
+                if os.path.exists(histfile):
+                    try:
+                        os.chmod(histfile, _PRIVATE_FILE_MODE)
+                    except OSError:
+                        pass
 
                 try:
                     _load_history_file(histfile)
@@ -13960,12 +14041,12 @@ class ChatLoop:
         if len(content) < UNFINISHED_WRITE_SPILL_MIN:
             return None
         try:
-            os.makedirs(CLUSTER_SPILL_DIR, exist_ok=True)
+            _ensure_private_dir(CLUSTER_SPILL_DIR)
             acl = getattr(self.ctx, "path_acl", None)
             if acl is not None:
                 acl.add("read", "allow", CLUSTER_SPILL_DIR, source="session")
             spill_file = os.path.join(CLUSTER_SPILL_DIR, UNFINISHED_WRITE_SPILL_NAME)
-            with open(spill_file, "w", encoding="utf-8") as f:
+            with _open_private(spill_file, "w", encoding="utf-8") as f:
                 f.write(content)
         except OSError:
             return None
