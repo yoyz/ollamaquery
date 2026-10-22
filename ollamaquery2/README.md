@@ -264,9 +264,12 @@ place `.ollamaquery-mcp.json` in the working directory (or
 /mcp tools                      # tools this build would expose
 /mcp tools --plan               # only tools eligible for /agentic plan
 /mcp connect calc               # start it now (lazy servers start on first call)
+/mcp help                       # subcommands (also shown by bare /mcp)
 ```
 
-Tools are namespaced `<prefix>__<tool>` (e.g. `calc__add`). Only the **stdio**
+Tools are namespaced `<prefix>__<tool>` (e.g. `calc__add`). Config paths expand
+`~`/`${VAR}` and relative paths resolve against the config file's directory, so
+a config works from any working directory. Only the **stdio**
 transport and the **tools** capability are implemented; HTTP/OAuth,
 prompts/resources, sampling/elicitation/roots and `list_changed` fail closed.
 In plan mode an MCP tool is eligible only when the server explicitly declares

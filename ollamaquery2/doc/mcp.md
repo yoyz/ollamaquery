@@ -30,7 +30,10 @@ OLLAMAQUERY_MCP_CONFIG=./mcp.test.json python3 ollamaquery2.py -c
 ```
 
 Inside the chat: `/mcp status`, `/mcp tools [server] [--plan|--all]`,
-`/mcp connect <server>`, `/mcp disconnect <server>`.
+`/mcp connect <server>`, `/mcp disconnect <server>`, `/mcp help`. Bare `/mcp`
+prints the aligned server table and then this same help block; tab completion
+offers the subcommands plus the configured server names after `connect`,
+`disconnect`, and `tools`.
 
 ## Example configuration
 
@@ -102,6 +105,7 @@ an `args` list, and `type` maps to `transport`:
 | `command`                  | `[]`                 | argv list (no shell). Absolute path or `${HOME}/...`                        |
 | `env`                      | `{}`                 | Extra environment for the child                                             |
 | `cwd`                      | `null`               | Working directory for the child                                             |
+| `vars`                     | `{}`                 | `{name}` placeholders for `args` / `env`                                    |
 | `enabled`                  | `true`               | Disabled servers are never started or listed as tools                       |
 | `startup`                  | `lazy`               | `lazy` = start on first call; `eager` = start at client init                |
 | `tool_prefix`              | sanitized name       | Model-visible namespace; tools become `<prefix>__<tool>`                    |
@@ -111,14 +115,36 @@ an `args` list, and `type` maps to `transport`:
 | `read_only_only`           | `false`              | Hide tools that are not explicitly annotated read-only                      |
 | `confirm_tools`            | `[]`                 | Force a confirmation prompt before each call                                |
 | `init_timeout_seconds`     | `15.0`               | `initialize` / `tools/list` deadline                                        |
+| `list_timeout_seconds`     | `30.0`               | `tools/list` deadline                                                       |
 | `call_timeout_seconds`     | `120.0`              | Per `tools/call` deadline                                                   |
+| `timeout`                  | unset                | Alias for init/list/call deadlines (explicit keys win)                      |
 | `max_result_chars`         | `100000`             | Ceiling; the live context window may lower it                               |
 | `retries`                  | `1`                  | Retries on transport failure                                                |
 | `backoff_seconds`          | `0.5`                | Delay between retries                                                       |
 | `protocol_version`         | `2025-11-25`         | One of `2026-07-28`, `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05` |
+| `dialect`                  | `mcp`                | `mcp` only; `raw`/`auto` parse but are reported                             |
+| `description`              | `""`                 | Free-text note, kept for display                                            |
 
 Unknown keys are reported as `unknown config key(s) ignored` rather than
 silently accepted.
+
+### Paths and placeholders
+
+Command paths are resolved when the config is loaded, not when the server is
+spawned, so a config works from any working directory:
+
+- `~` and `${VAR}` / `${VAR:-default}` expand in `command`, `cwd` and `env`.
+- A relative path (`./bin/server`, `tests/kubeconfig.yaml`) resolves against
+  **the directory holding the config file**, not the process CWD.
+- A bare name (`npx`, `kubernetes-mcp-server`) still resolves through `PATH`;
+  if a file with that name sits next to the config file, that copy wins.
+- An `env` value that is *only* an unset variable reference
+  (`"KUBECONFIG": "${KUBECONFIG}"`) is dropped, so the child inherits the real
+  environment instead of an empty string.
+- `vars` fills `{placeholders}` in `args` and `env` (unknown placeholders are
+  left verbatim).
+- `timeout` is a per-request alias: it sets `init`, `list` and `call` deadlines
+  unless those are configured explicitly.
 
 ## Security model
 
@@ -129,7 +155,10 @@ silently accepted.
   `/agentic plan` only when the server declares `readOnlyHint: true`,
   `destructiveHint` is not true, and no config filter removes it. An absent
   annotation is **not** "safe": the spec defaults `readOnlyHint=false` and
-  `destructiveHint=true`.
+  `destructiveHint=true`. Entering plan mode (or asking again while it is
+  already on) prints the full surface: the built-in query tools plus the
+  eligible MCP tools, grouped per server and stripped of the `<prefix>__`
+  namespace; `/mcp tools --plan` shows them with descriptions.
 - **Results spill like other tools.** Output over the effective cap is written
   to `~/.ollamaquery.d/spill/mcp_result_*.json` (mode `0600`) and the model gets
   a pure pointer; a session Path-ACL read-allow rule is registered first so the

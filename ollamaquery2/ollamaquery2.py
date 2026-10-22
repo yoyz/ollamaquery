@@ -25,6 +25,7 @@ import shlex
 import shutil
 import signal
 import termios
+import textwrap
 import threading
 import time
 import traceback
@@ -471,7 +472,7 @@ COMMANDS = {
         'aliases': ['/mcp'],
         'category': 'Model',
         'description': 'Inspect and control MCP tool servers',
-        'usage': '/mcp [status|tools [server] [--plan|--all]|connect <server>|disconnect <server>]',
+        'usage': '/mcp [status|tools [server] [--plan|--all]|connect <server>|disconnect <server>|help]',
         'handler': None
     },
     # === I/O Operations ===
@@ -1480,7 +1481,8 @@ class CommandContext:
 
     def create_completer(self) -> 'ChatCompleter':
         """Create a ChatCompleter using this context's connection info."""
-        return ChatCompleter(self.base_url, self.backend, api_key=self.api_key)
+        return ChatCompleter(self.base_url, self.backend, api_key=self.api_key,
+                             ctx=self)
 
     def create_query_handler(self) -> 'ModelQuery':
         """Create a ModelQuery using this context's connection info."""
@@ -6403,6 +6405,28 @@ MCP_MARK_UNDECLARED = "?"
 MCP_MARK_FILTERED = "x"
 MCP_LISTING_VIEWS = ("default", "plan", "all")
 
+# `/mcp` status keeps a roomy name column so long server names still line up
+# with the transport/state/count columns (widened further when a name is longer).
+MCP_STATUS_NAME_WIDTH = 30
+MCP_STATUS_TRANSPORT_WIDTH = 10
+
+# `/mcp` subcommands, as (usage token, one-line description). The first word of
+# each token is what tab completion offers.
+MCP_SUBCOMMAND_USAGE = (
+    ("status", "list configured servers and connection state"),
+    ("tools [server] [--plan|--all]", "list the tools this build exposes"),
+    ("connect <server>", "connect one server now"),
+    ("disconnect <server>", "stop one server"),
+    ("help", "show this help"),
+)
+MCP_SUBCOMMANDS = [token.split()[0] for token, _ in MCP_SUBCOMMAND_USAGE]
+
+# `/listtool` layout: name column floor, and the wrap width band (a very wide
+# terminal still gets wrapped text so descriptions stay readable).
+TOOL_LIST_NAME_WIDTH = 24
+TOOL_LIST_MIN_WIDTH = 70
+TOOL_LIST_MAX_WIDTH = 120
+
 MCP_ERR_PARSE = -32700
 MCP_ERR_INVALID_REQUEST = -32600
 MCP_ERR_METHOD_NOT_FOUND = -32601
@@ -6450,6 +6474,100 @@ def _mcp_expand_env(value: object) -> object:
     return value
 
 
+def _mcp_expand_vars(value: object, variables: dict) -> object:
+    """Expand `{name}` placeholders from a config's `vars` block.
+
+    Unknown placeholders are left verbatim (the reference client does the same)
+    so a stray brace in an argument never rewrites the whole string.
+
+    Args:
+        value: String (or nested list/dict) to expand.
+        variables: Placeholder values from the server entry's `vars`.
+
+    Returns:
+        The expanded value, or the original when formatting cannot complete.
+    """
+    if isinstance(value, str) and variables:
+        try:
+            return value.format(**variables)
+        except (KeyError, IndexError, ValueError):
+            return value
+    if isinstance(value, list):
+        return [_mcp_expand_vars(item, variables) for item in value]
+    if isinstance(value, dict):
+        return {key: _mcp_expand_vars(item, variables) for key, item in value.items()}
+    return value
+
+
+_MCP_ENV_ONLY_RE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+
+
+def _mcp_expand_path(value: str, base_dir: Optional[str]) -> str:
+    """Expand `~` and `${VAR}`, anchoring relative paths to the config's directory.
+
+    A bare name without a separator is returned untouched so it still resolves
+    through `PATH` (e.g. `npx`, `kubernetes-mcp-server`).
+
+    Args:
+        value: A command, cwd, or path-like argument.
+        base_dir: Directory holding the config file, or None.
+
+    Returns:
+        The expanded path (absolute when path-like).
+    """
+    text = os.path.expanduser(os.path.expandvars(str(_mcp_expand_env(str(value)))))
+    if os.sep not in text and not text.startswith("."):
+        return text
+    if not os.path.isabs(text) and base_dir:
+        text = os.path.join(base_dir, text)
+    return os.path.abspath(text)
+
+
+def _mcp_resolve_command(command: str, base_dir: Optional[str]) -> str:
+    """Resolve a server command, preferring a copy that sits next to the config.
+
+    Args:
+        command: `command[0]` from the server entry.
+        base_dir: Directory holding the config file, or None.
+
+    Returns:
+        The path to spawn.
+    """
+    resolved = _mcp_expand_path(command, base_dir)
+    if os.path.isabs(resolved) or not base_dir or shutil.which(resolved):
+        return resolved
+    local = os.path.join(base_dir, resolved)
+    return local if os.path.isfile(local) else resolved
+
+
+def _mcp_resolve_env_value(value: object, base_dir: Optional[str]) -> Optional[str]:
+    """Expand an env value; return None when it references an unset variable.
+
+    Dropping the key lets the child inherit the real environment instead of
+    receiving an empty string (the reference client does the same for
+    `KUBECONFIG: ${KUBECONFIG}` with KUBECONFIG unset).
+
+    Args:
+        value: The raw env value.
+        base_dir: Directory holding the config file, or None.
+
+    Returns:
+        The expanded value, or None when the key should be dropped.
+    """
+    text = str(value)
+    whole = _MCP_ENV_ONLY_RE.match(text.strip())
+    if whole and whole.group(1) not in os.environ:
+        return None
+    text = os.path.expanduser(os.path.expandvars(str(_mcp_expand_env(text))))
+    if text == "":
+        return None
+    if os.sep in text or text.startswith("."):
+        if not os.path.isabs(text) and base_dir:
+            text = os.path.join(base_dir, text)
+        text = os.path.abspath(text)
+    return text
+
+
 class MCPServerConfig:
     """One configured MCP server."""
 
@@ -6493,6 +6611,11 @@ class MCPServerConfig:
         self.backoff_seconds = float(kwargs.pop("backoff_seconds", 0.5))
         self.protocol_version = str(
             kwargs.pop("protocol_version", MCP_PREFERRED_PROTOCOL_VERSION))
+        self.description = str(kwargs.pop("description", "") or "")
+        # Accepted so mainstream configs (which carry a `dialect` hint) parse
+        # cleanly; this build only speaks compliant MCP, so anything else warns.
+        self.dialect = str(kwargs.pop("dialect", "mcp") or "mcp")
+        self.timeout_alias_problem = None
         self.ignored_keys = sorted(str(key) for key in kwargs)
 
     def effective_prefix(self) -> str:
@@ -6513,9 +6636,26 @@ class MCPConfig:
         return [cfg for cfg in self.servers.values() if cfg.enabled]
 
 
-def _mcp_coerce_server(name: str, raw: dict) -> MCPServerConfig:
-    """Accept both the extended shape and the Claude/VS Code `mcpServers` shape."""
+def _mcp_coerce_server(name: str, raw: dict,
+                       base_dir: Optional[str] = None) -> MCPServerConfig:
+    """Accept both the extended shape and the Claude/VS Code `mcpServers` shape.
+
+    Paths are resolved here (not at spawn time) so the config means the same
+    thing from any working directory: `~` and `${VAR}` expand, relative
+    commands/paths anchor to the config file's directory, and the `vars` block
+    fills `{placeholders}` in `args`/`env`.
+
+    Args:
+        name: Server name.
+        raw: One server entry from the config file.
+        base_dir: Directory holding the config file (None to keep paths as-is).
+
+    Returns:
+        A normalized server config.
+    """
     data = dict(raw)
+    variables = dict(data.pop("vars", {}) or {})
+    timeout = data.pop("timeout", None)
     if "args" in data and isinstance(data.get("command"), str):
         data["command"] = [data["command"], *data.get("args", [])]
     data.pop("args", None)
@@ -6530,8 +6670,38 @@ def _mcp_coerce_server(name: str, raw: dict) -> MCPServerConfig:
         data.pop("type", None)
     if "url" in data and "transport" not in data:
         data["transport"] = "streamable-http"
-    return MCPServerConfig(name=name,
+    cfg = MCPServerConfig(name=name,
                           **{k: _mcp_expand_env(v) for k, v in data.items()})
+    if timeout is not None:
+        try:
+            per_request = float(timeout)
+        except (TypeError, ValueError):
+            cfg.timeout_alias_problem = (
+                f"'timeout' must be a number (got {timeout!r})")
+        else:
+            if per_request <= 0:
+                cfg.timeout_alias_problem = "'timeout' must be > 0"
+            else:
+                for field in ("init_timeout_seconds", "list_timeout_seconds",
+                              "call_timeout_seconds"):
+                    setattr(cfg, field, getattr(cfg, field)
+                            if field in data else per_request)
+    if variables:
+        cfg.command = [str(part) for part in
+                       _mcp_expand_vars(cfg.command, variables)]
+        cfg.env = {key: _mcp_expand_vars(value, variables)
+                   for key, value in cfg.env.items()}
+    if cfg.command:
+        cfg.command[0] = _mcp_resolve_command(str(cfg.command[0]), base_dir)
+    if cfg.cwd is not None:
+        cfg.cwd = _mcp_expand_path(str(cfg.cwd), base_dir)
+    resolved_env = {}
+    for key, value in cfg.env.items():
+        resolved = _mcp_resolve_env_value(value, base_dir)
+        if resolved is not None:
+            resolved_env[key] = resolved
+    cfg.env = resolved_env
+    return cfg
 
 
 def load_mcp_config(path: Optional[str] = None) -> MCPConfig:
@@ -6579,7 +6749,8 @@ def load_mcp_config(path: Optional[str] = None) -> MCPConfig:
             if not isinstance(entry, dict):
                 raise ValueError(
                     f"invalid MCP config {candidate}: server {name!r} must be an object")
-            servers[name] = _mcp_coerce_server(name, entry)
+            servers[name] = _mcp_coerce_server(
+                name, entry, os.path.dirname(os.path.abspath(candidate)))
         return MCPConfig(servers, candidate)
     return MCPConfig({}, None)
 
@@ -6627,6 +6798,11 @@ def validate_mcp_server(cfg: MCPServerConfig) -> "List[str]":
     if cfg.ignored_keys:
         problems.append(f"{cfg.name}: unknown config key(s) ignored: "
                         f"{', '.join(cfg.ignored_keys)}")
+    if cfg.dialect.lower() != "mcp":
+        problems.append(f"{cfg.name}: dialect {cfg.dialect!r} is not implemented "
+                        f"(this build speaks compliant MCP only)")
+    if cfg.timeout_alias_problem:
+        problems.append(f"{cfg.name}: {cfg.timeout_alias_problem}")
     overlap = set(cfg.allowed_tools) & set(cfg.denied_tools)
     if overlap:
         problems.append(f"{cfg.name}: tool(s) in both allowed_tools and denied_tools: "
@@ -7077,13 +7253,54 @@ def format_mcp_tool_listing(catalogs: "Dict[str, List[MCPToolEntry]]",
 
 def format_mcp_server_summary(cfg: MCPServerConfig,
                               entries: "List[MCPToolEntry]",
-                              connected: bool) -> str:
-    """One-line server status for `/mcp`."""
+                              connected: bool,
+                              name_width: int = MCP_STATUS_NAME_WIDTH,
+                              transport_width: int = MCP_STATUS_TRANSPORT_WIDTH,
+                              count_widths: "tuple" = (1, 1, 1)) -> str:
+    """One-line server status for `/mcp`.
+
+    Args:
+        cfg: The server config.
+        entries: Classified tool entries (empty before connect).
+        connected: Whether the server is connected.
+        name_width: Column width for the server name (callers pass one width
+            for the whole table so every row lines up).
+        transport_width: Column width for the transport label.
+        count_widths: (tools, plan, hidden) numeric widths for the same reason.
+
+    Returns:
+        The formatted row.
+    """
     plan = sum(1 for entry in entries if entry.plan_eligible)
     hidden = sum(1 for entry in entries if entry.filtered_reason)
     state = "connected" if connected else "not connected"
-    return (f"{cfg.name:<14} {cfg.transport:<10} {state:<14} "
-            f"{len(entries)} tools \u00b7 {plan} plan \u00b7 {hidden} hidden")
+    tools_width, plan_width, hidden_width = count_widths
+    return (f"{cfg.name:<{name_width}} {cfg.transport:<{transport_width}} {state:<14} "
+            f"{len(entries):>{tools_width}} tools \u00b7 {plan:>{plan_width}} plan "
+            f"\u00b7 {hidden:>{hidden_width}} hidden")
+
+
+def format_mcp_usage() -> "List[str]":
+    """Render the `/mcp` subcommand help, aligned in one column block.
+
+    Returns:
+        Lines to print.
+    """
+    width = max(len(token) for token, _ in MCP_SUBCOMMAND_USAGE)
+    lines = ["Usage: /mcp <command>", "\u2500" * 66]
+    for token, description in MCP_SUBCOMMAND_USAGE:
+        lines.append(f"  /mcp {token:<{width}}  {description}")
+    lines.append("")
+    lines.append("  Bare /mcp shows server status; /mcp help shows this help.")
+    return lines
+
+
+def print_mcp_usage() -> None:
+    """Print the `/mcp` subcommand help block."""
+    print(file=sys.stderr)
+    for line in format_mcp_usage():
+        print(line, file=sys.stderr)
+    print(file=sys.stderr)
 
 
 # -- transports ---------------------------------------------------------------
@@ -7768,12 +7985,26 @@ class MCPManager:
     def status_lines(self) -> "List[str]":
         """One line per enabled server for `/mcp`."""
         catalogs = self.classified_tools()
+        configs = self.config.enabled()
+        rows = [(cfg, catalogs.get(cfg.name, [])) for cfg in configs]
+        name_width = max([MCP_STATUS_NAME_WIDTH] + [len(cfg.name) for cfg in configs])
+        transport_width = max([MCP_STATUS_TRANSPORT_WIDTH]
+                              + [len(cfg.transport) for cfg in configs])
+        tools_width = max([1] + [len(str(len(entries))) for _, entries in rows])
+        plan_width = max([1] + [len(str(sum(1 for entry in entries
+                                               if entry.plan_eligible)))
+                                for _, entries in rows])
+        hidden_width = max([1] + [len(str(sum(1 for entry in entries
+                                                 if entry.filtered_reason)))
+                                  for _, entries in rows])
+        count_widths = (tools_width, plan_width, hidden_width)
         lines = []
-        for cfg in self.config.enabled():
+        for cfg, entries in rows:
             client = self.clients.get(cfg.name)
             connected = bool(client is not None and client.connected)
-            lines.append(format_mcp_server_summary(cfg, catalogs.get(cfg.name, []),
-                                                  connected))
+            lines.append(format_mcp_server_summary(
+                cfg, entries, connected, name_width=name_width,
+                transport_width=transport_width, count_widths=count_widths))
             if cfg.name in self.errors:
                 lines.append(f"  ! {self.errors[cfg.name]}")
         return lines
@@ -7883,7 +8114,15 @@ class ToolRegistry:
         ]
 
     def list_tools_str(self) -> str:
-        """Format the tool list for /listtool display."""
+        """Format the tool list for /listtool display.
+
+        The name column is sized to the longest visible tool and every
+        description is wrapped with a hanging indent, so continuation lines sit
+        under the description column instead of restarting at column 0.
+
+        Returns:
+            The rendered listing (one tool per block, newline separated).
+        """
         manager = getattr(self._ctx, "mcp_manager", None) if self._ctx else None
         mcp_destructive = set()
         mcp_confirm = set()
@@ -7893,14 +8132,31 @@ class ToolRegistry:
                 mcp_confirm = manager.confirm_names()
             except Exception:
                 pass
+        definitions = self._plan_allowed_tools()
+        column_width = max([TOOL_LIST_NAME_WIDTH]
+                           + [len(name) for name in definitions])
+        terminal = shutil.get_terminal_size((100, 24)).columns
+        width = max(TOOL_LIST_MIN_WIDTH, min(terminal, TOOL_LIST_MAX_WIDTH))
+        description_column = 2 + column_width + 2
+        wrap_width = max(30, width - description_column)
         lines = []
-        for name, defn in self._plan_allowed_tools().items():
+        for name, defn in definitions.items():
             destructive = "! " if (name in DESTRUCTIVE_TOOLS
                                    or name in mcp_destructive) else "  "
             server = (defn.get("_mcp") or {}).get("server")
-            tag = f"[mcp:{server}] " if server else ""
-            confirm = " (confirm)" if name in mcp_confirm else ""
-            lines.append(f"{destructive}{name:<24} {tag}{defn['description']}{confirm}")
+            tag = f"[mcp:{server}]" if server else ""
+            description = defn["description"]
+            if tag and description.startswith(tag + " "):
+                # `_mcp_tool_to_agentic_def` already prefixes the origin; render
+                # it once (leading), not twice.
+                description = description[len(tag) + 1:]
+            markers = [part for part in (tag, "(confirm)" if name in mcp_confirm else "")
+                       if part]
+            head = " ".join(markers + [description]).strip()
+            wrapped = textwrap.wrap(head, wrap_width, break_on_hyphens=False) or [""]
+            lines.append(f"{destructive}{name:<{column_width}}  {wrapped[0]}")
+            for continuation in wrapped[1:]:
+                lines.append(" " * description_column + continuation)
         return "\n".join(lines)
 
     def _is_destructive_tool(self, tool_name: str) -> bool:
@@ -9678,17 +9934,21 @@ class ChatCompleter:
                  → get_command_aliases() for command completion
     """
 
-    def __init__(self, base_url: str, backend: str, api_key: Optional[str] = None) -> None:
+    def __init__(self, base_url: str, backend: str, api_key: Optional[str] = None,
+                 ctx: Optional[object] = None) -> None:
         """Initialize the completer with connection info and command aliases.
 
         Args:
             base_url: Backend API base URL.
             backend: Backend name.
             api_key: Optional API key for cloud backends.
+            ctx: Optional CommandContext, used for live server-name completion
+                (e.g. `/mcp connect <TAB>`).
         """
         self.base_url = base_url
         self.backend = backend
         self.api_key = api_key
+        self.ctx = ctx
         self.commands = get_command_aliases()
         self.models = []
 
@@ -9725,6 +9985,10 @@ class ChatCompleter:
         # 3. /compact subcommand completion
         elif buffer.startswith('/compact '):
             matches = self._complete_compact(buffer, text)
+
+        # 3a. /mcp subcommand completion (+ server names / flags)
+        elif buffer.startswith('/mcp '):
+            matches = self._complete_mcp(buffer, text)
 
         # 3b. /reasoning and /preservethinking subcommand completion
         elif buffer.startswith('/reasoning '):
@@ -9859,6 +10123,41 @@ class ChatCompleter:
             Matching /compact subcommands.
         """
         return self._complete_subcommands(buffer, text, COMPACT_SUBCOMMANDS)
+
+    def _mcp_server_names(self) -> list:
+        """Return configured MCP server names for completion ([] when none).
+
+        Returns:
+            Enabled server names in config order.
+        """
+        manager = getattr(self.ctx, "mcp_manager", None) if self.ctx else None
+        if manager is None:
+            return []
+        try:
+            return [cfg.name for cfg in manager.config.enabled()]
+        except Exception:
+            return []
+
+    def _complete_mcp(self, buffer: str, text: str) -> list:
+        """Complete `/mcp` subcommands, server names, and `tools` flags.
+
+        Args:
+            buffer: The full readline line buffer.
+            text: The token being completed.
+
+        Returns:
+            Matching candidates for the word position, or [] when exhausted.
+        """
+        words = buffer.split()
+        word_index = self._completion_word_index(buffer)
+        if word_index == 1:
+            return [sub for sub in MCP_SUBCOMMANDS if sub.startswith(text)]
+        flags = ["--plan", "--all"]
+        if word_index >= 2 and words[1] == "tools" and text.startswith("-"):
+            return [flag for flag in flags if flag.startswith(text)]
+        if word_index == 2 and words[1] in ("connect", "disconnect", "tools"):
+            return [name for name in self._mcp_server_names() if name.startswith(text)]
+        return []
 
 
 # ============================================================================
@@ -11892,8 +12191,10 @@ class ChatLoop:
         want_run = (arg == "run")
         if self.ctx.plan_mode:
             if want_run == bool(getattr(self.ctx, "plan_run", False)):
-                label = "run" if want_run else "strict"
-                print(colorize(f"[Agentic plan mode ({label}) already ON]", 'muted'), file=sys.stderr)
+                # Idempotent: re-print the full tier + tool surface so asking
+                # twice never answers with less than asking once.
+                self._print_plan_mode_status()
+                self._refresh_context_bar()
                 return False
             # Switching tier while plan mode is already active.
             self.ctx.plan_run = want_run
@@ -11924,7 +12225,8 @@ class ChatLoop:
 
     def _print_plan_mode_status(self) -> None:
         """Print the active plan-mode tier and its enforced tool surface."""
-        if getattr(self.ctx, "plan_run", False):
+        run_tier = bool(getattr(self.ctx, "plan_run", False))
+        if run_tier:
             print(colorize("[Agentic plan mode: ON — read-only planner (run)]", 'success'), file=sys.stderr)
             print(colorize("[Tools restricted to: read_file, glob, grep, list_directory, fetch_url, diff, kubernetes_cluster_query, run_command]", 'muted'), file=sys.stderr)
             print(colorize("[run_command will ask for confirmation before executing]", 'info'), file=sys.stderr)
@@ -11932,6 +12234,42 @@ class ChatLoop:
             print(colorize("[Agentic plan mode: ON — read-only, confined to CWD]", 'success'), file=sys.stderr)
             print(colorize("[Tools restricted to: read_file, glob, grep, list_directory, fetch_url, diff, kubernetes_cluster_query]", 'muted'), file=sys.stderr)
             print(colorize("[No shell; paths outside the current directory are refused]", 'info'), file=sys.stderr)
+        self._print_plan_mcp_tools(run_tier)
+
+    def _print_plan_mcp_tools(self, run_tier: bool) -> None:
+        """Print the MCP tools plan mode exposes (read-only, plan-eligible).
+
+        Names are grouped per server and stripped of their `<prefix>__` namespace
+        so a dozen long, identically-prefixed names stay readable.
+
+        Args:
+            run_tier: True for `/agentic plan run`, False for the strict tier.
+        """
+        base = PLAN_MODE_RUN_TOOLS if run_tier else PLAN_MODE_TOOLS
+        try:
+            mcp_names = sorted(plan_active_tools(self.ctx) - base)
+        except Exception:
+            mcp_names = []
+        if not mcp_names:
+            return
+        terminal = shutil.get_terminal_size((100, 24)).columns
+        width = max(TOOL_LIST_MIN_WIDTH, min(terminal, TOOL_LIST_MAX_WIDTH))
+        groups = {}
+        for name in mcp_names:
+            server, _, short = name.partition("__")
+            groups.setdefault(server, []).append(short or name)
+        for server in sorted(groups):
+            names = groups[server]
+            plural = "s" if len(names) != 1 else ""
+            header = f"[{len(names)} read-only MCP tool{plural} — {server}:"
+            print(colorize(header, 'muted'), file=sys.stderr)
+            wrapped = textwrap.wrap(", ".join(names) + "]", width,
+                                    initial_indent="    ", subsequent_indent="    ",
+                                    break_on_hyphens=False)
+            for part in wrapped:
+                print(colorize(part, 'muted'), file=sys.stderr)
+        print(colorize("[/mcp tools --plan lists them with descriptions]", 'info'),
+              file=sys.stderr)
 
     def _agentic_toggle_sandbox(self) -> bool:
         """Toggle the executor between container and host mode."""
@@ -12100,9 +12438,12 @@ class ChatLoop:
         if full_input.strip() != '/listtool':
             return None
         header = f"Available Tools (agentic: {'ON' if self.ctx.agentic_mode else 'OFF'})"
+        listing = self.tool_registry.list_tools_str()
+        width = max([70] + [len(line) for line in listing.splitlines()])
         print(colorize(f"\n{header}", 'info'), file=sys.stderr)
-        print(colorize("\u2500" * 70, 'muted'), file=sys.stderr)
-        print(self.tool_registry.list_tools_str(), file=sys.stderr)
+        print(colorize("\u2500" * width, 'muted'), file=sys.stderr)
+        print(listing, file=sys.stderr)
+        print(colorize("  ! destructive — confirmation required", 'muted'), file=sys.stderr)
         print(file=sys.stderr)
         return False
 
@@ -12119,19 +12460,27 @@ class ChatLoop:
         if stripped != '/mcp' and not stripped.startswith('/mcp '):
             return None
         parts = stripped.split()
-        sub = parts[1] if len(parts) > 1 else "status"
+        sub = parts[1] if len(parts) > 1 else ""
+        if sub == "help":
+            print_mcp_usage()
+            return False
         manager = getattr(self.ctx, "mcp_manager", None)
         if manager is None:
             print(colorize("[MCP] no servers configured — pass --mcp-config <path> or "
                            "create ~/.ollamaquery.d/mcp.json", 'warning'), file=sys.stderr)
+            print_mcp_usage()
             return False
-        if sub in ("status", "list"):
+        if sub in ("", "status", "list"):
             print(colorize(f"\nMCP servers ({manager.config.source_path or 'no config file'})",
                            'info'), file=sys.stderr)
-            print(colorize("\u2500" * 70, 'muted'), file=sys.stderr)
-            for line in manager.status_lines():
-                print(line, file=sys.stderr)
+            rows = manager.status_lines()
+            width = max([70] + [len(row) for row in rows])
+            print(colorize("\u2500" * width, 'muted'), file=sys.stderr)
+            for row in rows:
+                print(row, file=sys.stderr)
             print(file=sys.stderr)
+            if not sub:
+                print_mcp_usage()
         elif sub == "tools":
             view = "plan" if "--plan" in parts else ("all" if "--all" in parts else "default")
             wanted = [part for part in parts[2:] if not part.startswith("--")]
@@ -12172,9 +12521,8 @@ class ChatLoop:
             manager.stop(parts[2])
             print(colorize(f"[MCP] {parts[2]}: disconnected", 'warning'), file=sys.stderr)
         else:
-            print(colorize("[Usage: /mcp [status|tools [server] [--plan|--all]|"
-                           "connect <server>|disconnect <server>]", 'warning'),
-                  file=sys.stderr)
+            print(colorize(f"[MCP] unknown command: {sub}", 'warning'), file=sys.stderr)
+            print_mcp_usage()
         return False
 
     @staticmethod

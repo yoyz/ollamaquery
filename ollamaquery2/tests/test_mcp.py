@@ -514,6 +514,117 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.transport, "stdio")
         self.assertEqual(m.validate_mcp_server(cfg), [])
 
+    def _load_one(self, entry, config_name="mcp.json"):
+        """Write a one-server config and return its parsed entry."""
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, config_name)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"mcpServers": {"srv": entry}}, fh)
+            config = m.load_mcp_config(path)
+            # Paths are absolute already; the temp dir may vanish afterwards.
+            return config.servers["srv"], td
+
+    def test_tilde_command_is_expanded(self):
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, "Downloads"))
+            server = os.path.join(home, "Downloads", "server")
+            open(server, "w", encoding="utf-8").close()
+            with patch.dict(os.environ, {"HOME": home}):
+                cfg, _ = self._load_one({"command": "~/Downloads/server",
+                                         "args": ["--stdio"]})
+            self.assertEqual(cfg.command[0], server)
+            self.assertEqual(cfg.command[1:], ["--stdio"])
+            self.assertEqual(m.validate_mcp_server(cfg), [])
+
+    def test_relative_command_anchored_to_config_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "mcp.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"mcpServers": {"srv": {
+                    "command": "./bin/server", "args": ["mcp"]}}}, fh)
+            cfg = m.load_mcp_config(path).servers["srv"]
+            self.assertEqual(cfg.command[0],
+                             os.path.abspath(os.path.join(td, "bin", "server")))
+
+    def test_bare_command_next_to_config_is_preferred(self):
+        with tempfile.TemporaryDirectory() as td:
+            local = os.path.join(td, "srv-binary")
+            open(local, "w", encoding="utf-8").close()
+            path = os.path.join(td, "mcp.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"mcpServers": {"srv": {
+                    "command": "srv-binary", "args": []}}}, fh)
+            cfg = m.load_mcp_config(path).servers["srv"]
+            self.assertEqual(cfg.command[0], local)
+
+    def test_vars_expand_in_args_and_env(self):
+        cfg, _ = self._load_one({
+            "command": "srv", "args": ["--connect", "{host}"],
+            "vars": {"host": "127.0.0.1:10090"},
+            "env": {"TARGET": "{host}"},
+        })
+        self.assertEqual(cfg.command[1:], ["--connect", "127.0.0.1:10090"])
+        self.assertEqual(cfg.env, {"TARGET": "127.0.0.1:10090"})
+        self.assertEqual(m.validate_mcp_server(cfg), [])
+
+    def test_unknown_var_placeholder_is_left_verbatim(self):
+        cfg, _ = self._load_one({"command": "srv", "args": ["{missing}"],
+                                 "vars": {"host": "x"}})
+        self.assertEqual(cfg.command[1:], ["{missing}"])
+
+    def test_timeout_alias_sets_every_request_deadline(self):
+        cfg, _ = self._load_one({"command": "srv", "timeout": 90})
+        self.assertEqual((cfg.init_timeout_seconds, cfg.list_timeout_seconds,
+                          cfg.call_timeout_seconds), (90.0, 90.0, 90.0))
+        self.assertEqual(m.validate_mcp_server(cfg), [])
+
+    def test_explicit_deadline_wins_over_timeout_alias(self):
+        cfg, _ = self._load_one({"command": "srv", "timeout": 90,
+                                 "init_timeout_seconds": 5})
+        self.assertEqual(cfg.init_timeout_seconds, 5.0)
+        self.assertEqual(cfg.call_timeout_seconds, 90.0)
+
+    def test_bad_timeout_alias_is_reported(self):
+        cfg, _ = self._load_one({"command": "srv", "timeout": "soon"})
+        self.assertTrue(any("'timeout' must be a number" in problem
+                            for problem in m.validate_mcp_server(cfg)))
+
+    def test_env_reference_to_unset_variable_is_dropped(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MCP_TEST_UNSET_VAR", None)
+            cfg, _ = self._load_one({"command": "srv",
+                                     "env": {"KUBECONFIG": "${MCP_TEST_UNSET_VAR}"}})
+            self.assertEqual(cfg.env, {})
+        with patch.dict(os.environ, {"MCP_TEST_UNSET_VAR": "/tmp/kubeconfig"}):
+            cfg, _ = self._load_one({"command": "srv",
+                                     "env": {"KUBECONFIG": "${MCP_TEST_UNSET_VAR}"}})
+            self.assertEqual(cfg.env, {"KUBECONFIG": "/tmp/kubeconfig"})
+
+    def test_env_relative_path_anchored_to_config_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "mcp.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"mcpServers": {"srv": {
+                    "command": "srv",
+                    "env": {"KUBECONFIG": "./tests/kubeconfig-fake.yaml"}}}}, fh)
+            cfg = m.load_mcp_config(path).servers["srv"]
+            self.assertEqual(cfg.env["KUBECONFIG"],
+                             os.path.join(td, "tests", "kubeconfig-fake.yaml"))
+
+    def test_known_extra_keys_are_not_reported(self):
+        cfg, _ = self._load_one({
+            "command": "srv", "dialect": "mcp", "description": "hello",
+            "timeout": 30, "vars": {"host": "h"},
+        })
+        self.assertEqual(cfg.ignored_keys, [])
+        self.assertEqual(m.validate_mcp_server(cfg), [])
+        self.assertEqual(cfg.description, "hello")
+
+    def test_unsupported_dialect_is_reported(self):
+        cfg, _ = self._load_one({"command": "srv", "dialect": "raw"})
+        self.assertTrue(any("dialect 'raw' is not implemented" in problem
+                            for problem in m.validate_mcp_server(cfg)))
+
     def test_cli_flags(self):
         parser = m._build_parser()
         args = parser.parse_args(["--mcp-config", "/tmp/x.json", "--no-mcp"])
@@ -522,6 +633,41 @@ class TestConfig(unittest.TestCase):
 
 
 class TestListingAndCommand(unittest.TestCase):
+    def test_status_columns_align_across_servers(self):
+        config = m.MCPConfig({
+            "a": m.MCPServerConfig(name="a", command=["x"]),
+            "a-very-long-server-name": m.MCPServerConfig(
+                name="a-very-long-server-name", command=["x"]),
+        })
+        lines = m.MCPManager(config).status_lines()
+        self.assertEqual(len(lines), 2)
+        # The short name is padded to the 30-column minimum.
+        self.assertEqual(lines[0][:m.MCP_STATUS_NAME_WIDTH], "a" + " " * 29)
+        for marker in ("stdio", "not connected", "0 tools", "0 plan", "0 hidden"):
+            self.assertEqual(lines[0].index(marker), lines[1].index(marker), marker)
+
+    def test_status_name_column_widens_for_very_long_names(self):
+        long_name = "s" * 40
+        config = m.MCPConfig({
+            "short": m.MCPServerConfig(name="short", command=["x"]),
+            long_name: m.MCPServerConfig(name=long_name, command=["x"]),
+        })
+        lines = m.MCPManager(config).status_lines()
+        self.assertEqual(lines[0].index("stdio"), lines[1].index("stdio"))
+        self.assertEqual(lines[0].index("stdio"), 41)
+
+    def test_status_count_columns_align(self):
+        config = m.MCPConfig({
+            "a": m.MCPServerConfig(name="a", command=["x"]),
+            "b": m.MCPServerConfig(name="b", command=["x"]),
+        })
+        manager = m.MCPManager(config)
+        entry = types.SimpleNamespace(plan_eligible=True, filtered_reason=None)
+        manager.classified_tools = lambda: {"a": [], "b": [entry] * 12}
+        lines = manager.status_lines()
+        for marker in ("tools", "plan", "hidden"):
+            self.assertEqual(lines[0].index(marker), lines[1].index(marker), marker)
+
     def setUp(self):
         tools = [
             {"name": "pods_list", "description": "List pods",
@@ -602,6 +748,151 @@ class TestSpill(unittest.TestCase):
             _ctx(context_window_size=8000), 100000), 8000)
         self.assertEqual(m._mcp_resolve_max_result_chars(
             _ctx(context_window_size=100), 100000), 2000)
+
+
+class TestToolListingLayout(unittest.TestCase):
+    """`/listtool` renders aligned columns with hanging-indented descriptions."""
+
+    def _registry(self):
+        long_desc = "Get detailed resource usage statistics from a node. " * 6
+        defs = {
+            "short_tool": {
+                "description": "Small description.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            "kubernetes__nodes_stats_summary": {
+                "description": f"[mcp:kubernetes] {long_desc}",
+                "parameters": {"type": "object", "properties": {}},
+                "_mcp": {"server": "kubernetes", "tool": "nodes_stats_summary"},
+            },
+        }
+        manager = FakeManager(plan_names=(), destructive=(), defs=defs)
+        return m.ToolRegistry(_ctx(mcp_manager=manager))
+
+    def test_origin_tag_is_rendered_once(self):
+        self.assertEqual(self._registry().list_tools_str().count("[mcp:kubernetes]"), 1)
+
+    def test_columns_align_and_continuations_indent(self):
+        lines = self._registry().list_tools_str().splitlines()
+        column = len("kubernetes__nodes_stats_summary") + 4
+        short = next(line for line in lines if line.startswith("  short_tool"))
+        k8s = next(line for line in lines
+                   if line.startswith("  kubernetes__nodes_stats_summary"))
+        self.assertEqual(short.index("Small description."), column)
+        self.assertEqual(k8s.index("[mcp:kubernetes]"), column)
+        continuations = [line for line in lines if line[:column].strip() == ""]
+        self.assertTrue(continuations, "long descriptions must wrap")
+        for line in continuations:
+            self.assertEqual(len(line) - len(line.lstrip()), column, repr(line))
+
+    def test_wraps_instead_of_running_to_terminal_edge(self):
+        lines = self._registry().list_tools_str().splitlines()
+        self.assertTrue(all(len(line) <= m.TOOL_LIST_MAX_WIDTH for line in lines))
+        wrapped = [line for line in lines
+                   if "resource usage statistics" in line or "from a node." in line]
+        self.assertGreater(len(wrapped), 2)
+
+
+class TestMCPUsageAndCompletion(unittest.TestCase):
+    """Bare `/mcp` shows help, and tab completion knows subcommands + servers."""
+
+    def _run_handler(self, line, manager=None):
+        fake_self = types.SimpleNamespace(ctx=_ctx(mcp_manager=manager))
+        with patch("sys.stderr", new=io.StringIO()) as captured:
+            m.ChatLoop.run_handle_mcp(fake_self, line)
+        return captured.getvalue()
+
+    def _completer(self, manager=None):
+        return m.ChatCompleter("http://localhost:11434", "ollama",
+                               ctx=_ctx(mcp_manager=manager))
+
+    def _candidates(self, completer, buffer, text):
+        with patch.object(m.readline, "get_line_buffer", return_value=buffer):
+            out = []
+            for state in range(64):
+                candidate = completer.complete(text, state)
+                if candidate is None:
+                    break
+                out.append(candidate)
+        return out
+
+    def test_bare_mcp_shows_status_and_usage(self):
+        output = self._run_handler("/mcp", ManagerStub({"k8s": []}))
+        self.assertIn("MCP servers", output)
+        self.assertIn("Usage: /mcp", output)
+        self.assertIn("connect <server>", output)
+
+    def test_mcp_help_lists_every_subcommand(self):
+        output = self._run_handler("/mcp help")
+        for sub in m.MCP_SUBCOMMANDS:
+            self.assertIn(sub, output)
+        self.assertNotIn("no servers configured", output)
+
+    def test_unknown_subcommand_shows_usage(self):
+        output = self._run_handler("/mcp aaa", ManagerStub({"k8s": []}))
+        self.assertIn("unknown command: aaa", output)
+        self.assertIn("Usage: /mcp", output)
+
+    def test_completion_offers_subcommands(self):
+        candidates = self._candidates(self._completer(), "/mcp ", "")
+        for sub in m.MCP_SUBCOMMANDS:
+            self.assertIn(sub, candidates)
+
+    def test_completion_offers_server_names(self):
+        manager = types.SimpleNamespace(config=types.SimpleNamespace(
+            enabled=lambda: [types.SimpleNamespace(name="alpha"),
+                             types.SimpleNamespace(name="beta")]))
+        completer = self._completer(manager)
+        self.assertEqual(self._candidates(completer, "/mcp connect ", ""),
+                         ["alpha", "beta"])
+        self.assertEqual(self._candidates(completer, "/mcp connect a", "a"),
+                         ["alpha"])
+        self.assertEqual(self._candidates(completer, "/mcp disconnect ", ""),
+                         ["alpha", "beta"])
+
+    def test_completion_offers_tool_flags(self):
+        self.assertEqual(self._candidates(self._completer(), "/mcp tools -", "-"),
+                         ["--plan", "--all"])
+
+
+class TestPlanModeSurface(unittest.TestCase):
+    """Plan mode advertises the union of base and read-only MCP tools."""
+
+    def _loop(self, manager):
+        loop = object.__new__(m.ChatLoop)
+        loop.ctx = _ctx(mcp_manager=manager, plan_mode=True, plan_run=False,
+                        agentic_mode=True, model="qwen3.8", system_prompt="BASE",
+                        _plan_prev_prompt=None, _saved_plan_prompt=None)
+        return loop
+
+    def test_status_lists_read_only_mcp_tools(self):
+        loop = self._loop(FakeManager())
+        with patch("sys.stderr", new=io.StringIO()) as captured:
+            loop._print_plan_mode_status()
+        output = captured.getvalue()
+        self.assertIn("Tools restricted to:", output)
+        self.assertIn("read-only MCP tool", output)
+        self.assertIn("fake", output)
+        self.assertIn("pods_list", output)
+        self.assertNotIn("pods_delete", output)
+        self.assertNotIn("fake__", output)
+
+    def test_no_mcp_tools_adds_no_line(self):
+        loop = self._loop(None)
+        with patch("sys.stderr", new=io.StringIO()) as captured:
+            loop._print_plan_mode_status()
+        self.assertNotIn("MCP tool", captured.getvalue())
+
+    def test_asking_twice_prints_the_same_surface(self):
+        loop = self._loop(FakeManager())
+        with patch("sys.stderr", new=io.StringIO()):
+            loop._agentic_toggle_plan(['/agentic', 'plan'])
+        with patch("sys.stderr", new=io.StringIO()) as captured:
+            loop._agentic_toggle_plan(['/agentic', 'plan'])
+        output = captured.getvalue()
+        self.assertIn("Agentic plan mode: ON", output)
+        self.assertIn("Tools restricted to:", output)
+        self.assertIn("pods_list", output)
 
 
 class ManagerStub:
