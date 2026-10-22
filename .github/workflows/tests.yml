@@ -16,8 +16,6 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.12"]
-    env:
-      HOME: ${{ runner.temp }}/home
 
     steps:
       - uses: actions/checkout@v4
@@ -26,8 +24,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # The runner context is not available in a job-level env:, so export
+      # HOME here; GITHUB_ENV applies to every following step.
       - name: Isolate HOME
-        run: mkdir -p "$HOME"
+        run: |
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
 
       - name: Syntax check
         working-directory: ollamaquery2
