@@ -284,3 +284,11 @@ from composable blocks (role, tool definitions, format, examples, rules).
 ## Similar Projects
 
 See `doc/similar_project.md` for a detailed comparison with Aider, Open Interpreter, ShellGPT, and Fabric — the closest alternatives depending on whether you need agentic coding, pipeline CLIs, or sandboxed execution.
+
+## References
+
+| Reference                                                       | What it is                                                                                                                           |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| [MCP specification](https://modelcontextprotocol.io)            | Protocol source of truth; the built-in MCP client targets revision `2025-11-25`                                                      |
+| [Neumann-Labs/mcp-cpp](https://github.com/Neumann-Labs/mcp-cpp) | Spec-faithful C++20 MCP SDK. Trusted as a wire-format oracle and test fixture; GPL-3.0, so reference only — do not vendor its source |
+| `doc/mcp-conformance.md`                                        | Conformance review of the built-in MCP client against mcp-cpp: findings, capability matrix, fix plan                                 |
