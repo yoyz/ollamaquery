@@ -29,11 +29,18 @@ import ollamaquery2 as m
 # -- Backend Discovery ------------------------------------------------------
 
 
+def _normalize_url(url):
+    """Add http:// when an env var carries a bare host:port (OLLAMA_HOST style)."""
+    if not url:
+        return url
+    return url if url.startswith(('http://', 'https://')) else f"http://{url}"
+
+
 def _discover_backends():
     """Auto-discover LLM backends by probing common URLs.
 
     Checks in order:
-    1. User-set environment variables (OLLAMA_HOST, LLAMACPP_HOST)
+    1. User-set environment variables (OLLAMA_HOST, LLAMACPP_HOST, STRATA_HOST)
     2. Default localhost URLs on standard ports
     3. Local network IPs on standard ports (via gethostbyname_ex)
 
@@ -45,11 +52,13 @@ def _discover_backends():
          lambda u: m.check_backend_with_get(u, 'ollama')),
         ('llamacpp', 'LLAMACPP_HOST', 'http://127.0.0.1:8080',   8080,
          lambda u: m.check_backend_with_head(u, 'llama.cpp')),
+        ('strata',   'STRATA_HOST',   'http://127.0.0.1:8080',   8080,
+         lambda u: m.check_strata(u)),
     ]
 
     discovered = {}
     for name, env_var, default_url, port, check_fn in probes:
-        url = os.environ.get(env_var, default_url)
+        url = _normalize_url(os.environ.get(env_var, default_url))
         ok = False
 
         try:
@@ -85,12 +94,17 @@ if not any(v[1] for v in _discovered_backends.values()):
 
 OLLAMA_HOST   = _discovered_backends['ollama'][0]
 LLAMACPP_HOST = _discovered_backends['llamacpp'][0]
+STRATA_HOST   = _discovered_backends['strata'][0]
 HAS_OLLAMA    = _discovered_backends['ollama'][1]
 HAS_LLAMACPP  = _discovered_backends['llamacpp'][1]
+HAS_STRATA    = _discovered_backends['strata'][1]
 
 if HAS_LLAMACPP:
     BACKEND_URL = LLAMACPP_HOST
     BACKEND_TYPE = 'llamacpp'
+elif HAS_STRATA:
+    BACKEND_URL = STRATA_HOST
+    BACKEND_TYPE = 'strata'
 elif HAS_OLLAMA:
     BACKEND_URL = OLLAMA_HOST
     BACKEND_TYPE = 'ollama'

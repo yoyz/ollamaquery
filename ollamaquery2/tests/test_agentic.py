@@ -18,6 +18,12 @@ OLLAMA_HOST = os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')
 LLAMACPP_HOST = os.environ.get('LLAMACPP_HOST', 'http://127.0.0.1:8080')
 STRATA_HOST = os.environ.get('STRATA_HOST', 'http://127.0.0.1:8080')
 
+# The UDP stub-resolver end-to-end test is by far the slowest in the suite: the
+# model generates a C DNS resolver, compiles it, and walks a name, which costs
+# many minutes and produces a large file. It is off by default; export
+# RUN_SLOW_DNS_E2E=1 to re-enable it (e.g. before a release run).
+SLOW_DNS_E2E = os.environ.get('RUN_SLOW_DNS_E2E', '') == '1'
+
 # Auto-detect available backend
 BACKEND = None
 BASE_URL = None
@@ -1452,6 +1458,8 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+    @unittest.skipUnless(SLOW_DNS_E2E,
+                         "slow UDP DNS resolver E2E disabled; set RUN_SLOW_DNS_E2E=1 to run it")
     def test_dns_resolver_write_compile_run(self):
         """End-to-end: LLM writes dns_resolver.c, compiles it, and tests it.
 
@@ -2545,6 +2553,233 @@ class TestClusterQueryTool(unittest.TestCase):
         self.assertTrue(result["success"], msg=result.get("error"))
         self.assertNotIn("written to", result["output"])
         self.assertIn("pod/a 1/1 Running", result["output"])
+
+
+HAS_GIT = q.shutil.which("git") is not None
+
+
+def _git(cwd, *args):
+    """Run a real git command in `cwd` for test fixture setup."""
+    import subprocess
+    return subprocess.run(["git", *args], cwd=cwd, check=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True)
+
+
+class _FakeGitProc:
+    """Stand-in for `subprocess.Popen` in git_inspect argv/env assertions."""
+
+    def __init__(self, output="", returncode=0):
+        self.stdout = io.StringIO(output)
+        self.returncode = returncode
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+class TestGitInspect(unittest.TestCase):
+    """git_inspect: read-only, fixed-argv repo inspection (the plan-mode git gap)."""
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.auto_confirm = True
+        self.reg = q.ToolRegistry(ctx=self.ctx)
+
+    def _run(self, **args):
+        return self.reg.execute("git_inspect", args)
+
+    def test_available_in_strict_plan_mode(self):
+        self.assertIn("git_inspect", q.PLAN_MODE_TOOLS)
+        self.assertNotIn("run_command", q.PLAN_MODE_TOOLS)
+        self.ctx.plan_mode = True
+        try:
+            names = {t["function"]["name"] for t in self.reg.openai_tools_spec()}
+            self.assertIn("git_inspect", names)
+            self.assertIn("### git_inspect", self.reg.get_system_prompt_block())
+        finally:
+            self.ctx.plan_mode = False
+
+    def test_unknown_action_rejected(self):
+        result = self._run(action="commit")
+        self.assertFalse(result["success"])
+        self.assertIn("Unsupported action", result["error"])
+
+    def test_ref_cannot_be_an_option(self):
+        for ref in ("--output=/tmp/x", "-c", "--exec=id", "HEAD; rm -rf /"):
+            result = self._run(action="show", ref=ref)
+            self.assertFalse(result["success"], msg=ref)
+            self.assertIn("Unsupported ref", result["error"])
+
+    def test_path_outside_project_rejected(self):
+        for path in ("../../etc/passwd", "/etc/passwd", "-x", "sub/../../out"):
+            result = self._run(action="diff", path=path)
+            self.assertFalse(result["success"], msg=path)
+            self.assertIn("inside the project", result["error"])
+
+    def test_argv_is_fixed_and_hardened(self):
+        """No shell, no model text in argv, no repo-supplied hooks, no GIT_DIR.
+
+        `diff.<driver>.textconv` and `core.fsmonitor` both execute arbitrary
+        programs from the repo's own config, so a "read-only" tool that skipped
+        these flags would still run code. A `GIT_DIR` inherited from the parent
+        environment would redirect the whole command to another repository.
+        """
+        fake = _FakeGitProc("ok\n")
+        with patch.dict(os.environ, {"GIT_DIR": "/tmp/elsewhere",
+                                     "GIT_WORK_TREE": "/tmp/elsewhere",
+                                     "GIT_INDEX_FILE": "/tmp/elsewhere/index"}, clear=False), \
+             patch.object(q.subprocess, "Popen", return_value=fake) as popen:
+            result = self._run(action="diff", ref="main..dev", limit="5")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        argv = popen.call_args[0][0]
+        kwargs = popen.call_args[1]
+        self.assertEqual(argv[0], "git")
+        self.assertIn("--no-optional-locks", argv)
+        self.assertIn("core.fsmonitor=false", argv)
+        self.assertIn("--no-textconv", argv)
+        self.assertIn("--no-ext-diff", argv)
+        self.assertFalse(kwargs["shell"])
+        self.assertEqual(kwargs["cwd"], os.getcwd())
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+            self.assertNotIn(key, kwargs["env"])
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["GIT_OPTIONAL_LOCKS"], "0")
+        # The ref is only a `show` concept: `diff` must not smuggle it in.
+        self.assertNotIn("main..dev", argv)
+        self.assertTrue(all(isinstance(part, str) for part in argv))
+
+    def test_limit_is_clamped(self):
+        capture = {"returncode": 0, "stdout": "", "stderr": "",
+                   "truncated": False, "timed_out": False}
+        with patch.object(q, "_git_capture", return_value=capture) as fake:
+            self._run(action="log", limit=100000)
+            self.assertIn("-n100", fake.call_args[0][0])
+            self._run(action="log", limit=-4)
+            self.assertIn("-n1", fake.call_args[0][0])
+        bad = self._run(action="log", limit="abc")
+        self.assertFalse(bad["success"])
+        self.assertIn("integer", bad["error"])
+
+    def test_not_a_repo_reports_error(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(q.os, "getcwd", return_value=tmp):
+            result = self._run(action="status")
+        self.assertFalse(result["success"])
+        self.assertTrue(result["error"])
+
+    def test_missing_git_reports_error(self):
+        with patch.object(q.subprocess, "Popen", side_effect=FileNotFoundError()):
+            result = self._run(action="status")
+        self.assertFalse(result["success"])
+        self.assertIn("git is not installed", result["error"])
+
+    def test_timeout_reports_error(self):
+        capture = {"returncode": -1, "stdout": "partial", "stderr": "",
+                   "truncated": False, "timed_out": True}
+        with patch.object(q, "_git_capture", return_value=capture):
+            result = self._run(action="diff_head")
+        self.assertFalse(result["success"])
+        self.assertIn("timed out", result["error"])
+
+    def test_capture_is_bounded(self):
+        """stdout is read under a ceiling, not buffered whole and truncated later."""
+        big = "+" + ("x" * 50000) + "\n"
+        fake = _FakeGitProc(big)
+        with patch.object(q, "GIT_INSPECT_MAX_OUTPUT_CHARS", 100), \
+             patch.object(q.subprocess, "Popen", return_value=fake), \
+             patch.object(q, "CLUSTER_SPILL_THRESHOLD", 10 ** 9):
+            result = self._run(action="diff")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertIn("truncated at 100 chars", result["output"])
+        self.assertEqual(result["output"].count("x"), 99)  # 99 kept + the "+"
+
+    @unittest.skipUnless(HAS_GIT, "git not installed")
+    def test_inherited_git_dir_is_ignored(self):
+        """A GIT_DIR/GIT_WORK_TREE pointing elsewhere must not win over the CWD."""
+        with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as other:
+            for path, name in ((proj, "IN-PROJECT"), (other, "ELSEWHERE")):
+                _git(path, "init", "-q", ".")
+                _git(path, "config", "user.email", "t@example.com")
+                _git(path, "config", "user.name", "T")
+                with open(os.path.join(path, "a.txt"), "w") as f:
+                    f.write("one\n")
+                _git(path, "add", "a.txt")
+                _git(path, "commit", "-qm", "init")
+                with open(os.path.join(path, "a.txt"), "w") as f:
+                    f.write(name + "\n")
+            with patch.dict(os.environ, {"GIT_DIR": os.path.join(other, ".git"),
+                                         "GIT_WORK_TREE": other}, clear=False), \
+                 patch.object(q.os, "getcwd", return_value=proj):
+                result = self._run(action="diff_head")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertIn("IN-PROJECT", result["output"])
+        self.assertNotIn("ELSEWHERE", result["output"])
+
+    def test_large_output_spills_to_file(self):
+        big = "@@ -1 +1 @@\n" + ("+CHANGED-LINE\n" * 5000)
+        capture = {"returncode": 0, "stdout": big, "stderr": "",
+                   "truncated": False, "timed_out": False}
+        with tempfile.TemporaryDirectory() as tmp:
+            spill_dir = os.path.join(tmp, "spill")
+            spill_file = os.path.join(spill_dir, "git_result_diff_head.txt")
+            with patch.object(q, "CLUSTER_SPILL_DIR", spill_dir), \
+                 patch.object(q, "_git_capture", return_value=capture):
+                result = self._run(action="diff_head")
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn(spill_file, result["output"])
+            self.assertIn("chars", result["output"])
+            self.assertNotIn("CHANGED-LINE", result["output"])
+            with open(spill_file) as f:
+                self.assertEqual(f.read(), big)
+            # The spill dir is ACL-allowed so read_file can page it in plan mode.
+            rd = self.reg.execute("read_file", {"file_path": spill_file})
+
+    @unittest.skipUnless(HAS_GIT, "git not installed")
+    def test_status_and_log_on_real_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _git(tmp, "init", "-q", ".")
+            _git(tmp, "config", "user.email", "t@example.com")
+            _git(tmp, "config", "user.name", "T")
+            with open(os.path.join(tmp, "a.txt"), "w") as f:
+                f.write("one\n")
+            _git(tmp, "add", "a.txt")
+            _git(tmp, "commit", "-qm", "first commit")
+            with open(os.path.join(tmp, "a.txt"), "w") as f:
+                f.write("two\n")
+            with patch.object(q.os, "getcwd", return_value=tmp):
+                status = self._run(action="status")
+                log = self._run(action="log")
+                head = self._run(action="diff_head")
+                scoped = self._run(action="diff_head", path="a.txt")
+                missing = self._run(action="diff_head", path="nope.txt")
+        self.assertTrue(status["success"], msg=status.get("error"))
+        self.assertIn("a.txt", status["output"])
+        self.assertTrue(log["success"], msg=log.get("error"))
+        self.assertIn("first commit", log["output"])
+        self.assertTrue(head["success"], msg=head.get("error"))
+        self.assertIn("+two", head["output"])
+        self.assertTrue(scoped["success"], msg=scoped.get("error"))
+        self.assertIn("+two", scoped["output"])
+        self.assertTrue(missing["success"])  # empty pathspec match is not an error
+
+    @unittest.skipUnless(HAS_GIT, "git not installed")
+    def test_clean_tree_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _git(tmp, "init", "-q", ".")
+            _git(tmp, "config", "user.email", "t@example.com")
+            _git(tmp, "config", "user.name", "T")
+            with open(os.path.join(tmp, "a.txt"), "w") as f:
+                f.write("one\n")
+            _git(tmp, "add", "a.txt")
+            _git(tmp, "commit", "-qm", "initial")
+            with patch.object(q.os, "getcwd", return_value=tmp):
+                diff = self._run(action="diff")
+        self.assertTrue(diff["success"], msg=diff.get("error"))
+        self.assertIn("(no output)", diff["output"])
 
 
 class TestComposableSystemPrompt(unittest.TestCase):

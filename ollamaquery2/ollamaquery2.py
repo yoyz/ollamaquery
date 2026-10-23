@@ -24,6 +24,7 @@ import subprocess
 import shlex
 import shutil
 import signal
+import tempfile
 import termios
 import textwrap
 import threading
@@ -64,7 +65,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 
 # ============================================================================
@@ -2766,7 +2767,7 @@ AGENTIC_PLAN_BLOCK = """## Read-only planning mode
 You are operating in READ-ONLY PLANNING MODE. Your job is to INSPECT and PLAN, never to change anything.
 
 - You MUST NOT modify, create, delete, move, or overwrite any files, and you MUST NOT change any system state.
-- Only use the tools available to you to read and inspect: read_file, list_directory, glob, grep, fetch_url, diff, kubernetes_cluster_query.
+- Only use the tools available to you to read and inspect: read_file, list_directory, glob, grep, fetch_url, diff, git_inspect, kubernetes_cluster_query.
 - You are confined to the project's current working directory. Requests for paths outside it are REFUSED automatically — do not attempt /home, /etc, /proc, /sys, or any absolute path outside the project.
 - Never attempt write_file, run_python, run_command, patch, edit_file, or apply_patch — they are disabled in this mode. There is no shell access.
 - When you have gathered enough information, present a clear, step-by-step plan to the user. Do NOT execute the plan yourself."""
@@ -2777,8 +2778,8 @@ AGENTIC_PLAN_RUN_BLOCK = """## Read-only planning mode (run)
 You are operating in READ-ONLY PLANNING MODE. Your job is to INSPECT and PLAN, never to change anything.
 
 - You MUST NOT modify, create, delete, move, or overwrite any files, and you MUST NOT change any system state.
-- Only use the tools available to you to read and inspect: read_file, list_directory, glob, grep, fetch_url, diff, kubernetes_cluster_query, and run_command.
-- For run_command, only issue read-only inspection commands (e.g. ls, cat, head, git status, git diff, ps, grep, find). The user is asked to confirm every command before it runs.
+- Only use the tools available to you to read and inspect: read_file, list_directory, glob, grep, fetch_url, diff, git_inspect, kubernetes_cluster_query, and run_command.
+- For run_command, only issue read-only inspection commands (e.g. ls, cat, head, git status, git diff, ps, grep, find). The user is asked to confirm every command before it runs. Prefer the git_inspect tool over a shell `git` command: it needs no confirmation and cannot mutate anything.
 - Never attempt write_file, run_python, patch, edit_file, or apply_patch — they are disabled in this mode.
 - When you have gathered enough information, present a clear, step-by-step plan to the user. Do NOT execute the plan yourself."""
 
@@ -4347,6 +4348,19 @@ AGENTIC_TOOL_DEFS = {
             },
             "required": []
         }
+    },
+    "git_inspect": {
+        "description": "Inspect the git repository in the current project READ-ONLY: never writes, stages, commits, or runs a shell. Use it to orient yourself before planning — what is dirty, what changed, what the history looks like. Actions: status (short status + branch), diff (unstaged changes), diff_staged (staged changes), diff_head (ALL changes since the last commit — the best single answer to \"what changed?\"), log (recent commits), show (one commit: message + diffstat + patch). The command is fixed: there are no arbitrary git arguments. Pass `path` to restrict status/diff/show to one file or directory. Large output is spilled to a file you must page with read_file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["status", "diff", "diff_staged", "diff_head", "log", "show"], "description": "What to inspect (default: status)"},
+                "limit": {"type": "integer", "description": "log only: number of commits to show (default 20, max 100)"},
+                "ref": {"type": "string", "description": "show only: branch, tag, or commit hash to inspect (default: HEAD)"},
+                "path": {"type": "string", "description": "Optional relative path inside the project to restrict status/diff/show to, e.g. 'ollamaquery2.py' or 'tests/'"}
+            },
+            "required": []
+        }
     }
 }
 
@@ -4354,14 +4368,16 @@ DESTRUCTIVE_TOOLS = {"write_file", "run_python", "run_command", "patch", "edit_f
 
 # Read-only planning mode (/agentic plan) tool surface. The model may only
 # inspect: read files, search path/contents (glob + grep), list directories,
-# fetch URLs, diff files, and query a Kubernetes/OpenShift cluster read-only.
+# fetch URLs, diff files, query a Kubernetes/OpenShift cluster read-only, and
+# inspect the git repo (git_inspect — the only git access in this tier, since
+# there is no shell).
 # There is NO shell access: run_command is not reachable. Paths are confined to
 # the current working directory (see _path_acl_decision) — requests outside it
 # are refused, not prompted. Everything else (write_file, run_python,
 # run_command, patch, edit_file, apply_patch) is hidden from the prompt/tools
 # API AND denied at the execution backstop.
 PLAN_MODE_TOOLS = {"read_file", "glob", "grep", "list_directory", "fetch_url",
-                   "diff", "kubernetes_cluster_query"}
+                   "diff", "kubernetes_cluster_query", "git_inspect"}
 
 # Deeper `/agentic plan run` tier: re-adds run_command, which still asks for
 # confirmation on every invocation (bypass-immune). The path confinement of the
@@ -4402,6 +4418,44 @@ CLUSTER_QUERY_OUTPUTS = {"json", "yaml", "wide", "custom-columns", "jsonpath"}
 CLUSTER_QUERY_TIMEOUT = 60
 CLUSTER_LOG_TAIL_DEFAULT = 50  # logs are tailed by default (schema/prompt promise)
 OMC_CONFIG_PATH = os.path.expanduser("~/.omc/omc.json")
+
+# Read-only git inspection (git_inspect tool). Strict `/agentic plan` has no
+# shell, so the questions a planner asks first — "what is dirty?", "what changed
+# since HEAD?", "what is the history?" — were unanswerable. The action is an
+# enum and every command is a fixed argv with shell=False: no model-supplied
+# text ever reaches a shell and no raw git arguments are accepted.
+#
+# Hardening: a repository carries its own executable config, so the code paths
+# that would run it are disabled. `diff.<driver>.textconv` (from .git/config or
+# .gitattributes) runs an arbitrary binary during diff unless --no-textconv is
+# passed; `core.fsmonitor` runs a hook program during status; --no-ext-diff
+# blocks external diff drivers. --no-optional-locks (and GIT_OPTIONAL_LOCKS=0)
+# keeps the index read-only, so "read-only" holds for .git as well as the
+# worktree. GIT_TERMINAL_PROMPT=0 can never block on a credential prompt.
+#
+# Inherited location variables are stripped: GIT_DIR + GIT_WORK_TREE is a complete
+# repository redirect, and GIT_INDEX_FILE / GIT_OBJECT_DIRECTORY / GIT_COMMON_DIR
+# redirect individual stores, so a parent environment could make the tool inspect
+# (or write locks into) a repository outside the project CWD — a confinement
+# break in strict plan mode.
+GIT_INSPECT_STRIP_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR",
+                         "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                         "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
+                         "GIT_ASKPASS")
+GIT_INSPECT_READ_CHUNK = 65536  # chars per stdout read while bounding capture
+GIT_INSPECT_ACTIONS = ("status", "diff", "diff_staged", "diff_head", "log", "show")
+GIT_INSPECT_TIMEOUT = 30
+GIT_INSPECT_LOG_LIMIT_DEFAULT = 20
+GIT_INSPECT_LOG_LIMIT_MAX = 100
+GIT_INSPECT_MAX_OUTPUT_CHARS = 2_000_000  # hard ceiling before spilling
+GIT_INSPECT_BASE = ["git", "-c", "core.pager=cat", "-c", "core.fsmonitor=false",
+                    "-c", "core.quotepath=false", "--no-optional-locks"]
+GIT_INSPECT_DIFF_FLAGS = ["--no-ext-diff", "--no-textconv", "--no-color"]
+GIT_INSPECT_LOG_FORMAT = "%h %s (%an, %ar)"
+# A ref is only ever a revision expression: it cannot start with `-` (so it can
+# never be parsed as an option) and contains no shell/whitespace metacharacters.
+GIT_INSPECT_REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./~^@{}-]{0,200}$")
+GIT_SPILL_PREFIX = "git_result_"
 
 # Large `kubernetes_cluster_query` results are spilled to per-query files in the
 # spill dir so the model can page through them with `read_file` (observation-cap-
@@ -4497,11 +4551,25 @@ def _fetch_spill_path(url: str) -> str:
     return os.path.join(CLUSTER_SPILL_DIR, f"fetch_result_{stem}.txt")
 
 
+def _git_spill_path(action: str) -> str:
+    """Return the scoped spill file path for a git_inspect action.
+
+    Args:
+        action: The git inspection action (scopes the spill filename).
+
+    Returns:
+        Spill file path under CLUSTER_SPILL_DIR.
+    """
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", action).strip("_") or "query"
+    return os.path.join(CLUSTER_SPILL_DIR, f"{GIT_SPILL_PREFIX}{stem}.txt")
+
+
 def _cleanup_spill_files() -> None:
-    """Remove all cluster and fetch spill files at process exit."""
+    """Remove all cluster, fetch, git and MCP spill files at process exit."""
     prefixes = (("cluster_result_", ".json"), ("fetch_result_", ".txt"),
                 (UNFINISHED_WRITE_SPILL_NAME, ""),
-                (MCP_SPILL_PREFIX, ".json"))
+                (MCP_SPILL_PREFIX, ".json"),
+                (GIT_SPILL_PREFIX, ".txt"))
     try:
         if os.path.isdir(CLUSTER_SPILL_DIR):
             for fname in os.listdir(CLUSTER_SPILL_DIR):
@@ -6581,6 +6649,261 @@ def _tool_handle_cluster_query(self, args: dict) -> dict:
     return {"success": True, "output": prefix, "error": None}
 
 
+def _git_safe_pathspec(raw: str) -> tuple:
+    """Validate an optional git pathspec as a relative path inside the CWD.
+
+    Args:
+        raw: The model-supplied `path` argument (may be empty).
+
+    Returns:
+        (pathspec, error). `error` is empty when the pathspec is usable; the
+        pathspec is empty when none was supplied.
+    """
+    if not raw:
+        return "", ""
+    candidate = str(raw).strip()
+    if not candidate or os.path.isabs(candidate) or candidate.startswith("-"):
+        return "", f"path must be a relative path inside the project (got {raw!r})"
+    if ".." in candidate.replace("\\", "/").split("/"):
+        return "", f"path must stay inside the project (got {raw!r})"
+    root = os.path.realpath(os.getcwd())
+    real = os.path.realpath(os.path.join(root, candidate))
+    try:
+        inside = os.path.commonpath([real, root]) == root
+    except ValueError:
+        inside = False
+    if not inside:
+        return "", f"path must stay inside the project (got {raw!r})"
+    return candidate, ""
+
+
+def _git_inspect_argv(action: str, limit: int, ref: str, pathspec: str) -> list:
+    """Build the fixed argv for one git_inspect action (never a shell string).
+
+    Args:
+        action: One of GIT_INSPECT_ACTIONS.
+        limit: Commit count for `log` (already clamped).
+        ref: Revision for `show` (already validated).
+        pathspec: Optional validated pathspec.
+
+    Returns:
+        The complete argv list, starting with the hardened `git` base.
+
+    Raises:
+        ValueError: The action is not supported.
+    """
+    base = list(GIT_INSPECT_BASE)
+    scope = ["--", pathspec or "."]
+    if action == "status":
+        return base + ["status", "--short", "--branch"] + scope
+    if action == "diff":
+        return base + ["diff"] + GIT_INSPECT_DIFF_FLAGS + scope
+    if action == "diff_staged":
+        return base + ["diff", "--cached"] + GIT_INSPECT_DIFF_FLAGS + scope
+    if action == "diff_head":
+        return base + ["diff", "HEAD"] + GIT_INSPECT_DIFF_FLAGS + scope
+    if action == "log":
+        return base + ["log", f"-n{limit}", "--no-color",
+                       f"--format={GIT_INSPECT_LOG_FORMAT}"]
+    if action == "show":
+        return base + ["show", "--stat", "--patch"] + GIT_INSPECT_DIFF_FLAGS + [ref] + scope
+    raise ValueError(f"Unsupported action '{action}'")
+
+
+def _git_capture(argv: list, env: dict, limit: int) -> dict:
+    """Run git and capture at most `limit` characters of stdout.
+
+    `subprocess.run(stdout=PIPE)` buffers the whole output before any cap can be
+    applied — a generated multi-hundred-MB blob in an arbitrary repository would
+    be held in RAM before being truncated. stdout is therefore read in chunks and
+    the child is killed as soon as the ceiling is reached. stderr goes to a temp
+    file rather than a second pipe (a full pipe would block the child and deadlock
+    the read), and a watchdog kills the child at GIT_INSPECT_TIMEOUT so a hung
+    `read()` cannot block the ReAct loop forever.
+
+    Args:
+        argv: The complete, already-hardened argv.
+        env: The already-scrubbed child environment.
+        limit: Hard ceiling on captured stdout, in characters.
+
+    Returns:
+        {"returncode": int, "stdout": str, "stderr": str,
+         "truncated": bool, "timed_out": bool}.
+
+    Raises:
+        FileNotFoundError: No `git` executable.
+        OSError: The child could not be spawned.
+    """
+    chunks = []
+    total = 0
+    truncated = False
+    timed_out = False
+    killed_by_watchdog = {"value": False}
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(
+            argv, cwd=os.getcwd(), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=err, text=True,
+            encoding="utf-8", errors="replace", shell=False, env=env)
+
+        def _on_watchdog() -> None:
+            killed_by_watchdog["value"] = True
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+        watchdog = threading.Timer(GIT_INSPECT_TIMEOUT, _on_watchdog)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            while proc.stdout is not None:
+                chunk = proc.stdout.read(GIT_INSPECT_READ_CHUNK)
+                if not chunk:
+                    break
+                if total + len(chunk) > limit:
+                    chunks.append(chunk[:limit - total])
+                    total = limit
+                    truncated = True
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+        finally:
+            watchdog.cancel()
+            try:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+            except OSError:
+                pass
+            try:
+                returncode = proc.wait(timeout=GIT_INSPECT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                returncode = -1
+        timed_out = timed_out or (killed_by_watchdog["value"] and not truncated)
+        err.seek(0)
+        stderr_text = err.read().decode("utf-8", errors="replace")
+    return {"returncode": returncode, "stdout": "".join(chunks),
+            "stderr": stderr_text, "truncated": truncated, "timed_out": timed_out}
+
+
+def _spill_git_result(ctx: object, output_text: str, action: str) -> str:
+    """Spill a large git result to a per-action spill file for paged reading.
+
+    Args:
+        ctx: The ToolRegistry context (for the path ACL).
+        output_text: The captured command output (already bounded by
+            `_git_capture`).
+        action: The git action (scopes the spill filename).
+
+    Returns:
+        The observation text for the model: the output itself when it fits, or a
+        pure pointer (size + `read_file` instruction) with NO content inline, so
+        a big diff is not duplicated in context. A session Path-ACL read-allow
+        rule is added for the spill dir so `read_file` on it does not prompt (it
+        is a home dotfile dir outside the CWD, which strict plan mode would
+        otherwise refuse). On any failure the output is returned unchanged.
+    """
+    if len(output_text) <= CLUSTER_SPILL_THRESHOLD:
+        return output_text
+    try:
+        _ensure_private_dir(CLUSTER_SPILL_DIR)
+        acl = getattr(ctx, "path_acl", None)
+        if acl is not None:
+            acl.add("read", "allow", CLUSTER_SPILL_DIR, source="session")
+        spill_file = _git_spill_path(action)
+        with _open_private(spill_file, "w", encoding="utf-8") as f:
+            f.write(output_text)
+        n_chars = len(output_text)
+        n_lines = len(output_text.splitlines())
+        return (
+            f"[git_inspect] Result is large ({n_chars} chars / {n_lines} lines) — "
+            f"the output is NOT included here to avoid duplicating it in context. Read it with "
+            f"read_file(file_path=\"{spill_file}\"); read_file pages large files "
+            f"automatically via the `next` offset. Narrow the request with `path` "
+            f"or `limit` if you only need one file."
+        )
+    except Exception:
+        return text
+
+
+def _tool_handle_git_inspect(self, args: dict) -> dict:
+    """Inspect a git repository read-only: status, diff, log, or one commit.
+
+    Runs a fixed argv with shell=False from the current working directory, so no
+    model-supplied text ever reaches a shell. Repository-supplied executables are
+    disabled (--no-textconv kills diff textconv filters, core.fsmonitor=false
+    kills the fsmonitor hook, --no-ext-diff kills external diff drivers) and the
+    index is left unlocked (--no-optional-locks), so this can neither mutate the
+    worktree/.git nor run code from the repo's config. Inherited `GIT_DIR` &
+    friends are scrubbed so the inspected repository is always the one at the
+    CWD, and stdout is captured under a hard character ceiling rather than
+    buffered whole.
+
+    Args:
+        args: action (status|diff|diff_staged|diff_head|log|show), limit (log
+            lines, 1-100), ref (show only, default HEAD), path (optional relative
+            pathspec inside the project).
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}. Output is prefixed
+        with a `[git_inspect/<action>]` header; oversized output spills to a file
+        and the output becomes a pointer for `read_file`.
+    """
+    action = str(args.get("action") or "status").strip().lower()
+    if action not in GIT_INSPECT_ACTIONS:
+        return {"success": False, "output": "",
+                "error": f"Unsupported action '{action}' "
+                         f"(allowed: {', '.join(GIT_INSPECT_ACTIONS)})"}
+    try:
+        limit = int(args.get("limit") or GIT_INSPECT_LOG_LIMIT_DEFAULT)
+    except (TypeError, ValueError):
+        return {"success": False, "output": "", "error": "limit must be an integer"}
+    limit = max(1, min(limit, GIT_INSPECT_LOG_LIMIT_MAX))
+    ref = str(args.get("ref") or "HEAD").strip()
+    if action == "show" and not GIT_INSPECT_REF_RE.match(ref):
+        return {"success": False, "output": "",
+                "error": f"Unsupported ref {ref!r} (pass a branch, tag, or commit hash)"}
+    pathspec, path_error = _git_safe_pathspec(str(args.get("path") or ""))
+    if path_error:
+        return {"success": False, "output": "", "error": path_error}
+    argv = _git_inspect_argv(action, limit, ref, pathspec)
+    # Scrub inherited Git location variables (a full repo/index redirect) and
+    # force a non-interactive, lock-free child.
+    env = {key: value for key, value in os.environ.items()
+           if key not in GIT_INSPECT_STRIP_ENV}
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat",
+                "GIT_OPTIONAL_LOCKS": "0"})
+    try:
+        capture = _git_capture(argv, env, GIT_INSPECT_MAX_OUTPUT_CHARS)
+    except FileNotFoundError:
+        return {"success": False, "output": "",
+                "error": "git is not installed (no `git` executable on PATH)"}
+    except OSError as exc:
+        return {"success": False, "output": "", "error": f"git {action} failed: {exc}"}
+    if capture["timed_out"]:
+        return {"success": False, "output": capture["stdout"],
+                "error": f"git {action} timed out after {GIT_INSPECT_TIMEOUT}s"}
+    stderr_text = capture["stderr"].strip()
+    if capture["returncode"] != 0 and not capture["truncated"]:
+        return {"success": False, "output": capture["stdout"],
+                "error": stderr_text or f"git {action} failed ({capture['returncode']})"}
+    text = capture["stdout"] or ""
+    if capture["truncated"]:
+        text += (f"\n... [output truncated at {GIT_INSPECT_MAX_OUTPUT_CHARS} chars — "
+                 f"narrow the request with `path` or `limit`]")
+    if not text.strip():
+        text = "(no output)"
+    body = _spill_git_result(self._ctx, text, action)
+    output = f"[git_inspect/{action}]\n{body}"
+    if stderr_text:
+        output += f"\n[stderr] {stderr_text}"
+    return {"success": True, "output": output, "error": None}
+
+
 # ============================================================================
 # ============= TOOL REGISTRY                  ================================
 # ============================================================================
@@ -6607,6 +6930,10 @@ TOOL_ARG_ALIASES = {
                                  "selector": ["label_selector", "label", "labels"],
                                  "field_selector": ["fieldselector", "field-selector"],
                                  "container": ["container_name", "ctr"]},
+    "git_inspect": {"action": ["command", "verb", "subcommand", "subcmd"],
+                    "limit": ["count", "max_count", "n", "lines"],
+                    "ref": ["commit", "revision", "sha", "rev"],
+                    "path": ["file", "file_path", "pathspec", "filepath"]},
 }
 
 # curl/wget flags that keep a command a harmless read-only GET fetch (no body,
@@ -6749,9 +7076,12 @@ MCP_CLIENT_NAME = "ollamaquery2"
 MCP_MAX_FRAME_BYTES = 16 * 1024 * 1024
 
 # Result caps: the configured max_result_chars is a ceiling; the live context
-# window may lower it (a fixed 100K chars is ~25K tokens).
+# window may lower it (a fixed 100K chars is ~25K tokens). MCP_RESULT_MIN_CHARS
+# floors the context-derived budget so a tiny/unknown window does not shrink
+# results to nothing — it never raises a smaller configured ceiling.
 MCP_RESULT_CHARS_PER_TOKEN = 4
 MCP_RESULT_CONTEXT_FRACTION = 0.25
+MCP_RESULT_MIN_CHARS = 2000
 MCP_SPILL_PREFIX = "mcp_result_"
 
 # Listing markers (see /mcp tools).
@@ -7337,12 +7667,19 @@ def _mcp_tool_to_agentic_def(cfg: MCPServerConfig, tool: dict, model_name: str) 
 
 
 def _mcp_resolve_max_result_chars(ctx: object, configured: int) -> int:
-    """Effective result cap: configured ceiling, lowered to fit the live window."""
+    """Effective result cap: the configured ceiling, lowered to fit the live window.
+
+    `configured` is a hard ceiling (validation rejects <= 0), so the context
+    budget can only lower it. MCP_RESULT_MIN_CHARS is a floor on the *budget*,
+    not on the result: a tiny configured value must stay tiny, otherwise an
+    admin asking for 10 chars silently gets 2000 and results that should have
+    spilled are returned inline instead.
+    """
     window = int(getattr(ctx, "context_window_size", 0) or 0)
     if window <= 0:
         return configured
     budget = int(window * MCP_RESULT_CONTEXT_FRACTION) * MCP_RESULT_CHARS_PER_TOKEN
-    return max(2000, min(configured, budget))
+    return min(configured, max(MCP_RESULT_MIN_CHARS, budget))
 
 
 def _mcp_content_to_text(block: dict) -> str:
@@ -7662,6 +7999,19 @@ def print_mcp_usage() -> None:
 
 # -- transports ---------------------------------------------------------------
 
+def _close_quietly(stream: object) -> None:
+    """Close a pipe/stream, ignoring already-closed and OS errors.
+
+    Args:
+        stream: A file object (or None).
+    """
+    try:
+        if stream is not None:
+            stream.close()
+    except OSError:
+        pass
+
+
 class MCPTransport:
     """Byte/JSON transport with one reader thread and one write lock."""
 
@@ -7724,31 +8074,45 @@ class StdioMCPTransport(MCPTransport):
         except (OSError, ValueError) as exc:
             raise MCPError(f"cannot start {self.cfg.command[0]!r}: {exc}") from exc
         for target, name in ((self._read_stdout, "stdout"), (self._read_stderr, "stderr")):
-            thread = threading.Thread(target=target, name=f"mcp-{name}-{self.cfg.name}",
-                                      daemon=True)
+            thread = threading.Thread(target=target, args=(self._proc,),
+                                      name=f"mcp-{name}-{self.cfg.name}", daemon=True)
             thread.start()
             self._threads.append(thread)
 
-    def _read_stdout(self) -> None:
-        """Reader thread: decode frames into the inbound queue."""
+    def _read_stdout(self, proc: subprocess.Popen) -> None:
+        """Reader thread: decode frames into the inbound queue.
+
+        `proc` is captured at spawn and passed in, never re-read from
+        `self._proc`: `close()` clears that attribute, and dereferencing it here
+        would race into an AttributeError (not caught by the OSError/ValueError
+        guard below).
+
+        The reader closes its own pipe on the way out: a stream must never be
+        closed by another thread while a read is blocked on it (that blocks on
+        the buffer lock or raises inside the reader). Owning the close keeps the
+        fd from leaking without that race.
+        """
         try:
-            for message in _mcp_iter_json_lines(self._proc.stdout):
+            for message in _mcp_iter_json_lines(proc.stdout):
                 self._inbound.put(message)
         except (OSError, ValueError):
             pass
         finally:
             self._closed = True
+            _close_quietly(proc.stdout)
 
-    def _read_stderr(self) -> None:
+    def _read_stderr(self, proc: subprocess.Popen) -> None:
         """Reader thread: keep the tail of stderr for diagnostics only."""
         try:
-            for line in self._proc.stderr:
+            for line in proc.stderr:
                 text = line.decode("utf-8", errors="replace").rstrip()
                 if text:
                     self._stderr_tail.append(text)
                     del self._stderr_tail[:-20]
         except (OSError, ValueError):
             pass
+        finally:
+            _close_quietly(proc.stderr)
 
     def send(self, message: dict) -> None:
         """Write one frame to the child's stdin."""
@@ -7789,16 +8153,28 @@ class StdioMCPTransport(MCPTransport):
             proc.terminate()
             proc.wait(timeout=2)
         except (subprocess.TimeoutExpired, OSError):
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+            self._kill_group(proc)
             try:
                 proc.wait(timeout=2)
             except (subprocess.TimeoutExpired, OSError):
+                pass
+        # The child is gone, so its write ends are closed and both readers see
+        # EOF. Join them so their own (last) close of stdout/stderr has run
+        # before we return; a reader that is still stuck keeps its pipe, which
+        # is preferable to closing the stream under a blocked read.
+        for thread in list(self._threads):
+            thread.join(timeout=2)
+        self._threads = []
+
+    @staticmethod
+    def _kill_group(proc: subprocess.Popen) -> None:
+        """SIGKILL the child's process group (start_new_session made it a leader)."""
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            try:
+                proc.kill()
+            except OSError:
                 pass
 
     def is_alive(self) -> bool:
@@ -8448,6 +8824,7 @@ class ToolRegistry:
             "edit_file": _tool_handle_edit_file,
             "apply_patch": _tool_handle_apply_patch,
             "kubernetes_cluster_query": _tool_handle_cluster_query,
+            "git_inspect": _tool_handle_git_inspect,
         }
 
     def _plan_allowed_tools(self) -> dict:
@@ -16396,6 +16773,24 @@ def _probe_backend(backend: str, host: str, api_key: Optional[str] = None) -> bo
     return False
 
 
+def _ensure_url_scheme(host: str) -> str:
+    """Add an http:// scheme to a bare `host:port`.
+
+    `OLLAMA_HOST=192.168.1.20:11434` is the documented Ollama env format, so
+    every env-derived base URL goes through here; otherwise `urlopen` raises
+    "unknown url type: 192.168.1.20" on every request.
+
+    Args:
+        host: Base URL, possibly scheme-less.
+
+    Returns:
+        The URL with a scheme (unparseable/empty input is returned unchanged).
+    """
+    if not host or not isinstance(host, str):
+        return host
+    return host if host.startswith(("http://", "https://")) else f"http://{host}"
+
+
 def _resolve_host_override(args: argparse.Namespace) -> tuple:
     """Resolve backend/host when the user passed an explicit -H host.
 
@@ -16407,7 +16802,7 @@ def _resolve_host_override(args: argparse.Namespace) -> tuple:
 
     Infers the backend from the port when -b is omitted; defaults to ollama.
     """
-    base_url = args.host if args.host.startswith(('http://', 'https://')) else f"http://{args.host}"
+    base_url = _ensure_url_scheme(args.host)
     selected_backend = args.backend
     if not selected_backend:
         # Infer backend from known ports
@@ -16485,7 +16880,7 @@ def _resolve_fallback(args: argparse.Namespace) -> tuple:
         fallback_host = os.environ.get('LMSTUDIO_HOST', DEFAULT_LMSTUDIO_HOST)
     else:
         fallback_host = os.environ.get('OLLAMA_HOST', DEFAULT_OLLAMA_HOST)
-    return fallback_backend, fallback_host
+    return fallback_backend, _ensure_url_scheme(fallback_host)
 
 
 def resolve_connection(args: argparse.Namespace) -> tuple:

@@ -40,13 +40,25 @@ import ollamaquery2 as q
 # ── Backend Discovery ──────────────────────────────────────────────────────
 
 
+def _normalize_url(url):
+    """Add http:// when an env var carries a bare host:port (OLLAMA_HOST style)."""
+    if not url:
+        return url
+    return url if url.startswith(('http://', 'https://')) else f"http://{url}"
+
+
 def _discover_backends():
     """Auto-discover LLM backends by probing common URLs.
 
     Checks in order:
-    1. User-set environment variables (OLLAMA_HOST, LLAMACPP_HOST, LMSTUDIO_HOST)
+    1. User-set environment variables (OLLAMA_HOST, LLAMACPP_HOST,
+       LMSTUDIO_HOST, STRATA_HOST)
     2. Default localhost URLs on standard ports
     3. Local network IPs on standard ports (via gethostbyname_ex)
+
+    A bare `host:port` env value is normalized to a URL first: Ollama documents
+    OLLAMA_HOST without a scheme, and passing it raw to urlopen fails with
+    "unknown url type".
 
     Returns:
         dict: Backend name -> (discovered_url, available_bool)
@@ -58,11 +70,13 @@ def _discover_backends():
          lambda u: q.check_backend_with_head(u, 'llama.cpp')),
         ('lmstudio', 'LMSTUDIO_HOST', 'http://127.0.0.1:1234',   1234,
          lambda u: q.check_lmstudio(u)),
+        ('strata',   'STRATA_HOST',   'http://127.0.0.1:8080',   8080,
+         lambda u: q.check_strata(u)),
     ]
 
     discovered = {}
     for name, env_var, default_url, port, check_fn in probes:
-        url = os.environ.get(env_var, default_url)
+        url = _normalize_url(os.environ.get(env_var, default_url))
         ok = False
 
         try:
@@ -99,15 +113,18 @@ if not any(v[1] for v in _discovered_backends.values()):
 OLLAMA_HOST   = _discovered_backends['ollama'][0]
 LLAMACPP_HOST = _discovered_backends['llamacpp'][0]
 LMSTUDIO_HOST = _discovered_backends['lmstudio'][0]
+STRATA_HOST   = _discovered_backends['strata'][0]
 HAS_OLLAMA    = _discovered_backends['ollama'][1]
 HAS_LLAMACPP  = _discovered_backends['llamacpp'][1]
 HAS_LMSTUDIO  = _discovered_backends['lmstudio'][1]
+HAS_STRATA    = _discovered_backends['strata'][1]
 SMALL_MODEL   = os.environ.get('TEST_MODEL', 'granite4:350m')
 
 ollama_only   = unittest.skipUnless(HAS_OLLAMA,   'Ollama backend not available')
 llamacpp_only = unittest.skipUnless(HAS_LLAMACPP, 'Llama.cpp backend not available')
-any_backend   = unittest.skipUnless(HAS_OLLAMA or HAS_LLAMACPP or HAS_LMSTUDIO,
-                                    'No backend available')
+strata_only   = unittest.skipUnless(HAS_STRATA, 'Strata backend not available')
+any_backend   = unittest.skipUnless(HAS_OLLAMA or HAS_LLAMACPP or HAS_LMSTUDIO
+                                    or HAS_STRATA, 'No backend available')
 
 
 def _tokenize_available(base_url, model):
@@ -176,24 +193,33 @@ if HAS_OLLAMA:
     SMALL_MODEL = _pick_small_model(OLLAMA_HOST)
     _ensure_model_loaded(OLLAMA_HOST, SMALL_MODEL)
 
-# Detect which backend is actually available for any_backend tests
+# Detect which backend is actually available for any_backend tests. Strata is
+# probed first: it shares llama.cpp's 8080 port and answers the LM Studio probe,
+# so it must win the tie-break to route requests through the strata parser
+# (reasoning_content, /v1/messages/count_tokens).
 ANY_BACKEND = None
 ANY_BASE_URL = None
 ANY_MODEL = None
 
-if HAS_LMSTUDIO:
+if HAS_STRATA:
+    models = q.fetch_models_llamacpp(STRATA_HOST)
+    if models:
+        ANY_BACKEND = 'strata'
+        ANY_BASE_URL = STRATA_HOST
+        ANY_MODEL = models[0]['name']
+if ANY_BACKEND is None and HAS_LMSTUDIO:
     models = q.fetch_models_llamacpp(LMSTUDIO_HOST)
     if models:
         ANY_BACKEND = 'lmstudio'
         ANY_BASE_URL = LMSTUDIO_HOST
         ANY_MODEL = models[0]['name']
-elif HAS_LLAMACPP:
+if ANY_BACKEND is None and HAS_LLAMACPP:
     models = q.fetch_models_llamacpp(LLAMACPP_HOST)
     if models:
         ANY_BACKEND = 'llamacpp'
         ANY_BASE_URL = LLAMACPP_HOST
         ANY_MODEL = models[0]['name']
-elif HAS_OLLAMA:
+if ANY_BACKEND is None and HAS_OLLAMA:
     ANY_BACKEND = 'ollama'
     ANY_BASE_URL = OLLAMA_HOST
     ANY_MODEL = SMALL_MODEL

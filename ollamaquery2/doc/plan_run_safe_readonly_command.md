@@ -4,11 +4,18 @@
 > too complex to maintain. The implemented direction is instead two tiers, with
 > no per-command allowlist:
 > - `/agentic plan` (strict): query tools only (`read_file`, `glob`, `grep`,
->   `list_directory`, `fetch_url`, `diff`, `kubernetes_cluster_query`), no
->   shell, and all paths hard-confined to CWD (outside requests are refused,
->   not prompted).
+>   `list_directory`, `fetch_url`, `diff`, `kubernetes_cluster_query`,
+>   `git_inspect`), no shell, and all paths hard-confined to CWD (outside
+>   requests are refused, not prompted).
 > - `/agentic plan run`: re-adds `run_command` (always confirms) for shell-only
 >   inspection; CWD confinement lifted.
+>
+> The git use case this draft was built around is now served by a dedicated,
+> non-shell tool instead of a verified-command allowlist: see
+> `doc/agentic_git_inspect.md` (`git_inspect`, actions `status` / `diff` /
+> `diff_staged` / `diff_head` / `log` / `show`, fixed argv, repo-supplied
+> textconv/fsmonitor hooks disabled). It lives in `PLAN_MODE_TOOLS`, so plain
+> `/agentic plan` already answers "what changed?" without any prompt.
 >
 > See `PLAN_MODE_TOOLS` / `PLAN_MODE_RUN_TOOLS`, `plan_active_tools()`, the
 > `_path_acl_decision` strict branch, and `_agentic_toggle_plan`.

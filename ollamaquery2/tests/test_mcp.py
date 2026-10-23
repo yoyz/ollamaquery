@@ -878,6 +878,30 @@ class TestSpill(unittest.TestCase):
         self.assertEqual(m._mcp_resolve_max_result_chars(
             _ctx(context_window_size=100), 100000), 2000)
 
+    def test_configured_cap_is_a_ceiling_on_a_live_window(self):
+        """A tiny configured cap must not be raised to the 2k budget floor.
+
+        Regression: `max(2000, min(configured, budget))` turned a configured
+        10 into 2000 as soon as the window was known, so results that should
+        have spilled were returned inline. `_ctx()` defaults to
+        context_window_size=0, which short-circuits to `configured`, so the
+        spill test alone could not catch this.
+        """
+        for window in (100, 8182, 8192, 32768, 131072):
+            self.assertEqual(
+                m._mcp_resolve_max_result_chars(_ctx(context_window_size=window), 10),
+                10, msg=f"window={window}")
+
+    def test_small_result_not_spilled_when_cap_is_small(self):
+        """The effective cap decides: a 200-char result spills under a 10 cap."""
+        ctx = _ctx(context_window_size=32768)
+        cfg = m.MCPServerConfig(name="k8s", command=["x"], max_result_chars=10)
+        with patch.object(m, "CLUSTER_SPILL_DIR", tempfile.mkdtemp()), \
+             patch.object(m, "_cleanup_spill_files", lambda: None):
+            result = m._mcp_result_to_output(
+                ctx, {"content": [{"type": "text", "text": "y" * 200}]}, cfg, "pods_list")
+        self.assertIn("read_file(file_path=", result["output"])
+
 
 class TestToolListingLayout(unittest.TestCase):
     """`/listtool` renders aligned columns with hanging-indented descriptions."""
