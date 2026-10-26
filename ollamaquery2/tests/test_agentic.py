@@ -2633,7 +2633,7 @@ class TestGitInspect(unittest.TestCase):
                                      "GIT_WORK_TREE": "/tmp/elsewhere",
                                      "GIT_INDEX_FILE": "/tmp/elsewhere/index"}, clear=False), \
              patch.object(q.subprocess, "Popen", return_value=fake) as popen:
-            result = self._run(action="diff", ref="main..dev", limit="5")
+            result = self._run(action="diff", limit="5")
         self.assertTrue(result["success"], msg=result.get("error"))
         argv = popen.call_args[0][0]
         kwargs = popen.call_args[1]
@@ -2648,9 +2648,199 @@ class TestGitInspect(unittest.TestCase):
             self.assertNotIn(key, kwargs["env"])
         self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(kwargs["env"]["GIT_OPTIONAL_LOCKS"], "0")
-        # The ref is only a `show` concept: `diff` must not smuggle it in.
-        self.assertNotIn("main..dev", argv)
+        # No ref was requested, so no revision may appear in argv.
+        self.assertNotIn("HEAD", argv)
         self.assertTrue(all(isinstance(part, str) for part in argv))
+
+    def test_ref_is_rejected_for_actions_that_would_ignore_it(self):
+        """Silently dropping `ref` yields a confidently wrong answer.
+
+        A model asking for `diff` of another branch used to receive the
+        working-tree diff. Ref-taking actions are `log` and `show`; everything
+        else refuses instead of guessing.
+        """
+        for action in ("status", "diff", "diff_staged", "diff_head"):
+            with patch.object(q.subprocess, "Popen") as popen:
+                result = self._run(action=action, ref="main")
+            self.assertFalse(result["success"], msg=action)
+            self.assertIn("does not take a ref", result["error"])
+            popen.assert_not_called()
+
+    def test_log_uses_ref_and_pathspec(self):
+        capture = {"returncode": 0, "stdout": "abc123 one\n", "stderr": "",
+                   "truncated": False, "timed_out": False}
+        with patch.object(q, "_git_capture", return_value=capture) as fake:
+            self._run(action="log", ref="main", limit=5, path="tests")
+            argv = fake.call_args[0][0]
+            self._run(action="log")
+            default_argv = fake.call_args[0][0]
+        self.assertIn("main", argv)
+        self.assertIn("-n5", argv)
+        self.assertIn("tests", argv)
+        self.assertEqual(argv[argv.index("--") + 1], "tests")
+        # `log` without a ref walks HEAD implicitly: no revision in argv.
+        self.assertNotIn("HEAD", default_argv)
+
+    def test_log_ref_cannot_be_an_option(self):
+        for ref in ("--all", "-c", "--output=/tmp/x", "main; id"):
+            result = self._run(action="log", ref=ref)
+            self.assertFalse(result["success"], msg=ref)
+            self.assertIn("Unsupported ref", result["error"])
+
+    # ---- blame: per-line archaeology (bounded by -L, no textconv) ----------
+
+    def test_blame_needs_path_and_lines(self):
+        missing_path = self._run(action="blame", lines="1,10")
+        self.assertFalse(missing_path["success"])
+        self.assertIn("path", missing_path["error"])
+        missing_lines = self._run(action="blame", path="a.txt")
+        self.assertFalse(missing_lines["success"])
+        self.assertIn("lines", missing_lines["error"])
+
+    def test_blame_argv_is_hardened_and_bounded(self):
+        capture = {"returncode": 0, "stdout": "abc123 (T 2026-01-01 1) x\n",
+                   "stderr": "", "truncated": False, "timed_out": False}
+        with patch.object(q, "_git_capture", return_value=capture) as fake:
+            result = self._run(action="blame", path="a.txt",
+                               lines="120,150", ref="feature")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        argv = fake.call_args[0][0]
+        self.assertIn("blame", argv)
+        # textconv is opt-out, not opt-in: blame runs it unless told otherwise.
+        self.assertIn("--no-textconv", argv)
+        self.assertIn("-L 120,150", argv)
+        self.assertIn("--abbrev=8", argv)
+        self.assertIn("--date=short", argv)
+        self.assertIn("feature", argv)
+        self.assertLess(argv.index("feature"), argv.index("--"))  # rev before pathspec
+        self.assertEqual(argv[argv.index("--") + 1], "a.txt")
+        self.assertFalse([p for p in argv if p.startswith("-C")])
+
+    def test_blame_line_range_validation(self):
+        cases = {
+            "10,5": "reversed",
+            "0,5": "start at 1",
+            "abc": "numeric",
+            "1,2,3": "numeric",
+            "1,5000": "too wide",
+        }
+        for lines, needle in cases.items():
+            result = self._run(action="blame", path="a.txt", lines=lines)
+            self.assertFalse(result["success"], msg=lines)
+            self.assertIn(needle, result["error"], msg=lines)
+        # A single line is a valid shortcut for start==end.
+        capture = {"returncode": 0, "stdout": "x\n", "stderr": "",
+                   "truncated": False, "timed_out": False}
+        with patch.object(q, "_git_capture", return_value=capture) as fake:
+            self._run(action="blame", path="a.txt", lines="42")
+        self.assertIn("-L 42,42", fake.call_args[0][0])
+
+    def test_blame_ref_cannot_be_an_option(self):
+        for ref in ("--exec=id", "-c", "HEAD; id"):
+            result = self._run(action="blame", path="a.txt", lines="1,5", ref=ref)
+            self.assertFalse(result["success"], msg=ref)
+            self.assertIn("Unsupported ref", result["error"])
+
+    @unittest.skipUnless(HAS_GIT, "git not installed")
+    def test_blame_live_reports_commit_and_uncommitted_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _git(tmp, "init", "-q", "-b", "main", ".")
+            _git(tmp, "config", "user.email", "t@example.com")
+            _git(tmp, "config", "user.name", "T")
+            with open(os.path.join(tmp, "a.txt"), "w") as f:
+                f.write("one\ntwo\n")
+            _git(tmp, "add", "a.txt")
+            _git(tmp, "commit", "-qm", "base commit")
+            with open(os.path.join(tmp, "a.txt"), "w") as f:
+                f.write("one\ntwo\nthree\n")
+            with open(os.path.join(tmp, "new.txt"), "w") as f:
+                f.write("untracked\n")
+            with patch.object(q.os, "getcwd", return_value=tmp):
+                blamed = self._run(action="blame", path="a.txt", lines="1,3")
+                untracked = self._run(action="blame", path="new.txt", lines="1,1")
+        self.assertTrue(blamed["success"], msg=blamed.get("error"))
+        self.assertIn("Not Committed Yet", blamed["output"])
+        self.assertEqual(len(blamed["output"].splitlines()), 4)  # header + one row per line
+        self.assertFalse(untracked["success"])
+        self.assertIn("tracked", untracked["error"])
+
+    @unittest.skipUnless(HAS_GIT, "git not installed")
+    def test_blame_another_ref_and_line_numbers_match_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _git(tmp, "init", "-q", "-b", "main", ".")
+            _git(tmp, "config", "user.email", "t@example.com")
+            _git(tmp, "config", "user.name", "T")
+            with open(os.path.join(tmp, "a.txt"), "w") as f:
+                f.write("one\ntwo\n")
+            _git(tmp, "add", "a.txt")
+            _git(tmp, "commit", "-qm", "base commit")
+            _git(tmp, "checkout", "-q", "-b", "feature")
+            with open(os.path.join(tmp, "a.txt"), "w") as f:
+                f.write("one\ntwo from feature\n")
+            _git(tmp, "commit", "-qam", "feature edit")
+            _git(tmp, "checkout", "-q", "main")
+            with patch.object(q.os, "getcwd", return_value=tmp):
+                at_feature = self._run(action="blame", path="a.txt",
+                                      lines="2,2", ref="feature")
+                at_main = self._run(action="blame", path="a.txt", lines="2,2")
+        self.assertTrue(at_feature["success"], msg=at_feature.get("error"))
+        self.assertIn("two from feature", at_feature["output"])
+        self.assertIn(" 2) two from feature", at_feature["output"])  # 1-based, file order
+        # The same line on main belongs to the base commit, not the feature one.
+        self.assertTrue(at_main["success"], msg=at_main.get("error"))
+        self.assertNotIn("two from feature", at_main["output"])
+        self.assertNotEqual(at_main["output"], at_feature["output"])
+
+    # ---- log follow / name_status: file history through renames -----------
+
+    def test_follow_requires_a_path(self):
+        result = self._run(action="log", follow=True)
+        self.assertFalse(result["success"])
+        self.assertIn("path", result["error"])
+
+    def test_log_history_flags_argv(self):
+        capture = {"returncode": 0, "stdout": "", "stderr": "",
+                   "truncated": False, "timed_out": False}
+        with patch.object(q, "_git_capture", return_value=capture) as fake:
+            self._run(action="log", path="a.txt", follow=True, name_status=True)
+            history_argv = fake.call_args[0][0]
+            self._run(action="log")
+            plain_argv = fake.call_args[0][0]
+        self.assertIn("--follow", history_argv)
+        self.assertIn("--name-status", history_argv)
+        self.assertIn("--date=short", history_argv)
+        self.assertEqual(history_argv[history_argv.index("--") + 1], "a.txt")
+        # A plain log keeps its compact format and gains no archaeology flags.
+        self.assertNotIn("--follow", plain_argv)
+        self.assertNotIn("--name-status", plain_argv)
+        self.assertNotIn("--date=short", plain_argv)
+
+    @unittest.skipUnless(HAS_GIT, "git not installed")
+    def test_follow_traverses_a_rename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _git(tmp, "init", "-q", "-b", "main", ".")
+            _git(tmp, "config", "user.email", "t@example.com")
+            _git(tmp, "config", "user.name", "T")
+            with open(os.path.join(tmp, "a.txt"), "w") as f:
+                f.write("one\n")
+            _git(tmp, "add", "a.txt")
+            _git(tmp, "commit", "-qm", "pre-rename commit")
+            _git(tmp, "mv", "a.txt", "b.txt")
+            _git(tmp, "commit", "-qm", "rename commit")
+            with open(os.path.join(tmp, "b.txt"), "w") as f:
+                f.write("one\ntwo\n")
+            _git(tmp, "commit", "-qam", "post-rename edit")
+            with patch.object(q.os, "getcwd", return_value=tmp):
+                plain = self._run(action="log", path="b.txt")
+                followed = self._run(action="log", path="b.txt", follow=True,
+                                     name_status=True)
+        self.assertTrue(plain["success"], msg=plain.get("error"))
+        self.assertNotIn("pre-rename commit", plain["output"])
+        self.assertTrue(followed["success"], msg=followed.get("error"))
+        self.assertIn("pre-rename commit", followed["output"])
+        self.assertIn("M\tb.txt", followed["output"])
+
+
 
     def test_limit_is_clamped(self):
         capture = {"returncode": 0, "stdout": "", "stderr": "",
@@ -2765,6 +2955,39 @@ class TestGitInspect(unittest.TestCase):
         self.assertTrue(scoped["success"], msg=scoped.get("error"))
         self.assertIn("+two", scoped["output"])
         self.assertTrue(missing["success"])  # empty pathspec match is not an error
+
+    @unittest.skipUnless(HAS_GIT, "git not installed")
+    def test_log_ref_lists_another_branch(self):
+        """`log` with a ref walks that revision, and `path` narrows it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _git(tmp, "init", "-q", "-b", "main", ".")
+            _git(tmp, "config", "user.email", "t@example.com")
+            _git(tmp, "config", "user.name", "T")
+            with open(os.path.join(tmp, "a.txt"), "w") as f:
+                f.write("one\n")
+            _git(tmp, "add", "a.txt")
+            _git(tmp, "commit", "-qm", "base commit")
+            _git(tmp, "checkout", "-q", "-b", "feature")
+            with open(os.path.join(tmp, "b.txt"), "w") as f:
+                f.write("two\n")
+            _git(tmp, "add", "b.txt")
+            _git(tmp, "commit", "-qm", "feature commit")
+            _git(tmp, "checkout", "-q", "main")
+            with patch.object(q.os, "getcwd", return_value=tmp):
+                head_log = self._run(action="log")
+                feature_log = self._run(action="log", ref="feature")
+                scoped = self._run(action="log", ref="feature", path="b.txt")
+                unscoped = self._run(action="log", ref="feature", path="a.txt")
+        self.assertTrue(head_log["success"], msg=head_log.get("error"))
+        self.assertNotIn("feature commit", head_log["output"])
+        self.assertTrue(feature_log["success"], msg=feature_log.get("error"))
+        self.assertIn("feature commit", feature_log["output"])
+        self.assertIn("base commit", feature_log["output"])
+        self.assertTrue(scoped["success"], msg=scoped.get("error"))
+        self.assertIn("feature commit", scoped["output"])
+        # a.txt was not touched by the feature commit, so the pathspec excludes it
+        self.assertTrue(unscoped["success"], msg=unscoped.get("error"))
+        self.assertNotIn("feature commit", unscoped["output"])
 
     @unittest.skipUnless(HAS_GIT, "git not installed")
     def test_clean_tree_is_not_an_error(self):

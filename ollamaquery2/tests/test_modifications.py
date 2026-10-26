@@ -426,12 +426,14 @@ class TestPathTraversal(unittest.TestCase):
     def test_read_file_rejects_traversal(self):
         result = self.reg.execute("read_file", {"file": "../etc/passwd"})
         self.assertFalse(result["success"])
-        self.assertIn("Path traversal denied", result.get("error", ""))
+        self.assertIn("outside the project and $HOME", result.get("error", ""))
+        self.assertIn("path_policy", result.get("error", ""))
 
     def test_read_file_rejects_absolute_outside(self):
         result = self.reg.execute("read_file", {"file": "/tmp/foo"})
         self.assertFalse(result["success"])
-        self.assertIn("Path traversal denied", result.get("error", ""))
+        self.assertIn("outside the project and $HOME", result.get("error", ""))
+        self.assertIn("path_policy", result.get("error", ""))
 
     def test_read_file_absolute_system_proc(self):
         # /proc is `ask` by default; non-TTY runs deny it (bypass-immune).
@@ -471,17 +473,17 @@ class TestPathTraversal(unittest.TestCase):
     def test_write_file_rejects_traversal(self):
         result = self.reg.execute("write_file", {"file": "../outside.txt", "content": "x"})
         self.assertFalse(result["success"])
-        self.assertIn("Path traversal denied", result.get("error", ""))
+        self.assertIn("write outside the project and $HOME", result.get("error", ""))
 
     def test_list_directory_rejects_traversal(self):
         result = self.reg.execute("list_directory", {"path": "../"})
         self.assertFalse(result["success"])
-        self.assertIn("Path traversal denied", result.get("error", ""))
+        self.assertIn("outside the project and $HOME", result.get("error", ""))
 
     def test_edit_file_rejects_traversal(self):
         result = self.reg.execute("edit_file", {"file": "../etc/passwd", "old_string": "root", "new_string": "toor"})
         self.assertFalse(result["success"])
-        self.assertIn("Path traversal denied", result.get("error", ""))
+        self.assertIn("write outside the project and $HOME", result.get("error", ""))
 
     def test_apply_patch_rejects_traversal(self):
         """apply_patch must reject patches targeting files outside CWD."""
@@ -1186,6 +1188,23 @@ class TestInferenceParamsRegistry(unittest.TestCase):
     def test_unknown_model_falls_back_to_default(self):
         params = m.get_inference_params('some-random-model:latest')
         self.assertEqual(params, m.DEFAULT_INFERENCE_PARAMS)
+
+    def test_qwen38_matches_own_entry_not_qwen3(self):
+        # The served alias is what the backend reports; it must not fall through
+        # to the generic "qwen3" key (0.5/0.9), which over-constrains sampling
+        # on this reasoning checkpoint.
+        for alias in ('qwen3.8-flash-next-unsloth-ud-iq4_xs',
+                      'Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf',
+                      'qwen3.8:27b'):
+            params = m.get_inference_params(alias)
+            self.assertEqual(params['temperature'], 1.0, alias)
+            self.assertEqual(params['top_p'], 0.95, alias)
+            self.assertEqual(params['top_k'], 20, alias)
+
+    def test_registry_order_qwen38_before_qwen3(self):
+        keys = list(m.MODEL_INFERENCE_PARAMS_REGISTRY)
+        self.assertLess(keys.index('qwen3.8'), keys.index('qwen3'),
+                        "qwen3.8 must be matched before generic qwen3")
 
     def test_registry_order_qwen36_before_qwen3(self):
         keys = list(m.MODEL_INFERENCE_PARAMS_REGISTRY)
@@ -2453,6 +2472,164 @@ class TestContextBarConsistency(unittest.TestCase):
         self.assertEqual(self.ctx.current_context_tokens,
                          self.loop._wire_snapshot()['total'])
 
+
+class TestPromptShow(unittest.TestCase):
+    """`/promptshow` displays the outbound prompt + tools, read-only.
+
+    The point of the command is that the preview cannot drift from the payload:
+    it renders `_wire_snapshot()`, the same source `/tokencount` uses. These
+    tests pin the text, the per-mode tool surface and the fact that nothing is
+    mutated.
+    """
+
+    def setUp(self):
+        self.ctx = m.CommandContext()
+        self.ctx.backend = 'llamacpp'
+        self.ctx.base_url = 'http://127.0.0.1:1'
+        self.ctx.model = 'qwen3.5:9b'
+        self.ctx.context_window_size = 32768
+        self.ctx.max_output_tokens = m.DEFAULT_MAX_OUTPUT_TOKENS
+        self.ctx.agentic_mode = False
+        self.ctx.plan_mode = False
+        self.ctx.plan_run = False
+        self.loop = m.ChatLoop(self.ctx)
+        self.loop.messages = [{'role': 'system', 'content': 'sys', '_tokens': 10}]
+        self._patches = [
+            patch.object(m.CommandContext, 'tokenize',
+                         side_effect=lambda text: max(1, len(text) // 4)),
+            patch.object(m.CommandContext, 'count_wire_tokens',
+                         return_value={'total': None, 'tools': None, 'source': 'none'}),
+        ]
+        for patcher in self._patches:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in self._patches:
+            patcher.stop()
+
+    def _run(self, line='/promptshow'):
+        """Run a /promptshow line, returning (stdout, stderr)."""
+        out, err = io.StringIO(), io.StringIO()
+        with patch('sys.stdout', new=out), patch('sys.stderr', new=err):
+            handled = self.loop.run_handle_promptshow(line)
+        return handled, out.getvalue(), err.getvalue()
+
+    def test_registered_and_dispatched(self):
+        self.assertIn('promptshow', m.COMMANDS)
+        self.assertIn('/promptshow', m.COMMANDS['promptshow']['aliases'])
+        self.assertFalse(self.loop.run_handle_promptshow('/promptshow'))
+        # Not a /promptshow line -> not consumed (a plain query reaches the model).
+        self.assertIsNone(self.loop.run_handle_promptshow('/promptshowx'))
+        self.assertIsNone(self.loop.run_handle_promptshow('promptshow'))
+
+    def test_system_subcommand_prints_the_wire_prompt_verbatim(self):
+        handled, out, _ = self._run('/promptshow system')
+        self.assertFalse(handled)
+        self.assertEqual(out.strip(), self.loop._wire_snapshot()['system'].strip())
+        # The /maxtokens cap line is part of what the server receives.
+        self.assertIn('at most', out)
+
+    def test_chat_mode_has_no_tool_section(self):
+        _, out, _ = self._run('/promptshow')
+        self.assertIn('mode: chat', out)
+        self.assertIn('none — chat mode', out)
+        self.assertIn('no tool definitions in this mode', out)
+        self.assertNotIn('── tools (', out)
+
+    def test_plan_mode_lists_only_the_plan_surface(self):
+        self.ctx.agentic_mode = True
+        self.ctx.plan_mode = True
+        _, out, _ = self._run('/promptshow')
+        self.assertIn('mode: agentic, plan', out)
+        self.assertIn('── tools (', out)
+        self.assertIn('git_inspect', out)
+        self.assertIn('git_inspect', self.loop._wire_snapshot()['system'])
+        tools_section = out.split('── tools (', 1)[1]
+        self.assertNotIn('run_command', tools_section)
+
+    def test_read_only_regression(self):
+        """Displaying the prompt must not touch the prompt or the mode."""
+        before = (self.ctx.system_prompt, self.ctx.agentic_mode, self.ctx.plan_mode,
+                  list(self.loop.messages))
+        self._run('/promptshow')
+        self._run('/promptshow system')
+        self._run('/promptshow tools')
+        self._run('/promptshow json')
+        after = (self.ctx.system_prompt, self.ctx.agentic_mode, self.ctx.plan_mode,
+                 list(self.loop.messages))
+        self.assertEqual(before, after)
+
+    def test_tools_subcommand_shows_argument_schemas(self):
+        _, out, _ = self._run('/promptshow tools git_inspect')
+        self.assertIn('### git_inspect', out)
+        self.assertIn('action (string)', out)
+        self.assertIn('lines (string)', out)
+        self.assertIn('follow (boolean)', out)
+        self.assertIn('showing 1 of', out)
+        self.assertNotIn('### read_file', out)
+
+    def test_unknown_tool_and_subcommand_report_errors(self):
+        _, _, err = self._run('/promptshow tools nope')
+        self.assertIn("unknown tool 'nope'", err)
+        self.assertIn('available:', err)
+        _, _, err = self._run('/promptshow bogus')
+        self.assertIn("unknown /promptshow subcommand 'bogus'", err)
+        self.assertIn('/promptshow', err)  # usage block follows
+
+    def test_alias_works(self):
+        handled, out, _ = self._run('/showprompt system')
+        self.assertFalse(handled)
+        self.assertIn('accurate chatbot', out)
+
+    def test_json_payload_is_the_wire_request(self):
+        self.ctx.agentic_mode = True
+        _, out, _ = self._run('/promptshow json')
+        payload = json.loads(out)
+        wire = self.loop._wire_snapshot()
+        self.assertEqual(payload['system'], wire['system'])
+        self.assertEqual(payload['tools'], wire['tools'])
+        self.assertEqual(payload['mode'], wire['mode'])
+        self.assertTrue(payload['tools'])
+        self.assertIn('native tools array', payload['tools_delivery'])
+
+    def test_save_writes_the_same_json(self):
+        self.ctx.agentic_mode = True
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'request.json')
+            _, out, err = self._run(f'/promptshow save {path}')
+            with open(path, encoding='utf-8') as handle:
+                payload = json.load(handle)
+        self.assertEqual(out, '')  # content goes to the file, not the terminal
+        self.assertIn('wrote', err)
+        self.assertEqual(payload['system'], self.loop._wire_snapshot()['system'])
+        _, _, err = self._run('/promptshow save')
+        self.assertIn('Usage', err)
+
+    def test_snapshot_failure_falls_back_to_the_direct_build(self):
+        """No whole-request counter must not make the command unusable."""
+        with patch.object(m.ChatLoop, '_wire_snapshot', side_effect=RuntimeError('no backend')):
+            wire = self.loop._promptshow_wire()
+        self.assertEqual(wire['mode'], 'chat')
+        self.assertIn('at most', wire['system'])
+        self.assertIsNone(wire['tools'])
+
+    def test_completion_offers_subcommands(self):
+        completer = m.ChatCompleter('http://127.0.0.1:1', 'llamacpp', ctx=self.ctx)
+
+        def candidates(buffer, text):
+            with patch.object(m.readline, 'get_line_buffer', return_value=buffer):
+                out = []
+                for state in range(32):
+                    found = completer.complete(text, state)
+                    if found is None:
+                        break
+                    out.append(found)
+                return out
+
+        self.assertEqual(candidates('/promptshow ', ''), m.PROMPTSHOW_SUBCOMMANDS)
+        self.assertEqual(candidates('/promptshow to', 'to'), ['tools'])
+        self.assertEqual(candidates('/promptshow tools ', ''), [])
+        self.assertEqual(candidates('/showprompt ', ''), m.PROMPTSHOW_SUBCOMMANDS)
 
 
 # ============================================================================

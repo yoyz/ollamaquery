@@ -1036,6 +1036,31 @@ class TestPlanModeSurface(unittest.TestCase):
             loop._print_plan_mode_status()
         self.assertNotIn("MCP tool", captured.getvalue())
 
+    def test_banner_lists_the_real_tier_surface(self):
+        """The banner must not drift from PLAN_MODE_TOOLS.
+
+        It was hardcoded and omitted `git_inspect` (added in v0.3.4), so plan mode
+        looked like it had no git access while it did. Every tier tool has to be
+        named, and the run tier has to show its extra verb.
+        """
+        strict = self._loop(None)
+        with patch("sys.stderr", new=io.StringIO()) as captured:
+            strict._print_plan_mode_status()
+        strict_out = captured.getvalue()
+        for name in m.PLAN_MODE_TOOLS:
+            self.assertIn(name, strict_out)
+        self.assertIn("git_inspect", strict_out)  # the name the banner used to omit
+        self.assertNotIn("run_command", strict_out)
+
+        run = self._loop(None)
+        run.ctx.plan_run = True
+        with patch("sys.stderr", new=io.StringIO()) as captured:
+            run._print_plan_mode_status()
+        run_out = captured.getvalue()
+        for name in m.PLAN_MODE_RUN_TOOLS:
+            self.assertIn(name, run_out)
+        self.assertIn("confirmation", run_out)
+
     def test_asking_twice_prints_the_same_surface(self):
         loop = self._loop(FakeManager())
         with patch("sys.stderr", new=io.StringIO()):

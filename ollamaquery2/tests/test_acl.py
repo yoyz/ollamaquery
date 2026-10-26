@@ -3,7 +3,8 @@
 
 Covers:
 - PathAcl defaults: CWD allowed, $HOME reads allowed (explicit only), home
-  dotfiles / /proc /sys /etc are `ask`, everything else outside is denied.
+  dotfiles / /proc /sys /etc are `ask`, a read anywhere else is `ask`
+  (confirmed once), a write anywhere else is denied.
 - Session overrides via add()/remove(), longest-prefix precedence.
 - _path_acl_decision: ask -> non-TTY deny, hard-block of sensitive /proc files,
   and the "explicit home request only" rule (../ escapes stay denied).
@@ -65,9 +66,17 @@ class TestPathAclDefaults(unittest.TestCase):
         for p in ("/proc/x", "/sys/x", "/etc/passwd"):
             self.assertEqual(self._ev("write", p)[0], "deny", p)
 
-    def test_other_outside_paths_denied(self):
-        self.assertEqual(self._ev("read", "/tmp/foo")[0], "deny")
-        self.assertEqual(self._ev("read", "/var/log/syslog")[0], "deny")
+    def test_other_outside_reads_ask(self):
+        # Outside CWD/$HOME a read is confirmed once (never silently denied):
+        # a deny there would only push the model to `cat`, which the same ACL
+        # cannot gate. Writes stay denied.
+        self.assertEqual(self._ev("read", "/tmp/foo")[0], "ask")
+        self.assertEqual(self._ev("read", "/var/log/syslog")[0], "ask")
+        self.assertIsNone(self._ev("read", "/tmp/foo")[1])
+
+    def test_other_outside_writes_denied(self):
+        self.assertEqual(self._ev("write", "/tmp/foo")[0], "deny")
+        self.assertEqual(self._ev("write", "/var/log/syslog")[0], "deny")
 
 
 class TestPathAclOverrides(unittest.TestCase):
@@ -150,6 +159,36 @@ class TestPathAclDecision(unittest.TestCase):
                                              tool="write_file", raw_path="/etc/passwd")
         self.assertEqual(decision, "deny")
 
+    def test_outside_read_not_granted_names_the_remedy(self):
+        # Non-TTY: the implicit ask cannot be answered, so it denies — but the
+        # message must name the remedy and forbid the tool-switching workaround,
+        # otherwise the model tries `cat` then `python -c`.
+        decision, msg = m._path_acl_decision(self.ctx, "read", "/tmp/strata-kbuild.log",
+                                             tool="read_file",
+                                             raw_path="/tmp/strata-kbuild.log")
+        self.assertEqual(decision, "deny")
+        self.assertIn("path_policy", msg)
+        self.assertIn("run_command", msg)
+
+    def test_outside_read_granted_adds_session_allow(self):
+        # Real prompt path (TTY + "s" = allow for the session): the grant must
+        # add a session allow rule for that path so the next read is silent.
+        with patch("sys.stdin.isatty", return_value=True), \
+                patch("builtins.input", return_value="s"):
+            decision, msg = m._path_acl_decision(self.ctx, "read", "/tmp/granted.log",
+                                                 tool="read_file",
+                                                 raw_path="/tmp/granted.log")
+        self.assertEqual(decision, "allow")
+        self.assertIsNone(msg)
+        self.assertEqual(self.ctx.path_acl.evaluate("read", "/tmp/granted.log")[0], "allow")
+
+    def test_outside_write_denied_without_prompt(self):
+        with patch.object(m.PathAcl, "prompt", side_effect=AssertionError("write must not prompt")):
+            decision, msg = m._path_acl_decision(self.ctx, "write", "/tmp/out.txt",
+                                                 tool="write_file", raw_path="/tmp/out.txt")
+        self.assertEqual(decision, "deny")
+        self.assertIn("write outside", msg)
+
 
 class TestShellOperandRealpath(unittest.TestCase):
     def test_flags_and_bare_words(self):
@@ -209,6 +248,227 @@ class TestShellAclScan(unittest.TestCase):
         self.ctx.path_acl.add("read", "allow", "/etc", source="session")
         res = m.check_shell_approval("cat /etc/hosts", ctx=self.ctx)
         self.assertTrue(res["approved"])
+
+
+class TestShellCodeBlobScan(unittest.TestCase):
+    """Absolute paths hidden inside code blobs (`python3 -c`, `sh -c`) are seen.
+
+    Before this pass the whole `-c` argument was one opaque token that only
+    resolved to a meaningless CWD-relative path, so `python3 -c
+    "open('/etc/passwd')"` was auto-approved while `cat /etc/passwd` was
+    blocked — the model's documented escape route (read_file → cat → python).
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx)
+
+    def test_python_c_read_of_etc_denied(self):
+        res = self._scan("python3 -c \"print(open('/etc/passwd').read())\"")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+        self.assertIn("path ACL", res["reason"])
+
+    def test_sh_c_read_of_etc_denied(self):
+        res = self._scan("sh -c 'cat /etc/passwd'")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+
+    def test_dd_assignment_operand_denied(self):
+        res = self._scan("dd if=/etc/shadow of=/tmp/x")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+
+    def test_tilde_path_inside_code_denied(self):
+        res = self._scan("python3 -c \"print(open('~/.ssh/id_rsa').read())\"")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+
+    def test_sensitive_virtual_file_in_code_hard_blocked(self):
+        res = self._scan("python3 -c \"print(open('/proc/1/mem').read())\"")
+        self.assertIsNotNone(res)
+        self.assertIn("System file blocked", res["reason"])
+
+    def test_end_to_end_gate_blocks_python_code(self):
+        res = m.check_shell_approval(
+            "python3 -c \"print(open('/etc/passwd').read())\"", ctx=self.ctx)
+        self.assertFalse(res["approved"])
+
+    def test_commit_message_mentioning_etc_not_scanned(self):
+        # Prose that names a path without touching it must not prompt.
+        self.assertIsNone(self._scan("git commit -m 'fix /etc handling'"))
+
+    def test_code_path_without_rule_not_flagged(self):
+        # /tmp has no explicit rule: the code-blob scan must not invent one
+        # (read_file asks there; the shell does not, by design).
+        self.assertIsNone(self._scan("python3 -c \"print(open('/tmp/x').read())\""))
+
+    def test_url_not_treated_as_path(self):
+        self.assertIsNone(self._scan("curl -o out.html https://example.com/a/b"))
+
+
+class TestAclDenialPointsAtTool(unittest.TestCase):
+    """A denial is one line: the reason + a pointer to the `path_policy` tool.
+
+    It deliberately does NOT re-send the policy map. The allowed roots are in the
+    system prompt, and the full map is one `path_policy` call away, so a repeated
+    refusal costs ~200 chars instead of ~700 — and the model still has a defined
+    next step (`path_policy`) instead of improvising with `cat`/`python -c`.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _deny(self, op="read", path="/tmp/strata-kbuild.log", op_name="read_file"):
+        decision, msg = m._path_acl_decision(self.ctx, op, path, tool=op_name, raw_path=path)
+        self.assertEqual(decision, "deny")
+        return msg
+
+    def test_denial_is_labelled_short_and_points_at_the_tool(self):
+        msg = self._deny()
+        self.assertTrue(msg.startswith("[path ACL denied]"), msg[:80])
+        self.assertIn("outside the project and $HOME, not granted", msg)
+        self.assertIn("path_policy", msg)
+        self.assertIn("do not bypass", msg)
+        self.assertNotIn("path policy for this session:", msg,
+                         "the map belongs in path_policy / the prompt, not in every denial")
+        self.assertLess(len(msg), 400)
+
+    def test_hard_block_also_points_at_the_tool(self):
+        decision, msg = m._path_acl_decision(self.ctx, "read", "/proc/1/mem",
+                                             tool="read_file", raw_path="/proc/1/mem")
+        self.assertEqual(decision, "deny")
+        self.assertIn("System file blocked", msg)
+        self.assertIn("path_policy", msg)
+
+    def test_shell_denial_matches(self):
+        res = m._shell_acl_scan("python3 -c \"print(open('/etc/passwd').read())\"", self.ctx)
+        self.assertIn("[path ACL denied]", res["reason"])
+        self.assertIn("path_policy", res["reason"])
+        self.assertNotIn("path policy for this session:", res["reason"])
+        self.assertLess(len(res["reason"]), 400)
+
+    def test_plan_strict_denial_says_cwd_only(self):
+        self.ctx.plan_mode = True
+        self.ctx.plan_run = False
+        msg = self._deny(path="/etc/passwd")
+        self.assertIn("strict plan mode is confined to", msg)
+        self.assertIn("path_policy", msg)
+
+
+class TestPathPolicyTool(unittest.TestCase):
+    """`path_policy` is the on-demand map: no filesystem access, no prompt."""
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+        self.ctx.agentic_mode = True
+        self.reg = m.ToolRegistry(ctx=self.ctx)
+
+    def _tool(self, **args):
+        return self.reg.execute("path_policy", args)
+
+    def test_map_lists_allowed_ask_denied_and_grants(self):
+        self.ctx.path_acl.add("read", "allow", "/tmp", source="session")
+        out = self._tool()["output"]
+        self.assertIn("path policy for this session:", out)
+        self.assertIn(CWD, out)
+        self.assertIn("ask", out)
+        self.assertIn("/proc/*/mem", out)
+        self.assertIn("allow read: /tmp", out)
+        self.assertIn("/agentic acl allow", out)
+
+    def test_deny_rules_are_listed_before_grants(self):
+        self.ctx.path_acl.add("read", "allow", "/tmp", source="session")
+        self.ctx.path_acl.add("read", "deny", "~/.ssh", source="session")
+        out = self._tool()["output"]
+        self.assertLess(out.index("deny read"), out.index("allow read"))
+
+    def test_map_is_bounded(self):
+        for i in range(20):
+            self.ctx.path_acl.add("read", "allow", f"/opt/grant{i}", source="session")
+        out = self._tool()["output"]
+        self.assertIn("more)", out)
+        self.assertLess(len(out), 1200)
+
+    def test_cwd_path_reports_allow(self):
+        self.assertIn("ALLOW", self._tool(path="./some_file.txt")["output"])
+
+    def test_rule_path_reports_ask_without_prompting(self):
+        with patch.object(m.PathAcl, "prompt", side_effect=AssertionError("must not prompt")):
+            out = self._tool(path="/etc/passwd")["output"]
+        self.assertIn("ASK", out)
+        self.assertIn("/etc", out)
+
+    def test_sensitive_virtual_file_reports_hard_deny(self):
+        out = self._tool(path="/proc/1/mem")["output"]
+        self.assertIn("DENIED", out)
+        self.assertIn("hard-blocked", out)
+
+    def test_bad_op_is_an_error(self):
+        res = self._tool(path="/tmp/x", op="delete")
+        self.assertFalse(res["success"])
+        self.assertIn("read", res["error"])
+
+    def test_available_in_strict_plan_mode(self):
+        self.ctx.plan_mode = True
+        self.ctx.plan_run = False
+        self.assertIn("path_policy", m.plan_active_tools(self.ctx))
+        self.assertIn("path_policy", self.reg._plan_allowed_tools())
+
+    def test_plan_strict_cwd_allowed_home_read_denied(self):
+        self.ctx.plan_mode = True
+        self.ctx.plan_run = False
+        self.assertIn("ALLOW", self._tool(path="./x.txt")["output"])
+        self.assertIn("DENY", self._tool(path="~/notes.txt")["output"])
+
+
+class TestAgenticPromptPathPolicy(unittest.TestCase):
+    """The prompt states the POSITIVE half only; the map lives behind the tool."""
+
+    def setUp(self):
+        self.ctx = m.CommandContext()
+        self.ctx.backend = 'llamacpp'
+        self.ctx.base_url = 'http://127.0.0.1:1'
+        self.ctx.model = 'qwen3.5:9b'
+        self.ctx.agentic_mode = True
+        self.ctx.plan_mode = False
+        self.ctx.plan_run = False
+        self.loop = m.ChatLoop(self.ctx)
+
+    def test_agentic_prompt_lists_allowed_paths_only(self):
+        self.ctx.path_acl.add("read", "allow", "/tmp", source="session")
+        system, _tools, _native = self.loop._agentic_prompt_and_tools()
+        self.assertIn("## Path access", system)
+        self.assertIn("allowed here:", system)
+        self.assertIn(CWD, system)                       # what the model may use
+        self.assertIn("granted this session: /tmp", system)
+        self.assertIn("path_policy", system)             # where the rest lives
+        self.assertNotIn("path policy for this session:", system,
+                         "the full ask/denied map belongs to the path_policy tool")
+
+    def test_plan_prompt_restricts_to_cwd(self):
+        self.ctx.plan_mode = True
+        self.ctx.plan_run = False
+        system, _tools, _native = self.loop._agentic_prompt_and_tools()
+        self.assertIn("read only — strict plan mode", system)
+
+
+class TestRulesBlockPathPolicyRule(unittest.TestCase):
+    """The shared rules block makes `path_policy` the reflex after a denial.
+
+    The denial line already names the tool; this rule makes it a standing
+    instruction for every model and every prompt style (native/inline, normal
+    and plan), so the model does not improvise with `cat`/`python -c`.
+    """
+
+    def test_rule_present_for_every_prompt_style(self):
+        for model in ('qwen3.5:9b', 'nemotron-cascade', 'some-unknown:latest'):
+            for plan in (False, True):
+                prompt = m.get_agentic_prompt(model, plan_mode=plan)
+                self.assertIn("Call path_policy once", prompt, model)
+                self.assertIn("do NOT retry it with run_command/run_python", prompt, model)
 
 
 class TestShellApprovalPrompt(unittest.TestCase):

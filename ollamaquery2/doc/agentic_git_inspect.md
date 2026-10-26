@@ -1,6 +1,7 @@
 # `git_inspect` — read-only git inspection for `/agentic plan`
 
-Status: implemented (`ollamaquery2.py`, v0.3.4)
+Status: implemented (`ollamaquery2.py`, v0.3.5 — actions `status`, `diff`,
+`diff_staged`, `diff_head`, `log` (ref/follow/name_status), `show`, `blame -L`)
 Scope: read-only repository inspection as a first-class tool, no shell involved
 
 ---
@@ -21,26 +22,54 @@ model-supplied git arguments.
 
 ## 2. Actions
 
-| Action          | Command                                          | Answers                                      |
-| --------------- | ------------------------------------------------ | -------------------------------------------- |
-| `status`        | `git status --short --branch -- <scope>`         | what is dirty / untracked, current branch    |
-| `diff`          | `git diff --no-ext-diff --no-textconv …`         | unstaged changes                             |
-| `diff_staged`   | `git diff --cached …`                            | staged changes                               |
-| `diff_head`     | `git diff HEAD …`                                | **everything since the last commit**         |
-| `log`           | `git log -n<limit> --format='%h %s (%an, %ar)'`  | recent commits                               |
-| `show`          | `git show --stat --patch <ref> …`                | one commit: message, diffstat, patch         |
+| Action           | Command                                            | Answers                                   |
+| ---------------- | -------------------------------------------------- | ----------------------------------------- |
+| `status`         | `git status --short --branch -- <scope>`           | what is dirty / untracked, current branch |
+| `diff`           | `git diff --no-ext-diff --no-textconv …`           | unstaged changes                          |
+| `diff_staged`    | `git diff --cached …`                              | staged changes                            |
+| `diff_head`      | `git diff HEAD …`                                  | **everything since the last commit**      |
+| `log`            | `git log -n<limit> --format='…' [<ref>] -- <path>` | recent commits, of `<ref>` / one path     |
+| `log` + `follow` | `git log --follow --name-status --date=short …`    | file history through renames              |
+| `show`           | `git show --stat --patch <ref> …`                  | one commit: message, diffstat, patch      |
+| `blame`          | `git blame --no-textconv -L <a>,<b> …`             | which commit last touched these lines     |
 
 `diff_head` exists because `diff` alone hides staged changes: "what changed
 since the last commit" needs working tree **and** index against `HEAD`.
 
+`log` takes the same `<ref>` as `show` (`main`, `v1.2`, `abc123`, or a range
+such as `main..dev`), so "what landed on that branch?" and "what changed since
+the last release?" are answerable without a shell. With `follow=true` it also
+traverses renames (`--follow`), and `name_status=true` shows the `M`/`A`/`D`/`R`
+line per commit — that pair is the "what happened to this file?" answer.
+
+`blame` is per line, not per file: it reports the commit that last touched a
+range, which is how the model justifies *why* a piece of code looks the way it
+does. The natural chain is `blame` → `show <hash>` → the real rationale (message
++ diff). Lines that are not committed yet are attributed to
+`000000000 (Not Committed Yet)`, which separates in-progress work from legacy.
+
 Arguments:
 
-| Arg        | Type      | Notes                                                       |
-| ---------- | --------- | ----------------------------------------------------------- |
-| `action`   | enum      | default `status`; anything else is rejected                 |
-| `limit`    | integer   | `log` only, clamped to 1..100 (default 20)                  |
-| `ref`      | string    | `show` only, default `HEAD`, regex-validated                |
-| `path`     | string    | optional pathspec, relative and inside the CWD              |
+| Arg           | Type    | Notes                                                                  |
+| ------------- | ------- | ---------------------------------------------------------------------- |
+| `action`      | enum    | default `status`; anything else is rejected                            |
+| `limit`       | integer | `log` only, clamped to 1..100 (default 20)                             |
+| `ref`         | string  | `blame`/`log`/`show` only, default `HEAD`, regex-validated             |
+| `path`        | string  | pathspec inside the CWD; **required** for `blame` and `log follow`     |
+| `lines`       | string  | `blame` only, **required**: 1-based `start,end` (or one line), max 200 |
+| `follow`      | bool    | `log` only: follow renames (needs `path`)                              |
+| `name_status` | bool    | `log` only: which files each commit changed                            |
+
+`ref` is refused (not ignored) for the other actions: silently dropping it
+would answer the wrong question — a `diff` asked against another branch would
+return the working-tree diff, and the model would draw conclusions from it.
+
+`lines` is refused (not defaulted) for `blame`, for the same reason: a missing
+range either needs an arbitrary default or produces a 2 MB pointer for a 17k-line
+file (measured: ~98 bytes per blamed line). git itself is no help here — `-L
+50,10` is silently normalized to 10..50 and an end past EOF is clamped — so the
+range is validated on our side (reversed, non-numeric and > 200-line ranges are
+errors).
 
 ## 3. Why a tool instead of `run_command`
 
@@ -84,6 +113,7 @@ were reproduced in a throwaway repo:
 | Config                                        | Runs on              | Closed by                          |
 | --------------------------------------------- | -------------------- | ---------------------------------- |
 | `diff.<driver>.textconv` (+ `.gitattributes`) | `git diff`           | `--no-textconv`                    |
+| `diff.<driver>.textconv` (+ `.gitattributes`) | **`git blame`**      | `--no-textconv`                    |
 | `core.fsmonitor`                              | `git status`         | `-c core.fsmonitor=false`          |
 | `diff.external` / `GIT_EXTERNAL_DIFF`         | `git diff`           | `--no-ext-diff`                    |
 
@@ -92,6 +122,13 @@ arbitrary-code-execution primitive driven by repository contents. Verified
 before/after: a `.gitattributes`-declared textconv script and a `core.fsmonitor`
 hook both ran under plain `git diff` / `git status`, and neither ran through
 `git_inspect`.
+
+`blame` deserves its own note because it is counter-intuitive: textconv is
+**on by default** there (blame shows converted content), so the flag is not
+cosmetic. Measured in a throwaway repo: `git blame a.txt` ran the textconv
+script, `git blame --no-textconv a.txt` did not. It also keeps the line numbers
+aligned with the raw file — i.e. with `read_file`'s offsets — which the whole
+"blame line 120" workflow depends on.
 
 ### 4.3 State
 
@@ -151,5 +188,13 @@ backstop.
   confirmation.
 - No network operations (`fetch`, `pull`, `push`, `clone`).
 - No arbitrary git flags, and no `-c` passthrough.
-- No blame/archaeology actions; `log` + `show` cover orientation, and deeper
-  history work belongs in full agentic mode.
+- No `blame -w/-M/-C` (whitespace, move and copy detection): the cost explodes
+  (`-C -C` can run for minutes on a large repository) and the result is still
+  one row per line. `-L` + `--no-textconv` are the only blame options exposed.
+- No full-file blame: `lines` is required, so a 17k-line file cannot produce a
+  2 MB observation. For "who owns this file", `log(path=…, follow=true)` is the
+  bounded answer today; a `contributors` (`git shortlog -sne -- <path>`)
+  action would be the next step if that question comes up.
+- No blame of untracked content: git cannot attribute lines that were never
+  committed (`fatal: no such path … in HEAD`), so the handler returns a clear
+  error pointing at `read_file` instead.

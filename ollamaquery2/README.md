@@ -93,6 +93,7 @@ spawnshell are disabled when unavailable.
 | `/image <path>`              | Attach an image to conversation                                                                                              |          |                                                    |        |                                        |
 | `/spawnshell`                | Drop into interactive shell (output sent to LLM on exit)                                                                     |          |                                                    |        |                                        |
 | `/dumpcontext`               | Save conversation to JSON                                                                                                    |          |                                                    |        |                                        |
+| `/promptshow`                | Show the outbound system prompt + tools, read-only (`system`, `tools [name]`, `json`, `save <path>`)                         |          |                                                    |        |                                        |
 | `/contextsizeset <N>`        | Override context window                                                                                                      |          |                                                    |        |                                        |
 | `/quit` `/exit`              | End session (`Ctrl+C` twice / `Ctrl+D` also works)                                                                           |          |                                                    |        |                                        |
 
@@ -115,13 +116,14 @@ spawnshell are disabled when unavailable.
 | `edit_file`                | Precise string replacement                                                                             |
 | `apply_patch`              | Apply diff with file headers                                                                           |
 | `kubernetes_cluster_query` | Read-only OpenShift/Kubernetes cluster consultation (online `oc`/`kubectl`, offline `omc` must-gather) |
-| `git_inspect`              | Read-only git inspection: `status`, `diff`, `diff_staged`, `diff_head`, `log`, `show` (fixed argv, no shell) |
+| `git_inspect`              | Read-only git inspection: `status`, `diff`, `diff_staged`, `diff_head`, `log` (any ref, path-scoped, renames followed), `show`, `blame -L` (fixed argv, no shell) |
+| `path_policy`              | Read-only: the session path map (allowed / needs confirmation / forbidden), or the verdict for one path — no filesystem access, no prompt |
 
 Subcommands: `/agentic auto`, `plan [on|off|run]`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `iterations <N>`, `timeout <N>`.
 
 `/agentic plan` enables read-only planner mode. The default (strict) tier restricts
 the tool surface to `read_file`, `glob`, `grep`, `list_directory`, `fetch_url`,
-`diff`, `kubernetes_cluster_query`, and `git_inspect`, with **no shell**, and
+`diff`, `kubernetes_cluster_query`, `git_inspect`, and `path_policy`, with **no shell**, and
 confines every path to the current working directory — requests outside it (e.g.
 `read_file /home/...`) are refused outright, never prompted. `/agentic plan run`
 is the deeper tier: it re-adds `run_command`, which always asks for confirmation
@@ -141,14 +143,33 @@ File tools (`read_file`, `write_file`, `edit_file`, `list_directory`) and
 | `$HOME` (explicit `~` / absolute) | allow  | deny    |
 | `$HOME` dotfiles (`~/.*`)         | ask    | ask     |
 | `/proc`, `/sys`, `/etc`           | ask    | deny    |
-| anything else outside CWD/`$HOME` | deny   | deny    |
+| anything else outside CWD/`$HOME` | ask    | deny    |
 
 - `ask` prompts per access and is never auto-approved (bypass-immune to
   `/agentic auto`); non-TTY runs deny and log it.
+- **What the model sees, and when.** The agentic system prompt states the
+  *positive* half — the roots it may use, plus the grants made this session —
+  and points at the `path_policy` tool for everything else. A refusal is then one
+  line, not a wall of rules:
+  `[path ACL denied] read /var/log/syslog — outside the project and $HOME, not granted; call path_policy for the allowed paths …`
+  The full map (allowed / one-confirmation / forbidden / session grants, deny
+  rules first, with the `/agentic acl allow <path> read` remedy) is returned by
+  `path_policy`, which is also usable *before* touching a path: `path_policy`
+  with `path` reports `ALLOW` / `ASK` / `DENY` for that path without accessing it
+  and without triggering a confirmation prompt. The shared agentic rules block
+  makes that reflex explicit: a denial means stop, call `path_policy` once, then
+  use an allowed path — never reroute through `run_command`/`run_python`.
+- Reads outside the project are `ask`, not `deny`, on purpose: the gate is a
+  consent + audit layer, not a sandbox. The shell can read the same file anyway,
+  so a silent deny only pushed the model onto the least-audited channel.
 - Sensitive virtual files (`/proc/*/mem`, `environ`, `kcore`, `/proc/*/fd/*`) are
   hard-blocked regardless of rules.
 - `run_command` is now path-aware: `cat /etc/passwd`, `head /sys/...` etc.
-  require approval even though `cat`/`head` are otherwise allowed.
+  require approval even though `cat`/`head` are otherwise allowed. Absolute
+  paths hidden inside a code blob are seen too — `python3 -c
+  "open('/etc/passwd')"`, `sh -c 'cat /etc/passwd'`, `dd if=/etc/shadow` are
+  caught, while prose that merely names a path (`git commit -m 'fix /etc
+  handling'`) is not scanned.
 
 Inspect and influence the policy with `/agentic acl`:
 

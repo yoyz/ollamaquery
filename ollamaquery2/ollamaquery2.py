@@ -65,7 +65,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.3.4"
+__version__ = "0.3.5"
 
 
 # ============================================================================
@@ -468,6 +468,13 @@ COMMANDS = {
         'category': 'Model',
         'description': 'List available agentic tools',
         'usage': '/listtool',
+        'handler': None
+    },
+    'promptshow': {
+        'aliases': ['/promptshow', '/showprompt'],
+        'category': 'Settings',
+        'description': 'Show the system prompt and tools the next request sends (read-only)',
+        'usage': '/promptshow [system|tools [name]|json|save <path>|help]',
         'handler': None
     },
     'mcp': {
@@ -2756,6 +2763,7 @@ AGENTIC_EXAMPLE_NATIVE = """## ReAct protocol (Think → Act → Observe → Ans
 AGENTIC_RULES_BLOCK = """## General rules
 - Be precise with file paths. If you create a file in a subdirectory, use the same path when compiling or reading it later.
 - Mirror the user's language — if they write in French, reply in French.
+- A path refused by the path ACL (`[path ACL denied]`) means stop that attempt: do NOT retry it with run_command/run_python. Call path_policy once to see what you may use, then continue with an allowed path or tell the user what to grant.
 - The user's message may already include file contents they referenced (marked `[Content of local file ...]`). If the information you need is already in the conversation, answer directly — do NOT call tools merely to confirm, re-read, or "explore" what you were already given."""
 
 # Strict read-only planning-mode block, appended when `/agentic plan` is active.
@@ -2767,7 +2775,7 @@ AGENTIC_PLAN_BLOCK = """## Read-only planning mode
 You are operating in READ-ONLY PLANNING MODE. Your job is to INSPECT and PLAN, never to change anything.
 
 - You MUST NOT modify, create, delete, move, or overwrite any files, and you MUST NOT change any system state.
-- Only use the tools available to you to read and inspect: read_file, list_directory, glob, grep, fetch_url, diff, git_inspect, kubernetes_cluster_query.
+- Only use the tools available to you to read and inspect: read_file, list_directory, glob, grep, fetch_url, diff, git_inspect, kubernetes_cluster_query, path_policy (which paths you may touch).
 - You are confined to the project's current working directory. Requests for paths outside it are REFUSED automatically — do not attempt /home, /etc, /proc, /sys, or any absolute path outside the project.
 - Never attempt write_file, run_python, run_command, patch, edit_file, or apply_patch — they are disabled in this mode. There is no shell access.
 - When you have gathered enough information, present a clear, step-by-step plan to the user. Do NOT execute the plan yourself."""
@@ -2778,7 +2786,7 @@ AGENTIC_PLAN_RUN_BLOCK = """## Read-only planning mode (run)
 You are operating in READ-ONLY PLANNING MODE. Your job is to INSPECT and PLAN, never to change anything.
 
 - You MUST NOT modify, create, delete, move, or overwrite any files, and you MUST NOT change any system state.
-- Only use the tools available to you to read and inspect: read_file, list_directory, glob, grep, fetch_url, diff, git_inspect, kubernetes_cluster_query, and run_command.
+- Only use the tools available to you to read and inspect: read_file, list_directory, glob, grep, fetch_url, diff, git_inspect, kubernetes_cluster_query, path_policy (which paths you may touch), and run_command.
 - For run_command, only issue read-only inspection commands (e.g. ls, cat, head, git status, git diff, ps, grep, find). The user is asked to confirm every command before it runs. Prefer the git_inspect tool over a shell `git` command: it needs no confirmation and cannot mutate anything.
 - Never attempt write_file, run_python, patch, edit_file, or apply_patch — they are disabled in this mode.
 - When you have gathered enough information, present a clear, step-by-step plan to the user. Do NOT execute the plan yourself."""
@@ -2921,6 +2929,25 @@ MODEL_INFERENCE_PARAMS_REGISTRY = {
         "temperature": 0.7,
         "top_p": 1.0,
         "min_p": 0.01,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+    "qwen3.8": {
+        # Source: the checkpoint's own GGUF metadata (verified on
+        # Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf, shard 1):
+        #   general.sampling.temp = 1.0, general.sampling.top_p = 0.95,
+        #   general.sampling.top_k = 20
+        # MUST be matched before the generic "qwen3" key (substring collision —
+        # "qwen3" is contained in "qwen3.8"), otherwise this reasoning
+        # checkpoint silently inherits the qwen3-8B values (0.5/0.9), which
+        # over-constrain sampling on a thinking model and correlate with
+        # degenerate/meta-reasoning loops (the model narrating phantom harness
+        # messages instead of working). Same failure class already documented
+        # on the qwen3.6 entry below.
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
     },
@@ -3927,6 +3954,71 @@ def _shell_operand_realpath(tok: str) -> Optional[str]:
         return None
 
 
+# Absolute-path (or `~`-rooted) fragment inside an opaque shell token (a code or
+# command blob). The lookbehind keeps URLs (`https://host/path`), doubled
+# slashes, env refs and relative fragments from matching, so only a genuine
+# absolute path is extracted.
+_EMBEDDED_ABS_PATH_RE = re.compile(
+    r"(?<![\w:/.])((?:~|/)[A-Za-z0-9_.@%+,~/;-][A-Za-z0-9_.@%+,:/-]*)")
+
+# Programs whose quoted argument is code/commands, so an absolute path inside it
+# is a real access (`python3 -c "open('/etc/passwd')"`, `sh -c 'cat /etc/passwd'`).
+# Prose arguments of other programs (`git commit -m "fix /etc handling"`,
+# `grep "/proc/self/cgroup" docs/`) are deliberately NOT scanned — they mention a
+# path without touching it, and a prompt there would be pure noise.
+_SHELL_CODE_PROGRAMS = frozenset({
+    "python", "python2", "python3", "sh", "bash", "zsh", "dash", "ksh", "fish",
+    "perl", "ruby", "node", "nodejs", "php", "awk", "gawk", "sed", "env",
+    "xargs", "eval", "exec", "curl", "wget",
+})
+
+# Code-ish characters that mark a token as a blob even for an unknown program
+# (`dd if=/etc/shadow`, `open('/etc/passwd')`).
+_SHELL_CODE_CHARS = frozenset("()=;$`")
+
+
+def _shell_token_path_candidates(tok: str, program: str = "") -> list:
+    """Resolve one shell token to candidate realpaths for ACL scanning.
+
+    Returns the whole-token resolution (when the token looks like a path), plus
+    every absolute path embedded anywhere inside it when the token is code (a
+    `python3 -c` / `sh -c` blob, or `if=/etc/shadow`).
+
+    The embedded pass is what makes `python3 -c "open('/etc/passwd')"` and
+    `sh -c 'cat /etc/passwd'` visible: the whole token is a code/command blob,
+    not a path, so the whole-token resolution only produced garbage resolved
+    against the CWD and matched no rule. Blobs that *begin* with an absolute
+    path (`echo "/etc/passwd is a file"`) were already caught, so this completes
+    an existing rule rather than introducing a new one.
+
+    Non-code arguments are skipped on purpose: `git commit -m "fix /etc
+    handling"` or `grep "/proc/self/cgroup" docs/` mention a path without
+    touching it, and prompting there would be noise.
+
+    Args:
+        tok: A shell token (argument or command word).
+        program: The node's command word, used to recognise interpreters.
+
+    Returns:
+        List of realpaths (may be empty).
+    """
+    out = []
+    rp = _shell_operand_realpath(tok)
+    if rp:
+        out.append(rp)
+    prog = os.path.basename(program or "").lower()
+    if prog not in _SHELL_CODE_PROGRAMS and not any(c in tok for c in _SHELL_CODE_CHARS):
+        return out
+    for frag in _EMBEDDED_ABS_PATH_RE.findall(tok):
+        try:
+            real = os.path.realpath(os.path.expanduser(frag))
+        except Exception:
+            continue
+        if real not in out:
+            out.append(real)
+    return out
+
+
 def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[dict]:
     """Scan command operands against PathAcl (run_command path awareness).
 
@@ -3934,6 +4026,12 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
     plus anything the user added. The generic outside-CWD default deny is NOT
     applied (the shell gate already owns that). Sensitive virtual files
     (/proc/*/mem etc.) are hard-denied.
+
+    Operands are scanned both as-is and, for code blobs (`python3 -c`,
+    `sh -c`, `if=/etc/shadow`), by extracting absolute paths embedded inside
+    them — otherwise `python3 -c "open('/etc/passwd')"` silently bypassed a
+    rule that `cat /etc/passwd` respects. Non-code arguments that merely
+    mention a path (`git commit -m "fix /etc handling"`) are not scanned.
 
     Args:
         command: The raw command string.
@@ -3952,31 +4050,36 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
         if not toks:
             continue
         for tok in toks[1:]:
-            rp = _shell_operand_realpath(tok)
-            if rp is None:
-                continue
-            if _is_blocked_system_file(rp):
-                acl.log_event("run_command", rp, "deny", None)
-                return {"approved": False, "reason": f"System file blocked (sensitive virtual file): {rp}"}
-            decision, rule = acl.evaluate("read", rp, explicit_only=True)
-            if rule is None:
-                continue
-            if decision == "deny" and deny_info is None:
-                deny_info = (tok, rp, rule)
-            elif decision == "ask" and ask_info is None:
-                ask_info = (tok, rp, rule)
+            for rp in _shell_token_path_candidates(tok, toks[0]):
+                if _is_blocked_system_file(rp):
+                    acl.log_event("run_command", rp, "deny", None)
+                    return {"approved": False,
+                            "reason": f"[path ACL denied] {rp} — System file blocked "
+                                      f"(sensitive virtual file); {ACL_DENIAL_HINT}"}
+                decision, rule = acl.evaluate("read", rp, explicit_only=True)
+                if rule is None:
+                    continue
+                if decision == "deny" and deny_info is None:
+                    deny_info = (tok, rp, rule)
+                elif decision == "ask" and ask_info is None:
+                    ask_info = (tok, rp, rule)
     if deny_info:
         _, rp, rule = deny_info
         acl.log_event("run_command", rp, "deny", rule)
         shown = rule["path"] if rule.get("kind") == "prefix" else "home dotfile"
-        return {"approved": False, "reason": f"denied by path ACL rule: {rule['action']} {shown}"}
+        return {"approved": False,
+                "reason": f"[path ACL denied] {rp} — denied by path ACL rule: "
+                          f"{rule['action']} {shown}; {ACL_DENIAL_HINT}"}
     if ask_info:
         _, rp, rule = ask_info
         granted = acl.prompt("read", rp, rule, tool="run_command", context=command)
         acl.log_event("run_command", rp, "allow" if granted else "deny", rule)
         if not granted:
             shown = rule["path"] if rule.get("kind") == "prefix" else "home dotfile"
-            return {"approved": False, "reason": f"denied by user (path ACL ask {shown})"}
+            who = "denied by user" if sys.stdin.isatty() else "denied (no TTY to ask)"
+            return {"approved": False,
+                    "reason": f"[path ACL denied] {rp} — {who} "
+                              f"(path ACL ask {shown}); {ACL_DENIAL_HINT}"}
     return None
 
 
@@ -4282,6 +4385,16 @@ AGENTIC_TOOL_DEFS = {
             "required": ["command"]
         }
     },
+    "path_policy": {
+        "description": "Read-only. Show which paths you may use in this session (allowed / needs one confirmation / forbidden), or check one path before using it. Pass `path` to get the verdict for that specific path without touching it; omit it to list the whole map. Use this instead of retrying a denied path with another tool.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Optional path to check (absolute, ~/..., or relative to the CWD)"},
+                "op": {"type": "string", "enum": ["read", "write"], "description": "Operation to check (default: read)"}
+            }
+        }
+    },
     "diff": {
         "description": "Generate a unified diff between two files. Pure Python.",
         "parameters": {
@@ -4350,14 +4463,17 @@ AGENTIC_TOOL_DEFS = {
         }
     },
     "git_inspect": {
-        "description": "Inspect the git repository in the current project READ-ONLY: never writes, stages, commits, or runs a shell. Use it to orient yourself before planning — what is dirty, what changed, what the history looks like. Actions: status (short status + branch), diff (unstaged changes), diff_staged (staged changes), diff_head (ALL changes since the last commit — the best single answer to \"what changed?\"), log (recent commits), show (one commit: message + diffstat + patch). The command is fixed: there are no arbitrary git arguments. Pass `path` to restrict status/diff/show to one file or directory. Large output is spilled to a file you must page with read_file.",
+        "description": "Inspect the git repository in the current project READ-ONLY: never writes, stages, commits, or runs a shell. Use it to orient yourself before planning — what is dirty, what changed, what the history looks like, and who last touched a given line. Actions: status (short status + branch), diff (unstaged changes), diff_staged (staged changes), diff_head (ALL changes since the last commit — the best single answer to \"what changed?\"), log (recent commits, optionally of a specific branch/tag/range, optionally following renames), show (one commit: message + diffstat + patch), blame (which commit last touched a line range — the way to justify why code looks the way it does; then call show on the commit it reports). The command is fixed: there are no arbitrary git arguments. Pass `ref` to pick the revision for blame/log/show (branch, tag, hash, or 'main..dev'). For blame, `path` and `lines` are required. Large output is spilled to a file you must page with read_file.",
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["status", "diff", "diff_staged", "diff_head", "log", "show"], "description": "What to inspect (default: status)"},
+                "action": {"type": "string", "enum": ["status", "diff", "diff_staged", "diff_head", "log", "show", "blame"], "description": "What to inspect (default: status)"},
                 "limit": {"type": "integer", "description": "log only: number of commits to show (default 20, max 100)"},
-                "ref": {"type": "string", "description": "show only: branch, tag, or commit hash to inspect (default: HEAD)"},
-                "path": {"type": "string", "description": "Optional relative path inside the project to restrict status/diff/show to, e.g. 'ollamaquery2.py' or 'tests/'"}
+                "ref": {"type": "string", "description": "blame/log/show only: branch, tag, commit hash, or range to inspect, e.g. 'main', 'v1.2', 'abc123', 'main..dev' (default: HEAD)"},
+                "path": {"type": "string", "description": "Optional relative path inside the project to restrict status/diff/show/log to; REQUIRED for blame (one tracked file) and for log follow, e.g. 'ollamaquery2.py' or 'tests/'"},
+                "lines": {"type": "string", "description": "blame only (required): 1-based line range 'start,end' (e.g. '120,150'), or a single line '42'. Maximum 200 lines per call; read the file first to get the numbers."},
+                "follow": {"type": "boolean", "description": "log only: follow renames so the file's full history is listed (requires `path`)"},
+                "name_status": {"type": "boolean", "description": "log only: show which files each commit changed (M/A/D/R per path)"}
             },
             "required": []
         }
@@ -4377,7 +4493,7 @@ DESTRUCTIVE_TOOLS = {"write_file", "run_python", "run_command", "patch", "edit_f
 # run_command, patch, edit_file, apply_patch) is hidden from the prompt/tools
 # API AND denied at the execution backstop.
 PLAN_MODE_TOOLS = {"read_file", "glob", "grep", "list_directory", "fetch_url",
-                   "diff", "kubernetes_cluster_query", "git_inspect"}
+                   "diff", "kubernetes_cluster_query", "git_inspect", "path_policy"}
 
 # Deeper `/agentic plan run` tier: re-adds run_command, which still asks for
 # confirmation on every invocation (bypass-immune). The path confinement of the
@@ -4443,7 +4559,12 @@ GIT_INSPECT_STRIP_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR",
                          "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
                          "GIT_ASKPASS")
 GIT_INSPECT_READ_CHUNK = 65536  # chars per stdout read while bounding capture
-GIT_INSPECT_ACTIONS = ("status", "diff", "diff_staged", "diff_head", "log", "show")
+GIT_INSPECT_ACTIONS = ("status", "diff", "diff_staged", "diff_head", "log", "show", "blame")
+# `ref` is meaningful for the revision-taking actions only. Silently ignoring it
+# elsewhere is worse than refusing: a model asking for `diff` of another branch
+# would be handed the working-tree diff and answer confidently about the wrong
+# thing. Any other action + ref is therefore an explicit error.
+GIT_INSPECT_REF_ACTIONS = ("blame", "log", "show")
 GIT_INSPECT_TIMEOUT = 30
 GIT_INSPECT_LOG_LIMIT_DEFAULT = 20
 GIT_INSPECT_LOG_LIMIT_MAX = 100
@@ -4452,6 +4573,14 @@ GIT_INSPECT_BASE = ["git", "-c", "core.pager=cat", "-c", "core.fsmonitor=false",
                     "-c", "core.quotepath=false", "--no-optional-locks"]
 GIT_INSPECT_DIFF_FLAGS = ["--no-ext-diff", "--no-textconv", "--no-color"]
 GIT_INSPECT_LOG_FORMAT = "%h %s (%an, %ar)"
+# File-history mode (`log` with follow/name_status) uses absolute dates: relative
+# dates ("3 days ago") are useless once you are comparing commits months apart.
+GIT_INSPECT_LOG_HISTORY_FORMAT = "%h %ad %s (%an)"
+# `blame` is O(history) per line and prints one row per source line, so an
+# unbounded range is both slow and far past the spill threshold. -L is required
+# and every range is capped.
+GIT_INSPECT_BLAME_MAX_LINES = 200
+GIT_INSPECT_LINES_RE = re.compile(r"^\s*(\d{1,7})\s*(?:,\s*(\d{1,7})\s*)?$")
 # A ref is only ever a revision expression: it cannot start with `-` (so it can
 # never be parsed as an option) and contains no shell/whitespace metacharacters.
 GIT_INSPECT_REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./~^@{}-]{0,200}$")
@@ -4768,6 +4897,37 @@ def _raw_is_home_explicit(raw_path: str) -> bool:
 # ============= PATH ACL (session-scoped allow/ask/deny)  ====================
 # ============================================================================
 
+# How many session rules (from /agentic acl allow|ask|deny) are echoed to the
+# model in the policy reminder. Bounded so a heavily-tuned session cannot blow
+# up the observation budget on every denial.
+PATH_POLICY_MAX_SESSION_RULES = 8
+
+# Appended to every path-ACL denial. Deliberately one line: the allowed roots are
+# already stated in the system prompt and the full map is one `path_policy` call
+# away, so a repeated refusal must not re-push the whole policy into the context.
+ACL_DENIAL_HINT = ("call path_policy for the allowed paths — the same policy applies "
+                   "to run_command/run_python, so do not bypass")
+
+
+def _shorten_home(path: str) -> str:
+    """Render a path with $HOME abbreviated as `~` (model-facing brevity).
+
+    Args:
+        path: An absolute realpath.
+
+    Returns:
+        The path, with a leading $HOME replaced by `~` when it is a prefix.
+    """
+    home = os.path.realpath(os.path.expanduser("~"))
+    try:
+        if os.path.commonpath([home, path]) == home:
+            rest = path[len(home):]
+            return "~" + rest if rest else "~"
+    except ValueError:
+        pass
+    return path
+
+
 class PathAcl:
     """Session-scoped access policy for file tools and shell command operands.
 
@@ -4779,14 +4939,18 @@ class PathAcl:
     Evaluation precedence (highest wins):
       1. explicit rule match — most-specific (longest realpath), session over default
       2. implicit default — inside CWD → allow; read inside $HOME (non-dotfile) → allow
-      3. everything else → deny
+      3. everything else → `ask` for reads, `deny` for writes
 
     `ask` is bypass-immune: auto_confirm never auto-approves it (same as the
     dotfile gate). Non-TTY runs deny `ask` silently and record the denial.
 
-    Default policy (steering-first): CWD + $HOME allowed; home dotfiles,
-    /proc, /sys, /etc are `ask` (reminder prompt); everything else outside
-    CWD/$HOME is denied.
+    Default policy (steering-first): CWD + $HOME reads allowed; home dotfiles,
+    /proc, /sys, /etc are `ask` (reminder prompt); a read anywhere else is
+    `ask` (confirmed once, then a session allow rule); a write anywhere else is
+    denied. Reads are deliberately `ask` rather than `deny`: the gate is a
+    consent + audit layer, not a sandbox — `run_command`/`run_python` can
+    already read any path the OS allows, so a silent deny here only teaches the
+    model to route around the ACL through the least-audited channel.
     """
 
     def __init__(self) -> None:
@@ -4891,7 +5055,96 @@ class PathAcl:
                     return "allow", None
             except ValueError:
                 pass
+            # Outside CWD and $HOME: confirm once instead of denying silently.
+            # A denial here protects nothing (the shell can read the same path)
+            # and only pushes the model onto the least-audited channel.
+            return "ask", None
         return "deny", None
+
+    def allowed_lines(self, limit: int = PATH_POLICY_MAX_SESSION_RULES) -> list:
+        """Render only what the model MAY touch (the positive half of the map).
+
+        This is what goes in the system prompt: the actionable list. The
+        ask/denied detail and the grant command live behind the `path_policy`
+        tool, so a denial can stay one line instead of re-sending the whole map.
+
+        Args:
+            limit: Max session-granted paths to echo before "+N more".
+
+        Returns:
+            List of short lines.
+        """
+        cwd = os.path.realpath(os.getcwd())
+        home = os.path.realpath(os.path.expanduser("~"))
+        lines = [f"{cwd} (cwd, read+write); {home} (read, when asked as ~/... "
+                 "or an absolute path)"]
+        granted = [r["path"] for r in self.rules
+                   if r["source"] == "session" and r["action"] == "allow"
+                   and r.get("kind") == "prefix"]
+        if granted:
+            shown = [_shorten_home(p) for p in sorted(granted)[:limit]]
+            more = f" (+{len(granted) - len(shown)} more)" if len(granted) > len(shown) else ""
+            lines.append("granted this session: " + ", ".join(shown) + more)
+        return lines
+
+    def describe(self, plan_strict: bool = False,
+                 limit: int = PATH_POLICY_MAX_SESSION_RULES) -> list:
+        """Render the effective policy as bounded, model-facing lines.
+
+        One source for both views, so they cannot drift: the agentic system
+        prompt (so the model rarely needs a denial at all) and every ACL denial
+        (so a denied attempt tells the model what it MAY touch instead of
+        leaving it to hunt for another tool that will do the same thing).
+
+        Args:
+            plan_strict: True in `/agentic plan` (CWD-only, no shell), which
+                replaces the normal allow/ask/deny summary.
+            limit: Max session rules to echo before collapsing to "+N more".
+
+        Returns:
+            List of short lines (no leading header, no remedy line).
+        """
+        cwd = os.path.realpath(os.getcwd())
+        home = os.path.realpath(os.path.expanduser("~"))
+        if plan_strict:
+            return [
+                f"allowed : {cwd} (read only — strict plan mode, no shell)",
+                "denied  : every path outside it, and every write",
+            ]
+        lines = [
+            f"allowed : {cwd} (cwd, read+write); {home} (read, when asked as ~/... "
+            "or an absolute path)",
+            "ask     : $HOME dotfiles, /proc, /sys, /etc — one confirmation each; if the user "
+            "declines, stop and say what you needed",
+            "denied  : writes outside the allowed roots; /proc/*/mem, /proc/*/environ, "
+            "/proc/*/kcore, /proc/*/fd/*",
+        ]
+        session = [r for r in self.rules if r["source"] == "session"]
+        if session:
+            groups = {}
+            for rule in session:
+                where = (_shorten_home(rule["path"]) if rule.get("kind") == "prefix"
+                         else "~ dotfiles")
+                groups.setdefault((rule["op"], rule["action"]), []).append(where)
+            # Deny first: a rule the user explicitly forbade is the most
+            # important line in the block, and a long allow list must never
+            # starve it out of the budget.
+            action_rank = {"deny": 0, "ask": 1, "allow": 2}
+            parts = []
+            shown = 0
+            ordered = sorted(groups.items(),
+                             key=lambda kv: (action_rank.get(kv[0][1], 3), kv[0][0]))
+            for idx, ((op, action), paths) in enumerate(ordered):
+                left_groups = len(ordered) - idx - 1
+                budget = max(1, limit - shown - left_groups)
+                take = paths[:max(1, budget)]
+                shown += len(take)
+                parts.append(f"{action} {op}: {', '.join(take)}")
+            more = f" (+{len(session) - shown} more)" if len(session) > shown else ""
+            lines.append("session : " + "; ".join(parts) + more)
+        else:
+            lines.append("session : no extra grants")
+        return lines
 
     def log_event(self, tool: str, path: str, decision: str, rule: Optional[dict] = None) -> None:
         """Record a path ACL decision in the rolling log (capped at 100 entries).
@@ -4933,8 +5186,10 @@ class PathAcl:
             print(colorize(f"  from: {context}", 'muted'), file=sys.stderr)
         if rule and rule.get("kind") == "prefix":
             print(colorize(f"  rule: {rule['action']} {rule['path']}", 'muted'), file=sys.stderr)
-        else:
+        elif rule and rule.get("kind") == "home_dotfile":
             print(colorize("  rule: ask home dotfile", 'muted'), file=sys.stderr)
+        else:
+            print(colorize("  rule: outside the project and $HOME", 'muted'), file=sys.stderr)
         try:
             reply = input(colorize("Allow? [y/N/s/a/d] (s/a = this session, d = deny): ", 'warning')).strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -4946,6 +5201,43 @@ class PathAcl:
                 self.add(op, "allow", realpath, source="session")
             return True
         return False
+
+
+def _acl_policy_block(acl: Optional['PathAcl'], plan_strict: bool = False,
+                      detail: str = "full") -> str:
+    """Render the session path policy as a reminder block.
+
+    Two consumers, one renderer:
+      - the agentic system prompt (`detail="allowed"`): the positive list only,
+        plus a pointer to the `path_policy` tool for the rest;
+      - the `path_policy` tool and `/agentic acl status` (`detail="full"`): the
+        whole map including ask/denied classes and the grant command.
+
+    Denials no longer embed this block: they name the specific reason and point
+    at the tool, so a repeated refusal cannot flood the context with the policy.
+
+    Args:
+        acl: The session PathAcl (None → empty string, e.g. no context).
+        plan_strict: True in strict `/agentic plan` (CWD-only, no shell).
+        detail: "allowed" (prompt) or "full" (tool output).
+
+    Returns:
+        A multi-line block, or "" when no ACL is available.
+    """
+    if acl is None:
+        return ""
+    if detail == "allowed" and not plan_strict:
+        lines = ["allowed here:"]
+        lines.extend("  " + line for line in acl.allowed_lines())
+        lines.append("  anything else is ask (one confirmation) or denied — call "
+                     "path_policy to see the full map or to check a path before using it")
+        return "\n".join(lines)
+    lines = ["path policy for this session:"]
+    lines.extend("  " + line for line in acl.describe(plan_strict=plan_strict))
+    lines.append("  needed outside these? the user grants it with "
+                 "/agentic acl allow <path> read — the same policy applies to "
+                 "run_command/run_python, so do not bypass")
+    return "\n".join(lines)
 
 
 def _path_acl_decision(ctx: Optional['CommandContext'], op: str, realpath: str, tool: str, context: str = "", raw_path: Optional[str] = None) -> tuple:
@@ -4971,12 +5263,13 @@ def _path_acl_decision(ctx: Optional['CommandContext'], op: str, realpath: str, 
     acl = getattr(ctx, "path_acl", None) if ctx is not None else None
     if acl is None:
         return "allow", None
-    if _is_blocked_system_file(realpath):
-        acl.log_event(tool, realpath, "deny", None)
-        return "deny", "System file blocked (sensitive virtual file)"
-    decision, rule = acl.evaluate(op, realpath)
     plan_strict = (ctx is not None and getattr(ctx, "plan_mode", False)
                    and not getattr(ctx, "plan_run", False))
+    if _is_blocked_system_file(realpath):
+        acl.log_event(tool, realpath, "deny", None)
+        return "deny", (f"[path ACL denied] {op} {realpath} — System file blocked "
+                        f"(sensitive virtual file); {ACL_DENIAL_HINT}")
+    decision, rule = acl.evaluate(op, realpath)
     if plan_strict:
         # Strict /agentic plan is confined to CWD: any implicit allow outside
         # CWD (the $HOME read allowance) and every `ask` rule become a hard
@@ -5014,12 +5307,21 @@ def _path_acl_decision(ctx: Optional['CommandContext'], op: str, realpath: str, 
             decision = "allow" if granted else "deny"
     acl.log_event(tool, realpath, decision, rule)
     if decision == "deny":
-        if rule is not None:
-            shown = rule["path"] if rule.get("kind") == "prefix" else "home dotfile"
-            return "deny", f"denied by path ACL rule: {rule['action']} {shown}"
+        head = f"[path ACL denied] {op} {realpath}"
         if plan_strict:
-            return "deny", "Strict plan mode is confined to the current working directory"
-        return "deny", "Path traversal denied"
+            # Plan mode has no askable path: reporting the rule ("ask /etc")
+            # would invite a retry that can never succeed.
+            reason = ("strict plan mode is confined to "
+                      f"{os.path.realpath(os.getcwd())}")
+        elif rule is not None:
+            shown = rule["path"] if rule.get("kind") == "prefix" else "home dotfile"
+            reason = f"denied by path ACL rule: {rule['action']} {shown}"
+        elif op == "read":
+            # Implicit `ask` that was not granted (user declined / no TTY).
+            reason = "outside the project and $HOME, not granted"
+        else:
+            reason = "write outside the project and $HOME (denied)"
+        return "deny", f"{head} — {reason}; {ACL_DENIAL_HINT}"
     return "allow", None
 
 def _tool_handle_read_file(self, args: dict) -> dict:
@@ -5738,6 +6040,69 @@ def _tool_handle_run_command(self, args: dict) -> dict:
     if result["stderr"]:
         output += f"\n[stderr]\n{result['stderr']}"
     return {"success": result["returncode"] == 0, "output": output, "error": result["stderr"] or None}
+
+
+def _tool_handle_path_policy(self, args: dict) -> dict:
+    """Report the session path policy, or the verdict for one path (read-only).
+
+    No filesystem access and no prompt: this is the tool a denied model calls to
+    learn the map instead of probing the gate with `cat`/`python -c`. The
+    per-path verdict is deliberately side-effect free — it reports `ask` as a
+    decision instead of triggering the confirmation, so the model can choose an
+    allowed path (or ask the user) without costing a prompt.
+
+    Args:
+        args: Tool arguments with optional "path" and "op" ("read"/"write").
+
+    Returns:
+        {"success": bool, "output": str, "error": str|None}.
+    """
+    ctx = self._ctx if self._ctx is not None else (CommandContext() if CommandContext._initialized else None)
+    acl = getattr(ctx, "path_acl", None) if ctx is not None else None
+    if acl is None:
+        return {"success": True, "output": "No path ACL is mounted (all paths allowed).",
+                "error": None}
+    plan_strict = (ctx is not None and getattr(ctx, "plan_mode", False)
+                   and not getattr(ctx, "plan_run", False))
+    raw = args.get("path")
+    if not raw:
+        return {"success": True, "output": _acl_policy_block(acl, plan_strict=plan_strict),
+                "error": None}
+
+    op = str(args.get("op", "read")).lower()
+    if op not in ("read", "write"):
+        return {"success": False, "output": "", "error": "op must be 'read' or 'write'"}
+    raw = str(raw).strip()
+    if raw.startswith("~") or raw.startswith("/"):
+        realpath = os.path.realpath(os.path.expanduser(raw))
+    else:
+        realpath = os.path.realpath(os.path.join(os.getcwd(), raw))
+
+    if _is_blocked_system_file(realpath):
+        return {"success": True, "output": (
+            f"{realpath}\n  {op}: DENIED (hard-blocked sensitive virtual file — no rule can allow it)"),
+            "error": None}
+    decision, rule = acl.evaluate(op, realpath)
+    if plan_strict:
+        cwd_real = os.path.realpath(os.getcwd())
+        try:
+            in_cwd = os.path.commonpath([cwd_real, realpath]) == cwd_real
+        except ValueError:
+            in_cwd = False
+        if decision == "ask" or (decision == "allow" and rule is None and not in_cwd):
+            decision = "deny"
+    advice = {
+        "allow": "you may use it",
+        "ask": "needs one user confirmation (bypass-immune; non-TTY denies) — prefer an "
+               "allowed path, or ask the user in your reply",
+        "deny": "do not use it, and do not retry it with run_command/run_python — the user "
+                "can grant it with /agentic acl allow <path> read",
+    }[decision]
+    where = ("rule: " + (rule["path"] if rule.get("kind") == "prefix" else "home dotfile")
+             if rule is not None else "no explicit rule")
+    return {"success": True,
+            "output": f"{realpath}\n  {op}: {decision.upper()} — {advice} ({where})",
+            "error": None}
 
 
 def _tool_handle_diff(self, args: dict) -> dict:
@@ -6677,14 +7042,54 @@ def _git_safe_pathspec(raw: str) -> tuple:
     return candidate, ""
 
 
-def _git_inspect_argv(action: str, limit: int, ref: str, pathspec: str) -> list:
+def _git_parse_line_range(raw) -> tuple:
+    """Validate a 1-based line range for `blame` as `start,end`.
+
+    git silently normalizes what it does not like here: `-L 50,10` is accepted
+    and treated as 10..50, and an end past EOF is clamped. Either one would make
+    the model blame a different region than it asked for, so the range is
+    validated (and normalized) on our side instead.
+
+    Args:
+        raw: The model-supplied `lines` argument ("120,150" or a single "42").
+
+    Returns:
+        (line_range, error). `line_range` is the normalized `start,end` string;
+        `error` is empty when it is usable.
+    """
+    text = str(raw if raw is not None else "").strip()
+    if not text:
+        return "", ("blame needs `lines` (1-based 'start,end', e.g. '120,150' — "
+                    "read the file first to get line numbers)")
+    match = GIT_INSPECT_LINES_RE.match(text)
+    if not match:
+        return "", f"lines must be numeric 'start,end' or a single line (got {raw!r})"
+    start = int(match.group(1))
+    end = int(match.group(2) or start)
+    if start < 1:
+        return "", "lines must start at 1 or later"
+    if end < start:
+        return "", f"lines range is reversed ({start},{end}): pass 'start,end' with start <= end"
+    if end - start + 1 > GIT_INSPECT_BLAME_MAX_LINES:
+        return "", (f"lines range is too wide ({end - start + 1} lines): "
+                    f"the maximum is {GIT_INSPECT_BLAME_MAX_LINES} — blame a "
+                    f"narrower window around the code you care about")
+    return f"{start},{end}", ""
+
+
+def _git_inspect_argv(action: str, limit: int, ref: str, pathspec: str, *,
+                      follow: bool = False, name_status: bool = False,
+                      line_range: str = "") -> list:
     """Build the fixed argv for one git_inspect action (never a shell string).
 
     Args:
         action: One of GIT_INSPECT_ACTIONS.
         limit: Commit count for `log` (already clamped).
-        ref: Revision for `show` (already validated).
+        ref: Revision for `blame`/`log`/`show` (already validated, may be empty).
         pathspec: Optional validated pathspec.
+        follow: `log` only: follow renames (requires a single path).
+        name_status: `log` only: show which files each commit changed.
+        line_range: `blame` only: normalized `start,end`.
 
     Returns:
         The complete argv list, starting with the hardened `git` base.
@@ -6703,10 +7108,28 @@ def _git_inspect_argv(action: str, limit: int, ref: str, pathspec: str) -> list:
     if action == "diff_head":
         return base + ["diff", "HEAD"] + GIT_INSPECT_DIFF_FLAGS + scope
     if action == "log":
-        return base + ["log", f"-n{limit}", "--no-color",
-                       f"--format={GIT_INSPECT_LOG_FORMAT}"]
+        # `ref` (when given) walks the history of a branch/tag/range instead of
+        # HEAD; the pathspec narrows it to commits touching one path.
+        argv = ["log", f"-n{limit}", "--no-color"]
+        if follow or name_status:
+            argv += [f"--format={GIT_INSPECT_LOG_HISTORY_FORMAT}", "--date=short"]
+        else:
+            argv.append(f"--format={GIT_INSPECT_LOG_FORMAT}")
+        if follow:
+            argv.append("--follow")
+        if name_status:
+            argv.append("--name-status")
+        return base + argv + ([ref] if ref else []) + scope
     if action == "show":
         return base + ["show", "--stat", "--patch"] + GIT_INSPECT_DIFF_FLAGS + [ref] + scope
+    if action == "blame":
+        # --no-textconv is not cosmetic: blame applies the textconv driver by
+        # default, so without the flag a repo-supplied .gitattributes could make
+        # a "read-only" inspection execute a program. It also keeps the blamed
+        # line numbers aligned with the raw file, i.e. with read_file's offsets.
+        return (base + ["blame", "--no-textconv", "--date=short", "--abbrev=8",
+                        f"-L {line_range}"]
+                + ([ref] if ref else []) + ["--", pathspec])
     raise ValueError(f"Unsupported action '{action}'")
 
 
@@ -6844,9 +7267,11 @@ def _tool_handle_git_inspect(self, args: dict) -> dict:
     buffered whole.
 
     Args:
-        args: action (status|diff|diff_staged|diff_head|log|show), limit (log
-            lines, 1-100), ref (show only, default HEAD), path (optional relative
-            pathspec inside the project).
+        args: action (status|diff|diff_staged|diff_head|log|show|blame), limit
+            (log lines, 1-100), ref (blame/log/show only, default HEAD for
+            show), path (optional relative pathspec inside the project, required
+            for blame and for log follow), lines (blame only, 1-based
+            'start,end'), follow/name_status (log only).
 
     Returns:
         {"success": bool, "output": str, "error": str|None}. Output is prefixed
@@ -6863,14 +7288,36 @@ def _tool_handle_git_inspect(self, args: dict) -> dict:
     except (TypeError, ValueError):
         return {"success": False, "output": "", "error": "limit must be an integer"}
     limit = max(1, min(limit, GIT_INSPECT_LOG_LIMIT_MAX))
-    ref = str(args.get("ref") or "HEAD").strip()
-    if action == "show" and not GIT_INSPECT_REF_RE.match(ref):
+    ref = str(args.get("ref") or "").strip()
+    if not ref and action == "show":
+        ref = "HEAD"
+    if ref and action not in GIT_INSPECT_REF_ACTIONS:
+        return {"success": False, "output": "",
+                "error": f"action '{action}' does not take a ref "
+                         f"(only: {', '.join(GIT_INSPECT_REF_ACTIONS)})"}
+    if ref and not GIT_INSPECT_REF_RE.match(ref):
         return {"success": False, "output": "",
                 "error": f"Unsupported ref {ref!r} (pass a branch, tag, or commit hash)"}
     pathspec, path_error = _git_safe_pathspec(str(args.get("path") or ""))
     if path_error:
         return {"success": False, "output": "", "error": path_error}
-    argv = _git_inspect_argv(action, limit, ref, pathspec)
+    line_range = ""
+    follow = name_status = False
+    if action == "blame":
+        if not pathspec:
+            return {"success": False, "output": "",
+                    "error": "blame needs `path` (one tracked file inside the project)"}
+        line_range, range_error = _git_parse_line_range(args.get("lines"))
+        if range_error:
+            return {"success": False, "output": "", "error": range_error}
+    elif action == "log":
+        follow = bool(args.get("follow"))
+        name_status = bool(args.get("name_status"))
+        if follow and not pathspec:
+            return {"success": False, "output": "",
+                    "error": "follow needs a single `path` (git --follow takes one file)"}
+    argv = _git_inspect_argv(action, limit, ref, pathspec, follow=follow,
+                             name_status=name_status, line_range=line_range)
     # Scrub inherited Git location variables (a full repo/index redirect) and
     # force a non-interactive, lock-free child.
     env = {key: value for key, value in os.environ.items()
@@ -6889,8 +7336,11 @@ def _tool_handle_git_inspect(self, args: dict) -> dict:
                 "error": f"git {action} timed out after {GIT_INSPECT_TIMEOUT}s"}
     stderr_text = capture["stderr"].strip()
     if capture["returncode"] != 0 and not capture["truncated"]:
-        return {"success": False, "output": capture["stdout"],
-                "error": stderr_text or f"git {action} failed ({capture['returncode']})"}
+        message = stderr_text or f"git {action} failed ({capture['returncode']})"
+        if action == "blame" and "no such path" in stderr_text:
+            message += (" (blame only covers tracked content at that revision — "
+                        "use read_file for untracked or newly added files)")
+        return {"success": False, "output": capture["stdout"], "error": message}
     text = capture["stdout"] or ""
     if capture["truncated"]:
         text += (f"\n... [output truncated at {GIT_INSPECT_MAX_OUTPUT_CHARS} chars — "
@@ -6931,9 +7381,14 @@ TOOL_ARG_ALIASES = {
                                  "field_selector": ["fieldselector", "field-selector"],
                                  "container": ["container_name", "ctr"]},
     "git_inspect": {"action": ["command", "verb", "subcommand", "subcmd"],
-                    "limit": ["count", "max_count", "n", "lines"],
+                    "limit": ["count", "max_count", "n"],
                     "ref": ["commit", "revision", "sha", "rev"],
-                    "path": ["file", "file_path", "pathspec", "filepath"]},
+                    "path": ["file", "file_path", "pathspec", "filepath"],
+                    "lines": ["line_range", "range", "line"],
+                    "follow": ["follow_renames"],
+                    "name_status": ["files_changed"]},
+    "path_policy": {"path": ["file", "file_path", "filepath", "dir", "directory"],
+                    "op": ["operation", "access", "mode"]},
 }
 
 # curl/wget flags that keep a command a harmless read-only GET fetch (no body,
@@ -8825,6 +9280,7 @@ class ToolRegistry:
             "apply_patch": _tool_handle_apply_patch,
             "kubernetes_cluster_query": _tool_handle_cluster_query,
             "git_inspect": _tool_handle_git_inspect,
+            "path_policy": _tool_handle_path_policy,
         }
 
     def _plan_allowed_tools(self) -> dict:
@@ -10700,6 +11156,28 @@ COMPACT_SUBCOMMANDS = ['now', 'force', 'llm', 'threshold', 'list', 'status']
 REASONING_SUBCOMMANDS = ['off', 'on', 'low', 'medium', 'high']
 PRESERVE_THINKING_SUBCOMMANDS = ['on', 'off', 'status']
 
+# /promptshow subcommands for tab completion. The setter (`/promptset`) is not
+# implemented yet; the family is named so a display command can never be confused
+# with one that mutates the prompt.
+PROMPTSHOW_SUBCOMMANDS = ['system', 'tools', 'json', 'save', 'help']
+
+
+def print_promptshow_usage() -> None:
+    """Print the `/promptshow` subcommand help block."""
+    print(file=sys.stderr)
+    print(colorize("  /promptshow [subcommand] — show the request the next query sends", 'info'), file=sys.stderr)
+    for line in (
+        "    (no argument)   system prompt + tool summary + token counts",
+        "    system          the exact outbound system prompt (mode-aware, /maxtokens cap line included)",
+        "    tools [name]    tool definitions with their argument schemas (one tool when `name` is given)",
+        "    json            {\"mode\", \"system\", \"tools\"} exactly as built for the payload",
+        "    save <path>     write that same JSON to a file",
+        "    help            this block",
+    ):
+        print(colorize(line, 'muted'), file=sys.stderr)
+    print(colorize("  Read-only: /promptshow never changes the prompt.", 'muted'), file=sys.stderr)
+    print(file=sys.stderr)
+
 
 class ChatCompleter:
     """
@@ -10779,6 +11257,10 @@ class ChatCompleter:
 
         elif buffer.startswith('/preservethinking '):
             matches = self._complete_subcommands(buffer, text, PRESERVE_THINKING_SUBCOMMANDS)
+
+        # 3c. /promptshow subcommand completion (read-only request inspection)
+        elif buffer.startswith('/promptshow ') or buffer.startswith('/showprompt '):
+            matches = self._complete_subcommands(buffer, text, PROMPTSHOW_SUBCOMMANDS)
 
         # 4. File Path Autocompletion (/cwd, /ls, /image and inline @)
         # buffer is the full line, text could be in the middle of the line
@@ -11946,6 +12428,7 @@ class ChatLoop:
             self.run_handle_spawnshell,
             self.run_handle_agentic,
             self.run_handle_listtool,
+            self.run_handle_promptshow,
             self.run_handle_mcp,
             self.run_handle_compact,
             self.run_handle_drop,
@@ -13007,15 +13490,23 @@ class ChatLoop:
         return False
 
     def _print_plan_mode_status(self) -> None:
-        """Print the active plan-mode tier and its enforced tool surface."""
+        """Print the active plan-mode tier and its enforced tool surface.
+
+        The list is derived from the tier's own tool set (`PLAN_MODE_TOOLS` /
+        `PLAN_MODE_RUN_TOOLS`) instead of being a literal: the hardcoded banner
+        drifted — it never mentioned `git_inspect`, so a user reading it would
+        conclude that plan mode had no git access at all.
+        """
         run_tier = bool(getattr(self.ctx, "plan_run", False))
+        lane = PLAN_MODE_RUN_TOOLS if run_tier else PLAN_MODE_TOOLS
+        allowed = ", ".join(sorted(lane))
         if run_tier:
             print(colorize("[Agentic plan mode: ON — read-only planner (run)]", 'success'), file=sys.stderr)
-            print(colorize("[Tools restricted to: read_file, glob, grep, list_directory, fetch_url, diff, kubernetes_cluster_query, run_command]", 'muted'), file=sys.stderr)
+            print(colorize(f"[Tools restricted to: {allowed}]", 'muted'), file=sys.stderr)
             print(colorize("[run_command will ask for confirmation before executing]", 'info'), file=sys.stderr)
         else:
             print(colorize("[Agentic plan mode: ON — read-only, confined to CWD]", 'success'), file=sys.stderr)
-            print(colorize("[Tools restricted to: read_file, glob, grep, list_directory, fetch_url, diff, kubernetes_cluster_query]", 'muted'), file=sys.stderr)
+            print(colorize(f"[Tools restricted to: {allowed}]", 'muted'), file=sys.stderr)
             print(colorize("[No shell; paths outside the current directory are refused]", 'info'), file=sys.stderr)
         self._print_plan_mcp_tools(run_tier)
 
@@ -13229,6 +13720,179 @@ class ChatLoop:
         print(colorize("  ! destructive — confirmation required", 'muted'), file=sys.stderr)
         print(file=sys.stderr)
         return False
+
+    def run_handle_promptshow(self, full_input: str) -> Optional[bool]:
+        """Handle /promptshow — display the prompt and tools the next query sends.
+
+        Read-only by construction: it renders the same snapshot `/tokencount`
+        uses (`_wire_snapshot` → `_wire_system_and_tools` + the /maxtokens cap
+        line), so the preview cannot drift from the payload. Nothing here writes
+        to `ctx.system_prompt`; the mutating sibling will be `/promptset`.
+
+        Args:
+            full_input: The raw command line.
+
+        Returns:
+            False when handled, None when the line is not a /promptshow command.
+        """
+        stripped = full_input.strip()
+        head = stripped.split(maxsplit=1)[0] if stripped else ""
+        if head not in ('/promptshow', '/showprompt'):
+            return None
+        parts = stripped.split(maxsplit=2)
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        arg = parts[2].strip() if len(parts) > 2 else ""
+        if sub in ("", "all"):
+            self._promptshow_all(self._promptshow_wire())
+        elif sub == "system":
+            print(self._promptshow_wire()['system'])
+        elif sub == "tools":
+            self._promptshow_tools(arg)
+        elif sub in ("json", "save"):
+            if sub == "save" and not arg:
+                print(colorize("[Usage: /promptshow save <path>]", 'warning'), file=sys.stderr)
+                return False
+            text = json.dumps(self._promptshow_payload(self._promptshow_wire()),
+                              indent=2, ensure_ascii=False)
+            if sub == "json":
+                print(text)
+            else:
+                self._promptshow_save(arg, text)
+        elif sub in ("help", "?"):
+            print_promptshow_usage()
+        else:
+            print(colorize(f"[ERROR] unknown /promptshow subcommand '{sub}'", 'error'),
+                  file=sys.stderr)
+            print_promptshow_usage()
+        return False
+
+    def _promptshow_wire(self) -> Dict:
+        """Return the outbound system prompt and tools, with token counts.
+
+        Shares `_wire_snapshot()` with `/tokencount` so both report the same
+        request. The fallback covers the case where the snapshot raises (e.g. no
+        live backend to count the whole request): the two blocks are then built
+        the same way, just without the whole-request measurement.
+
+        Returns:
+            The `_wire_snapshot()` dict (mode, system, tools, token counts).
+        """
+        try:
+            return self._wire_snapshot()
+        except Exception:
+            system, tools, mode = self._wire_system_and_tools()
+            configured = int(getattr(self.ctx, 'max_output_tokens',
+                                     DEFAULT_MAX_OUTPUT_TOKENS) or DEFAULT_MAX_OUTPUT_TOKENS)
+            system = self.query_handler._with_output_cap_line(
+                [{'role': 'system', 'content': system}], configured)[0]['content']
+            return {'mode': mode, 'system': system,
+                    'system_tokens': self.ctx.tokenize(system),
+                    'conversation_messages': 0, 'conversation_tokens': 0,
+                    'tools': tools,
+                    'tools_tokens': self.ctx.count_tools_tokens(tools),
+                    'overhead': 0, 'total': 0, 'source': 'none'}
+
+    def _promptshow_tool_defs(self) -> Dict:
+        """Return the tool definitions the next request exposes, in order.
+
+        Goes through `_plan_allowed_tools()` — the single choke point the prompt
+        block and the native schema both read — so plan mode is reflected here
+        exactly as it is in the payload.
+        """
+        try:
+            return self.tool_registry._plan_allowed_tools()
+        except Exception:
+            return {}
+
+    def _promptshow_delivery(self, wire: Dict) -> str:
+        """Describe how the tool definitions reach the model in the active mode.
+
+        Three cases, not two: chat mode sends no tool definitions at all, native
+        models get a `tools` array, and inline models get the definitions inside
+        the system prompt.
+        """
+        tools = wire.get('tools')
+        if tools:
+            size_kb = len(json.dumps(tools)) / 1024
+            return f"sent as the native tools array ({size_kb:.1f} KB)"
+        if str(wire.get('mode', '')).startswith('chat'):
+            return "not sent — chat mode carries no tool definitions"
+        return "sent inline inside the system prompt (no separate tools array)"
+
+    def _promptshow_all(self, wire: Dict) -> None:
+        """Print the system prompt, a tool summary and the section sizes."""
+        mode = str(wire.get('mode', ''))
+        sends_tools = bool(wire.get('tools')) or mode.startswith('agentic')
+        tools_part = (f"{wire['tools_tokens']} tok — {self._promptshow_delivery(wire)}"
+                      if sends_tools else "none — chat mode")
+        print(colorize(
+            f"\n[promptshow] mode: {mode} | system: {wire['system_tokens']} tok"
+            f" | tools: {tools_part}", 'info'))
+        print(colorize("── system prompt ──", 'muted'))
+        print(wire['system'])
+        if not sends_tools:
+            print(colorize("(no tool definitions in this mode — /agentic on or "
+                           "/agentic plan adds them)", 'muted'))
+            return
+        defs = self._promptshow_tool_defs()
+        print(colorize(f"── tools ({len(defs)}) ──", 'muted'))
+        for name, defn in defs.items():
+            props = (defn.get('parameters') or {}).get('properties') or {}
+            print(f"  {name:<24} {', '.join(props) if props else '(no arguments)'}")
+        print(colorize("── /promptshow tools <name> for the argument schemas · "
+                       "/promptshow json for the exact payload ──", 'muted'))
+
+    def _promptshow_tools(self, name: str) -> None:
+        """Print tool definitions with their argument schemas.
+
+        `/listtool` shows name + description; this adds the argument types,
+        which is what you need to write a call by hand.
+        """
+        defs = self._promptshow_tool_defs()
+        total = len(defs)
+        if name:
+            if name not in defs:
+                print(colorize(f"[ERROR] unknown tool '{name}' "
+                               f"(available: {', '.join(sorted(defs))})", 'error'),
+                      file=sys.stderr)
+                return
+            defs = {name: defs[name]}
+        wire = self._promptshow_wire()
+        print(colorize(f"\n[promptshow] showing {len(defs)} of {total} tools — "
+                       f"{self._promptshow_delivery(wire)}", 'info'))
+        for tool_name, defn in defs.items():
+            print(colorize(f"\n### {tool_name}", 'success'))
+            print(defn.get('description', ''))
+            parameters = defn.get('parameters') or {}
+            props = parameters.get('properties') or {}
+            required = set(parameters.get('required') or [])
+            for arg_name, spec in props.items():
+                marker = " [required]" if arg_name in required else ""
+                kind = spec.get('type', 'any')
+                print(f"  - {arg_name} ({kind}){marker}: {spec.get('description', '')}")
+
+    def _promptshow_payload(self, wire: Dict) -> Dict:
+        """Build the JSON view shared by `/promptshow json` and `save`."""
+        return {
+            'mode': wire['mode'],
+            'system': wire['system'],
+            'system_tokens': wire['system_tokens'],
+            'tools': wire.get('tools'),
+            'tools_tokens': wire['tools_tokens'],
+            'tools_delivery': self._promptshow_delivery(wire),
+        }
+
+    def _promptshow_save(self, path: str, text: str) -> None:
+        """Write the payload JSON to `path`, expanding `~`."""
+        target = os.path.expanduser(path)
+        try:
+            with open(target, 'w', encoding='utf-8') as handle:
+                handle.write(text + "\n")
+        except OSError as e:
+            print(colorize(f"[ERROR] cannot write {target}: {e}", 'error'), file=sys.stderr)
+            return
+        print(colorize(f"[promptshow] wrote {len(text)} chars to {target}", 'success'),
+              file=sys.stderr)
 
     def run_handle_mcp(self, full_input: str) -> Optional[bool]:
         """Handle /mcp — status, tool listings, and connect/disconnect.
@@ -14231,6 +14895,16 @@ class ChatLoop:
         content = get_agentic_prompt(
             self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
             plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)
+        # Path policy up front, positive half only: the allowed roots (plus this
+        # session's grants) are what the model actually needs to plan. The
+        # ask/denied detail and the grant command live behind the `path_policy`
+        # tool, so a denial can stay one line.
+        policy = _acl_policy_block(
+            getattr(self.ctx, "path_acl", None),
+            plan_strict=(self.ctx.plan_mode and not getattr(self.ctx, "plan_run", False)),
+            detail="allowed")
+        if policy:
+            content += "\n\n## Path access\n" + policy
         tools = None if include_tool_defs else self.tool_registry.openai_tools_spec()
         return content, tools, not include_tool_defs
 

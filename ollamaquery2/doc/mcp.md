@@ -146,6 +146,14 @@ spawned, so a config works from any working directory:
 - `timeout` is a per-request alias: it sets `init`, `list` and `call` deadlines
   unless those are configured explicitly.
 
+## Design recipe
+
+`doc/mcp_client_interface.py` is the pre-implementation recipe this client was
+built from: the protocol cheat-sheet, the config schema, the data shapes and a
+skeleton of every class with the algorithm in the docstrings. It is not imported
+by `ollamaquery2.py`; run it directly to print the recipe, or with `--config` to
+dry-run config parsing and validation without contacting any server.
+
 ## Security model
 
 - **No shell.** The child is spawned with an argv (`shell=False`), its own

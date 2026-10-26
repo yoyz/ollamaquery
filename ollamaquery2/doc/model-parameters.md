@@ -26,16 +26,18 @@ This document consolidates all model-specific tuning parameters used across olla
 
 Defined in `MODEL_INFERENCE_PARAMS_REGISTRY` (`ollamaquery2.py:1088`). Keys are model name substrings matched case-insensitively. The first matching key wins (order matters — more specific keys like `"nemotron-cascade"` should appear before generic ones like `"nemotron"`).
 
-| Key                  | temperature | top_p | top_k | min_p | presence_penalty | repeat_penalty | Use Case                   | Source                        |
-|----------------------|-------------|-------|-------|-------|------------------|----------------|----------------------------|-------------------------------|
-| `nemotron-cascade`   | 0.6         | 0.95  | 40    | 0.0   | 0.0              | 1.0            | Tool calling / coding       | Nemotron-Cascade-2-30B        |
-| `glm-4.7`            | 0.7         | 1.0   | —     | 0.01  | 0.0              | 1.0            | Tool calling                | Medium guide + Gemini 3.5     |
-| `qwen3.5`            | 0.5         | 0.9   | 20    | 0.0   | 0.0              | 1.0            | Precise coding / tool call   | Qwen3.5-9B + Gemini 3.5      |
-| `qwen3`              | 0.5         | 0.9   | 20    | 0.0   | 0.0              | 1.0            | Agentic tool calling         | Qwen3-8B + Gemini 3.5        |
-| `nemotron`           | 0.6   | 0.95  | 40    | 0.0   | 0.0              | 1.0            | Tool calling                | Nemotron-3-Nano               |
-| `granite4`           | 0.7   | 0.9   | 40    | 0.0   | 0.0              | 1.0            | Tool calling (native API)   | Granite-4.1-8B + Ollama      |
-| `gpt-oss`            | 0.7   | 1.0   | —     | 0.0   | 0.0              | 1.0            | Agentic / tool calling       | Gemini 3.5 agentic profile    |
-| `(default)`          | 0.7         | 0.9   | 40    | 0.0   | 0.0              | 1.0            | Conservative fallback       | `ollamaquery2.py:1131`        |
+| Key                | temperature | top_p | top_k | min_p | presence_penalty | repeat_penalty | Use Case                   | Source                     |
+|--------------------|-------------|-------|-------|-------|------------------|----------------|----------------------------|----------------------------|
+| `nemotron-cascade` | 0.6         | 0.95  | 40    | 0.0   | 0.0              | 1.0            | Tool calling / coding      | Nemotron-Cascade-2-30B     |
+| `glm-4.7`          | 0.7         | 1.0   | —     | 0.01  | 0.0              | 1.0            | Tool calling               | Medium guide + Gemini 3.5  |
+| `qwen3.8`          | 1.0         | 0.95  | 20    | 0.0   | 0.0              | 1.0            | Reasoning / agentic        | GGUF `general.sampling.*`  |
+| `qwen3.6`          | 0.6         | 0.95  | 20    | 0.0   | 0.0              | 1.0            | Precise coding / tool call | HF Qwen3.6 best practices  |
+| `qwen3.5`          | 0.5         | 0.9   | 20    | 0.0   | 0.0              | 1.0            | Precise coding / tool call | Qwen3.5-9B + Gemini 3.5    |
+| `qwen3`            | 0.5         | 0.9   | 20    | 0.0   | 0.0              | 1.0            | Agentic tool calling       | Qwen3-8B + Gemini 3.5      |
+| `nemotron`         | 0.6         | 0.95  | 40    | 0.0   | 0.0              | 1.0            | Tool calling               | Nemotron-3-Nano            |
+| `granite4`         | 0.7         | 0.9   | 40    | 0.0   | 0.0              | 1.0            | Tool calling (native API)  | Granite-4.1-8B + Ollama    |
+| `gpt-oss`          | 0.7         | 1.0   | —     | 0.0   | 0.0              | 1.0            | Agentic / tool calling     | Gemini 3.5 agentic profile |
+| `(default)`        | 0.7         | 0.9   | 40    | 0.0   | 0.0              | 1.0            | Conservative fallback      | `ollamaquery2.py:1131`     |
 
 ### Prompt Style Registry
 
