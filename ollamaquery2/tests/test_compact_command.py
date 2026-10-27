@@ -155,6 +155,16 @@ class TestCompactDispatch(unittest.TestCase):
 
 
 class TestCompactLlm(unittest.TestCase):
+    def setUp(self):
+        # These fixtures are bare loops: there is no tool_registry/runner, so
+        # the context bar cannot build a real outbound request. The subject
+        # here is /compact llm, not the bar — stub the bar itself (every caller
+        # in the compact path goes through it, and it read as 0 before via its
+        # own fallback).
+        patcher = mock.patch.object(m.WireView, 'refresh_context_bar', return_value=0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _loop(self):
         loop = _loop()
         loop.messages += [{'role': 'user', 'content': f'q{i}'} for i in range(8)]

@@ -290,6 +290,25 @@ class TestBackendDetection(unittest.TestCase):
         result = q.check_backend_with_get(OLLAMA_HOST, 'ollama')
         self.assertTrue(result)
 
+    def test_check_backend_with_get_returns_false_not_none(self):
+        """A reachable probe whose body lacks the marker returns False, not None.
+
+        The function is annotated `-> bool`; the old code only returned False
+        from the `except`, so a body without the marker fell off the end.
+        """
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self):
+                return b"<html>some other server</html>"
+
+        with patch.object(q, "urlopen", return_value=_Response()):
+            self.assertIs(q.check_backend_with_get("http://example.invalid", "ollama"), False)
+
     def test_check_backend_with_head_failure(self):
         result = q.check_backend_with_head('http://127.0.0.1:1', 'nonexistent')
         self.assertFalse(result)
@@ -564,18 +583,11 @@ class TestThinkingColor(unittest.TestCase):
         self.assertIn('the answer', sout.getvalue())
 
     def test_agentic_step_thinking_dim(self):
-        loop = q.ChatLoop.__new__(q.ChatLoop)
-        state = {
-            "thinking_open": False, "last_activity": time.time(),
-            "cancelled": False, "heartbeat_shown": False, "content": "",
-            "thought": "", "thinking_tokens": 0, "thinking_capped": False,
-            "tok_acc": 0, "content_streamed": False,
-            "write_lock": threading.Lock(),
-        }
+        feedback = q.StepFeedback(q.CommandContext(), show_thinking=True)
         with patch.object(q, 'colors_enabled', return_value=True), \
              patch('sys.stderr', new_callable=io.StringIO) as err, \
              patch('sys.stdout', new_callable=io.StringIO):
-            loop._render_step_feedback(state, 'agentic reasoning', '', True)
+            feedback.feed('agentic reasoning', '', False)
         out = err.getvalue()
         self.assertTrue(out.startswith(self.MUTED))
         self.assertIn('<thinking>', out)
@@ -748,7 +760,6 @@ class TestBasicQueries(unittest.TestCase):
     def test_query_stream_returns_content(self):
         loop = _chat_loop(self.ctx)
         loop.run_process_query('Say hello')
-        self.assertTrue(hasattr(loop, 'messages'))
         self.assertGreaterEqual(len(loop.messages), 2)
         self.assertEqual(loop.messages[-1]['role'], 'assistant')
         self.assertGreater(len(loop.messages[-1]['content']), 0)
@@ -802,7 +813,6 @@ class TestAnyBackend(unittest.TestCase):
     def test_chat_loop_processes_query(self):
         loop = _chat_loop(self.ctx)
         loop.run_process_query('Say hello')
-        self.assertTrue(hasattr(loop, 'messages'))
         self.assertGreaterEqual(len(loop.messages), 2)
         self.assertEqual(loop.messages[-1]['role'], 'assistant')
         self.assertGreater(len(loop.messages[-1]['content']), 0)
@@ -1128,14 +1138,13 @@ class TestCommandHandlers(unittest.TestCase):
         self.assertEqual(self.ctx.total_queries, 0)
 
     def test_handle_clear_clears_messages(self):
-        """/clear must delete self.messages so conversation history is not carried over (regression)."""
+        """/clear must clear the conversation so history is not carried over (regression)."""
         self.loop.run_process_query('Say hello')
-        self.assertTrue(hasattr(self.loop, 'messages'))
         self.assertGreater(len(self.loop.messages), 0)
         self.loop.run_handle_clear('/clear')
-        self.assertFalse(
-            hasattr(self.loop, 'messages'),
-            "/clear did not delete self.messages — history leaks to next query"
+        self.assertEqual(
+            self.loop.messages, [],
+            "/clear did not clear the conversation — history leaks to next query"
         )
 
 
@@ -1224,7 +1233,7 @@ class TestFetchAndConvertUrl(unittest.TestCase):
         resp.read.return_value = b'<html><body><script>var x=1;</script></body></html>'
         with patch("ollamaquery2._request_with_retry", return_value=resp):
             with patch("ollamaquery2._curl_fetch_text",
-                       return_value="<html><body>curl rescued content</body></html>"):
+                       return_value=("<html><body>curl rescued content</body></html>", False)):
                 text, tool = q.fetch_and_convert_url("https://js-only.example")
         self.assertIn('curl rescued content', text)
         self.assertEqual(tool, "htmlstrip")
@@ -1236,7 +1245,7 @@ class TestFetchAndConvertUrl(unittest.TestCase):
         with patch("ollamaquery2._request_with_retry",
                    side_effect=Exception("HTTP Error 500: Internal Server Error")):
             with patch("ollamaquery2._curl_fetch_text",
-                       return_value="<html><body><script>var x=1;</script></body></html>"):
+                       return_value=("<html><body><script>var x=1;</script></body></html>", False)):
                 text, tool = q.fetch_and_convert_url("https://blocked.example")
         self.assertTrue(text.startswith('[Failed to fetch URL:'))
         self.assertEqual(tool, "None")
@@ -1855,25 +1864,41 @@ class TestSwitchModel(unittest.TestCase):
         after = self.ctx.get_cumulative_stats()
         self.assertEqual(before['total_queries'], after['total_queries'])
 
-    def test_switch_reads_ollama_token_schema(self):
-        """/switchmodel reads prompt_eval_count from warmup ping for Ollama."""
+    def test_switch_sends_a_warmup_ping(self):
+        """/switchmodel pings the new model so the load cost is paid at switch time."""
         self.loop.run_process_query('Say hi')
-        self.ctx.backend = 'ollama'
         with patch.object(self.loop.query_handler, 'query_sync',
-                          return_value={"prompt_eval_count": 42}):
+                          return_value={"prompt_eval_count": 42}) as ping:
             self.loop.run_handle_switchmodel(f'/switchmodel {SMALL_MODEL}')
-        self.assertEqual(self.ctx.current_context_tokens, 42,
-                         "Ollama warmup token schema not read correctly")
+        self.assertEqual(ping.call_count, 1)
+        self.assertTrue(ping.call_args.kwargs.get('is_warmup'))
 
-    def test_switch_reads_llamacpp_token_schema(self):
-        """/switchmodel reads prompt_tokens from usage.{} for llama.cpp/LM Studio."""
+    def test_switch_rebuilds_the_bar_from_the_wire_not_the_ping_usage(self):
+        """The warmup ping's usage block does not decide the context bar.
+
+        Since v0.2.22 the bar reports the *outbound* request (what the next query
+        will cost, `tools` and the /maxtokens cap line included), and the ping is
+        only a chat-shaped warmup request — so the handler refreshes the bar from
+        `outbound_tokens()` instead of trusting `prompt_eval_count` /
+        `usage.prompt_tokens`. The old assertion (bar == the ping's number)
+        pinned the pre-v0.2.22 behaviour and only ran when Ollama was reachable,
+        which is why it survived. The exact wire maths is pinned by
+        `TestContextBarConsistency`; here we only need "refreshed, and not the
+        ping's numbers".
+        """
         self.loop.run_process_query('Say hi')
-        self.ctx.backend = 'llamacpp'
-        with patch.object(self.loop.query_handler, 'query_sync',
-                          return_value={"usage": {"prompt_tokens": 37}}):
-            self.loop.run_handle_switchmodel(f'/switchmodel {SMALL_MODEL}')
-        self.assertEqual(self.ctx.current_context_tokens, 37,
-                         "llama.cpp warmup token schema not read correctly")
+        for backend, usage in (('ollama', {"prompt_eval_count": 42}),
+                               ('llamacpp', {"usage": {"prompt_tokens": 37}})):
+            with self.subTest(backend=backend):
+                self.ctx.backend = backend
+                self.ctx.current_context_tokens = 1234567  # sentinel: a refresh must replace it
+                with patch.object(self.loop.query_handler, 'query_sync', return_value=usage):
+                    self.loop.run_handle_switchmodel(f'/switchmodel {SMALL_MODEL}')
+                self.assertNotEqual(self.ctx.current_context_tokens, 1234567,
+                                    "the bar was not rebuilt after the switch")
+                self.assertGreater(self.ctx.current_context_tokens, 0)
+                self.assertNotIn(self.ctx.current_context_tokens, (42, 37),
+                                 "the warmup ping's usage block leaked into the bar")
 
 
 # ============================================================================
@@ -2178,7 +2203,6 @@ class TestFullWorkflow(unittest.TestCase):
 
         # 5. Query after clear
         self.loop.run_process_query('Say again')
-        self.assertTrue(hasattr(self.loop, 'messages'))
         self.assertGreaterEqual(len(self.loop.messages), 2)
 
 
@@ -2515,6 +2539,79 @@ class TestSyncStream(unittest.TestCase):
         self.assertEqual(seen[1], ("", "answer", False))
         self.assertEqual(seen[2][0], "")  # final chunk: no thought/content
         self.assertTrue(seen[2][2])       # is_final True
+
+
+class TestStreamParserSeam(unittest.TestCase):
+    """The StreamParser (TODO 4.1c) must not bypass ModelQuery's stub seams.
+
+    `_iter_stream_lines` is the documented stub point of the stream tests, so a
+    parser that captured the method at construction time (instead of resolving
+    it per call) would make those tests exercise the real transport while still
+    looking green. These pin the delegation and the late binding.
+    """
+
+    def setUp(self):
+        self.ctx = _fresh_ctx()
+
+    def _make_query(self, backend="llamacpp"):
+        qh = q.ModelQuery(context=self.ctx)
+        qh.ctx.backend = backend
+        qh.ctx.base_url = "http://localhost/fake"
+        qh.ctx.model = SMALL_MODEL
+        return qh
+
+    def test_iter_lines_is_late_bound_through_the_door(self):
+        """Replacing `_iter_stream_lines` on the instance is honoured by aggregation.
+
+        The parser is built *before* the replacement on purpose: a session that
+        already streamed has a live parser, and a captured (bound) method would
+        keep reading the real transport from then on.
+        """
+        qh = self._make_query()
+        qh._stream_parser()  # a parser already exists, as after any earlier stream
+        qh._iter_stream_lines = lambda response, backend: iter([json.dumps(
+            {"choices": [{"delta": {"content": "from-stub"}}]})])
+
+        class FakeResponse:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *a):
+                return False
+
+        with patch.object(q, '_request_with_retry', return_value=FakeResponse()):
+            result = qh._aggregate_sync_stream(Request("http://x"), "llamacpp", 1, None)
+
+        # The stub was used: no socket was opened and the fake line was parsed.
+        self.assertEqual(result[0], "from-stub")
+
+    def test_parser_provider_is_not_a_bound_copy(self):
+        """The parser's `iter_lines` provider is a lambda, not a captured method."""
+        qh = self._make_query()
+        parser = qh._stream_parser()
+        self.assertIs(parser, qh._stream_parser())        # cached
+        self.assertIsNot(parser.iter_lines, parser._iter_stream_lines)
+
+        qh._iter_stream_lines = lambda response, backend: iter([])
+        self.assertEqual(list(parser.iter_lines(None, "llamacpp")), [])
+
+    def test_doors_delegate_to_the_parser(self):
+        """Every door the streaming paths/tests call still routes through StreamParser."""
+        qh = self._make_query()
+        parser = qh._stream_parser()
+
+        self.assertEqual(qh._parse_chunk({"message": {"content": "x"}}, "ollama")[1], "x")
+        self.assertEqual(list(qh._iter_stream_lines([b'data: {"a": 1}', b'[DONE]'], "strata")),
+                         ['{"a": 1}'])
+        # Shape follows the active backend (llamacpp here), not a constant.
+        self.assertEqual(qh._synthesize_sync_response("hi", "", [], {})["choices"][0]["message"]["content"], "hi")
+        qh.ctx.backend = "ollama"
+        self.assertEqual(qh._synthesize_sync_response("hi", "", [], {})["message"]["content"], "hi")
+        self.assertIs(qh._stream_parser(), parser)
+
+        # _normalize_llamacpp_usage is internal to the parser (no door by design).
+        self.assertFalse(hasattr(qh, '_normalize_llamacpp_usage'))
+        self.assertTrue(hasattr(parser, '_normalize_llamacpp_usage'))
 
 
 # ============================================================================

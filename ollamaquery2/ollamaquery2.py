@@ -38,6 +38,7 @@ import unicodedata
 import fnmatch
 from datetime import datetime
 
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Optional, Dict, List, Union, Literal, TypedDict, IO
 from urllib.parse import urlparse
@@ -65,7 +66,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.3.5"
+__version__ = "0.4.0"
 
 
 # ============================================================================
@@ -234,15 +235,34 @@ DEFAULT_SYSTEM_PROMPT = BUILTIN_PROMPTS["default"]
 
 
 MAX_CONTEXT_SIZE = 4192000  # 4M tokens maximum limit (prevent OOM)
-MAX_READ_FILE_SIZE = 102400    # 100KB max per agentic read_file page
+MAX_READ_FILE_SIZE = 102400    # 100K chars max per agentic read_file page (≈100 KB ASCII)
 MAX_READ_LINES = 2000          # max lines per agentic read_file page
 MAX_READ_LINE_LENGTH = 2000    # per-line truncation in read_file pages
 MAX_GREP_RESULTS = 100         # max matches returned per grep tool call
 MAX_GREP_LINE_LENGTH = 500     # per-line truncation in grep results
 MAX_GREP_OUTPUT_CHARS = 14000  # hard cap on rendered grep output (context safety)
 GREP_SEARCH_TIMEOUT = 30       # wall-clock seconds before a grep/rg subprocess is killed
-MAX_WRITE_FILE_SIZE = 1048576  # 1MB max for agentic write_file tool
+GREP_BINARY_SNIFF_BYTES = 8192 # NUL-check window; the same heuristic rg and `grep -I` use
+GREP_SCAN_CHECK_LINES = 200    # deadline check interval inside the pure-Python scan
+GREP_TIMEOUT_PREFIX = "search timed out"  # shared by both backends, so the chain can stop
+MAX_WRITE_FILE_SIZE = 1048576  # 1M chars max for write_file (UTF-8 bytes on disk can exceed it)
 MAX_FILE_INCLUSION_SIZE = 5 * 1024 * 1024  # 5MB max for @file inclusions
+# Network read budgets. The spill threshold protects the *context*; these bound
+# the *process* (a page/blob must never be buffered whole before any decision).
+# A page is allowed to be large because a big fetch is spilled to a file and
+# paged with read_file; a startup probe and git's stderr are only ever scanned
+# for a marker / shown as diagnostics, so they get a small ceiling.
+MAX_URL_FETCH_BYTES = 16 * 1024 * 1024  # 16 MiB per fetched page
+MAX_PROBE_READ_BYTES = 256 * 1024      # startup probe body (marker search)
+# Agentic container sandbox (see Executor). `--sandbox-*` flags override these;
+# the env vars remain for the old behaviour and for CI.
+DEFAULT_CONTAINER_RUNTIME = "podman"
+DEFAULT_CONTAINER_IMAGE = "docker.io/library/python:3.12-alpine"
+# Resource ceiling for the throwaway-image sandbox: a model-run stray process
+# must not cost what the host costs. `exec` sandboxes are left alone (the
+# container is the user's, with its own limits).
+DEFAULT_CONTAINER_MEMORY = "1g"
+DEFAULT_CONTAINER_CPUS = "1"
 # Per-response output cap (always on; see /maxtokens). Sent to the backend as
 # Ollama `options.num_predict` or OpenAI-compatible `max_tokens`; it includes
 # reasoning/thinking tokens. The cap is lowered at request time so the prompt
@@ -787,6 +807,38 @@ def _request_with_retry(req: Request, max_retries: int = 3, delay: float = 1,
                          'warning')
             )
             raise
+
+
+def _bounded_read(source: object, limit: int) -> tuple:
+    """Read at most `limit` bytes from a file-like object, with a cut flag.
+
+    `HTTPResponse.read(n)` blocks until `n` bytes or EOF (it accumulates
+    chunked bodies internally), and a temp-file read behaves the same, so one
+    sized read is enough — and the process never holds more than `limit + 1`
+    bytes before the ceiling is applied.
+
+    Args:
+        source: Binary file-like object (HTTP response, temp file) with read(n).
+        limit: Maximum number of bytes to return.
+
+    Returns:
+        (data, truncated): at most `limit` bytes plus a flag telling whether
+        the source had more (i.e. the returned data is a prefix).
+    """
+    data = source.read(limit + 1) or b""
+    return data[:limit], len(data) > limit
+
+
+def _truncated_marker(limit: int) -> str:
+    """Return the note appended when a bounded read stopped at its ceiling.
+
+    Args:
+        limit: The byte ceiling that was reached.
+
+    Returns:
+        A short marker line the model can recognize as "this is a prefix".
+    """
+    return f"\n\n[truncated at {limit} bytes — this is a prefix, the content continues]"
 
 
 # ============================================================================
@@ -1400,6 +1452,13 @@ class CommandContext:
         # Execution state
         self.debug_mode: bool = False
         self.stream_enabled: bool = True
+        # Container sandbox (Executor); --sandbox-* flags fill these in
+        self.executor_mode: str = "host"
+        self.container_runtime: Optional[str] = None
+        self.container_image: Optional[str] = None
+        self.container_name: Optional[str] = None
+        self.container_memory: Optional[str] = None
+        self.container_cpus: Optional[str] = None
 
         # Statistics (cumulative)
         self.total_queries: int = 0
@@ -1498,8 +1557,19 @@ class CommandContext:
         return ModelQuery(self.base_url, self.backend)
 
     def create_executor(self) -> 'Executor':
-        """Create an Executor for agentic tool execution."""
-        return Executor()
+        """Create an Executor for agentic tool execution.
+
+        Reads the sandbox settings from the context, so `--sandbox-image`,
+        `--sandbox-container` and `--sandbox-runtime` (stored by
+        `_apply_sandbox_args`) reach both the loop's executor and the tool
+        registry's executor without either of them knowing about argparse.
+        """
+        return Executor(mode=getattr(self, "executor_mode", "host"),
+                        container_runtime=getattr(self, "container_runtime", None),
+                        container_image=getattr(self, "container_image", None),
+                        container_name=getattr(self, "container_name", None),
+                        container_memory=getattr(self, "container_memory", None),
+                        container_cpus=getattr(self, "container_cpus", None))
 
     def create_tool_registry(self) -> 'ToolRegistry':
         """Create a ToolRegistry for agentic mode."""
@@ -3309,10 +3379,16 @@ DEFAULT_SHELL_PERMISSION = {
         "oc logs *": "allow",
         "oc describe *": "allow",
         "oc config current-context": "allow",
+        # `api-resources` is the read-only discovery probe the cluster tool
+        # runs once per session to validate a resource name. It must be
+        # allow-listed or strict `/agentic plan` (no shell, no TTY prompt)
+        # would refuse the probe instead of just skipping validation.
+        "oc api-resources *": "allow",
         "kubectl get *": "allow",
         "kubectl logs *": "allow",
         "kubectl describe *": "allow",
         "kubectl config current-context": "allow",
+        "kubectl api-resources *": "allow",
         "omc use *": "allow",          # select a local must-gather dir (local config write)
         "omc get *": "allow",
         "omc logs *": "allow",
@@ -4202,34 +4278,210 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
 class Executor:
     """Runs shell commands on host or inside a container sandbox.
 
+    Two container flavours, selected by `container_name`:
+
+      run --rm <image>   one throwaway container per command; only the CWD
+                         (bind-mounted at /workspace) survives a command.
+      exec <name>        an already-running container; whatever the user set up
+                         inside it (packages, state, mounts) is what the model
+                         gets, and nothing is created or destroyed.
+
+    The image pull is memoized per session: `podman pull` costs ~3 s even for a
+    local image, and an unpullable image used to be retried (silently) on every
+    single command.
+
     Call map:
-      run() → _run_shell() or _pre_pull_image()
-      _run_shell() → subprocess.run / podman|docker exec
+      run() → _container_command() → _run_shell()
+      _container_command() → _pre_pull_image() | _container_workdir()
     """
 
     def __init__(self, mode: str = "host", container_runtime: Optional[str] = None,
-                 container_image: Optional[str] = None) -> None:
+                 container_image: Optional[str] = None,
+                 container_name: Optional[str] = None,
+                 container_memory: Optional[str] = None,
+                 container_cpus: Optional[str] = None) -> None:
         """Initialize the executor with host/container mode and runtime settings.
 
         Args:
             mode: "host" or "container".
             container_runtime: podman/docker runtime (defaults to env or podman).
-            container_image: Image for container mode (defaults to python:3.12-alpine).
+            container_image: Image for container mode (defaults to env or
+                DEFAULT_CONTAINER_IMAGE).
+            container_name: Already-running container to exec into. Takes
+                precedence over container_image; no pull, no --rm.
+            container_memory: Memory ceiling for the throwaway container
+                (defaults to env or DEFAULT_CONTAINER_MEMORY). Ignored with
+                container_name: that container's limits are the user's.
+            container_cpus: CPU ceiling for the throwaway container (defaults to
+                env or DEFAULT_CONTAINER_CPUS); same caveat.
         """
         self.mode = mode
-        self.runtime = container_runtime or os.environ.get("OLLAMAQUERY_CONTAINER_RT", "podman")
-        self.image = container_image or os.environ.get("OLLAMAQUERY_CONTAINER_IMAGE",
-                                                       "docker.io/library/python:3.12-alpine")
+        self.runtime = (container_runtime or os.environ.get("OLLAMAQUERY_CONTAINER_RT")
+                        or DEFAULT_CONTAINER_RUNTIME)
+        self.image = (container_image or os.environ.get("OLLAMAQUERY_CONTAINER_IMAGE")
+                      or DEFAULT_CONTAINER_IMAGE)
+        self.container_name = (container_name
+                               or os.environ.get("OLLAMAQUERY_CONTAINER_NAME") or None)
+        self.memory = (container_memory or os.environ.get("OLLAMAQUERY_CONTAINER_MEMORY")
+                       or DEFAULT_CONTAINER_MEMORY)
+        self.cpus = (container_cpus or os.environ.get("OLLAMAQUERY_CONTAINER_CPUS")
+                     or DEFAULT_CONTAINER_CPUS)
+        self._pull_state = "pending"   # pending | done | failed
+        self._workdir_state = "pending"  # pending | resolved
+        self._container_workdir: Optional[str] = None
+
+    def describe(self) -> str:
+        """One-line description of what commands run in (for banners/status)."""
+        if self.mode != "container":
+            return "host"
+        return f"container ({self.describe_target()}; {self.describe_limits()})"
+
+    def describe_target(self) -> str:
+        """What the sandbox is: an image we start, or a container we exec into."""
+        if self.container_name:
+            return f"exec into {self.container_name}"
+        return f"image {self.image}"
+
+    def describe_limits(self) -> str:
+        """Human form of the resource ceiling in force for this sandbox."""
+        if self.container_name:
+            return "the container's own limits"
+        return f"{self.cpus} cpu, {self.memory} memory"
+
+    def _image_present(self) -> bool:
+        """True when the image is already in the local store.
+
+        `podman image inspect` is used rather than `podman pull` because a pull
+        is not a harmless probe: `localhost/name:tag` (a locally-built image) is
+        interpreted as a *registry* and the pull fails after a TCP timeout —
+        which then looked like a broken image even though `run` worked.
+
+        Returns:
+            True when the runtime reports the image locally.
+        """
+        try:
+            proc = subprocess.run(
+                [self.runtime, "image", "inspect", self.image],
+                capture_output=True, text=True, timeout=15, check=False
+            )
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return False
+        return proc.returncode == 0
 
     def _pre_pull_image(self) -> None:
-        """Pull the container image with a separate timeout so pulls don't consume command timeout."""
+        """Resolve the image once per session, pulling it only when absent.
+
+        Memoized deliberately: the probe (and a pull) costs a subprocess per
+        command, and the old code pulled on *every* command (~3 s each, even for
+        a local image) and retried a failing pull forever. A failed pre-pull is
+        reported once and then left alone: `run` still asks the runtime for the
+        image, which pulls on demand, so the failure is not silently fatal.
+        """
+        if self.container_name or self._pull_state != "pending":
+            return
+        if self._image_present():
+            self._pull_state = "done"
+            return
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 [self.runtime, "pull", self.image],
-                capture_output=True, timeout=120, check=False
+                capture_output=True, text=True, timeout=120, check=False
             )
-        except Exception:
-            pass
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            self._pull_state = "failed"
+            sys.stderr.write(colorize(f"[Sandbox] cannot pull {self.image}: {e}\n", 'warning'))
+            return
+        if proc.returncode == 0:
+            self._pull_state = "done"
+            return
+        self._pull_state = "failed"
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = tail[-1] if tail else f"exit {proc.returncode}"
+        sys.stderr.write(colorize(
+            f"[Sandbox] cannot pull {self.image}: {reason}\n"
+            f"[Sandbox] the first command will retry the pull, or use "
+            f"--sandbox-image / OLLAMAQUERY_CONTAINER_IMAGE / --sandbox-container <name>\n",
+            'warning'))
+
+    def _resolve_container_workdir(self) -> Optional[str]:
+        """Destination that maps the current CWD inside the running container.
+
+        `exec` starts in the container's own filesystem, so the host CWD is only
+        addressable where the container mounts it. A CWD *inside* a mounted
+        volume maps too: `/mnt/data` → `/w` puts `/mnt/data/proj/sub` at
+        `/w/proj/sub`. The deepest (longest) matching source wins, so nested
+        mounts resolve to the most specific one. Returns None when no mount
+        contains the CWD, which keeps the container's default workdir (the model
+        then writes inside the container, not on the host).
+
+        Returns:
+            The mount destination matching the CWD (plus the relative path), or
+            None.
+        """
+        if self._workdir_state == "resolved":
+            return self._container_workdir
+        self._workdir_state = "resolved"
+        cwd = os.path.realpath(os.getcwd())
+        try:
+            proc = subprocess.run(
+                [self.runtime, "inspect", self.container_name, "--format", "{{json .Mounts}}"],
+                capture_output=True, text=True, timeout=15, check=False
+            )
+            mounts = json.loads(proc.stdout or "[]") if proc.returncode == 0 else []
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            mounts = []
+        best: Optional[tuple] = None   # (source length, container workdir)
+        for mount in mounts or []:
+            if not isinstance(mount, dict):
+                continue
+            source = mount.get("Source") or mount.get("source") or ""
+            dest = mount.get("Destination") or mount.get("destination") or ""
+            if not source or not dest:
+                continue
+            try:
+                source_real = os.path.realpath(source)
+            except (OSError, ValueError):
+                continue
+            if cwd == source_real:
+                self._container_workdir = dest
+                return dest
+            # A source of "/" already ends with the separator; appending another
+            # would make the prefix "//", which no path matches (review P3).
+            prefix = source_real if source_real.endswith(os.sep) else source_real + os.sep
+            if cwd.startswith(prefix):
+                rel = os.path.relpath(cwd, source_real).replace(os.sep, "/")
+                candidate = dest.rstrip("/") + "/" + rel
+                if best is None or len(source_real) > best[0]:
+                    best = (len(source_real), candidate)
+        if best is not None:
+            self._container_workdir = best[1]
+            return best[1]
+        return None
+
+    def _container_command(self, command: str) -> str:
+        """Build the runtime invocation for one sandboxed command.
+
+        Args:
+            command: Shell command to run inside the container.
+
+        Returns:
+            A shell-quoted command string for the runtime (split again by
+            `_run_shell` with shell=False, so nothing is interpreted twice).
+        """
+        if self.container_name:
+            argv = [self.runtime, "exec"]
+            workdir = self._resolve_container_workdir()
+            if workdir:
+                argv += ["-w", workdir]
+            argv += [self.container_name, "sh", "-c", command]
+        else:
+            self._pre_pull_image()
+            argv = [self.runtime, "run", "--rm",
+                    "--memory", self.memory, "--cpus", self.cpus,
+                    "-v", f"{os.getcwd()}:/workspace:Z",
+                    "-w", "/workspace",
+                    self.image, "sh", "-c", command]
+        return " ".join(shlex.quote(part) for part in argv)
 
     def run(self, command: str, timeout: int = 120) -> dict:
         """Run a shell command on the host or inside a container.
@@ -4242,16 +4494,7 @@ class Executor:
             dict with stdout, stderr, returncode.
         """
         if self.mode == "container":
-            self._pre_pull_image()
-            cwd_bind = os.getcwd()
-            wrapped = (
-                f"{self.runtime} run --rm "
-                f"-v {shlex.quote(cwd_bind)}:/workspace:Z "
-                f"-w /workspace "
-                f"{shlex.quote(self.image)} "
-                f"sh -c {shlex.quote(command)}"
-            )
-            return self._run_shell(wrapped, timeout, is_container=True)
+            return self._run_shell(self._container_command(command), timeout, is_container=True)
         return self._run_shell(command, timeout)
 
     def _run_shell(self, command: str, timeout: int, is_container: bool = False) -> dict:
@@ -4350,7 +4593,7 @@ AGENTIC_TOOL_DEFS = {
         }
     },
     "grep": {
-        "description": "Search file contents with a regex and return matches grouped by file with line numbers. Optionally restrict to a path and an include glob (e.g. '*.md'). Case-insensitive by default (pass case_insensitive=false for exact case). Recursive searches skip `.git` (an explicit path inside .git is still searched), and every matched file is re-checked against the path ACL — restricted matches are hidden and counted. Returns up to max_results matches (default 100) and the rendered output is hard-capped; when a cap is hit, narrow the pattern/path/include. Path relative to CWD; searching outside CWD (e.g. /etc, home dotfiles) may prompt for approval. Direct content search, NOT a shell command — never wrap the pattern in shell metacharacters.",
+        "description": "Search file contents with a regex and return matches grouped by file with line numbers. Optionally restrict to a path and an include glob (e.g. '*.md'). Case-insensitive by default (pass case_insensitive=false for exact case). Recursive searches skip `.git` (an explicit path inside .git is still searched), and every matched file is re-checked against the path ACL — restricted matches are hidden and counted. Binary files (a NUL byte in the first 8 KiB) are skipped, never matched as text; the pure-Python fallback also counts the binary and unreadable files it skipped (the external tools report neither), so do not read a bare 'No files found' as proof the whole tree was searched. Returns up to max_results matches (default 100) and the rendered output is hard-capped; when a cap is hit, narrow the pattern/path/include. Path relative to CWD; searching outside CWD (e.g. /etc, home dotfiles) may prompt for approval. Direct content search, NOT a shell command — never wrap the pattern in shell metacharacters.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -4442,13 +4685,13 @@ AGENTIC_TOOL_DEFS = {
         }
     },
     "kubernetes_cluster_query": {
-        "description": "Read-only query of a Kubernetes/OpenShift cluster. NEVER modifies anything. Online (oc/kubectl) talks to the live cluster via kubeconfig; offline (omc) inspects a local OpenShift must-gather directory. cluster_type auto: KUBECONFIG env var set → online; else omc configured (binary + ~/.omc/omc.json) → offline; else online via default kubeconfig. Resources differ by platform — OpenShift also has projects, routes, buildconfigs, deploymentconfigs. Use CANONICAL resource names: `persistentvolumes`/`persistentvolumeclaims` (or `pv`/`pvc`) — do NOT invent plural forms like `pvs`, `volumeclaims`, or `claims`, which the backend rejects. Object storage (ODF) uses `objectbucketclaim`/`objectbucket`; those may not be collected in a must-gather, so a 'resource type not known' error there means the data is not available offline — try the canonical name once, then report it rather than retrying other spellings. Logs are tailed (default 50 lines). Filtering: selector (-l label selector) narrows get/logs/events; field_selector (--field-selector) narrows get; container (-c) selects one container for logs. All argument values are shell-quoted before execution — pass plain single values, never shell operators or substitutions. For LISTING tasks (e.g. 'list all PVs and their sizes') prefer output='custom-columns' with fields= (compact, one line per object) or output='wide' over output='json' — json dumps whole objects and large results are spilled to a file you must read via read_file. When a result IS spilled, the file path returned in the observation is authoritative: read it directly with read_file(file_path=\"...\") and page with its `next` offset — do NOT list the parent directory (~/.ollamaquery.d) to locate it.",
+        "description": "Read-only query of a Kubernetes/OpenShift cluster. NEVER modifies anything. Online (oc/kubectl) talks to the live cluster via kubeconfig; offline (omc) inspects a local OpenShift must-gather directory. cluster_type auto: KUBECONFIG env var set → online; else omc configured (binary + ~/.omc/omc.json) → offline; else online via default kubeconfig. Resources differ by platform — OpenShift also has projects, routes, buildconfigs, deploymentconfigs. Use the full resource name (e.g. `persistentvolumeclaims`, `persistentvolumes`, `deployments`). The name is sent exactly as given; online, a name the cluster does not know is refused with the closest real types. Object storage (ODF) uses `objectbucketclaims`/`objectbuckets`; those may not be collected in a must-gather, so a 'resource type not known' error there means the data is not available offline — report it rather than retrying other spellings. Logs are tailed (default 50 lines). Filtering: selector (-l label selector) narrows get/logs/events; field_selector (--field-selector) narrows get; container (-c) selects one container for logs. All argument values are shell-quoted before execution — pass plain single values, never shell operators or substitutions. For LISTING tasks (e.g. 'list all PVs and their sizes') prefer output='custom-columns' with fields= (compact, one line per object) or output='wide' over output='json' — json dumps whole objects and large results are spilled to a file you must read via read_file. When a result IS spilled, the file path returned in the observation is authoritative: read it directly with read_file(file_path=\"...\") and page with its `next` offset — do NOT list the parent directory (~/.ollamaquery.d) to locate it.",
         "parameters": {
             "type": "object",
             "properties": {
                 "cluster_type": {"type": "string", "enum": ["omc", "openshift", "kubernetes", "auto"], "description": "Consultation backend: omc=offline must-gather, openshift=oc, kubernetes=kubectl, auto=detect from environment (default)"},
                 "verb": {"type": "string", "enum": ["get", "logs", "describe", "events", "current-context"], "description": "Read-only action (default: get)"},
-                "resource": {"type": "string", "description": "Resource type to query, e.g. pods, deployments, nodes, namespaces (required for get/logs/describe). For logs, pass resource='pods' with name='<pod>', or resource='pod/<pod>'."},
+                "resource": {"type": "string", "description": "Resource type to query (required for get/logs/describe), preferably the full name, e.g. persistentvolumes, persistentvolumeclaims, pods, deployments. It is sent to the backend exactly as given. For logs, pass resource='pods' with name='<pod>', or resource='pod/<pod>'."},
                 "name": {"type": "string", "description": "Optional resource instance name, e.g. my-pod. For logs this is the pod name and is folded into a single TYPE/NAME target."},
                 "namespace": {"type": "string", "description": "Optional namespace (-n)"},
                 "selector": {"type": "string", "description": "Optional label selector to filter on, e.g. 'app=nginx' (-l). Supported by get and logs; rejected for describe."},
@@ -4535,6 +4778,29 @@ CLUSTER_QUERY_TIMEOUT = 60
 CLUSTER_LOG_TAIL_DEFAULT = 50  # logs are tailed by default (schema/prompt promise)
 OMC_CONFIG_PATH = os.path.expanduser("~/.omc/omc.json")
 
+# Resource names are passed to the backend EXACTLY as the model sent them.
+# Nothing is rewritten: a typo (`pvs`, `podss`) is the model's input, and
+# silently correcting it would teach the wrong lesson (and hide a real
+# mismatch between what was asked and what ran). The only thing we do is
+# decide: online, `oc/kubectl api-resources` is the authority on which
+# resource types exist, so a name it does not know is refused with the closest
+# real types; when discovery is unavailable (offline omc, failed probe) the
+# name is passed through and the backend's own "resource type not known"
+# error is reported.
+#
+# Only a simple, single, lowercase resource is checked. A `TYPE/NAME` target,
+# a comma list, the `all` pseudo-resource and anything with shell-ish
+# characters keep the text the model sent — `shlex.quote` in
+# `_cluster_query_verb_args` is what protects those.
+CLUSTER_RESOURCE_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+# `api-resources` is one local discovery round-trip, cached per session (a big
+# cluster answers in ~1-2 s; a chatty or wedged one must not stall a query).
+CLUSTER_DISCOVERY_TIMEOUT = 20
+# Anchors a table cell as the APIVERSION column: `v1`, `apps/v1`,
+# `storage.k8s.io/v1`. Used to parse `api-resources` output, whose columns are
+# separated by 2+ spaces and whose SHORTNAMES cell may be empty.
+_CLUSTER_API_VERSION_RE = re.compile(r"^(?:[a-z0-9.-]+/)?v\d+[a-z0-9]*$")
+
 # Read-only git inspection (git_inspect tool). Strict `/agentic plan` has no
 # shell, so the questions a planner asks first — "what is dirty?", "what changed
 # since HEAD?", "what is the history?" — were unanswerable. The action is an
@@ -4569,6 +4835,10 @@ GIT_INSPECT_TIMEOUT = 30
 GIT_INSPECT_LOG_LIMIT_DEFAULT = 20
 GIT_INSPECT_LOG_LIMIT_MAX = 100
 GIT_INSPECT_MAX_OUTPUT_CHARS = 2_000_000  # hard ceiling before spilling
+# stderr is diagnostics only (it reaches the model in an error), so it gets a
+# small ceiling: stdout is chunked and killed, and stderr used to be read whole
+# from its temp file (a bavard repo/hook could fill memory).
+GIT_INSPECT_MAX_STDERR_CHARS = 256 * 1024
 GIT_INSPECT_BASE = ["git", "-c", "core.pager=cat", "-c", "core.fsmonitor=false",
                     "-c", "core.quotepath=false", "--no-optional-locks"]
 GIT_INSPECT_DIFF_FLAGS = ["--no-ext-diff", "--no-textconv", "--no-color"]
@@ -4592,7 +4862,17 @@ GIT_SPILL_PREFIX = "git_result_"
 # (cluster_result_<verb>_<resource>.json) so one query never clobbers another
 # that is still being paged. All spill files are removed at process exit (atexit).
 CLUSTER_SPILL_THRESHOLD = 3500  # spill results larger than this (chars)
-CLUSTER_SPILL_DIR = os.path.expanduser("~/.ollamaquery.d/spill")
+SPILL_ROOT = os.path.expanduser("~/.ollamaquery.d/spill")
+
+# Per-process subdirectory. Several sessions legitimately run at once (two
+# terminals, a TUI plus a scripted agent) and they all spill into the same root.
+# Scoping by PID fixes two silent data bugs at once:
+#   - the atexit purge used to unlink every session's files *by prefix*, so
+#     closing one session deleted pages another was still paging — the model
+#     then got "File not found" on a path it had been handed a turn earlier;
+#   - coarse/fixed names (`unfinished_write_file`, `git_result_<action>`, a
+#     shared truncated URL stem) let one session overwrite another's spill.
+CLUSTER_SPILL_DIR = os.path.join(SPILL_ROOT, f"pid-{os.getpid()}")
 
 # Large `fetch_url` results spill to the same per-fetch spill dir so the model
 # can page them with `read_file` instead of the observation cap truncating them
@@ -4676,8 +4956,14 @@ def _fetch_spill_path(url: str) -> str:
     Returns:
         Spill file path under CLUSTER_SPILL_DIR.
     """
-    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", url).strip("_")[:80].strip("_") or "page"
-    return os.path.join(CLUSTER_SPILL_DIR, f"fetch_result_{stem}.txt")
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", url).strip("_")[:64].strip("_") or "page"
+    # Two long URLs from the same site share their first 64 sanitized
+    # characters, so truncating alone made them collide on one file: the second
+    # fetch silently overwrote the first, and an `offset=` handed out a turn
+    # earlier then pointed into a different page. A hash of the FULL url keeps
+    # names unique and still stable for a re-fetch of the same URL.
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(CLUSTER_SPILL_DIR, f"fetch_result_{stem}_{digest}.txt")
 
 
 def _git_spill_path(action: str) -> str:
@@ -4693,8 +4979,45 @@ def _git_spill_path(action: str) -> str:
     return os.path.join(CLUSTER_SPILL_DIR, f"{GIT_SPILL_PREFIX}{stem}.txt")
 
 
+def _pid_alive(pid: int) -> bool:
+    """Whether `pid` still exists (PermissionError means it exists, not ours)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _sweep_dead_spill_dirs() -> None:
+    """Remove `pid-<n>` spill dirs left behind by processes that no longer exist.
+
+    A session killed with SIGKILL (or one that crashes) never reaches the atexit
+    purge, so its directory would linger forever. Only dirs whose owning PID is
+    gone are removed: a live session's directory is never touched, whatever its
+    mtime (an idle chat session can sit for hours without writing).
+    """
+    match = re.fullmatch(r"pid-(\d+)", os.path.basename(CLUSTER_SPILL_DIR))
+    if not match:
+        return  # not a per-process dir (tests patch it): nothing to sweep
+    parent = os.path.dirname(CLUSTER_SPILL_DIR)
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        return
+    for name in entries:
+        entry = re.fullmatch(r"pid-(\d+)", name)
+        if not entry:
+            continue
+        pid = int(entry.group(1))
+        if pid == os.getpid() or _pid_alive(pid):
+            continue
+        shutil.rmtree(os.path.join(parent, name), ignore_errors=True)
+
+
 def _cleanup_spill_files() -> None:
-    """Remove all cluster, fetch, git and MCP spill files at process exit."""
+    """Remove this process's spill files (and dead sessions' dirs) at exit."""
     prefixes = (("cluster_result_", ".json"), ("fetch_result_", ".txt"),
                 (UNFINISHED_WRITE_SPILL_NAME, ""),
                 (MCP_SPILL_PREFIX, ".json"),
@@ -4708,8 +5031,15 @@ def _cleanup_spill_files() -> None:
                             os.unlink(os.path.join(CLUSTER_SPILL_DIR, fname))
                         except OSError:
                             pass
+            # Drop the now-empty per-process dir; fails harmlessly if a foreign
+            # file was left in it (a patched directory, or a manual drop-in).
+            try:
+                os.rmdir(CLUSTER_SPILL_DIR)
+            except OSError:
+                pass
     except OSError:
         pass
+    _sweep_dead_spill_dirs()
 
 
 # Backward-compat alias
@@ -5452,12 +5782,12 @@ def _tool_handle_write_file(self, args: dict) -> dict:
         return {"success": False, "output": "", "error": acl_err or "Path traversal denied"}
     content = args["content"]
     if len(content) > MAX_WRITE_FILE_SIZE:
-        return {"success": False, "output": "", "error": "Content too large (max 1MB)"}
+        return {"success": False, "output": "", "error": "Content too large (max 1M chars)"}
     try:
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
-        return {"success": True, "output": f"Written {len(content)} bytes to {args['file_path']}", "error": None}
+        return {"success": True, "output": f"Written {len(content)} chars to {args['file_path']}", "error": None}
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
 
@@ -5590,6 +5920,56 @@ def _grep_drain_stderr(pipe, sink: dict, limit: int = 4096) -> None:
             pass
 
 
+def _grep_timeout_error(timeout: int) -> str:
+    """Build the shared timeout message (both backends must produce it).
+
+    Args:
+        timeout: The wall-clock budget that expired, in seconds.
+
+    Returns:
+        A message starting with GREP_TIMEOUT_PREFIX so `_grep_search` can tell a
+        timeout (do not retry with a slower backend) from "tool unavailable".
+    """
+    return f"{GREP_TIMEOUT_PREFIX} after {timeout}s"
+
+
+def _grep_is_binary(path: str) -> bool:
+    """True when a NUL byte appears in the first GREP_BINARY_SNIFF_BYTES.
+
+    The same heuristic rg and `grep -I` apply while scanning, so all three
+    backends skip the same files instead of disagreeing about them (pre-fix the
+    pure-Python backend matched NUL-containing files that rg and grep skipped).
+
+    Args:
+        path: File to sniff.
+
+    Returns:
+        True for a binary-looking file. A failed open returns False so the
+        caller's read reports it as unreadable instead of "binary".
+    """
+    try:
+        with open(path, "rb") as fh:
+            return b"\x00" in fh.read(GREP_BINARY_SNIFF_BYTES)
+    except OSError:
+        return False
+
+
+def _grep_sort_hits(hits: list) -> list:
+    """Order hits by (path, line) so every backend renders the same result.
+
+    Search-tool output order is unspecified (rg emits in scan order, which can
+    vary run to run), and the model cites these line numbers. Sorting also
+    decides deterministically which hits survive the match/char caps.
+
+    Args:
+        hits: List of (path, line_no, text) tuples.
+
+    Returns:
+        The same hits, sorted.
+    """
+    return sorted(hits, key=lambda hit: (hit[0], hit[1]))
+
+
 def _grep_run_external(argv: list, cap: int, timeout: int) -> tuple:
     """Run an rg/grep subprocess, capturing at most cap+1 matching lines.
 
@@ -5663,7 +6043,7 @@ def _grep_run_external(argv: list, cap: int, timeout: int) -> tuple:
         err_thread.join(timeout=1)
     stderr_tail = err_sink.get("tail", "").strip()
     if timed_out:
-        err = f"search timed out after {timeout}s"
+        err = _grep_timeout_error(timeout)
     # A cap-triggered stop kills the tool, either by our terminate (-SIGTERM) or
     # by SIGPIPE once the reader closes stdout (-SIGPIPE). Both are expected
     # when we already have cap+1 lines, so only judge the exit status when the
@@ -5713,6 +6093,11 @@ def _grep_search_python(root: str, pattern: str, include: str, ci: bool, cap: in
                         read_allowed=None, skip_git: bool = True) -> tuple:
     """Pure-Python fallback content search (rg/grep unavailable).
 
+    Binary files are skipped (the same NUL-in-the-first-8-KiB heuristic rg and
+    `grep -I` use) and unreadable files are counted instead of vanishing
+    silently: a zero-hit answer must never be indistinguishable from "I could
+    not read everything".
+
     Args:
         root: Directory or single file to search.
         pattern: Regex pattern.
@@ -5724,40 +6109,95 @@ def _grep_search_python(root: str, pattern: str, include: str, ci: bool, cap: in
         skip_git: Prune `.git` directories during the walk.
 
     Returns:
-        ((path, line, text) hits, truncated, error|None).
+        ((path, line, text) hits, truncated, error|None, stats dict) where stats
+        counts `unreadable` and `binary` files the scan could not search.
     """
+    stats = {"unreadable": 0, "binary": 0}
     try:
         rx = re.compile(pattern, re.IGNORECASE if ci else 0)
     except re.error as e:
-        return [], False, f"invalid regex: {e}"
+        return [], False, f"invalid regex: {e}", stats
     targets = []
     if os.path.isdir(root):
         for dirpath, dirnames, filenames in os.walk(root):
             if skip_git:
                 dirnames[:] = [d for d in dirnames if d != ".git"]
+            dirnames.sort()
             for name in sorted(filenames):
                 if include and not fnmatch.fnmatch(name, include):
                     continue
                 targets.append(os.path.join(dirpath, name))
     else:
         targets.append(root)
+    deadline = time.monotonic() + GREP_SEARCH_TIMEOUT
     hits = []
     for target in targets:
+        if time.monotonic() > deadline:
+            return hits, False, _grep_timeout_error(GREP_SEARCH_TIMEOUT), stats
         try:
             real = os.path.realpath(target)
             if _is_blocked_system_file(real):
                 continue
             if read_allowed is not None and not read_allowed(real):
                 continue
+            if _grep_is_binary(target):
+                stats["binary"] += 1
+                continue
             with open(target, "r", encoding="utf-8", errors="replace") as f:
                 for lineno, line in enumerate(f, 1):
+                    if (lineno % GREP_SCAN_CHECK_LINES == 0
+                            and time.monotonic() > deadline):
+                        return hits, False, _grep_timeout_error(GREP_SEARCH_TIMEOUT), stats
                     if rx.search(line.rstrip("\n")):
                         hits.append((real, lineno, line.rstrip("\n")))
                         if len(hits) >= cap:
-                            return hits, True, None
+                            return hits, True, None, stats
         except (OSError, UnicodeError):
+            stats["unreadable"] += 1
             continue
-    return hits, False, None
+    return hits, False, None, stats
+
+
+def _grep_search_python_bounded(root: str, pattern: str, include: str, ci: bool, cap: int,
+                               read_allowed=None, skip_git: bool = True) -> tuple:
+    """Run the pure-Python scan under a hard wall-clock deadline.
+
+    The in-loop deadline only runs between lines, so a scan that spends its time
+    in `open`/`read` (huge tree, slow disk) can still outlast the budget. A
+    daemon thread bounds that case: on expiry the scan is abandoned (it dies
+    with the process) and reported as a timeout, exactly like a killed rg/grep.
+
+    Known limit, deliberately not papered over: CPython's `re` engine holds the
+    GIL for a whole match, so one catastrophic pattern on one huge line cannot
+    be preempted in-process — neither by this thread nor by the in-loop check.
+    That case is only killable out-of-process, which is what the external
+    backends are (rg is linear-time, grep is a subprocess); this fallback exists
+    for machines that have neither.
+
+    Args:
+        root: Directory or single file to search.
+        pattern: Regex pattern.
+        include: Optional basename glob filter.
+        ci: Case-insensitive flag.
+        cap: Maximum matches.
+        read_allowed: Optional predicate (realpath) -> bool.
+        skip_git: Prune `.git` directories during the walk.
+
+    Returns:
+        ((path, line, text) hits, truncated, error|None, stats dict).
+    """
+    box: dict = {}
+
+    def _run() -> None:
+        box["r"] = _grep_search_python(root, pattern, include, ci, cap,
+                                       read_allowed=read_allowed, skip_git=skip_git)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(GREP_SEARCH_TIMEOUT)
+    if worker.is_alive():
+        return [], False, _grep_timeout_error(GREP_SEARCH_TIMEOUT), {"unreadable": 0, "binary": 0}
+    return box.get("r", ([], False, "search failed", {"unreadable": 0, "binary": 0}))
 
 
 def _grep_root_inside_git(root: str) -> bool:
@@ -5785,8 +6225,14 @@ def _grep_search(root: str, pattern: str, include: str, ci: bool, cap: int,
     """Search file contents, preferring ripgrep over grep over pure Python.
 
     Recursive searches skip `.git` in every backend so results do not depend on
-    which binary is installed (rg skips it by default; grep -r and os.walk do
-    not). An explicit root inside `.git` is left alone.
+    which binary is installed for that policy (rg skips it by default; grep -r
+    and os.walk do not). An explicit root inside `.git` is left alone. Binary
+    files are skipped by all three backends (NUL heuristic), and hits are sorted
+    by (path, line) so the rendered answer is stable across runs and backends.
+
+    A timeout stops the chain instead of falling back: re-running the same
+    pathological pattern with a slower engine (grep, then the Python scan) would
+    burn three budgets and report the third one's error.
 
     Args:
         root: Directory or single file to search.
@@ -5798,8 +6244,9 @@ def _grep_search(root: str, pattern: str, include: str, ci: bool, cap: int,
             enforcement.
 
     Returns:
-        ((path, line, text) hits, truncated, error|None).
+        ((path, line, text) hits, truncated, error|None, stats dict).
     """
+    empty_stats = {"unreadable": 0, "binary": 0}
     rg = shutil.which("rg")
     single_file = os.path.isfile(root)
     skip_git = not single_file and not _grep_root_inside_git(root)
@@ -5820,9 +6267,12 @@ def _grep_search(root: str, pattern: str, include: str, ci: bool, cap: int,
         raw, err = _grep_run_external(argv, cap, GREP_SEARCH_TIMEOUT)
         if err is None:
             hits, truncated = _grep_parse_hits(raw, cap, read_allowed)
-            return hits, truncated, None
+            return _grep_sort_hits(hits), truncated, None, empty_stats
+        if err.startswith(GREP_TIMEOUT_PREFIX):
+            return [], False, err, empty_stats
     grep = shutil.which("grep")
     if grep:
+        # `-I` is the same binary policy as rg's default and _grep_is_binary.
         argv = ["grep", "-r", "-n", "-E", "-I"]
         if ci:
             argv.append("-i")
@@ -5837,9 +6287,12 @@ def _grep_search(root: str, pattern: str, include: str, ci: bool, cap: int,
         raw, err = _grep_run_external(argv, cap, GREP_SEARCH_TIMEOUT)
         if err is None:
             hits, truncated = _grep_parse_hits(raw, cap, read_allowed)
-            return hits, truncated, None
-    return _grep_search_python(root, pattern, include, ci, cap,
-                               read_allowed=read_allowed, skip_git=skip_git)
+            return _grep_sort_hits(hits), truncated, None, empty_stats
+        if err.startswith(GREP_TIMEOUT_PREFIX):
+            return [], False, err, empty_stats
+    hits, truncated, err, stats = _grep_search_python_bounded(
+        root, pattern, include, ci, cap, read_allowed=read_allowed, skip_git=skip_git)
+    return _grep_sort_hits(hits), truncated, err, stats
 
 
 def _grep_display_path(path_abs: str) -> str:
@@ -5860,7 +6313,8 @@ def _grep_display_path(path_abs: str) -> str:
     return path_abs
 
 
-def _grep_render(hits: list, truncated: bool, cap: int, blocked: int = 0) -> str:
+def _grep_render(hits: list, truncated: bool, cap: int, blocked: int = 0,
+                 stats: Optional[dict] = None) -> str:
     """Render hits opencode-style: grouped by file with line numbers.
 
     The rendered text is hard-capped at MAX_GREP_OUTPUT_CHARS so a full match
@@ -5871,19 +6325,28 @@ def _grep_render(hits: list, truncated: bool, cap: int, blocked: int = 0) -> str
         truncated: Whether results hit the match cap.
         cap: The configured match cap (for the truncation note).
         blocked: Number of results hidden by the per-file path ACL.
+        stats: Optional scan stats ({"unreadable": n, "binary": n}) from the
+            pure-Python fallback; the external tools cannot report either.
 
     Returns:
         Formatted output string.
     """
+    stats = stats or {}
+    notes = []
+    if stats.get("unreadable"):
+        notes.append(f"+{stats['unreadable']} file(s) could not be read")
+    if stats.get("binary"):
+        notes.append(f"+{stats['binary']} binary file(s) skipped")
+    if blocked:
+        notes.append(f"{blocked} result(s) hidden by the path ACL — grant access "
+                     f"with /agentic acl allow <path> if intended.")
+    note_text = f"\n({'; '.join(notes)})" if notes else ""
     if not hits:
-        text = "No files found"
-        if blocked:
-            text += (f"\n({blocked} result(s) hidden by the path ACL — grant access "
-                     f"with /agentic acl allow <path> if intended.)")
-        return text
+        return "No files found" + note_text
     lines = [f"Found {len(hits)} matches"]
     current = None
     for path_abs, lineno, text in hits:
+        text = text.rstrip("\r")
         if len(text) > MAX_GREP_LINE_LENGTH:
             text = text[:MAX_GREP_LINE_LENGTH] + f" [+{len(text) - MAX_GREP_LINE_LENGTH} chars]"
         shown = _grep_display_path(path_abs)
@@ -5897,10 +6360,7 @@ def _grep_render(hits: list, truncated: bool, cap: int, blocked: int = 0) -> str
         lines.append("")
         lines.append(f"(Results capped at {cap} matches. Narrow the pattern/path/include "
                      f"or pass max_results={cap} for the same ceiling.)")
-    if blocked:
-        lines.append(f"({blocked} result(s) hidden by the path ACL — grant access "
-                     f"with /agentic acl allow <path> if intended.)")
-    rendered = "\n".join(lines)
+    rendered = "\n".join(lines) + note_text
     if len(rendered) > MAX_GREP_OUTPUT_CHARS:
         note = (f"\n(Output capped at {MAX_GREP_OUTPUT_CHARS} chars; narrow "
                 f"pattern/path/include.)")
@@ -5918,7 +6378,9 @@ def _tool_handle_grep(self, args: dict) -> dict:
     `~/.ssh/id_rsa` even though they are `ask` by default. Results the per-file
     check refuses are dropped (never prompted, to avoid one prompt per match)
     and counted in the output. Matches are cap-bounded, per-line truncated, and
-    the rendered text is hard-capped before rendering.
+    the rendered text is hard-capped before rendering. Binary and unreadable
+    files are skipped rather than half-searched; the pure-Python fallback counts
+    them so a zero-hit answer never implies a complete search when it was not.
 
     Args:
         args: Tool arguments with "pattern"; optional "path", "include",
@@ -5984,12 +6446,13 @@ def _tool_handle_grep(self, args: dict) -> dict:
                 return False
         return True
 
-    hits, truncated, err = _grep_search(root, pattern, include, ci, cap,
-                                        read_allowed=_read_allowed)
+    hits, truncated, err, stats = _grep_search(root, pattern, include, ci, cap,
+                                             read_allowed=_read_allowed)
     if err:
         return {"success": False, "output": "", "error": err}
     return {"success": True,
-            "output": _grep_render(hits, truncated, cap, blocked=blocked["n"]),
+            "output": _grep_render(hits, truncated, cap, blocked=blocked["n"],
+                                   stats=stats),
             "error": None}
 
 
@@ -6710,6 +7173,196 @@ def _read_omc_config_must_gather_dir() -> Optional[str]:
     return None
 
 
+def _cluster_parse_api_resources(text: str) -> dict:
+    """Parse `oc api-resources` table output into {token: canonical name}.
+
+    The table's columns are separated by 2+ spaces (tabwriter padding) and the
+    SHORTNAMES cell is empty for many resources, so cells cannot be indexed
+    positionally. The APIVERSION cell is the anchor: the cell after it is
+    NAMESPACED (`true`/`false`) and the one after that is KIND, whatever the
+    preceding columns contain.
+
+    Args:
+        text: Raw stdout of `<cli> api-resources`.
+
+    Returns:
+        Mapping of every resource NAME, short name and lowercase kind to the
+        canonical NAME (plural resource name).
+    """
+    known = {}
+    for line in str(text or "").splitlines():
+        cells = [c for c in re.split(r"\s{2,}", line.strip()) if c]
+        if len(cells) < 3:
+            continue
+        name = cells[0]
+        if name == "NAME" or not re.match(r"^[a-z0-9][a-z0-9.-]*$", name):
+            continue
+        apiversion = None
+        for idx in range(1, min(len(cells), 5)):
+            if _CLUSTER_API_VERSION_RE.match(cells[idx]):
+                apiversion = idx
+                break
+        if apiversion is None:
+            continue
+        known[name] = name
+        if apiversion > 1:
+            for short in cells[1].split(","):
+                short = short.strip()
+                if short:
+                    known.setdefault(short, name)
+        kind_index = apiversion + 2
+        if kind_index < len(cells):
+            known.setdefault(cells[kind_index].lower(), name)
+    return known
+
+
+def _cluster_known_resources(executor: object, cli: str, cache_owner: object) -> Optional[dict]:
+    """Return the cluster's {token: canonical resource name} map, or None.
+
+    `oc/kubectl api-resources` is the ground truth: it is the only way to know
+    whether a resource exists (CRDs are discovered, not hardcoded) and it maps
+    every real short name to its canonical NAME. It runs lazily, at most once
+    per session per cluster client, and a failure (auth, timeout, no discovery)
+    is cached as "unavailable" too: validation is best-effort and must never
+    block a query the backend itself could answer. `omc` has no such command,
+    so offline mode never calls this.
+
+    The cache lives on the caller (the session's ToolRegistry), not on the
+    process-wide CommandContext singleton: two sessions in different processes
+    have different clusters, and tests create a fresh registry per case.
+
+    Args:
+        executor: The Executor used to run the probe.
+        cli: "oc" or "kubectl".
+        cache_owner: Object holding the per-session cache (may be None).
+
+    Returns:
+        The parsed map, or None when discovery is unavailable/empty.
+    """
+    cache = None
+    if cache_owner is not None:
+        cache = getattr(cache_owner, "_cluster_resources_cache", None)
+        if cache is None:
+            try:
+                cache = {}
+                setattr(cache_owner, "_cluster_resources_cache", cache)
+            except (AttributeError, TypeError):
+                cache = None
+    key = f"{cli}:{os.environ.get('KUBECONFIG', '')}"
+    if cache is not None and key in cache:
+        return cache[key]
+    known = None
+    try:
+        result = executor.run(f"{cli} api-resources", timeout=CLUSTER_DISCOVERY_TIMEOUT)
+        if result.get("returncode") == 0:
+            known = _cluster_parse_api_resources(result.get("stdout") or "") or None
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        # A broken/short-circuited executor must not break the query: without
+        # discovery the name is simply passed through.
+        known = None
+    if cache is not None:
+        cache[key] = known
+    return known
+
+
+def _cluster_resource_suggestions(name: str, known: dict, limit: int = 3) -> list:
+    """Return up to `limit` real resource types close to `name`.
+
+    Feeds the teaching error: a model that invented a plural should be told
+    the real name in one line instead of retrying spellings. Three generic
+    signals, strongest first: the name (or its singular, by stripping a
+    trailing "s") is a known short name/kind; containment (`claims` ⊂
+    `persistentvolumeclaims`); edit distance.
+
+    Args:
+        name: The unresolved token (the `TYPE` of a `TYPE/NAME` target).
+        known: The {token: canonical name} map from `api-resources`.
+        limit: Maximum number of suggestions.
+
+    Returns:
+        Strings like "persistentvolumeclaims (pvc)", best first.
+    """
+    lower = str(name or "").lower()
+    if not lower:
+        return []
+    scored = []
+    seen = set()
+
+    def _add(score: int, candidate: str) -> None:
+        """Record one candidate once, keeping the strongest score."""
+        if candidate in seen:
+            return
+        seen.add(candidate)
+        scored.append((score, candidate))
+
+    variants = [lower]
+    if lower.endswith("s") and len(lower) > 1:
+        variants.append(lower[:-1])
+    for variant in variants:
+        for probe in (variant, variant + "s"):
+            target = known.get(probe)
+            if target:
+                _add(3 if probe == variant else 2, target)
+    for candidate in sorted(set(known.values())):
+        base = candidate.lower()
+        if base.startswith(lower) or base.endswith(lower) or lower in base:
+            _add(2, candidate)
+        elif difflib.SequenceMatcher(None, lower, base).ratio() >= 0.6:
+            _add(1, candidate)
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    hints = []
+    for _score, candidate in scored[:limit]:
+        shorts = sorted(token for token, target in known.items()
+                        if target == candidate and token != candidate and len(token) <= 6)
+        hints.append(f"{candidate} ({shorts[0]})" if shorts else candidate)
+    return hints
+
+
+def _cluster_checkable_token(raw: str) -> str:
+    """Return the resource TYPE token to validate, or "" when not checkable.
+
+    A `TYPE/NAME` target contributes its TYPE; a comma list, the `all`
+    pseudo-resource and anything with shell-ish characters are not checked —
+    they are passed through exactly as sent (quoting protects them).
+
+    Args:
+        raw: The `resource` argument exactly as sent by the model.
+
+    Returns:
+        The lowercase TYPE token, or "" when the value is not checkable.
+    """
+    name = str(raw or "").strip()
+    if not name or name.lower() == "all":
+        return ""
+    head = name.partition("/")[0]
+    return head if CLUSTER_RESOURCE_NAME_RE.match(head) else ""
+
+
+def _cluster_check_resource(raw: str, known: Optional[dict]) -> str:
+    """Check a model-supplied resource name against the cluster's API list.
+
+    Nothing is rewritten: the string is either accepted as-is or refused with
+    a message naming the closest real resource types. A refusal is a teaching
+    error, not a correction — the model re-issues the call itself.
+
+    Args:
+        raw: The `resource` argument, exactly as the model sent it.
+        known: The cluster's {token: canonical name} map, or None when
+            discovery is unavailable (offline omc, failed probe).
+
+    Returns:
+        An error message when the name is unknown to a cluster that answered
+        discovery, or "" when it is usable (including the no-discovery case).
+    """
+    token = _cluster_checkable_token(raw)
+    if not token or known is None or token in known:
+        return ""
+    hints = _cluster_resource_suggestions(token, known)
+    hint = f"; closest known: {', '.join(hints)}" if hints else ""
+    return (f"unknown resource '{raw}'{hint} — use a resource type this cluster "
+            f"knows (e.g. persistentvolumeclaims, deployments, pods)")
+
+
 def _cluster_query_verb_args(verb: str, args: dict) -> list:
     """Build the verb-specific command tokens for a cluster query.
 
@@ -6942,6 +7595,10 @@ def _tool_handle_cluster_query(self, args: dict) -> dict:
         {"success": bool, "output": str, "error": str|None}. The output is
         prefixed with a `platform: ... | context/must-gather: ...` header so the
         model (and logs) always record which cluster was consulted.
+
+    Resource names are validated, never rewritten: the model's `resource`
+    string is exactly what runs (or the call is refused with the closest real
+    types when online discovery says it does not exist).
     """
     verb = str(args.get("verb", "get")).lower()
     if verb not in CLUSTER_QUERY_VERBS:
@@ -6956,6 +7613,21 @@ def _tool_handle_cluster_query(self, args: dict) -> dict:
     if backend is None:
         return {"success": False, "output": "",
                 "error": "No cluster client available: install oc, kubectl, or omc"}
+
+    # Validate the resource name — never rewrite it. `events` and
+    # `current-context` take no resource; `omc` has no `api-resources`, so
+    # offline the name is passed through unchanged and the backend reports
+    # whether the must-gather has it.
+    if verb not in ("events", "current-context"):
+        raw_resource = str(args.get("resource") or "")
+        if _cluster_checkable_token(raw_resource):
+            known = None
+            if backend != "omc":
+                cli = "oc" if backend == "oc" else "kubectl"
+                known = _cluster_known_resources(self.executor, cli, self)
+            resource_error = _cluster_check_resource(raw_resource, known)
+            if resource_error:
+                return {"success": False, "output": "", "error": resource_error}
 
     header = [f"platform: {backend}"]
     offline_dir = ""
@@ -7208,9 +7880,14 @@ def _git_capture(argv: list, env: dict, limit: int) -> dict:
                 returncode = -1
         timed_out = timed_out or (killed_by_watchdog["value"] and not truncated)
         err.seek(0)
-        stderr_text = err.read().decode("utf-8", errors="replace")
+        raw_err, stderr_truncated = _bounded_read(err, GIT_INSPECT_MAX_STDERR_CHARS)
+        stderr_text = raw_err.decode("utf-8", errors="replace")
+        if stderr_truncated:
+            stderr_text += (f"\n[stderr truncated at {GIT_INSPECT_MAX_STDERR_CHARS} "
+                            f"bytes]")
     return {"returncode": returncode, "stdout": "".join(chunks),
-            "stderr": stderr_text, "truncated": truncated, "timed_out": timed_out}
+            "stderr": stderr_text, "truncated": truncated,
+            "stderr_truncated": stderr_truncated, "timed_out": timed_out}
 
 
 def _spill_git_result(ctx: object, output_text: str, action: str) -> str:
@@ -8206,8 +8883,13 @@ def _mcp_result_to_output(ctx: object, result: dict, cfg: MCPServerConfig,
                     f"NOT included here to avoid duplicating it in context. Read it with "
                     f"read_file(file_path=\"{path}\"); read_file pages large files "
                     f"automatically via the `next` offset. Preview: {preview}...")
-        except OSError:
-            pass  # fall through with the truncated-in-context text
+        except OSError as e:
+            # No pointer to hand over, so say so and bound the copy explicitly:
+            # the note is charged against the cap, so the model never receives
+            # a silently cut body that looks complete.
+            note = (f"[mcp:{cfg.name}] Result is {len(text)} chars; the spill file could not "
+                    f"be written ({e}). Showing a truncated copy below:\n")
+            text = (note + text)[:max_chars]
     return {
         "success": not is_error,
         "output": text,
@@ -9556,22 +10238,35 @@ class AgenticLogger:
     Automatically cleans up log files older than AGENTIC_LOG_RETENTION_DAYS
     (default 1) on initialization to prevent unbounded disk growth.
 
+    Logging is best-effort by contract: a full disk, an EIO or an
+    unserializable payload disables the logger with one warning instead of
+    raising into the ReAct loop, because losing the log must never abort a
+    working query mid-tool-use.
+
     Call map:
-      __init__() → _cleanup_old_logs()
-      write() → appends JSONL line
-      close() → flushes file
+      __init__() → _cleanup_old_logs() → _open_private()
+      write() → appends JSONL line (no-op once disabled)
+      close() → flushes file (idempotent, no-op once disabled)
     """
 
     AGENTIC_LOG_RETENTION_DAYS = 1
 
     def __init__(self) -> None:
         """Open a fresh timestamped JSONL log after pruning old ones."""
+        self.disabled = False
+        self.file: Optional[IO] = None
+        self.path = ""
         log_dir = os.path.expanduser("~/.ollamaquery.d/agentic")
         _ensure_private_dir(log_dir)
         self._cleanup_old_logs(log_dir)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.path = os.path.join(log_dir, f"{timestamp}.jsonl")
-        self.file = _open_private(self.path, "w", encoding="utf-8")
+        path = os.path.join(log_dir, f"{timestamp}.jsonl")
+        try:
+            self.file = _open_private(path, "w", encoding="utf-8")
+        except OSError as e:
+            self._disable(f"cannot open {path}: {e}")
+            return
+        self.path = path
 
     def _cleanup_old_logs(self, log_dir: str) -> None:
         """Remove log files older than AGENTIC_LOG_RETENTION_DAYS."""
@@ -9585,19 +10280,54 @@ class AgenticLogger:
         except OSError:
             pass
 
+    def _disable(self, reason: str) -> None:
+        """Turn logging off after a failure, warning exactly once.
+
+        Args:
+            reason: Human-readable cause appended to the warning.
+        """
+        if self.disabled:
+            return
+        self.disabled = True
+        self.file = None
+        sys.stderr.write(colorize(f"[Agentic] logging disabled: {reason}\n", 'warning'))
+        sys.stderr.flush()
+
     def write(self, **data: dict) -> None:
         """Append a JSONL entry with a timestamp.
 
         Args:
             **data: Arbitrary fields to log (type, iteration, model_response, ...).
+
+        Returns:
+            None. A write/serialization failure disables logging instead of
+            propagating (the agentic loop must survive a broken log sink).
         """
-        data["timestamp"] = datetime.now().isoformat()
-        self.file.write(json.dumps(data, default=str) + "\n")
-        self.file.flush()
+        if self.disabled or self.file is None:
+            return
+        entry = dict(data)
+        entry["timestamp"] = datetime.now().isoformat()
+        try:
+            self.file.write(json.dumps(entry, default=str) + "\n")
+            self.file.flush()
+        except (OSError, ValueError) as e:
+            self._disable(str(e) or e.__class__.__name__)
 
     def close(self) -> None:
-        """Flush and close the log file."""
-        self.file.close()
+        """Flush and close the log file.
+
+        Returns:
+            None. Idempotent, and a close failure disables logging rather than
+            raising on the loop's exit path.
+        """
+        if self.file is None:
+            return
+        try:
+            self.file.close()
+        except OSError as e:
+            self._disable(str(e) or e.__class__.__name__)
+        finally:
+            self.file = None
 
 
 # ============================================================================
@@ -9727,6 +10457,904 @@ def debug_log(debug_mgr: 'DebugManager', category: str, level: int, message: str
 
     sys.stderr.write(colorize(f"{output}\n", 'muted'))
 
+
+# ============================================================================
+# ============= REQUEST BUILDER (outbound payload shaping) ====================
+# ============================================================================
+
+class RequestBuilder:
+    """Builds the outbound request for a query: payload, URL (and image/tools wiring).
+
+    Extracted from `ModelQuery`, which keeps thin doors for the names the
+    streaming paths, `WireView` and the tests call. Everything that shapes what
+    goes over the wire lives here: image injection, the size/output-cap
+    options, per-backend inference/reasoning params, and the payload assembly.
+    The builder owns no state beyond the shared `CommandContext`; the backend
+    name is passed in by the caller so a door cannot disagree with the payload
+    it just built.
+    """
+
+    def __init__(self, ctx: 'CommandContext') -> None:
+        """Bind the builder to the shared context.
+
+        Args:
+            ctx: The shared CommandContext (base URL, output budget, tokenizer).
+        """
+        self.ctx = ctx
+
+    @staticmethod
+    def _last_user_message_index(messages: list[Message]) -> int:
+        """Return the index of the last real user message, or -1.
+
+        Skips `_system_nudge` messages (loop-internal steering such as the
+        near-full notice) so image injection targets the actual user turn.
+
+        Args:
+            messages: Message list.
+
+        Returns:
+            Index of the last non-nudge user message, or -1 when none.
+        """
+        for i in range(len(messages) - 1, -1, -1):
+            m = messages[i]
+            if isinstance(m, dict) and m.get("role") == "user" and not m.get("_system_nudge"):
+                return i
+        return -1
+
+    @staticmethod
+    def _inject_images_into_messages(messages: list[Message], images: Optional[list], backend: str) -> None:
+        """Inject image data into the last real user message, mutating in-place.
+
+        Args:
+            messages: Message list (mutated in place).
+            images: List of base64 image strings.
+            backend: Backend name for shape selection.
+
+        Ollama backend: sets the message's `images` list.
+        OpenAI-compatible backends (llamacpp, lmstudio, strata): embeds images
+        as content parts with data:image URIs. `_system_nudge` messages are
+        skipped so a trailing nudge never steals the attachments.
+        """
+        if not images or not messages:
+            return
+        idx = RequestBuilder._last_user_message_index(messages)
+        if idx < 0:
+            return
+        if backend == "ollama":
+            messages[idx]["images"] = images
+        else:
+            text = messages[idx].get("content", "")
+            content_parts = [{"type": "text", "text": text or "Describe this image"}]
+            for img in images:
+                mime = guess_image_mime(img)
+                content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img}"}})
+            messages[idx]["content"] = content_parts
+
+    @staticmethod
+    def _apply_backend_inference_params(payload: dict, backend: str, kwargs: dict) -> None:
+        """Copy the backend-supported inference params from kwargs into the payload.
+
+        Args:
+            payload: The payload dict (mutated in place).
+            backend: Backend name (controls which params are supported).
+            kwargs: The kwargs dict (images/tools/params/etc.).
+        """
+        if backend in ("llamacpp", "strata"):
+            params = ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]
+        elif backend == "lmstudio":
+            params = ["temperature", "top_p", "presence_penalty", "repeat_penalty"]
+        elif backend in ("gemini", "opencodezen", "opencodego"):
+            params = ["temperature", "top_p", "top_k"]
+        elif backend in ("mistral", "deepseek"):
+            params = ["temperature", "top_p"]
+        else:
+            params = []
+        for param in params:
+            if param in kwargs:
+                payload[param] = kwargs[param]
+
+    @staticmethod
+    def _apply_no_thinking(payload: dict, backend: str) -> None:
+        """Disable the model's reasoning phase via the backend template flag.
+
+        Reasoning models ignore prompt-level instructions, so the thinking phase
+        must be turned off through the chat-template flag. Each local backend and
+        model family exposes it differently:
+          - ollama: /api/chat `options.think = false`
+          - llama.cpp / lmstudio Qwen-style templates: `chat_template_kwargs`
+            (llama.cpp uses `thinking`, vLLM uses `enable_thinking`; both keys
+            are set so either is honored, unknown keys are ignored by templates)
+          - gpt-oss: has NO reasoning off-switch — the model is trained to always
+            reason (llama.cpp: "incapable of not reasoning"). Only
+            `reasoning_effort` (low/medium/high) is supported, so `/thinkingoff`
+            downgrades it to "low" to minimize the analysis phase.
+
+        Args:
+            payload: The payload dict (mutated in place).
+            backend: Backend name.
+        """
+        if backend == "ollama":
+            payload["options"] = {**payload.get("options", {}), "think": False}
+        elif backend in ("llamacpp", "strata", "lmstudio"):
+            kwargs = dict(payload.get("chat_template_kwargs") or {})
+            model = str(payload.get("model", "")).lower()
+            if "gpt-oss" in model or "gpt_oss" in model:
+                kwargs["reasoning_effort"] = "low"
+            else:
+                kwargs["enable_thinking"] = False
+                kwargs["thinking"] = False
+            payload["chat_template_kwargs"] = kwargs
+
+    @staticmethod
+    def _apply_reasoning_effort(payload: dict, backend: str, effort: str) -> None:
+        """Set the model's reasoning effort via the backend-specific field.
+
+        Templates that support reasoning levels (gpt-oss, newer Qwen3) read
+        `reasoning_effort` (low/medium/high); templates that don't silently
+        ignore it. Ollama exposes it through `options`, the OpenAI-compatible
+        backends through `chat_template_kwargs`.
+
+        Args:
+            payload: The payload dict (mutated in place).
+            backend: Backend name.
+            effort: Reasoning effort level ("low", "medium" or "high").
+        """
+        if backend == "ollama":
+            payload["options"] = {**payload.get("options", {}), "reasoning_effort": effort}
+        elif backend in ("llamacpp", "strata", "lmstudio"):
+            kwargs = dict(payload.get("chat_template_kwargs") or {})
+            kwargs["reasoning_effort"] = effort
+            payload["chat_template_kwargs"] = kwargs
+
+    @staticmethod
+    def _apply_preserve_thinking(payload: dict, backend: str, value: bool) -> None:
+        """Set the `preserve_thinking` chat-template flag (OpenAI-compatible backends).
+
+        Qwen3.6/3.8 templates read `preserve_thinking` from `chat_template_kwargs`
+        to retain reasoning traces from historical assistant turns. Ollama has no
+        equivalent option, so the flag is only emitted for the OpenAI-compatible
+        local backends; callers must also keep reasoning in the message history
+        for it to have any effect.
+
+        Args:
+            payload: The payload dict (mutated in place).
+            backend: Backend name.
+            value: True to retain historical reasoning, False to keep only the
+                latest turn's reasoning.
+        """
+        if backend in ("llamacpp", "strata", "lmstudio"):
+            kwargs = dict(payload.get("chat_template_kwargs") or {})
+            kwargs["preserve_thinking"] = bool(value)
+            payload["chat_template_kwargs"] = kwargs
+
+    def _apply_size_options(self, payload: dict, backend: str, kwargs: dict) -> None:
+        """Apply warmup, context-size, and output-cap options to the payload.
+
+        Args:
+            payload: The payload dict (mutated in place).
+            backend: Backend name.
+            kwargs: The kwargs dict.
+        """
+        if kwargs.get('is_warmup'):
+            if backend == "ollama":
+                payload["options"] = {"num_predict": 1}
+            elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+                payload["max_tokens"] = 1
+            return
+        # Ollama context window via num_ctx. OpenAI-compatible servers treat the
+        # window as a server-side setting, not a request field — the old
+        # `max_tokens = context_size` conflated the input window with the output
+        # cap, silently limiting (or 400-ing) generation on /contextsizeset.
+        if context_size := kwargs.get('context_size'):
+            if backend == "ollama":
+                payload.setdefault("options", {})
+                payload["options"]["num_ctx"] = context_size
+        # Per-response output cap (/maxtokens); already clamped by
+        # build_request_payload. Includes reasoning/thinking tokens.
+        if max_output := kwargs.get('max_output_tokens'):
+            if backend == "ollama":
+                payload.setdefault("options", {})
+                payload["options"]["num_predict"] = max_output
+            elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+                payload["max_tokens"] = max_output
+
+    def _apply_output_cap(self, messages: list[Message], kwargs: dict) -> tuple:
+        """Add the static cap line and resolve the effective (clamped) cap.
+
+        Args:
+            messages: The outbound message list.
+            kwargs: The request kwargs dict.
+
+        Returns:
+            (messages_with_cap_line, kwargs_with_max_output_tokens). The stored
+            conversation is never mutated.
+        """
+        configured = int(getattr(self.ctx, 'max_output_tokens', DEFAULT_MAX_OUTPUT_TOKENS)
+                         or DEFAULT_MAX_OUTPUT_TOKENS)
+        messages = self._with_output_cap_line(messages, configured)
+        window = self.ctx.context_window_size
+        prompt_tokens = self.ctx.calculate_context_tokens(messages)
+        # The native `tools` array is serialized upstream of the conversation by
+        # every chat template, so it competes for the window too. Counting it
+        # here keeps the clamp honest in agentic mode (~1.4-2.9K tokens).
+        prompt_tokens += self.ctx.count_tools_tokens(kwargs.get('tools'))
+        effective, _reserve = resolve_output_budget(configured, window, prompt_tokens)
+        if window <= 0:
+            global _MAX_OUTPUT_WINDOW_WARNED
+            if not _MAX_OUTPUT_WINDOW_WARNED:
+                _MAX_OUTPUT_WINDOW_WARNED = True
+                sys.stderr.write(colorize(
+                    f"[maxtokens] Context window unknown; applying {configured} "
+                    "tokens without clamping.", 'warning') + "\n")
+        elif effective <= 0:
+            # No room after the reserve — the caller should have force-compacted.
+            # Backstop so the request still goes out instead of erroring.
+            effective = MAX_OUTPUT_MIN_FLOOR
+            sys.stderr.write(colorize(
+                f"[maxtokens] No output room ({prompt_tokens}/{window}); "
+                f"using floor {MAX_OUTPUT_MIN_FLOOR}.", 'warning') + "\n")
+        kwargs = dict(kwargs)
+        kwargs['max_output_tokens'] = effective
+        return messages, kwargs
+
+    @staticmethod
+    def _with_output_cap_line(messages: list, configured: int) -> list:
+        """Return a copy of `messages` with the static cap sentence in the system message.
+
+        Args:
+            messages: The outbound message list.
+            configured: The configured output cap.
+
+        Returns:
+            A new list whose system message carries the cap line. The stored
+            conversation objects are not mutated.
+        """
+        if not messages:
+            return messages
+        line = max_output_cap_line(configured)
+        new = list(messages)
+        first = new[0]
+        if first.get('role') != 'system':
+            return [{'role': 'system', 'content': line}] + new
+        new_first = dict(first)
+        content = new_first.get('content') or ''
+        if isinstance(content, list):
+            new_first['content'] = list(content) + [{"type": "text", "text": line}]
+        else:
+            new_first['content'] = (f"{content}\n\n{line}" if content else line)
+        new_first.pop('_tokens', None)  # content changed; cached count no longer valid
+        new[0] = new_first
+        return new
+
+    def build_request_payload(self, messages: list[Message], model: str, backend: str,
+                              stream_enabled: bool = False, **kwargs: dict) -> dict:
+        """Build request payload for the backend.
+
+        Args:
+            messages: Message list to send.
+            model: Model name.
+            backend: Backend name (the model/URL selection lives with the caller).
+            stream_enabled: Whether to request streaming.
+            **kwargs: images, tools, context_size, is_warmup, inference params.
+                apply_output_cap: When True, apply the /maxtokens per-response
+                    output cap (clamped to the context window) and advertise it
+                    in the system message.
+
+        Returns:
+            The JSON payload dict.
+        """
+        self._inject_images_into_messages(messages, kwargs.get('images'), backend)
+
+        if kwargs.get('apply_output_cap'):
+            messages, kwargs = self._apply_output_cap(messages, kwargs)
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": stream_enabled
+        }
+
+        self._apply_size_options(payload, backend, kwargs)
+
+        if tools := kwargs.get('tools'):
+            payload["tools"] = tools
+
+        self._apply_backend_inference_params(payload, backend, kwargs)
+
+        if kwargs.get('no_thinking'):
+            self._apply_no_thinking(payload, backend)
+
+        if effort := kwargs.get('reasoning_effort'):
+            self._apply_reasoning_effort(payload, backend, str(effort))
+
+        preserve = kwargs.get('preserve_thinking')
+        if preserve is not None and supports_preserve_thinking(model):
+            self._apply_preserve_thinking(payload, backend, bool(preserve))
+
+        return payload
+
+    def _get_chat_url(self, backend: str) -> str:
+        """Return the chat API URL for the given backend.
+
+        Args:
+            backend: Backend name ("ollama" uses /api/chat, others use /v1/chat/completions).
+        """
+        base_url = self.ctx.base_url
+        return f"{base_url}/api/chat" if backend == "ollama" else f"{base_url}/v1/chat/completions"
+
+    def _build_stream_request(self, backend: str, messages: list[Message], model: str,
+                              stream_enabled: bool, context_size: Optional[int],
+                              headers: dict, **kwargs: dict) -> tuple:
+        """Build URL, payload and headers for the backend.
+
+        Args:
+            backend: Backend name.
+            messages: Message list to send.
+            model: Model name.
+            stream_enabled: Whether streaming was requested.
+            context_size: Context window size (or None).
+            headers: HTTP headers for the request (built by the caller).
+            **kwargs: Extra payload args.
+
+        Returns:
+            (api_url, payload, headers) tuple.
+        """
+        payload = self.build_request_payload(messages, model, backend,
+                                            stream_enabled=stream_enabled,
+                                            context_size=context_size, **kwargs)
+        return self._get_chat_url(backend), payload, headers
+
+# ============================================================================
+# ============= STATS CALCULATOR (per-query timing + display) ================
+# ============================================================================
+
+class StatsCalculator:
+    """Turns one query's server usage + client timestamps into a stats dict.
+
+    Extracted from `ModelQuery` (TODO 4.1b), which keeps thin doors for
+    `calculate_stats`/`print_stats_display`. The calculator owns no state beyond
+    the shared `CommandContext` (tokenizer + the context-token bar it reports).
+
+    Timing is hybrid: server-reported durations (Ollama nanoseconds, llama.cpp
+    milliseconds/per-second rates, LM Studio rates) are preferred, with client
+    wall-clock phase timestamps (time-to-first-token, first-content, stream end)
+    as the fallback for backends that report none. Prefill is kept out of the
+    decode rate so prompt-eval work never dilutes the generation number.
+    """
+
+    def __init__(self, ctx: 'CommandContext') -> None:
+        """Bind the calculator to the shared context.
+
+        Args:
+            ctx: The shared CommandContext (tokenizer, context-token bar).
+        """
+        self.ctx = ctx
+
+    @staticmethod
+    def _extract_usage_timings(usage: dict) -> tuple:
+        """Extract server-reported prefill/decode timings and rates.
+
+        Handles Ollama nanosecond durations (prompt_eval_duration /
+        eval_duration) and llama.cpp millisecond timings plus precomputed
+        rates (prompt_ms / predicted_ms / prompt_per_second /
+        predicted_per_second).
+
+        Args:
+            usage: Server usage dict.
+
+        Returns:
+            (prefill_sec, gen_sec, prefill_tps, gen_tps), each None if absent.
+        """
+        prefill_sec = gen_sec = prefill_tps = gen_tps = None
+        pe_dur = usage.get("prompt_eval_duration") or 0   # Ollama nanoseconds
+        ev_dur = usage.get("eval_duration") or 0
+        if pe_dur > 0:
+            prefill_sec = pe_dur / 1e9
+        if ev_dur > 0:
+            gen_sec = ev_dur / 1e9
+        if usage.get("prompt_ms"):
+            prefill_sec = float(usage["prompt_ms"]) / 1000.0
+        if usage.get("predicted_ms"):
+            gen_sec = float(usage["predicted_ms"]) / 1000.0
+        if usage.get("prompt_per_second"):
+            prefill_tps = float(usage["prompt_per_second"])
+        if usage.get("predicted_per_second"):
+            gen_tps = float(usage["predicted_per_second"])
+        return prefill_sec, gen_sec, prefill_tps, gen_tps
+
+    @staticmethod
+    def _client_phase_seconds(phase_times: Optional[dict]) -> tuple:
+        """Derive wall-clock (prefill, thinking, answer) seconds from timestamps.
+
+        Args:
+            phase_times: Optional dict with start/first_token/first_content/end.
+
+        Returns:
+            (prefill_sec, thinking_sec, answer_sec), each None if underivable.
+        """
+        if not phase_times:
+            return None, None, None
+        start = phase_times.get("start")
+        first = phase_times.get("first_token")
+        first_content = phase_times.get("first_content")
+        end = phase_times.get("end")
+        prefill = max(first - start, 0.0) if (start is not None and first is not None) else None
+        thinking = max(first_content - first, 0.0) if (first is not None and first_content is not None) else None
+        if first_content is not None and end is not None:
+            answer = max(end - first_content, 0.0)
+        elif first is not None and end is not None:
+            answer = max(end - first, 0.0)
+        else:
+            answer = None
+        return prefill, thinking, answer
+
+    def _split_generation_tokens(self, content: str, thought: str, eval_count: int) -> tuple:
+        """Split generated tokens into (thinking, answer) via a length ratio.
+
+        The server reports one combined generated-token count (thinking +
+        answer). The ratio is estimated from text length and scaled to the
+        server total so the two parts always sum to `eval_count`.
+
+        Args:
+            content: Visible answer text.
+            thought: Thinking/reasoning text.
+            eval_count: Combined server-reported generated tokens.
+
+        Returns:
+            (think_tokens, answer_tokens).
+        """
+        if not thought:
+            return 0, eval_count
+        think_est = self.ctx.estimate_tokens(thought)
+        answer_est = self.ctx.estimate_tokens(content)
+        total_est = think_est + answer_est
+        if eval_count > 0 and total_est > 0:
+            think_tokens = min(int(round(eval_count * think_est / total_est)), eval_count)
+            answer_tokens = eval_count - think_tokens
+            # Never round a present answer down to zero.
+            if answer_est > 0 and answer_tokens == 0:
+                answer_tokens = 1
+                think_tokens = max(eval_count - 1, 0)
+            return think_tokens, answer_tokens
+        return think_est, answer_est
+
+    def calculate_stats(self, total_time: float, content: str, usage: Optional[dict] = None,
+                        messages: Optional[list] = None, thought: str = "",
+                        phase_times: Optional[dict] = None) -> dict:
+        """Calculate per-query stats with prefill, thinking and answer rates.
+
+        Timing is hybrid: server-reported durations (Ollama/llama.cpp) are
+        preferred, with client wall-clock phase timestamps (time-to-first-token,
+        first-content, stream end) as fallback for backends that report none.
+
+        Args:
+            total_time: Wall-clock seconds for the whole query.
+            content: The visible response text.
+            usage: Optional server usage dict.
+            messages: Optional message list for context-token fallback.
+            thought: Accumulated thinking/reasoning text.
+            phase_times: Optional client phase timestamps dict.
+
+        Returns:
+            dict of eval_count/prompt_eval_count/total_context_tokens/total_time/
+            tps/prefill_tps/think_tokens/think_tps/answer_tokens/answer_tps/
+            gen_sec/content_length.
+        """
+        usage = usage or {}
+        eval_count = usage.get("completion_tokens", 0) or usage.get("eval_count", 0)
+        prompt_tokens = usage.get("prompt_tokens", 0) or usage.get("prompt_eval_count", 0)
+        total_context_tokens = usage.get("total_tokens", 0) or (prompt_tokens + eval_count)
+
+        if not total_context_tokens and messages:
+            total_context_tokens = self.ctx.calculate_context_tokens(messages)
+
+        if not eval_count and (content or thought):
+            eval_count = self.ctx.estimate_tokens(content) + self.ctx.estimate_tokens(thought)
+
+        srv_prefill_sec, srv_gen_sec, srv_prefill_tps, srv_gen_tps = self._extract_usage_timings(usage)
+        cli_prefill, cli_think, cli_answer = self._client_phase_seconds(phase_times)
+
+        prefill_sec = srv_prefill_sec if srv_prefill_sec is not None else cli_prefill
+        prefill_tps = srv_prefill_tps
+        if prefill_tps is None and prefill_sec and prompt_tokens > 0:
+            prefill_tps = prompt_tokens / prefill_sec
+
+        think_tokens, answer_tokens = self._split_generation_tokens(content, thought, eval_count)
+
+        # Decode window: server-reported total (accurate) is apportioned between
+        # thinking and answer by token ratio. Thinking and answer tokens share the
+        # same decode loop, so their rate equals the overall decode rate; the
+        # useful split is the token counts. Without server timing, fall back to
+        # the client-measured answer/thinking phase windows.
+        if srv_gen_sec is not None and eval_count > 0:
+            gen_sec = srv_gen_sec
+            think_sec = srv_gen_sec * (think_tokens / eval_count)
+            answer_sec = srv_gen_sec * (answer_tokens / eval_count)
+        elif cli_answer is not None and cli_answer >= 0.05:
+            # A near-zero client window means a single non-streamed chunk, not
+            # a real decode phase — avoid fabricating an infinite rate.
+            think_sec = cli_think if cli_think is not None else 0.0
+            answer_sec = cli_answer
+            gen_sec = think_sec + answer_sec
+        else:
+            gen_sec = think_sec = answer_sec = None
+
+        think_tps = think_tokens / think_sec if think_sec and think_tokens > 0 else 0.0
+        answer_tps = answer_tokens / answer_sec if answer_sec and answer_tokens > 0 else 0.0
+
+        # Overall decode rate excluding prefill (server rate > server window > client).
+        if srv_gen_tps is not None:
+            tps = srv_gen_tps
+        elif gen_sec and eval_count > 0:
+            tps = eval_count / gen_sec
+        else:
+            tps = eval_count / total_time if eval_count > 0 and total_time > 0 else 0.0
+
+        # With no thinking, the answer rate equals the overall decode rate.
+        if answer_tps == 0.0 and think_tokens == 0 and answer_tokens > 0 and tps > 0:
+            answer_tps = tps
+
+        return {
+            "eval_count": eval_count,
+            "prompt_eval_count": prompt_tokens,
+            "total_context_tokens": total_context_tokens,
+            "total_time": total_time,
+            "tps": tps,
+            "prefill_tps": prefill_tps or 0.0,
+            "prefill_sec": prefill_sec or 0.0,
+            "gen_sec": gen_sec or 0.0,
+            "think_tokens": think_tokens,
+            "think_tps": think_tps,
+            "answer_tokens": answer_tokens,
+            "answer_tps": answer_tps,
+            "content_length": len(content)
+        }
+
+    def print_stats_display(self, stats: dict) -> None:
+        """Print formatted stats to stderr.
+
+        Shows prefill (prompt-eval) throughput, thinking throughput and
+        answer-only throughput so thinking tokens no longer dilute the
+        visible generation rate.
+
+        Args:
+            stats: Stats dict from calculate_stats().
+        """
+        if not stats:
+            return
+
+        parts = [f"{stats['total_time']:.2f}s total"]
+
+        prompt_tokens = stats.get("prompt_eval_count", 0)
+        if prompt_tokens > 0 and stats.get("prefill_tps", 0.0) > 0:
+            parts.append(f"prefill {prompt_tokens} tok @ {stats['prefill_tps']:.1f} t/s")
+        if stats.get("think_tokens", 0) > 0:
+            parts.append(f"think {stats['think_tokens']} tok @ {stats.get('think_tps', 0.0):.1f} t/s")
+
+        if stats.get("eval_count", 0) > 0:
+            answer_tokens = stats.get("answer_tokens", stats["eval_count"])
+            if answer_tokens > 0:
+                parts.append(f"answer {answer_tokens} tok @ {stats.get('answer_tps', 0.0):.1f} t/s")
+            elif stats.get("think_tokens", 0) == 0:
+                # No reasoning split and no visible answer (plain generation):
+                # report the overall decode rate. When reasoning IS present the
+                # `think` line already accounts for every generated token, so a
+                # `gen` line here would double-count (e.g. pure tool-call steps).
+                parts.append(f"gen {stats['eval_count']} tok @ {stats.get('tps', 0.0):.1f} t/s")
+            ctx = self.ctx.current_context_tokens
+            if not ctx:
+                ctx = stats.get("total_context_tokens", 0)
+            if not ctx:
+                ctx = stats.get("prompt_eval_count", 0) + stats['eval_count']
+            parts.append(f"Context: {ctx} tokens")
+        else:
+            parts.append(f"Content: {stats.get('content_length', 0)} chars")
+
+        sys.stderr.write(colorize(f"\n--- Stats: {' | '.join(parts)} ---\n", 'muted'))
+
+# ============================================================================
+# ============= STREAM PARSER (chunk shapes + sync aggregation) ===============
+# ============================================================================
+
+class StreamParser:
+    """Parses streaming lines into chunks and aggregates them into a sync response.
+
+    Extracted from `ModelQuery` (TODO 4.1c). This is the one place where the
+    backends actually differ: Ollama streams NDJSON with full-object tool calls,
+    while llama.cpp / Strata / LM Studio stream SSE `data:` frames with
+    accumulated tool-call deltas. Everything here is per-chunk and backend-shaped;
+    transport, retries and display stay with `ModelQuery`.
+
+    `iter_lines` is a **late-bound seam**, not a copy of the method: `ModelQuery`
+    passes a lambda resolving its own `_iter_stream_lines` door at call time, so a
+    test (or a caller) that replaces `query_handler._iter_stream_lines` still
+    intercepts the aggregation loop instead of silently exercising the real
+    transport reader.
+    """
+
+    def __init__(self, ctx: 'CommandContext', iter_lines: object = None) -> None:
+        """Bind the parser to the shared context and the line-reading seam.
+
+        Args:
+            ctx: The shared CommandContext (backend name for response shaping).
+            iter_lines: Optional `(response, backend) -> iterator of lines`
+                provider; defaults to this object's own `_iter_stream_lines`.
+        """
+        self.ctx = ctx
+        self.iter_lines = iter_lines or self._iter_stream_lines
+
+    def _normalize_llamacpp_usage(self, chunk: dict) -> dict:
+        """
+        Extract token counts from any Llama.cpp chunk format.
+        Returns dict with standardized keys: total_tokens, prompt_tokens, completion_tokens
+        """
+        usage = {}
+
+        # Format 1: Standard OpenAI-style usage block
+        if "usage" in chunk and chunk["usage"]:
+            u = chunk["usage"]
+            usage["prompt_tokens"] = u.get("prompt_tokens", 0)
+            usage["completion_tokens"] = u.get("completion_tokens", 0)
+            usage["total_tokens"] = u.get("total_tokens",
+                                           usage["prompt_tokens"] + usage["completion_tokens"])
+
+        # Format 2: Llama.cpp timings block (your server uses this)
+        if "timings" in chunk:
+            t = chunk["timings"]
+            usage["prompt_tokens"] = t.get("prompt_n", 0)
+            usage["completion_tokens"] = t.get("predicted_n", 0)
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+            # Server-measured phase timings/rates (exclude prefill from decode rate)
+            if t.get("prompt_ms"):
+                usage["prompt_ms"] = t["prompt_ms"]
+            if t.get("predicted_ms"):
+                usage["predicted_ms"] = t["predicted_ms"]
+            if t.get("prompt_per_second"):
+                usage["prompt_per_second"] = t["prompt_per_second"]
+            if t.get("predicted_per_second"):
+                usage["predicted_per_second"] = t["predicted_per_second"]
+
+        # Format 4: LM Studio stats block (tokens_per_second / time_to_first_token)
+        if "stats" in chunk and chunk["stats"]:
+            s = chunk["stats"]
+            if s.get("tokens_per_second"):
+                usage["predicted_per_second"] = s["tokens_per_second"]
+            if s.get("time_to_first_token"):
+                usage.setdefault("prompt_ms", s["time_to_first_token"] * 1000.0)
+
+        # Format 3: Root-level fields (some versions)
+        if "prompt_eval_count" in chunk:
+            usage["prompt_tokens"] = usage.get("prompt_tokens", 0) or chunk.get("prompt_eval_count", 0)
+        if "eval_count" in chunk:
+            usage["completion_tokens"] = usage.get("completion_tokens", 0) or chunk.get("eval_count", 0)
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+
+        return usage if usage else None
+
+    def _parse_chunk(self, chunk: dict, backend: str) -> tuple:
+        """Extract (thought, content, is_final, usage, tool_calls) from a chunk for any backend.
+
+        Args:
+            chunk: A parsed JSON chunk dict.
+            backend: Backend name for shape selection.
+
+        Returns:
+            (thought, content, is_final, usage, tool_calls) tuple.
+        """
+        if backend == "ollama":
+            thought = (chunk.get("message", {}).get("thought") or
+                       chunk.get("message", {}).get("thinking")) or ""
+            content = chunk.get("message", {}).get("content", "")
+            is_final = chunk.get("done", False)
+            usage = None
+            tool_calls = chunk.get("message", {}).get("tool_calls", [])
+            if is_final:
+                if "usage" in chunk:
+                    usage = chunk["usage"]
+                else:
+                    usage = {
+                        "prompt_eval_count": chunk.get("prompt_eval_count", 0),
+                        "eval_count": chunk.get("eval_count", 0),
+                        "prompt_eval_duration": chunk.get("prompt_eval_duration", 0),
+                        "eval_duration": chunk.get("eval_duration", 0),
+                        "total_duration": chunk.get("total_duration", 0),
+                        "load_duration": chunk.get("load_duration", 0),
+                    }
+            return thought, content, is_final, usage, tool_calls
+        elif backend in ("llamacpp", "strata", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            choices = chunk.get("choices", [])
+            is_final = bool(choices and choices[0].get("finish_reason") is not None)
+            delta = choices[0].get("delta", {}) if choices else {}
+            thought = delta.get("reasoning_content") or ""
+            content = delta.get("content") or ""
+            tool_calls = delta.get("tool_calls", [])
+            usage = self._normalize_llamacpp_usage(chunk) if is_final else None
+            return thought, content, is_final, usage, tool_calls
+        elif backend == "lmstudio":
+            choices = chunk.get("choices", [])
+            is_final = bool(choices and choices[0].get("finish_reason") is not None)
+            delta = choices[0].get("delta", {}) if choices else {}
+            thought = delta.get("reasoning") or ""
+            content = delta.get("content") or ""
+            tool_calls = delta.get("tool_calls", [])
+            usage = self._normalize_llamacpp_usage(chunk) if is_final else None
+            return thought, content, is_final, usage, tool_calls
+        else:
+            raise ValueError(f"Unknown backend: {backend}")
+
+    def _iter_stream_lines(self, response: object, backend: str) -> tuple:
+        """Yield decoded JSON lines from streaming response, stripping SSE prefixes.
+
+        Args:
+            response: The streaming HTTP response object.
+            backend: Backend name (SSE stripping applies to non-ollama backends).
+        """
+        for line in response:
+            decoded = line.decode('utf-8').strip()
+            if not decoded:
+                continue
+            if backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+                if decoded.startswith('data: '):
+                    decoded = decoded[6:].strip()
+            if decoded == '[DONE]':
+                continue
+            yield decoded
+
+    @staticmethod
+    def _accumulate_stream_tool_calls(tool_calls: list[ToolCall], tool_call_index: dict, new_calls: list) -> None:
+        """Merge incremental tool-call chunks into `tool_calls` and `tool_call_index`.
+
+        Args:
+            tool_calls: List to append full-object tool calls to.
+            tool_call_index: Dict mapping index → partial tool call dict.
+            new_calls: The new tool calls from a chunk.
+
+        Handles both OpenAI-compatible deltas (arguments accumulate as strings, keyed by
+        `index`) and Ollama full-object tool calls (no `index`, arguments already a dict).
+        """
+        for tc in new_calls:
+            if "index" not in tc:
+                tool_calls.append({
+                    "id": tc.get("id", ""),
+                    "type": tc.get("type", "function"),
+                    "function": {
+                        "name": tc.get("function", {}).get("name", ""),
+                        "arguments": tc.get("function", {}).get("arguments", ""),
+                    }
+                })
+                continue
+            idx = tc.get("index", 0)
+            if idx not in tool_call_index:
+                tool_call_index[idx] = {
+                    "id": tc.get("id", ""),
+                    "type": tc.get("type", "function"),
+                    "function": {
+                        "name": tc.get("function", {}).get("name", ""),
+                        "arguments": tc.get("function", {}).get("arguments", ""),
+                    }
+                }
+            else:
+                existing = tool_call_index[idx]
+                if tc.get("id"):
+                    existing["id"] = tc["id"]
+                fn_delta = tc.get("function") or {}
+                if fn_delta.get("name"):
+                    existing["function"]["name"] = fn_delta["name"]
+                if "arguments" in fn_delta and fn_delta["arguments"]:
+                    existing["function"]["arguments"] += fn_delta["arguments"]
+
+    def _synthesize_sync_response(self, content: str, thinking: str, tool_calls: list[ToolCall], usage: dict) -> dict:
+        """Build a non-streaming-shaped response dict from aggregated stream chunks.
+
+        Args:
+            content: Aggregated assistant text.
+            thinking: Aggregated reasoning/thinking text.
+            tool_calls: Accumulated native tool calls.
+            usage: Aggregated usage dict.
+
+        Returns:
+            A sync-shaped response dict for the current backend.
+
+        Mirrors the shape returned by `query_sync` for the current backend so callers
+        (e.g. the ReAct loop) can parse it identically.
+        """
+        backend = self.ctx.backend
+        if backend == "ollama":
+            resp = {
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls,
+                },
+            }
+            if thinking:
+                resp["message"]["reasoning_content"] = thinking
+            resp["prompt_eval_count"] = usage.get("prompt_eval_count", 0)
+            resp["eval_count"] = usage.get("eval_count", 0)
+            return resp
+        resp = {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls,
+                },
+                "finish_reason": "stop",
+            }],
+        }
+        if thinking:
+            resp["choices"][0]["message"]["reasoning_content"] = thinking
+        if usage:
+            resp["usage"] = {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
+        return resp
+
+    def _aggregate_sync_stream(self, req: Request, backend: str, socket_timeout: float,
+                               on_chunk: object, cancel: Optional[dict] = None,
+                               tool_calls_out: Optional[list] = None) -> tuple:
+        """Read a streaming response and aggregate content/thinking/tools/usage.
+
+        Args:
+            req: The prepared urllib Request.
+            backend: Backend name.
+            socket_timeout: Socket timeout for the request.
+            on_chunk: Optional per-chunk callback (thought, content, is_final).
+            cancel: Optional {"event", "close"} cancel token dict.
+            tool_calls_out: Optional by-ref list kept in sync with the
+                accumulated tool calls (partial or complete) as they stream, so
+                a caller can salvage a finished tool call after a timeout.
+
+        Returns:
+            (full_content, full_thinking, tool_calls, tool_call_index, usage),
+            or None when the request was cancelled.
+        """
+        full_content = ""
+        full_thinking = ""
+        tool_calls = []          # ordered, deduped accumulated tool calls
+        tool_call_index = {}     # index -> partial tool call dict
+        usage = {}
+        try:
+            with _request_with_retry(req, timeout=socket_timeout) as response:
+                if cancel is not None and hasattr(response, 'close'):
+                    # Expose a close callback so a ^C (or timeout retry) on the
+                    # calling thread can abort this blocked stream read promptly.
+                    cancel["close"] = response.close
+                for raw_line in self.iter_lines(response, backend):
+                    if cancel is not None and cancel["event"].is_set():
+                        return None
+                    try:
+                        chunk = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    thought, content, is_final, u, tcs = self._parse_chunk(chunk, backend)
+                    if thought:
+                        full_thinking += thought
+                    if content:
+                        full_content += content
+                    if tcs:
+                        self._accumulate_stream_tool_calls(tool_calls, tool_call_index, tcs)
+                        if tool_calls_out is not None:
+                            # By-ref view for timeout salvage: OpenAI-style
+                            # deltas live in tool_call_index until the loop
+                            # ends, so expose both collections as they grow.
+                            tool_calls_out[:] = (
+                                list(tool_calls)
+                                + [tool_call_index[k] for k in sorted(tool_call_index)])
+                    if u:
+                        usage.update(u)
+                    if on_chunk:
+                        on_chunk(thought, content, is_final)
+        except Exception as e:
+            if cancel is not None and cancel["event"].is_set():
+                # User aborted (^C) or a timeout retry superseded this request —
+                # return quietly instead of spamming an error line.
+                return None
+            sys.stderr.write(colorize(f"[ERROR] {backend} sync stream failed: {e}\n", 'error'))
+            return {"error": {"message": str(e), "type": type(e).__name__}}
+        return full_content, full_thinking, tool_calls, tool_call_index, usage
 
 # ============================================================================
 # ============= MODEL QUERY CLASS ============================================
@@ -9919,374 +11547,113 @@ class ModelQuery:
         """Calculate estimated total tokens in conversation context. Delegates to CommandContext."""
         return self.ctx.calculate_context_tokens(messages)
 
+    def _request_builder(self) -> 'RequestBuilder':
+        """Return the payload builder bound to the shared context."""
+        builder = getattr(self, 'request_builder', None)
+        if builder is None or builder.ctx is not self.ctx:
+            builder = RequestBuilder(self.ctx)
+            self.request_builder = builder
+        return builder
+
+    def _stats_calculator(self) -> 'StatsCalculator':
+        """Return the stats calculator bound to the shared context."""
+        calculator = getattr(self, 'stats_calculator', None)
+        if calculator is None or calculator.ctx is not self.ctx:
+            calculator = StatsCalculator(self.ctx)
+            self.stats_calculator = calculator
+        return calculator
+
+    def _stream_parser(self) -> 'StreamParser':
+        """Return the stream parser, wired to this object's `_iter_stream_lines` door.
+
+        The provider is a lambda, not a bound copy: replacing
+        `query_handler._iter_stream_lines` (as the stream tests do) must still
+        intercept the aggregation loop.
+        """
+        parser = getattr(self, 'stream_parser', None)
+        if parser is None or parser.ctx is not self.ctx:
+            parser = StreamParser(
+                self.ctx, lambda response, backend: self._iter_stream_lines(response, backend))
+            self.stream_parser = parser
+        return parser
+
+    def _iter_stream_lines(self, response: object, backend: str) -> tuple:
+        """Yield decoded JSON lines from the stream (door onto `StreamParser`)."""
+        return self._stream_parser()._iter_stream_lines(response, backend)
+
+    def _parse_chunk(self, chunk: dict, backend: str) -> tuple:
+        """Parse one chunk for the backend (door onto `StreamParser`)."""
+        return self._stream_parser()._parse_chunk(chunk, backend)
+
     @staticmethod
-    def _extract_usage_timings(usage: dict) -> tuple:
-        """Extract server-reported prefill/decode timings and rates.
+    def _accumulate_stream_tool_calls(tool_calls: list[ToolCall], tool_call_index: dict,
+                                      new_calls: list) -> None:
+        """Merge incremental tool-call chunks (door onto `StreamParser`)."""
+        StreamParser._accumulate_stream_tool_calls(tool_calls, tool_call_index, new_calls)
 
-        Handles Ollama nanosecond durations (prompt_eval_duration /
-        eval_duration) and llama.cpp millisecond timings plus precomputed
-        rates (prompt_ms / predicted_ms / prompt_per_second /
-        predicted_per_second).
+    def _synthesize_sync_response(self, content: str, thinking: str,
+                                  tool_calls: list[ToolCall], usage: dict) -> dict:
+        """Shape a sync response for the backend (door onto `StreamParser`)."""
+        return self._stream_parser()._synthesize_sync_response(
+            content, thinking, tool_calls, usage)
 
-        Args:
-            usage: Server usage dict.
-
-        Returns:
-            (prefill_sec, gen_sec, prefill_tps, gen_tps), each None if absent.
-        """
-        prefill_sec = gen_sec = prefill_tps = gen_tps = None
-        pe_dur = usage.get("prompt_eval_duration") or 0   # Ollama nanoseconds
-        ev_dur = usage.get("eval_duration") or 0
-        if pe_dur > 0:
-            prefill_sec = pe_dur / 1e9
-        if ev_dur > 0:
-            gen_sec = ev_dur / 1e9
-        if usage.get("prompt_ms"):
-            prefill_sec = float(usage["prompt_ms"]) / 1000.0
-        if usage.get("predicted_ms"):
-            gen_sec = float(usage["predicted_ms"]) / 1000.0
-        if usage.get("prompt_per_second"):
-            prefill_tps = float(usage["prompt_per_second"])
-        if usage.get("predicted_per_second"):
-            gen_tps = float(usage["predicted_per_second"])
-        return prefill_sec, gen_sec, prefill_tps, gen_tps
-
-    @staticmethod
-    def _client_phase_seconds(phase_times: Optional[dict]) -> tuple:
-        """Derive wall-clock (prefill, thinking, answer) seconds from timestamps.
-
-        Args:
-            phase_times: Optional dict with start/first_token/first_content/end.
-
-        Returns:
-            (prefill_sec, thinking_sec, answer_sec), each None if underivable.
-        """
-        if not phase_times:
-            return None, None, None
-        start = phase_times.get("start")
-        first = phase_times.get("first_token")
-        first_content = phase_times.get("first_content")
-        end = phase_times.get("end")
-        prefill = max(first - start, 0.0) if (start is not None and first is not None) else None
-        thinking = max(first_content - first, 0.0) if (first is not None and first_content is not None) else None
-        if first_content is not None and end is not None:
-            answer = max(end - first_content, 0.0)
-        elif first is not None and end is not None:
-            answer = max(end - first, 0.0)
-        else:
-            answer = None
-        return prefill, thinking, answer
-
-    def _split_generation_tokens(self, content: str, thought: str, eval_count: int) -> tuple:
-        """Split generated tokens into (thinking, answer) via a length ratio.
-
-        The server reports one combined generated-token count (thinking +
-        answer). The ratio is estimated from text length and scaled to the
-        server total so the two parts always sum to `eval_count`.
-
-        Args:
-            content: Visible answer text.
-            thought: Thinking/reasoning text.
-            eval_count: Combined server-reported generated tokens.
-
-        Returns:
-            (think_tokens, answer_tokens).
-        """
-        if not thought:
-            return 0, eval_count
-        think_est = self.estimate_tokens(thought)
-        answer_est = self.estimate_tokens(content)
-        total_est = think_est + answer_est
-        if eval_count > 0 and total_est > 0:
-            think_tokens = min(int(round(eval_count * think_est / total_est)), eval_count)
-            answer_tokens = eval_count - think_tokens
-            # Never round a present answer down to zero.
-            if answer_est > 0 and answer_tokens == 0:
-                answer_tokens = 1
-                think_tokens = max(eval_count - 1, 0)
-            return think_tokens, answer_tokens
-        return think_est, answer_est
+    def _aggregate_sync_stream(self, req: Request, backend: str, socket_timeout: float,
+                               on_chunk: object, cancel: Optional[dict] = None,
+                               tool_calls_out: Optional[list] = None) -> tuple:
+        """Aggregate a streaming response (door onto `StreamParser`)."""
+        return self._stream_parser()._aggregate_sync_stream(
+            req, backend, socket_timeout, on_chunk, cancel, tool_calls_out=tool_calls_out)
 
     def calculate_stats(self, total_time: float, content: str, usage: Optional[dict] = None,
                         messages: Optional[list] = None, thought: str = "",
                         phase_times: Optional[dict] = None) -> dict:
-        """Calculate per-query stats with prefill, thinking and answer rates.
-
-        Timing is hybrid: server-reported durations (Ollama/llama.cpp) are
-        preferred, with client wall-clock phase timestamps (time-to-first-token,
-        first-content, stream end) as fallback for backends that report none.
-
-        Args:
-            total_time: Wall-clock seconds for the whole query.
-            content: The visible response text.
-            usage: Optional server usage dict.
-            messages: Optional message list for context-token fallback.
-            thought: Accumulated thinking/reasoning text.
-            phase_times: Optional client phase timestamps dict.
-
-        Returns:
-            dict of eval_count/prompt_eval_count/total_context_tokens/total_time/
-            tps/prefill_tps/think_tokens/think_tps/answer_tokens/answer_tps/
-            gen_sec/content_length.
-        """
-        usage = usage or {}
-        eval_count = usage.get("completion_tokens", 0) or usage.get("eval_count", 0)
-        prompt_tokens = usage.get("prompt_tokens", 0) or usage.get("prompt_eval_count", 0)
-        total_context_tokens = usage.get("total_tokens", 0) or (prompt_tokens + eval_count)
-
-        if not total_context_tokens and messages:
-            total_context_tokens = self.calculate_context_tokens(messages)
-
-        if not eval_count and (content or thought):
-            eval_count = self.estimate_tokens(content) + self.estimate_tokens(thought)
-
-        srv_prefill_sec, srv_gen_sec, srv_prefill_tps, srv_gen_tps = self._extract_usage_timings(usage)
-        cli_prefill, cli_think, cli_answer = self._client_phase_seconds(phase_times)
-
-        prefill_sec = srv_prefill_sec if srv_prefill_sec is not None else cli_prefill
-        prefill_tps = srv_prefill_tps
-        if prefill_tps is None and prefill_sec and prompt_tokens > 0:
-            prefill_tps = prompt_tokens / prefill_sec
-
-        think_tokens, answer_tokens = self._split_generation_tokens(content, thought, eval_count)
-
-        # Decode window: server-reported total (accurate) is apportioned between
-        # thinking and answer by token ratio. Thinking and answer tokens share the
-        # same decode loop, so their rate equals the overall decode rate; the
-        # useful split is the token counts. Without server timing, fall back to
-        # the client-measured answer/thinking phase windows.
-        if srv_gen_sec is not None and eval_count > 0:
-            gen_sec = srv_gen_sec
-            think_sec = srv_gen_sec * (think_tokens / eval_count)
-            answer_sec = srv_gen_sec * (answer_tokens / eval_count)
-        elif cli_answer is not None and cli_answer >= 0.05:
-            # A near-zero client window means a single non-streamed chunk, not
-            # a real decode phase — avoid fabricating an infinite rate.
-            think_sec = cli_think if cli_think is not None else 0.0
-            answer_sec = cli_answer
-            gen_sec = think_sec + answer_sec
-        else:
-            gen_sec = think_sec = answer_sec = None
-
-        think_tps = think_tokens / think_sec if think_sec and think_tokens > 0 else 0.0
-        answer_tps = answer_tokens / answer_sec if answer_sec and answer_tokens > 0 else 0.0
-
-        # Overall decode rate excluding prefill (server rate > server window > client).
-        if srv_gen_tps is not None:
-            tps = srv_gen_tps
-        elif gen_sec and eval_count > 0:
-            tps = eval_count / gen_sec
-        else:
-            tps = eval_count / total_time if eval_count > 0 and total_time > 0 else 0.0
-
-        # With no thinking, the answer rate equals the overall decode rate.
-        if answer_tps == 0.0 and think_tokens == 0 and answer_tokens > 0 and tps > 0:
-            answer_tps = tps
-
-        return {
-            "eval_count": eval_count,
-            "prompt_eval_count": prompt_tokens,
-            "total_context_tokens": total_context_tokens,
-            "total_time": total_time,
-            "tps": tps,
-            "prefill_tps": prefill_tps or 0.0,
-            "prefill_sec": prefill_sec or 0.0,
-            "gen_sec": gen_sec or 0.0,
-            "think_tokens": think_tokens,
-            "think_tps": think_tps,
-            "answer_tokens": answer_tokens,
-            "answer_tps": answer_tps,
-            "content_length": len(content)
-        }
-
+        """Calculate per-query stats (door onto `StatsCalculator`)."""
+        return self._stats_calculator().calculate_stats(
+            total_time, content, usage=usage, messages=messages,
+            thought=thought, phase_times=phase_times)
 
     def print_stats_display(self, stats: dict) -> None:
-        """Print formatted stats to stderr.
+        """Print the stats line to stderr (door onto `StatsCalculator`)."""
+        self._stats_calculator().print_stats_display(stats)
 
-        Shows prefill (prompt-eval) throughput, thinking throughput and
-        answer-only throughput so thinking tokens no longer dilute the
-        visible generation rate.
+    def build_request_payload(self, messages: list[Message], model: str,
+                              stream_enabled: bool = False, **kwargs: dict) -> dict:
+        """Build the request payload (door onto `RequestBuilder`)."""
+        return self._request_builder().build_request_payload(
+            messages, model, self.backend, stream_enabled=stream_enabled, **kwargs)
 
-        Args:
-            stats: Stats dict from calculate_stats().
-        """
-        if not stats:
-            return
+    def _build_stream_request(self, backend: str, messages: list[Message], model: str,
+                              stream_enabled: bool, context_size: Optional[int],
+                              **kwargs: dict) -> tuple:
+        """Build URL, payload and headers (door onto `RequestBuilder`)."""
+        return self._request_builder()._build_stream_request(
+            backend, messages, model, stream_enabled, context_size,
+            self._get_headers(), **kwargs)
 
-        parts = [f"{stats['total_time']:.2f}s total"]
+    def _get_chat_url(self, backend: str) -> str:
+        """Return the chat API URL for the backend (door onto `RequestBuilder`)."""
+        return self._request_builder()._get_chat_url(backend)
 
-        prompt_tokens = stats.get("prompt_eval_count", 0)
-        if prompt_tokens > 0 and stats.get("prefill_tps", 0.0) > 0:
-            parts.append(f"prefill {prompt_tokens} tok @ {stats['prefill_tps']:.1f} t/s")
-        if stats.get("think_tokens", 0) > 0:
-            parts.append(f"think {stats['think_tokens']} tok @ {stats.get('think_tps', 0.0):.1f} t/s")
+    def _apply_output_cap(self, messages: list[Message], kwargs: dict) -> tuple:
+        """Add the cap line and clamp the output budget (door onto `RequestBuilder`)."""
+        return self._request_builder()._apply_output_cap(messages, kwargs)
 
-        if stats.get("eval_count", 0) > 0:
-            answer_tokens = stats.get("answer_tokens", stats["eval_count"])
-            if answer_tokens > 0:
-                parts.append(f"answer {answer_tokens} tok @ {stats.get('answer_tps', 0.0):.1f} t/s")
-            elif stats.get("think_tokens", 0) == 0:
-                # No reasoning split and no visible answer (plain generation):
-                # report the overall decode rate. When reasoning IS present the
-                # `think` line already accounts for every generated token, so a
-                # `gen` line here would double-count (e.g. pure tool-call steps).
-                parts.append(f"gen {stats['eval_count']} tok @ {stats.get('tps', 0.0):.1f} t/s")
-            ctx = self.ctx.current_context_tokens
-            if not ctx:
-                ctx = stats.get("total_context_tokens", 0)
-            if not ctx:
-                ctx = stats.get("prompt_eval_count", 0) + stats['eval_count']
-            parts.append(f"Context: {ctx} tokens")
-        else:
-            parts.append(f"Content: {stats.get('content_length', 0)} chars")
+    @staticmethod
+    def _with_output_cap_line(messages: list, configured: int) -> list:
+        """Return `messages` with the cap sentence (door onto `RequestBuilder`)."""
+        return RequestBuilder._with_output_cap_line(messages, configured)
 
-        sys.stderr.write(colorize(f"\n--- Stats: {' | '.join(parts)} ---\n", 'muted'))
-
+    @staticmethod
+    def _inject_images_into_messages(messages: list[Message], images: Optional[list],
+                                     backend: str) -> None:
+        """Inject images into the last user turn (door onto `RequestBuilder`)."""
+        RequestBuilder._inject_images_into_messages(messages, images, backend)
 
     @staticmethod
     def _last_user_message_index(messages: list[Message]) -> int:
-        """Return the index of the last real user message, or -1.
+        """Return the index of the last real user message (door onto `RequestBuilder`)."""
+        return RequestBuilder._last_user_message_index(messages)
 
-        Skips `_system_nudge` messages (loop-internal steering such as the
-        near-full notice) so image injection targets the actual user turn.
-
-        Args:
-            messages: Message list.
-
-        Returns:
-            Index of the last non-nudge user message, or -1 when none.
-        """
-        for i in range(len(messages) - 1, -1, -1):
-            m = messages[i]
-            if isinstance(m, dict) and m.get("role") == "user" and not m.get("_system_nudge"):
-                return i
-        return -1
-
-    @staticmethod
-    def _inject_images_into_messages(messages: list[Message], images: Optional[list], backend: str) -> None:
-        """Inject image data into the last real user message, mutating in-place.
-
-        Args:
-            messages: Message list (mutated in place).
-            images: List of base64 image strings.
-            backend: Backend name for shape selection.
-
-        Ollama backend: sets the message's `images` list.
-        OpenAI-compatible backends (llamacpp, lmstudio, strata): embeds images
-        as content parts with data:image URIs. `_system_nudge` messages are
-        skipped so a trailing nudge never steals the attachments.
-        """
-        if not images or not messages:
-            return
-        idx = ModelQuery._last_user_message_index(messages)
-        if idx < 0:
-            return
-        if backend == "ollama":
-            messages[idx]["images"] = images
-        else:
-            text = messages[idx].get("content", "")
-            content_parts = [{"type": "text", "text": text or "Describe this image"}]
-            for img in images:
-                mime = guess_image_mime(img)
-                content_parts.append({"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{img}"}})
-            messages[idx]["content"] = content_parts
-
-    @staticmethod
-    def _apply_backend_inference_params(payload: dict, backend: str, kwargs: dict) -> None:
-        """Copy the backend-supported inference params from kwargs into the payload.
-
-        Args:
-            payload: The payload dict (mutated in place).
-            backend: Backend name (controls which params are supported).
-            kwargs: The kwargs dict (images/tools/params/etc.).
-        """
-        if backend in ("llamacpp", "strata"):
-            params = ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]
-        elif backend == "lmstudio":
-            params = ["temperature", "top_p", "presence_penalty", "repeat_penalty"]
-        elif backend in ("gemini", "opencodezen", "opencodego"):
-            params = ["temperature", "top_p", "top_k"]
-        elif backend in ("mistral", "deepseek"):
-            params = ["temperature", "top_p"]
-        else:
-            params = []
-        for param in params:
-            if param in kwargs:
-                payload[param] = kwargs[param]
-
-    @staticmethod
-    def _apply_no_thinking(payload: dict, backend: str) -> None:
-        """Disable the model's reasoning phase via the backend template flag.
-
-        Reasoning models ignore prompt-level instructions, so the thinking phase
-        must be turned off through the chat-template flag. Each local backend and
-        model family exposes it differently:
-          - ollama: /api/chat `options.think = false`
-          - llama.cpp / lmstudio Qwen-style templates: `chat_template_kwargs`
-            (llama.cpp uses `thinking`, vLLM uses `enable_thinking`; both keys
-            are set so either is honored, unknown keys are ignored by templates)
-          - gpt-oss: has NO reasoning off-switch — the model is trained to always
-            reason (llama.cpp: "incapable of not reasoning"). Only
-            `reasoning_effort` (low/medium/high) is supported, so `/thinkingoff`
-            downgrades it to "low" to minimize the analysis phase.
-
-        Args:
-            payload: The payload dict (mutated in place).
-            backend: Backend name.
-        """
-        if backend == "ollama":
-            payload["options"] = {**payload.get("options", {}), "think": False}
-        elif backend in ("llamacpp", "strata", "lmstudio"):
-            kwargs = dict(payload.get("chat_template_kwargs") or {})
-            model = str(payload.get("model", "")).lower()
-            if "gpt-oss" in model or "gpt_oss" in model:
-                kwargs["reasoning_effort"] = "low"
-            else:
-                kwargs["enable_thinking"] = False
-                kwargs["thinking"] = False
-            payload["chat_template_kwargs"] = kwargs
-
-    @staticmethod
-    def _apply_reasoning_effort(payload: dict, backend: str, effort: str) -> None:
-        """Set the model's reasoning effort via the backend-specific field.
-
-        Templates that support reasoning levels (gpt-oss, newer Qwen3) read
-        `reasoning_effort` (low/medium/high); templates that don't silently
-        ignore it. Ollama exposes it through `options`, the OpenAI-compatible
-        backends through `chat_template_kwargs`.
-
-        Args:
-            payload: The payload dict (mutated in place).
-            backend: Backend name.
-            effort: Reasoning effort level ("low", "medium" or "high").
-        """
-        if backend == "ollama":
-            payload["options"] = {**payload.get("options", {}), "reasoning_effort": effort}
-        elif backend in ("llamacpp", "strata", "lmstudio"):
-            kwargs = dict(payload.get("chat_template_kwargs") or {})
-            kwargs["reasoning_effort"] = effort
-            payload["chat_template_kwargs"] = kwargs
-
-    @staticmethod
-    def _apply_preserve_thinking(payload: dict, backend: str, value: bool) -> None:
-        """Set the `preserve_thinking` chat-template flag (OpenAI-compatible backends).
-
-        Qwen3.6/3.8 templates read `preserve_thinking` from `chat_template_kwargs`
-        to retain reasoning traces from historical assistant turns. Ollama has no
-        equivalent option, so the flag is only emitted for the OpenAI-compatible
-        local backends; callers must also keep reasoning in the message history
-        for it to have any effect.
-
-        Args:
-            payload: The payload dict (mutated in place).
-            backend: Backend name.
-            value: True to retain historical reasoning, False to keep only the
-                latest turn's reasoning.
-        """
-        if backend in ("llamacpp", "strata", "lmstudio"):
-            kwargs = dict(payload.get("chat_template_kwargs") or {})
-            kwargs["preserve_thinking"] = bool(value)
-            payload["chat_template_kwargs"] = kwargs
 
     def reasoning_flags(self, model: str, backend: str, force_no_thinking: bool,
                         reasoning_effort: Optional[str] = None) -> dict:
@@ -10308,9 +11675,9 @@ class ModelQuery:
         """
         payload = {"model": model}
         if reasoning_effort:
-            self._apply_reasoning_effort(payload, backend, reasoning_effort)
+            RequestBuilder._apply_reasoning_effort(payload, backend, reasoning_effort)
         elif force_no_thinking:
-            self._apply_no_thinking(payload, backend)
+            RequestBuilder._apply_no_thinking(payload, backend)
         return {k: v for k, v in payload.items() if k != "model"}
 
     @staticmethod
@@ -10349,158 +11716,6 @@ class ModelQuery:
         return {"supported": bool(options), "options": options,
                 "transport": transport if options else "", "note": note}
 
-    def _apply_size_options(self, payload: dict, backend: str, kwargs: dict) -> None:
-        """Apply warmup, context-size, and output-cap options to the payload.
-
-        Args:
-            payload: The payload dict (mutated in place).
-            backend: Backend name.
-            kwargs: The kwargs dict.
-        """
-        if kwargs.get('is_warmup'):
-            if backend == "ollama":
-                payload["options"] = {"num_predict": 1}
-            elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-                payload["max_tokens"] = 1
-            return
-        # Ollama context window via num_ctx. OpenAI-compatible servers treat the
-        # window as a server-side setting, not a request field — the old
-        # `max_tokens = context_size` conflated the input window with the output
-        # cap, silently limiting (or 400-ing) generation on /contextsizeset.
-        if context_size := kwargs.get('context_size'):
-            if backend == "ollama":
-                payload.setdefault("options", {})
-                payload["options"]["num_ctx"] = context_size
-        # Per-response output cap (/maxtokens); already clamped by
-        # build_request_payload. Includes reasoning/thinking tokens.
-        if max_output := kwargs.get('max_output_tokens'):
-            if backend == "ollama":
-                payload.setdefault("options", {})
-                payload["options"]["num_predict"] = max_output
-            elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-                payload["max_tokens"] = max_output
-
-    def _apply_output_cap(self, messages: list[Message], kwargs: dict) -> tuple:
-        """Add the static cap line and resolve the effective (clamped) cap.
-
-        Args:
-            messages: The outbound message list.
-            kwargs: The request kwargs dict.
-
-        Returns:
-            (messages_with_cap_line, kwargs_with_max_output_tokens). The stored
-            conversation is never mutated.
-        """
-        configured = int(getattr(self.ctx, 'max_output_tokens', DEFAULT_MAX_OUTPUT_TOKENS)
-                         or DEFAULT_MAX_OUTPUT_TOKENS)
-        messages = self._with_output_cap_line(messages, configured)
-        window = self.ctx.context_window_size
-        prompt_tokens = self.ctx.calculate_context_tokens(messages)
-        # The native `tools` array is serialized upstream of the conversation by
-        # every chat template, so it competes for the window too. Counting it
-        # here keeps the clamp honest in agentic mode (~1.4-2.9K tokens).
-        prompt_tokens += self.ctx.count_tools_tokens(kwargs.get('tools'))
-        effective, _reserve = resolve_output_budget(configured, window, prompt_tokens)
-        if window <= 0:
-            global _MAX_OUTPUT_WINDOW_WARNED
-            if not _MAX_OUTPUT_WINDOW_WARNED:
-                _MAX_OUTPUT_WINDOW_WARNED = True
-                sys.stderr.write(colorize(
-                    f"[maxtokens] Context window unknown; applying {configured} "
-                    "tokens without clamping.", 'warning') + "\n")
-        elif effective <= 0:
-            # No room after the reserve — the caller should have force-compacted.
-            # Backstop so the request still goes out instead of erroring.
-            effective = MAX_OUTPUT_MIN_FLOOR
-            sys.stderr.write(colorize(
-                f"[maxtokens] No output room ({prompt_tokens}/{window}); "
-                f"using floor {MAX_OUTPUT_MIN_FLOOR}.", 'warning') + "\n")
-        kwargs = dict(kwargs)
-        kwargs['max_output_tokens'] = effective
-        return messages, kwargs
-
-    @staticmethod
-    def _with_output_cap_line(messages: list, configured: int) -> list:
-        """Return a copy of `messages` with the static cap sentence in the system message.
-
-        Args:
-            messages: The outbound message list.
-            configured: The configured output cap.
-
-        Returns:
-            A new list whose system message carries the cap line. The stored
-            conversation objects are not mutated.
-        """
-        if not messages:
-            return messages
-        line = max_output_cap_line(configured)
-        new = list(messages)
-        first = new[0]
-        if first.get('role') != 'system':
-            return [{'role': 'system', 'content': line}] + new
-        new_first = dict(first)
-        content = new_first.get('content') or ''
-        if isinstance(content, list):
-            new_first['content'] = list(content) + [{"type": "text", "text": line}]
-        else:
-            new_first['content'] = (f"{content}\n\n{line}" if content else line)
-        new_first.pop('_tokens', None)  # content changed; cached count no longer valid
-        new[0] = new_first
-        return new
-
-    def build_request_payload(self, messages: list[Message], model: str, stream_enabled: bool = False, **kwargs: dict) -> dict:
-        """Build request payload for the backend.
-
-        Args:
-            messages: Message list to send.
-            model: Model name.
-            stream_enabled: Whether to request streaming.
-            **kwargs: images, tools, context_size, is_warmup, inference params.
-                apply_output_cap: When True, apply the /maxtokens per-response
-                    output cap (clamped to the context window) and advertise it
-                    in the system message.
-
-        Returns:
-            The JSON payload dict.
-        """
-        self._inject_images_into_messages(messages, kwargs.get('images'), self.backend)
-
-        if kwargs.get('apply_output_cap'):
-            messages, kwargs = self._apply_output_cap(messages, kwargs)
-
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": stream_enabled
-        }
-
-        self._apply_size_options(payload, self.backend, kwargs)
-
-        if tools := kwargs.get('tools'):
-            payload["tools"] = tools
-
-        self._apply_backend_inference_params(payload, self.backend, kwargs)
-
-        if kwargs.get('no_thinking'):
-            self._apply_no_thinking(payload, self.backend)
-
-        if effort := kwargs.get('reasoning_effort'):
-            self._apply_reasoning_effort(payload, self.backend, str(effort))
-
-        preserve = kwargs.get('preserve_thinking')
-        if preserve is not None and supports_preserve_thinking(model):
-            self._apply_preserve_thinking(payload, self.backend, bool(preserve))
-
-        return payload
-
-    def _get_chat_url(self, backend: str) -> str:
-        """Return the chat API URL for the given backend.
-
-        Args:
-            backend: Backend name ("ollama" uses /api/chat, others use /v1/chat/completions).
-        """
-        return f"{self.base_url}/api/chat" if backend == "ollama" else f"{self.base_url}/v1/chat/completions"
-
     def query_sync(self, messages: list[Message], model: str, stream_enabled: bool = False, **kwargs: dict) -> dict:
         """Non-streaming sync query wrapper.
 
@@ -10534,162 +11749,6 @@ class ModelQuery:
                     msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
             sys.stderr.write(colorize(msg, 'error'))
             return {"error": {"message": str(e), "type": type(e).__name__}}
-
-    @staticmethod
-    def _accumulate_stream_tool_calls(tool_calls: list[ToolCall], tool_call_index: dict, new_calls: list) -> None:
-        """Merge incremental tool-call chunks into `tool_calls` and `tool_call_index`.
-
-        Args:
-            tool_calls: List to append full-object tool calls to.
-            tool_call_index: Dict mapping index → partial tool call dict.
-            new_calls: The new tool calls from a chunk.
-
-        Handles both OpenAI-compatible deltas (arguments accumulate as strings, keyed by
-        `index`) and Ollama full-object tool calls (no `index`, arguments already a dict).
-        """
-        for tc in new_calls:
-            if "index" not in tc:
-                tool_calls.append({
-                    "id": tc.get("id", ""),
-                    "type": tc.get("type", "function"),
-                    "function": {
-                        "name": tc.get("function", {}).get("name", ""),
-                        "arguments": tc.get("function", {}).get("arguments", ""),
-                    }
-                })
-                continue
-            idx = tc.get("index", 0)
-            if idx not in tool_call_index:
-                tool_call_index[idx] = {
-                    "id": tc.get("id", ""),
-                    "type": tc.get("type", "function"),
-                    "function": {
-                        "name": tc.get("function", {}).get("name", ""),
-                        "arguments": tc.get("function", {}).get("arguments", ""),
-                    }
-                }
-            else:
-                existing = tool_call_index[idx]
-                if tc.get("id"):
-                    existing["id"] = tc["id"]
-                fn_delta = tc.get("function") or {}
-                if fn_delta.get("name"):
-                    existing["function"]["name"] = fn_delta["name"]
-                if "arguments" in fn_delta and fn_delta["arguments"]:
-                    existing["function"]["arguments"] += fn_delta["arguments"]
-
-    def _synthesize_sync_response(self, content: str, thinking: str, tool_calls: list[ToolCall], usage: dict) -> dict:
-        """Build a non-streaming-shaped response dict from aggregated stream chunks.
-
-        Args:
-            content: Aggregated assistant text.
-            thinking: Aggregated reasoning/thinking text.
-            tool_calls: Accumulated native tool calls.
-            usage: Aggregated usage dict.
-
-        Returns:
-            A sync-shaped response dict for the current backend.
-
-        Mirrors the shape returned by `query_sync` for the current backend so callers
-        (e.g. the ReAct loop) can parse it identically.
-        """
-        backend = self.backend
-        if backend == "ollama":
-            resp = {
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                    "tool_calls": tool_calls,
-                },
-            }
-            if thinking:
-                resp["message"]["reasoning_content"] = thinking
-            resp["prompt_eval_count"] = usage.get("prompt_eval_count", 0)
-            resp["eval_count"] = usage.get("eval_count", 0)
-            return resp
-        resp = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                    "tool_calls": tool_calls,
-                },
-                "finish_reason": "stop",
-            }],
-        }
-        if thinking:
-            resp["choices"][0]["message"]["reasoning_content"] = thinking
-        if usage:
-            resp["usage"] = {
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            }
-        return resp
-
-    def _aggregate_sync_stream(self, req: Request, backend: str, socket_timeout: float,
-                               on_chunk: object, cancel: Optional[dict] = None,
-                               tool_calls_out: Optional[list] = None) -> tuple:
-        """Read a streaming response and aggregate content/thinking/tools/usage.
-
-        Args:
-            req: The prepared urllib Request.
-            backend: Backend name.
-            socket_timeout: Socket timeout for the request.
-            on_chunk: Optional per-chunk callback (thought, content, is_final).
-            cancel: Optional {"event", "close"} cancel token dict.
-            tool_calls_out: Optional by-ref list kept in sync with the
-                accumulated tool calls (partial or complete) as they stream, so
-                a caller can salvage a finished tool call after a timeout.
-
-        Returns:
-            (full_content, full_thinking, tool_calls, tool_call_index, usage),
-            or None when the request was cancelled.
-        """
-        full_content = ""
-        full_thinking = ""
-        tool_calls = []          # ordered, deduped accumulated tool calls
-        tool_call_index = {}     # index -> partial tool call dict
-        usage = {}
-        try:
-            with _request_with_retry(req, timeout=socket_timeout) as response:
-                if cancel is not None and hasattr(response, 'close'):
-                    # Expose a close callback so a ^C (or timeout retry) on the
-                    # calling thread can abort this blocked stream read promptly.
-                    cancel["close"] = response.close
-                for raw_line in self._iter_stream_lines(response, backend):
-                    if cancel is not None and cancel["event"].is_set():
-                        return None
-                    try:
-                        chunk = json.loads(raw_line)
-                    except json.JSONDecodeError:
-                        continue
-                    thought, content, is_final, u, tcs = self._parse_chunk(chunk, backend)
-                    if thought:
-                        full_thinking += thought
-                    if content:
-                        full_content += content
-                    if tcs:
-                        self._accumulate_stream_tool_calls(tool_calls, tool_call_index, tcs)
-                        if tool_calls_out is not None:
-                            # By-ref view for timeout salvage: OpenAI-style
-                            # deltas live in tool_call_index until the loop
-                            # ends, so expose both collections as they grow.
-                            tool_calls_out[:] = (
-                                list(tool_calls)
-                                + [tool_call_index[k] for k in sorted(tool_call_index)])
-                    if u:
-                        usage.update(u)
-                    if on_chunk:
-                        on_chunk(thought, content, is_final)
-        except Exception as e:
-            if cancel is not None and cancel["event"].is_set():
-                # User aborted (^C) or a timeout retry superseded this request —
-                # return quietly instead of spamming an error line.
-                return None
-            sys.stderr.write(colorize(f"[ERROR] {backend} sync stream failed: {e}\n", 'error'))
-            return {"error": {"message": str(e), "type": type(e).__name__}}
-        return full_content, full_thinking, tool_calls, tool_call_index, usage
 
     def query_sync_stream(self, messages: list[Message], model: str, stream_enabled: bool = True, **kwargs: dict) -> dict:
         """Streaming variant of `query_sync` that aggregates chunks into a single dict.
@@ -10754,141 +11813,6 @@ class ModelQuery:
 
         return self._synthesize_sync_response(full_content, full_thinking, tool_calls, usage)
 
-
-    def _normalize_llamacpp_usage(self, chunk: dict) -> dict:
-        """
-        Extract token counts from any Llama.cpp chunk format.
-        Returns dict with standardized keys: total_tokens, prompt_tokens, completion_tokens
-        """
-        usage = {}
-
-        # Format 1: Standard OpenAI-style usage block
-        if "usage" in chunk and chunk["usage"]:
-            u = chunk["usage"]
-            usage["prompt_tokens"] = u.get("prompt_tokens", 0)
-            usage["completion_tokens"] = u.get("completion_tokens", 0)
-            usage["total_tokens"] = u.get("total_tokens",
-                                           usage["prompt_tokens"] + usage["completion_tokens"])
-
-        # Format 2: Llama.cpp timings block (your server uses this)
-        if "timings" in chunk:
-            t = chunk["timings"]
-            usage["prompt_tokens"] = t.get("prompt_n", 0)
-            usage["completion_tokens"] = t.get("predicted_n", 0)
-            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-            # Server-measured phase timings/rates (exclude prefill from decode rate)
-            if t.get("prompt_ms"):
-                usage["prompt_ms"] = t["prompt_ms"]
-            if t.get("predicted_ms"):
-                usage["predicted_ms"] = t["predicted_ms"]
-            if t.get("prompt_per_second"):
-                usage["prompt_per_second"] = t["prompt_per_second"]
-            if t.get("predicted_per_second"):
-                usage["predicted_per_second"] = t["predicted_per_second"]
-
-        # Format 4: LM Studio stats block (tokens_per_second / time_to_first_token)
-        if "stats" in chunk and chunk["stats"]:
-            s = chunk["stats"]
-            if s.get("tokens_per_second"):
-                usage["predicted_per_second"] = s["tokens_per_second"]
-            if s.get("time_to_first_token"):
-                usage.setdefault("prompt_ms", s["time_to_first_token"] * 1000.0)
-
-        # Format 3: Root-level fields (some versions)
-        if "prompt_eval_count" in chunk:
-            usage["prompt_tokens"] = usage.get("prompt_tokens", 0) or chunk.get("prompt_eval_count", 0)
-        if "eval_count" in chunk:
-            usage["completion_tokens"] = usage.get("completion_tokens", 0) or chunk.get("eval_count", 0)
-            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-
-        return usage if usage else None
-
-    def _build_stream_request(self, backend: str, messages: list[Message], model: str,
-                              stream_enabled: bool, context_size: Optional[int], **kwargs: dict) -> tuple:
-        """Build URL, payload and headers for the backend.
-
-        Args:
-            backend: Backend name.
-            messages: Message list to send.
-            model: Model name.
-            stream_enabled: Whether streaming was requested.
-            context_size: Context window size (or None).
-            **kwargs: Extra payload args.
-
-        Returns:
-            (api_url, payload, headers) tuple.
-        """
-        payload = self.build_request_payload(messages, model, stream_enabled=stream_enabled, context_size=context_size, **kwargs)
-        return self._get_chat_url(backend), payload, self._get_headers()
-
-    def _parse_chunk(self, chunk: dict, backend: str) -> tuple:
-        """Extract (thought, content, is_final, usage, tool_calls) from a chunk for any backend.
-
-        Args:
-            chunk: A parsed JSON chunk dict.
-            backend: Backend name for shape selection.
-
-        Returns:
-            (thought, content, is_final, usage, tool_calls) tuple.
-        """
-        if backend == "ollama":
-            thought = (chunk.get("message", {}).get("thought") or
-                       chunk.get("message", {}).get("thinking")) or ""
-            content = chunk.get("message", {}).get("content", "")
-            is_final = chunk.get("done", False)
-            usage = None
-            tool_calls = chunk.get("message", {}).get("tool_calls", [])
-            if is_final:
-                if "usage" in chunk:
-                    usage = chunk["usage"]
-                else:
-                    usage = {
-                        "prompt_eval_count": chunk.get("prompt_eval_count", 0),
-                        "eval_count": chunk.get("eval_count", 0),
-                        "prompt_eval_duration": chunk.get("prompt_eval_duration", 0),
-                        "eval_duration": chunk.get("eval_duration", 0),
-                        "total_duration": chunk.get("total_duration", 0),
-                        "load_duration": chunk.get("load_duration", 0),
-                    }
-            return thought, content, is_final, usage, tool_calls
-        elif backend in ("llamacpp", "strata", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-            choices = chunk.get("choices", [])
-            is_final = bool(choices and choices[0].get("finish_reason") is not None)
-            delta = choices[0].get("delta", {}) if choices else {}
-            thought = delta.get("reasoning_content") or ""
-            content = delta.get("content") or ""
-            tool_calls = delta.get("tool_calls", [])
-            usage = self._normalize_llamacpp_usage(chunk) if is_final else None
-            return thought, content, is_final, usage, tool_calls
-        elif backend == "lmstudio":
-            choices = chunk.get("choices", [])
-            is_final = bool(choices and choices[0].get("finish_reason") is not None)
-            delta = choices[0].get("delta", {}) if choices else {}
-            thought = delta.get("reasoning") or ""
-            content = delta.get("content") or ""
-            tool_calls = delta.get("tool_calls", [])
-            usage = self._normalize_llamacpp_usage(chunk) if is_final else None
-            return thought, content, is_final, usage, tool_calls
-        else:
-            raise ValueError(f"Unknown backend: {backend}")
-
-    def _iter_stream_lines(self, response: object, backend: str) -> tuple:
-        """Yield decoded JSON lines from streaming response, stripping SSE prefixes.
-
-        Args:
-            response: The streaming HTTP response object.
-            backend: Backend name (SSE stripping applies to non-ollama backends).
-        """
-        for line in response:
-            decoded = line.decode('utf-8').strip()
-            if not decoded:
-                continue
-            if backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-                if decoded.startswith('data: '):
-                    decoded = decoded[6:].strip()
-            if decoded == '[DONE]':
-                continue
-            yield decoded
 
     def _update_context_tokens(self, backend: str, aggregated_usage: dict, messages: list,
                                tools: Optional[list] = None) -> None:
@@ -11733,6 +12657,34 @@ def _start_sigcont_watchdog(in_read: 'threading.Event') -> tuple:
     return watchdog, stop_event, old_mask
 
 
+def _signal_watchdog(watchdog: 'threading.Thread') -> None:
+    """Nudge the SIGCONT watchdog out of its sigwait.
+
+    `os.kill(getpid(), SIGCONT)` is *process-directed*: the kernel delivers it
+    to any thread that does not block SIGCONT, which is most threads created
+    while no input session is active (the mask is saved/restored per session,
+    and new threads inherit whatever the creator had). With the agentic step
+    timeouts, tool workers and E2E tests that is plenty of candidates, so the
+    signal lands elsewhere and the watchdog stays blocked in sigwait forever —
+    reproduced deterministically (3/3 stuck with one such thread alive). A
+    thread-directed pthread_kill targets the sigwait itself.
+
+    Args:
+        watchdog: The watchdog thread being stopped.
+    """
+    ident = getattr(watchdog, "ident", None)
+    if ident is not None and hasattr(signal, "pthread_kill"):
+        try:
+            signal.pthread_kill(ident, signal.SIGCONT)
+            return
+        except (OSError, ValueError):
+            pass
+    try:
+        os.kill(os.getpid(), signal.SIGCONT)
+    except OSError:
+        pass
+
+
 def _stop_sigcont_watchdog(watchdog: 'Optional[threading.Thread]',
                            stop_event: 'Optional[threading.Event]',
                            old_mask: object) -> None:
@@ -11745,10 +12697,7 @@ def _stop_sigcont_watchdog(watchdog: 'Optional[threading.Thread]',
     """
     if watchdog is not None:
         stop_event.set()
-        try:
-            os.kill(os.getpid(), signal.SIGCONT)
-        except OSError:
-            pass
+        _signal_watchdog(watchdog)
         try:
             watchdog.join(timeout=1)
         except Exception:
@@ -12091,7 +13040,8 @@ def execute_os_command(command: str, timeout: Optional[int] = None) -> str:
     return f"\n[Command executed: `{command}`]\n```text\n{output.strip()}\n```\n"
 
 
-def _curl_fetch_text(url: str, timeout: int = 20) -> str:
+def _curl_fetch_text(url: str, timeout: int = 20,
+                     limit: int = MAX_URL_FETCH_BYTES) -> tuple:
     """Fetch a URL via curl as a fallback when urllib is blocked.
 
     Some sites (Red Hat docs, Akamai-fronted pages) reply 403 to urllib's
@@ -12099,30 +13049,67 @@ def _curl_fetch_text(url: str, timeout: int = 20) -> str:
     builtin should be as capable as a shell `curl`, so fetch_url tries this
     rather than forcing the model to reach for run_command.
 
+    `--max-filesize` is kept as a cheap early abort for the known-length case,
+    but it is **not** the memory bound: it counts bytes on the *wire*, so with
+    `--compressed` a 51 kB gzip body that inflates to 50 MB passes the check and
+    curl decompresses it into the pipe (measured: 52 428 800 chars returned for a
+    2 000 000 limit). The authoritative bound is therefore a bounded read of
+    curl's stdout: at most `limit + 1` bytes are pulled, then curl is killed.
+
     Args:
         url: The URL to fetch.
         timeout: Max seconds for curl.
+        limit: Maximum body bytes to keep.
 
     Returns:
-        Decoded response body, or empty string when curl is unavailable/fails.
+        (text, truncated): the decoded body (empty on failure) and whether it
+        is a prefix of a larger body.
     """
     parsed = urlparse(url)
     if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
-        return ""
+        return "", False
     if shutil.which("curl") is None:
-        return ""
+        return "", False
     ua = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
     try:
-        proc = subprocess.run(
-            ["curl", "-sL", "--compressed", "--fail", "--max-time", str(timeout), "-A", ua, url],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        proc = subprocess.Popen(
+            ["curl", "-sL", "--compressed", "--fail", "--max-time", str(timeout),
+             "--max-filesize", str(limit), "-A", ua, url],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
     except (OSError, ValueError):
-        return ""
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return ""
-    return proc.stdout
+        return "", False
+    try:
+        raw, truncated = _bounded_read(proc.stdout, limit)
+    except (OSError, ValueError):
+        raw, truncated = b"", False
+    finally:
+        try:
+            proc.stdout.close()
+        except (OSError, ValueError):
+            pass
+    if truncated:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        returncode = proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        returncode = -1
+    text = raw.decode("utf-8", errors="replace")
+    if not text.strip():
+        return "", False
+    if truncated:
+        return text, True          # bounded prefix; caller appends the marker
+    if returncode != 0:
+        return "", False
+    return text, False
 
 
 def _strip_html_text(html: str) -> str:
@@ -12172,17 +13159,22 @@ def fetch_and_convert_url(url: str) -> tuple:
         req = Request(url, headers=headers)
         with _request_with_retry(req, max_retries=1, timeout=15) as response:
             charset = response.info().get_content_charset() or 'utf-8'
-            html_content = response.read().decode(charset, errors='ignore')
+            raw_body, truncated = _bounded_read(response, MAX_URL_FETCH_BYTES)
+            html_content = raw_body.decode(charset, errors='ignore')
         text = _strip_html_text(html_content)
         if text:
+            if truncated:
+                text += _truncated_marker(MAX_URL_FETCH_BYTES)
             return text, "htmlstrip"
         err = "empty response body"
     except Exception as e:
         err = str(e)
     # urllib blocked or empty — try curl (browser TLS/header fingerprint).
-    html = _curl_fetch_text(url)
+    html, curl_truncated = _curl_fetch_text(url, limit=MAX_URL_FETCH_BYTES)
     text = _strip_html_text(html)
     if text:
+        if curl_truncated:
+            text += _truncated_marker(MAX_URL_FETCH_BYTES)
         return text, "htmlstrip"
     if html:
         err = "no visible text extracted from response"
@@ -12272,6 +13264,3252 @@ HTMLStripper = CoreHTMLStripper  # Backward-compat alias for tests
 
 
 # ============================================================================
+# ============= TOOL-CALL PARSING ============================================
+# ============================================================================
+#
+# The primitives here are pure functions (no context, no I/O), so they can be
+# exercised unbound: extract_json_balanced('{"a": 1}', 0). The policy — strict
+# vs lazy extraction, where a tool call is allowed to appear — lives in
+# ToolCallParser, which reads ctx.lazy_tool once per call.
+#
+# ChatLoop keeps two thin doors for backward compatibility:
+#   * parse_tool_call() / parse_tool_calls() delegate to its parser instance
+#     (call sites inside the loop use self.parse_tool_call(...)),
+#   * the former staticmethods are re-exported as class attributes
+#     (_extract_json_balanced = staticmethod(extract_json_balanced)) because
+#     tests invoke them unbound as ChatLoop._extract_json_balanced(...).
+
+
+def normalize_tool_json(json_text: str) -> Optional[dict]:
+    """Parse JSON and normalize any tool call format to {"tool": ..., "arguments": ...}.
+
+    Supports:
+    - Internal:  {"tool": "name", "arguments": {...}}
+    - OpenAI:    {"type": "function", "function": {"name": "name", "arguments": {...}}}
+    - Compact:   {"function": {"name": "name", "arguments": {...}}}
+    Arguments can be a dict or a JSON string.
+    """
+    try:
+        obj = json.loads(json_text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if "tool" in obj:
+        return obj
+    tool_name = None
+    tool_args = {}
+    if "function" in obj and isinstance(obj["function"], dict):
+        fn = obj["function"]
+        if "name" in fn:
+            tool_name = fn["name"]
+            raw_args = fn.get("arguments", {})
+            if isinstance(raw_args, str):
+                try:
+                    tool_args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    tool_args = {"raw": raw_args}
+            elif isinstance(raw_args, dict):
+                tool_args = raw_args
+    # OpenAI format without function wrapper: {"type": "function", "name": "...", "arguments": {...}}
+    if not tool_name and obj.get("type") == "function" and isinstance(obj.get("name"), str):
+        tool_name = obj["name"]
+        raw_args = obj.get("arguments", {})
+        if isinstance(raw_args, str):
+            try:
+                tool_args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                tool_args = {"raw": raw_args}
+        elif isinstance(raw_args, dict):
+            tool_args = raw_args
+    if tool_name:
+        return {"tool": tool_name, "arguments": tool_args}
+    return None
+
+
+def find_tool_call_brace(text: str, pos: int = 0) -> int:
+    """Find the next { that introduces a tool call JSON (with tool/function/type key).
+
+    Args:
+        text: The response text to search.
+        pos: Starting offset.
+
+    Returns:
+        Index of the opening brace, or -1 if none found.
+    """
+    idx = text.find('{', pos)
+    while idx != -1:
+        rest = text[idx+1:].lstrip()
+        if rest.startswith(('"tool"', '"function"', '"type"')):
+            return idx
+        idx = text.find('{', idx + 1)
+    return -1
+
+
+def rfind_tool_call_brace(text: str) -> int:
+    """Find the last { that introduces a tool call JSON, scanning right-to-left.
+
+    Args:
+        text: The response text to search.
+
+    Returns:
+        Index of the last tool-call opening brace, or -1 if none found.
+    """
+    idx = text.rfind('{')
+    while idx != -1:
+        rest = text[idx+1:].lstrip()
+        if rest.startswith(('"tool"', '"function"', '"type"')):
+            return idx
+        if idx == 0:
+            break
+        idx = text.rfind('{', 0, idx)
+    return -1
+
+
+def extract_json_balanced(text: str, start: int) -> Optional[str]:
+    """Extract balanced JSON from text starting at an opening brace.
+
+    Args:
+        text: The response text.
+        start: Index of the opening brace.
+
+    Returns:
+        The balanced JSON substring, or None if unbalanced.
+
+    Handles braces inside JSON string values correctly by tracking
+    string boundaries and escape sequences.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text[start:], start):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+    return None
+
+
+def tool_call_json_acceptable(result: Optional[dict]) -> bool:
+    """Reject tool-call JSON that looks like an XML/HTML hybrid fragment.
+
+    Args:
+        result: Normalized tool call dict (or None).
+
+    Returns:
+        True when the result should be accepted.
+    """
+    if not result:
+        return False
+    args_str = json.dumps(result.get("arguments", {}))
+    return not ('<' in args_str and '>' in args_str)
+
+
+def looks_like_truncated_tool_call(text: str) -> bool:
+    """Detect an in-flight (unbalanced) tool-call JSON opening in partial text.
+
+    ToolCallParser.has_tool_call only sees *parseable* tool calls. A model cut
+    off mid-emission leaves an unbalanced `{"tool": ...` opening that would
+    parse as nothing — but echoing that prefix back invites the model to
+    continue the JSON from the middle and emit a malformed call. This catches
+    the unbalanced opening so the nudge can omit partial content.
+    """
+    if not text or not text.strip():
+        return False
+    idx = find_tool_call_brace(text)
+    if idx == -1:
+        return False
+    return extract_json_balanced(text, idx) is None
+
+
+class ToolCallParser:
+    """Extract tool calls from a model response, honoring the strict/lazy policy.
+
+    Strict mode (default) only accepts consecutive tool calls from the start of
+    the response; lazy mode (/agentic lazytool) scans the whole text, because
+    many models emit a preamble or a thinking block first.
+    """
+
+    def __init__(self, ctx: Optional['CommandContext']) -> None:
+        """Bind the parser to the session context (source of the lazy flag)."""
+        self.ctx = ctx
+
+    @property
+    def lazy(self) -> bool:
+        """Whether extraction may look for a tool call anywhere in the text."""
+        return bool(getattr(self.ctx, 'lazy_tool', False))
+
+    def parse_tool_call(self, text: str) -> Optional[dict]:
+        """Extract tool call JSON from LLM response. Returns {"tool": ..., "arguments": ...} or None.
+
+        Args:
+            text: The response text to parse.
+        """
+        lazy = self.lazy
+        text = text.strip()
+        # Pass 1: full JSON parse
+        result = normalize_tool_json(text)
+        if result:
+            return result
+        # Pass 2: fenced JSON code block
+        result = self._parse_fenced_tool_call(text, lazy)
+        if result:
+            return result
+        # Pass 3: bare JSON object with "tool" key
+        return self._parse_bare_tool_call(text, lazy)
+
+    def _parse_fenced_tool_call(self, text: str, lazy: bool) -> Optional[dict]:
+        """Pass 2: extract a tool call from a fenced ```json code block.
+
+        Args:
+            text: The response text.
+            lazy: Whether lazy extraction is enabled.
+
+        Returns:
+            A normalized tool call dict, or None.
+        """
+        parts = text.split("```")
+        for i in range(1, len(parts), 2):
+            block = parts[i].strip()
+            if block.startswith("json"):
+                block = block[4:].strip()
+            elif block.startswith("text"):
+                block = block[4:].strip()
+            brace_idx = find_tool_call_brace(block)
+            if brace_idx != -1:
+                prefix = "```".join(parts[:i])
+                suffix = "```".join(parts[i+1:])
+                accept = lazy
+                if not accept:
+                    accept = ((not prefix or len(prefix) <= 100) and not suffix)
+                if accept:
+                    json_str = extract_json_balanced(block, brace_idx)
+                    if json_str:
+                        result = normalize_tool_json(json_str)
+                        if tool_call_json_acceptable(result):
+                            return result
+        return None
+
+    def _parse_bare_tool_call(self, text: str, lazy: bool) -> Optional[dict]:
+        """Pass 3: extract a bare JSON tool call (anywhere in lazy mode).
+
+        Args:
+            text: The response text.
+            lazy: Whether lazy extraction is enabled.
+
+        Returns:
+            A normalized tool call dict, or None.
+        """
+        if lazy:
+            brace_idx = find_tool_call_brace(text)
+            if brace_idx != -1:
+                json_str = extract_json_balanced(text, brace_idx)
+                if json_str:
+                    result = normalize_tool_json(json_str)
+                    if tool_call_json_acceptable(result):
+                        return result
+        else:
+            # Strict mode: only at START of the text
+            stripped = text.lstrip()
+            if stripped.startswith('{') and stripped[1:].lstrip().startswith(('"tool"', '"function"', '"type"')):
+                start = text.index('{')
+                json_str = extract_json_balanced(text, start)
+                if json_str:
+                    result = normalize_tool_json(json_str)
+                    if result:
+                        return result
+            # Pass 4: bare JSON tool call at the END of the text (strict mode only).
+            # The JSON must be the final content (no trailing text), but a short
+            # prose preamble is allowed — models often narrate intent ("Let me
+            # check...") then emit the JSON tool call as the last thing.
+            idx = rfind_tool_call_brace(text)
+            if idx >= 0:
+                json_str = extract_json_balanced(text, idx)
+                if json_str:
+                    end = idx + len(json_str)
+                    if not text[end:].strip():
+                        result = normalize_tool_json(json_str)
+                        if tool_call_json_acceptable(result):
+                            return result
+        return None
+
+    def parse_tool_calls(self, text: str) -> list[dict]:
+        """Extract ALL tool call JSONs from the response.
+
+        First tries direct JSON parse (works for clean tool calls at start of text).
+        Falls back to strict/lazy extraction for embedded or malformed JSON.
+
+        In strict mode (default): only matches consecutive tool calls starting
+        from the beginning of the response (no preamble).
+        In lazy mode (/agentic lazytool): finds tool calls anywhere in the text.
+        Returns list of {"tool": ..., "arguments": ...} dicts.
+
+        Args:
+            text: The response text to parse.
+        """
+        lazy = self.lazy
+        text = text.strip()
+
+        # Pass 0: Quick check — if text starts with '{', try direct JSON parse.
+        # A proper JSON parser handles braces inside string values correctly,
+        # unlike brace-counting approaches.
+        if text.startswith('{'):
+            try:
+                obj = json.loads(text)
+                if isinstance(obj, dict) and 'tool' in obj:
+                    return [obj]
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        if lazy:
+            return self._extract_tool_calls_lazy(text)
+        return self._extract_tool_calls_strict(text)
+
+    def has_tool_call(self, text: str) -> bool:
+        """Whether the text contains a parseable tool call (partial-output check).
+
+        Used by the timeout policy to tell "the model was narrating prose" from
+        "a tool call was in flight". Only TypeError/ValueError are swallowed
+        (malformed argument payloads): a broken collaborator must surface, since
+        swallowing it turns an internal defect into a silent policy decision —
+        which is exactly how a missing parser attribute once downgraded State C
+        to "no tool call pending".
+        """
+        if not text or not text.strip():
+            return False
+        try:
+            calls = self.parse_tool_calls(text)
+            if not calls:
+                single = self.parse_tool_call(text)
+                if single:
+                    calls = [single]
+        except (TypeError, ValueError):
+            return False
+        return bool(calls)
+
+    def _extract_tool_calls_lazy(self, text: str) -> list:
+        """Lazy mode: find ALL tool call JSONs anywhere in the text (deduped).
+
+        Args:
+            text: The response text.
+
+        Returns:
+            List of normalized tool call dicts.
+        """
+        results = []
+        seen_keys = set()
+        pos = 0
+        while pos < len(text):
+            idx = find_tool_call_brace(text, pos)
+            if idx == -1:
+                break
+            json_str = extract_json_balanced(text, idx)
+            if not json_str:
+                pos = idx + 1
+                continue
+            result = normalize_tool_json(json_str)
+            if result:
+                key = (result["tool"], json.dumps(result.get("arguments", {}), sort_keys=True))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    results.append(result)
+            pos = idx + len(json_str) if json_str else idx + 1
+        return results
+
+    def _extract_tool_calls_strict(self, text: str) -> list:
+        """Strict mode: only consecutive tool calls from the start.
+
+        Args:
+            text: The response text.
+
+        Returns:
+            List of normalized tool call dicts (empty when the text has preamble).
+        """
+        results = []
+        # Strict mode: only consecutive tool calls from the start
+        stripped = text.lstrip()
+        if not (stripped.startswith('{') and stripped[1:].lstrip().startswith(('"tool"', '"function"', '"type"'))):
+            return []
+        pos = 0
+        while pos < len(text):
+            # Skip whitespace between consecutive tool calls
+            while pos < len(text) and text[pos] in (' ', '\t', '\n', '\r'):
+                pos += 1
+            if pos >= len(text):
+                break
+            # Check if next non-whitespace is a tool call
+            if not (text[pos] == '{' and text[pos+1:].lstrip().startswith(('"tool"', '"function"', '"type"'))):
+                break
+            json_str = extract_json_balanced(text, pos)
+            if not json_str:
+                break
+            result = normalize_tool_json(json_str)
+            if result:
+                results.append(result)
+            else:
+                break
+            pos += len(json_str)
+        return results
+
+# ============================================================================
+# ============= AGENTIC TIMEOUT POLICY =======================================
+# ============================================================================
+#
+# When a ReAct step times out, what happens next depends on what the model was
+# doing, what already ran, and whether it was still generating:
+#
+#   State C — the last executed tool was destructive. Abort ONLY when a tool
+#             call was in flight (a retry could re-execute it). A prose
+#             narration after the tool completed is safe to retry.
+#   State A — no tool executed yet. Extend the budget while tokens still flow;
+#             otherwise retry once, then abort after two consecutive timeouts.
+#   State B — a tool already ran. Exponential backoff, raising the max ceiling
+#             (doubling it, capped at AGENTIC_TIMEOUT_MAX_CEILING) at the
+#             ceiling instead of aborting outright.
+#
+# This is a decision function, not an I/O loop: `on_timeout()` mutates the
+# context counters / the timeout ceiling, appends a nudge to the conversation
+# when the step continues, and returns (should_break, new_budget). Keeping it
+# out of ChatLoop lets the policy be driven in isolation (see
+# tests/test_agentic_timeout.py), which is exactly the class of bug a blind
+# `except` in the loop used to hide.
+
+
+@dataclass(frozen=True)
+class TimeoutEvent:
+    """Everything the escalation policy needs to know about one timed-out step.
+
+    Built once per timeout by `AgenticTimeoutPolicy.on_timeout()`; the three
+    state handlers read it instead of taking ten positional arguments.
+    """
+
+    iteration: int
+    expired: int          # the budget that just fired (seconds)
+    step_timeout: int     # the current budget (same value at decision time)
+    pending_tool: bool    # a parseable tool call was in flight
+    content_is_tool: bool  # ... or an unbalanced/truncated JSON opening
+    partial_text: str
+    partial_thought: str
+    tok_per_sec: float
+    making_progress: bool  # tokens flowed within the progress grace window
+    thinking_capped: bool  # the reasoning exceeded agentic_max_thinking_tokens
+
+
+class AgenticTimeoutPolicy:
+    """Escalate a timed-out agentic step (see the state table above)."""
+
+    def __init__(self, ctx: Optional['CommandContext'], parser: 'ToolCallParser') -> None:
+        """Bind the policy to the session context and the tool-call parser."""
+        self.ctx = ctx
+        self.parser = parser
+
+    def on_timeout(self, iteration: int, step_timeout: int, messages: list,
+                   partial_text: str = "", partial_thought: str = "",
+                   elapsed_sec: Optional[float] = None,
+                   partial_tokens: Optional[int] = None,
+                   idle_sec: Optional[float] = None,
+                   thinking_capped: bool = False) -> tuple:
+        """Decide what to do after a step timeout and apply it.
+
+        Args:
+            iteration: Current ReAct iteration number.
+            step_timeout: The timeout (seconds) that just expired.
+            messages: The conversation list (a nudge message is appended on continue).
+            partial_text: Content generated before the timeout (from the step buffer).
+            partial_thought: Reasoning generated before the timeout (from the step buffer).
+            elapsed_sec: Wall-clock seconds the step actually ran (for tok/s).
+            partial_tokens: Estimated tokens generated before the timeout (for tok/s).
+            idle_sec: Seconds since the last chunk arrived (progress/stall signal).
+            thinking_capped: Whether the reasoning hit the per-step thinking cap.
+
+        Returns:
+            (should_break: bool, new_step_timeout: int)
+        """
+        self.ctx.agentic_consecutive_timeouts += 1
+
+        # F3: generation-rate + progress signal from the step buffer.
+        tok_per_sec = 0.0
+        if elapsed_sec and elapsed_sec > 0 and partial_tokens and partial_tokens > 0:
+            tok_per_sec = partial_tokens / elapsed_sec
+        grace = max(0, int(getattr(self.ctx, 'agentic_progress_grace', 15)))
+        making_progress = (idle_sec is not None and idle_sec <= grace and tok_per_sec > 0)
+
+        pending_tool = self.parser.has_tool_call(partial_text)
+        event = TimeoutEvent(
+            iteration=iteration,
+            expired=step_timeout,
+            step_timeout=step_timeout,
+            pending_tool=pending_tool,
+            content_is_tool=pending_tool or looks_like_truncated_tool_call(partial_text),
+            partial_text=partial_text,
+            partial_thought=partial_thought,
+            tok_per_sec=tok_per_sec,
+            making_progress=making_progress,
+            thinking_capped=thinking_capped,
+        )
+
+        if self.ctx.agentic_last_tool_name in AGENTIC_TIMEOUT_ABORT_TOOLS:
+            return self._state_c(event, messages)
+        if not self.ctx.agentic_has_executed_tool:
+            return self._state_a(event, messages)
+        return self._state_b(event, messages)
+
+    # === State handlers ===
+    def _state_c(self, event: TimeoutEvent, messages: list) -> tuple:
+        """State C: the last executed tool was destructive.
+
+        Args:
+            event: The timed-out step's facts.
+            messages: Conversation list (nudge appended when the step continues).
+
+        Returns:
+            (should_break, step_timeout).
+        """
+        last_tool = self.ctx.agentic_last_tool_name
+        if event.pending_tool:
+            # Retrying risks re-executing the destructive tool.
+            print(colorize(
+                f"\n[Agentic] Step {event.iteration} timed out after {event.expired}s. "
+                f"Last tool was '{last_tool}' (destructive) and a tool call was "
+                "pending. Aborting to avoid re-execution.",
+                'error'), file=sys.stderr)
+            return True, event.step_timeout
+        # Destructive tool already completed; the model was only narrating.
+        # Continue with State B backoff.
+        print(colorize(
+            f"\n[Agentic] Step {event.iteration} timed out after {event.expired}s. "
+            f"Last tool was '{last_tool}' (destructive) but no tool call was "
+            "pending — continuing with backoff.",
+            'warning'), file=sys.stderr)
+        return self._state_b(event, messages)
+
+    def _state_a(self, event: TimeoutEvent, messages: list) -> tuple:
+        """State A: no tool has run yet — extend while progressing, else retry/abort.
+
+        Args:
+            event: The timed-out step's facts.
+            messages: Conversation list (nudge appended when the step continues).
+
+        Returns:
+            (should_break, step_timeout).
+        """
+        if event.making_progress and event.step_timeout < self.ctx.agentic_timeout_max:
+            # F3: the model is actively generating — extend the budget instead of
+            # retrying at the same (insufficient) timeout, which would just fail
+            # again. A stalled step falls through to the retry/abort below.
+            step_timeout = min(event.step_timeout * 2, self.ctx.agentic_timeout_max)
+            print(colorize(
+                f"\n[Agentic] Step {event.iteration} timed out after {event.expired}s but still "
+                f"generating ({event.tok_per_sec:.1f} tok/s) — extending to {step_timeout}s.",
+                'warning'), file=sys.stderr)
+            self._push_nudge(messages, event, step_timeout)
+            return False, step_timeout
+        if event.making_progress and self.ctx.agentic_timeout_max < AGENTIC_TIMEOUT_MAX_CEILING:
+            # At the ceiling but still generating — raise the ceiling (capped at
+            # the hard ceiling) so a genuinely long think can finish.
+            self.ctx.agentic_timeout_max = min(
+                self.ctx.agentic_timeout_max * 2, AGENTIC_TIMEOUT_MAX_CEILING)
+            step_timeout = self.ctx.agentic_timeout_max
+            print(colorize(
+                f"\n[Agentic] Step {event.iteration} timed out after {event.expired}s but still "
+                f"generating ({event.tok_per_sec:.1f} tok/s) — raising max timeout to "
+                f"{self.ctx.agentic_timeout_max}s.", 'warning'), file=sys.stderr)
+            self._push_nudge(messages, event, step_timeout)
+            return False, step_timeout
+        # No recent progress, or the hard timeout ceiling is reached —
+        # conservative; abort after two timeouts.
+        if self.ctx.agentic_consecutive_timeouts >= 2:
+            print(colorize(
+                f"\n[Agentic] Step {event.iteration} timed out twice. Model may be stuck. Aborting.",
+                'error'), file=sys.stderr)
+            return True, event.step_timeout
+        print(colorize(
+            f"\n[Agentic] Step {event.iteration} timed out after {event.expired}s. "
+            "Model may be thinking — retrying.",
+            'warning'), file=sys.stderr)
+        self._push_nudge(messages, event, event.step_timeout)
+        return False, event.step_timeout
+
+    def _state_b(self, event: TimeoutEvent, messages: list) -> tuple:
+        """State B: a tool already ran — back off, raising the ceiling at the cap.
+
+        Args:
+            event: The timed-out step's facts.
+            messages: Conversation list (nudge appended when the step continues).
+
+        Returns:
+            (should_break, step_timeout).
+        """
+        if event.step_timeout >= self.ctx.agentic_timeout_max:
+            if self.ctx.agentic_timeout_max >= AGENTIC_TIMEOUT_MAX_CEILING:
+                # Hard ceiling reached — stop growing and abort.
+                print(colorize(
+                    f"\n[Agentic] Max timeout ceiling ({AGENTIC_TIMEOUT_MAX_CEILING}s) "
+                    "reached. Aborting agentic query.", 'error'), file=sys.stderr)
+                return True, event.step_timeout
+            # Already at the ceiling — raise the ceiling by doubling it (capped
+            # at the hard ceiling) rather than aborting, so a slow-but-progressing
+            # model can finish.
+            self.ctx.agentic_timeout_max = min(
+                self.ctx.agentic_timeout_max * 2, AGENTIC_TIMEOUT_MAX_CEILING)
+            step_timeout = self.ctx.agentic_timeout_max
+            print(colorize(
+                f"\n[Agentic] Step {event.iteration} timed out after {event.expired}s. "
+                f"Model was executing tools — raising max timeout to {self.ctx.agentic_timeout_max}s.",
+                'warning'), file=sys.stderr)
+        else:
+            step_timeout = min(event.step_timeout * 2, self.ctx.agentic_timeout_max)
+            print(colorize(
+                f"\n[Agentic] Step {event.iteration} timed out after {event.expired}s. "
+                f"Model was executing tools — extending to {step_timeout}s.",
+                'warning'), file=sys.stderr)
+
+        self._push_nudge(messages, event, step_timeout)
+        return False, step_timeout
+
+    # === Nudge ===
+    def _push_nudge(self, messages: list, event: TimeoutEvent, budget_sec: int) -> None:
+        """Append the timeout nudge, tagged so it is excluded from saved history."""
+        messages.append({
+            'role': 'user',
+            'content': self.build_nudge(event.partial_text, event.partial_thought,
+                                        event.content_is_tool,
+                                        metrics=self._metrics(event, budget_sec)),
+            '_system_nudge': True,
+        })
+
+    def _metrics(self, event: TimeoutEvent, budget_sec: int) -> dict:
+        """Build the metrics dict embedded in the nudge (speed, expired, budget)."""
+        metrics = {"tok_per_sec": event.tok_per_sec, "expired_sec": event.expired,
+                   "budget_sec": budget_sec}
+        if event.thinking_capped:
+            metrics["thinking_capped"] = True
+            metrics["thinking_cap"] = int(getattr(self.ctx, 'agentic_max_thinking_tokens', 0) or 0)
+        return metrics
+
+    @staticmethod
+    def build_nudge(partial_content: str, partial_thought: str, pending_tool: bool,
+                    metrics: Optional[dict] = None) -> str:
+        """Build the timeout-continuation nudge message for the model.
+
+        Feeds the model's partial reasoning/content back so it continues from
+        where it left off instead of restarting its analysis from scratch
+        (re-thinking the same problem burns a full generation budget). Partial
+        *content* is omitted when a tool call was pending — feeding a cut-off
+        JSON prefix back invites a malformed JSON continuation. The reasoning is
+        always included; it is the model's internal monologue, not the output
+        channel, so echoing it is safe and preserves the in-flight train of
+        thought.
+
+        Two refinements:
+          - F4: the echoed reasoning is capped from the **tail** (`[-4000:]`,
+            where the model was cut off) rather than the head, so a resumed step
+            continues instead of re-deriving the earlier analysis.
+          - F3: an optional `metrics` dict (`tok_per_sec`, `expired_sec`,
+            `budget_sec`) tells the model its actual generation speed, the timeout
+            it hit, and the new budget in seconds/tokens so it can self-throttle
+            and finish within budget instead of getting killed again.
+
+        Args:
+            partial_content: Partial text content from the step buffer.
+            partial_thought: Partial reasoning (`reasoning_content`) from the step buffer.
+            pending_tool: True if the partial content contained a parseable tool call.
+            metrics: Optional dict with tok_per_sec / expired_sec / budget_sec.
+
+        Returns:
+            str: The nudge message to append as a user turn.
+        """
+        def _cap_tail(text: str, cap: int = 4000) -> str:
+            """Cap text from the tail, marking omitted leading content."""
+            text = text.strip()
+            if len(text) <= cap:
+                return text
+            return "…[earlier reasoning omitted]\n" + text[-cap:]
+
+        lines = []
+        thought = partial_thought.strip()
+        if thought:
+            lines.append("Your reasoning before the interruption:\n" + _cap_tail(thought))
+        if not pending_tool:
+            content = partial_content.strip()
+            if content:
+                lines.append("Your response before the interruption:\n" + _cap_tail(content))
+        base = ("You were interrupted by a timeout while generating your response. "
+                "Please continue your previous response.")
+
+        if metrics and metrics.get("budget_sec"):
+            tps = metrics.get("tok_per_sec", 0.0) or 0.0
+            expired = metrics.get("expired_sec", 0) or 0
+            budget = metrics.get("budget_sec", 0) or 0
+            est_tokens = int(budget * tps)
+            base += ("\n\nGeneration metrics:\n"
+                     f"- ~{tps:.1f} tokens/second\n"
+                     f"- cut off after {expired}s (step timeout)\n"
+                     f"- new budget: {budget}s (~{est_tokens} tokens at your current speed)\n")
+            if metrics.get("thinking_capped"):
+                cap = metrics.get("thinking_cap") or 0
+                if cap:
+                    base += (f"- note: your reasoning exceeded the {cap}-token cap — be more "
+                             "concise and move to a tool call or final answer\n")
+                else:
+                    base += ("- note: your reasoning is very long — be more concise and move to "
+                             "a tool call or final answer\n")
+            base += ("Keep your total thinking + output within that budget — finish as soon "
+                     "as you have enough to act, and prefer a tool call or final answer over "
+                     "re-deriving your full analysis.")
+        if lines:
+            return base + "\n\n" + "\n\n".join(lines)
+        return base
+
+# ============================================================================
+# ============= AGENTIC STEP FEEDBACK ========================================
+# ============================================================================
+#
+# One agentic ReAct step needs live feedback while it generates: the reasoning
+# stream (when the user asked to see it), liveness dots when nothing visible is
+# rendered, and an accumulated buffer of what was generated before a timeout or
+# a ^C. This used to be a free-form dict (`{"thought": ..., "tok_acc": ...}`)
+# threaded through three helpers and read with `.get()` by six consumers, so a
+# typo in a key silently produced `""`/`0`/`False` instead of an error — the
+# same failure class the timeout policy extraction removed.
+#
+# Lifecycle: construct → start() (spawns the idle watchdog) → feed() per chunk
+# → finalize(). Rendering and accumulation work without start()/finalize(), so
+# tests can exercise them without a thread or terminal state.
+
+
+class StepFeedback:
+    """Live feedback + accumulated output for one agentic ReAct step."""
+
+    def __init__(self, ctx: 'CommandContext', show_thinking: bool,
+                 heartbeat_tokens: int = 10) -> None:
+        """Initialize the per-step feedback state (no thread until start()).
+
+        Args:
+            ctx: The shared context (thinking cap / token accounting).
+            show_thinking: Whether to stream the model's reasoning live.
+            heartbeat_tokens: Streamed tokens per liveness dot (thinking-off mode).
+        """
+        self.ctx = ctx
+        self.show_thinking = show_thinking
+        self.heartbeat_tokens = max(1, int(heartbeat_tokens or 10))
+
+        # Accumulated generation (consumed after a timeout / on ^C).
+        self.thought = ""
+        self.content = ""
+        self.thinking_tokens = 0
+        self.thinking_capped = False
+        self.content_streamed = False
+
+        # Terminal state.
+        self.thinking_open = False
+        self.heartbeat_shown = False
+        self.cancelled = False
+        self.last_activity = time.time()
+        self.last_visible = time.time()
+
+        self._tok_acc = 0
+        self._write_lock = threading.Lock()
+        self._watchdog: Optional[threading.Thread] = None
+
+    # === Public API (what the ReAct loop consumes) ===
+    def start(self) -> None:
+        """Start the idle-fallback watchdog thread."""
+        self._watchdog = threading.Thread(target=self._run_watchdog, daemon=True)
+        self._watchdog.start()
+
+    def feed(self, thought: str, content: str, is_final: bool = False) -> None:
+        """Handle a parsed stream chunk: record activity, accumulate, render.
+
+        Args:
+            thought: Reasoning text for this chunk.
+            content: Assistant text for this chunk.
+            is_final: Whether this is the final chunk (unused; kept for the
+                `query_sync_stream` on_chunk signature).
+        """
+        if self.cancelled:
+            return
+        # Any chunk counts as generation activity — including native tool-call
+        # deltas, which carry no thought/content. Without this, the timeout
+        # policy would see a busy tool-call write (120s of silent deltas at
+        # ~30 tok/s) as a stalled step and abort.
+        self.last_activity = time.time()
+        self._accumulate(thought, content)
+        self._render(thought, content)
+        # Token-driven dots are the liveness signal for thinking-off mode only.
+        # With show_thinking the user already sees reasoning stream live; dots
+        # after the block closes (while hidden content streams, re-rendered
+        # later by the final query_stream) read as noise.
+        if ((not self.show_thinking) and (thought or content)
+                and not self.thinking_open):
+            self._tok_acc += max(1, len(thought) // 4) + max(1, len(content) // 4)
+            while self._tok_acc >= self.heartbeat_tokens:
+                self._tok_acc -= self.heartbeat_tokens
+                self.heartbeat_shown = True
+                with self._write_lock:
+                    self.last_visible = time.time()
+                    sys.stderr.write(".")
+                    sys.stderr.flush()
+
+    def finalize(self) -> None:
+        """Close any open thinking block and stop further feedback output."""
+        with self._write_lock:
+            if self.thinking_open:
+                sys.stderr.write(_thinking_close_tag())
+                sys.stderr.flush()
+                self.thinking_open = False
+            elif self.heartbeat_shown:
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+                self.heartbeat_shown = False
+            self.cancelled = True
+
+    def idle_sec(self) -> float:
+        """Seconds since the last chunk (the timeout policy's progress signal)."""
+        return max(0.0, time.time() - self.last_activity)
+
+    # === Internals ===
+    def _accumulate(self, thought: str, content: str) -> None:
+        """Accumulate thought/content into the step buffer with F5 cap tracking.
+
+        Args:
+            thought: Reasoning text for this chunk.
+            content: Assistant text for this chunk.
+        """
+        if thought:
+            self.thought += thought
+            self.last_activity = time.time()
+            # F5: track an estimate of total thinking tokens so a single step
+            # can't silently burn the whole budget on reasoning undetected.
+            # Detection + flag only — we keep accumulating (F4 tail-caps the
+            # nudge) and keep streaming live thinking; the flag is surfaced to
+            # the timeout nudge so a verbose thinker is told to be concise.
+            cap = int(getattr(self.ctx, 'agentic_max_thinking_tokens', 0) or 0)
+            if cap > 0:
+                self.thinking_tokens += max(1, len(thought) // 4)
+                if self.thinking_tokens >= cap:
+                    self.thinking_capped = True
+        if content:
+            self.content += content
+            self.last_activity = time.time()
+
+    def _render(self, thought: str, content: str) -> None:
+        """Render live feedback for a chunk (thinking stream or heartbeat dot).
+
+        Args:
+            thought: Reasoning text for this chunk.
+            content: Assistant text for this chunk.
+
+        Note: when thinking is not streamed, liveness dots come from the
+        watchdog thread started by `start()`, not from chunk arrival — long
+        tool-call generations may deliver no chunks at all, so a chunk-driven
+        heartbeat would leave the terminal silent.
+        """
+        if not self.show_thinking:
+            return
+        if thought:
+            with self._write_lock:
+                if not self.thinking_open:
+                    self.thinking_open = True
+                    sys.stderr.write(_thinking_open_tag())
+                sys.stderr.write(thought)
+                sys.stderr.flush()
+                self.last_visible = time.time()
+        if content:
+            with self._write_lock:
+                if self.thinking_open:
+                    sys.stderr.write(_thinking_close_tag())
+                    self.thinking_open = False
+                # Stream the model's visible text live too (chat-style: the
+                # user chose to see thinking AND what the model says). stdout
+                # so the answer stays pipeable; the thinking stays on stderr as
+                # diagnostics. `finalize` skips the final re-stream when this
+                # already displayed the answer.
+                sys.stdout.write(content)
+                sys.stdout.flush()
+                self.content_streamed = True
+                self.last_visible = time.time()
+
+    def _run_watchdog(self) -> None:
+        """Idle-fallback liveness: a dot ~1/s while the step is silent.
+
+        Token-driven dots (`feed`) cover active streaming; generations that
+        deliver no chunks at all would otherwise leave the terminal silent, so
+        after ~2s without VISIBLE output the watchdog ticks once per second
+        until something is rendered again. This fires even while the
+        `<thinking>` block is open: a silent thinking phase usually means the
+        model has switched to a tool call (native tool-call deltas carry no
+        content, so the block never closes on its own) — the block is closed
+        and the dots keep the user informed. If thinking later resumes, the
+        block reopens. The idle test tracks the last RENDERED output
+        (`last_visible`), not raw chunk arrival: native tool-call deltas stream
+        continuously but render nothing, so chunk activity alone must not
+        starve the heartbeat.
+        """
+        idle_grace = 2.0
+        while not self.cancelled:
+            time.sleep(1.0)
+            if self.cancelled:
+                return
+            if time.time() - self.last_visible < idle_grace:
+                continue
+            with self._write_lock:
+                if self.cancelled:
+                    return
+                if self.thinking_open:
+                    sys.stderr.write(_thinking_close_tag())
+                    self.thinking_open = False
+                self.heartbeat_shown = True
+                self.last_visible = time.time()
+                sys.stderr.write(".")
+                sys.stderr.flush()
+
+# ============================================================================
+# ============= AGENTIC TOOL EXECUTION =======================================
+# ============================================================================
+#
+# Executing a tool call is three separate jobs that used to live in ChatLoop:
+# run it and normalize the observation (size-capped to the live context usage),
+# guard against the same call repeating forever, and turn the results into
+# well-formed conversation turns (native `tool` role vs inline `Tool result:`
+# note). None of it needs the UI loop, so it lives here with `ctx`, the
+# registry and the parser injected — the loop keeps thin doors for its call
+# sites and for the tests that stub them.
+
+
+class ToolExecution:
+    """Run tool calls and append their results to the conversation."""
+
+    def __init__(self, ctx: Optional['CommandContext'], tool_registry: 'ToolRegistry',
+                 parser: 'ToolCallParser') -> None:
+        """Bind the executor to the session context, registry and parser."""
+        self.ctx = ctx
+        self.tool_registry = tool_registry
+        self.parser = parser
+
+    # === Running ===
+    def run_single(self, tool_name: str, tool_args: dict, iteration: int,
+                   logger: Optional['AgenticLogger'], messages: list) -> dict:
+        """Run one tool, returning a normalized observation dict.
+
+        Args:
+            tool_name: Tool to execute.
+            tool_args: Tool arguments.
+            iteration: Current iteration.
+            logger: Optional AgenticLogger.
+            messages: The conversation list (for truncation measurement).
+
+        Returns:
+            {"observation": str, "raw": str, "success": bool, "cancelled": bool}.
+        """
+        args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+        print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
+        sys.stderr.flush()
+
+        if self.ctx.agentic_trace:
+            print(colorize(f"\n[Trace] Full args: {json.dumps(tool_args, default=str)[:2000]}", 'muted'), file=sys.stderr)
+
+        t_start = time.time()
+        result = self.tool_registry.execute(tool_name, tool_args)
+        elapsed = time.time() - t_start
+        status = "OK" if result["success"] else "ERROR"
+        print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
+
+        if result["success"]:
+            observation = result["output"]
+        else:
+            full = result["output"] or ""
+            lines = full.split("\n")[:4]
+            context = "\n".join(lines).strip()
+            error_msg = result.get("error", "") or ""
+            observation = f"{context}\nERROR: {error_msg}" if context else f"ERROR: {error_msg}"
+        if not observation:
+            observation = "[Tool returned no output]"
+
+        # read_file pages are exempt — they self-bound and carry a `next`
+        # offset that a blanket cap would silently drop.
+        max_obs_chars = self.observation_char_cap(messages)
+        observation = self.cap_observation(tool_name, observation, max_obs_chars)
+
+        timed_observation = json.dumps({"tool": tool_name, "duration_s": round(elapsed, 1), "success": result["success"], "output": observation})
+        if self.ctx.agentic_trace:
+            trace_out = result["output"] if len(result["output"]) < 2000 else result["output"][:2000] + "..."
+            print(colorize(f"[Trace] Result: {json.dumps({'success': result['success'], 'output': trace_out, 'error': result['error']}, default=str)}", 'muted'), file=sys.stderr)
+
+        if self.ctx.agentic_logging and logger:
+            logger.write(type="result", iteration=iteration, tool_name=tool_name, tool_args=tool_args, result=result)
+
+        cancelled = (not result["success"]) and "Cancelled" in (result.get("error") or "")
+        return {"observation": f"[{tool_name}] {timed_observation}", "raw": observation,
+                "success": result["success"], "cancelled": cancelled}
+
+    def run_calls(self, tool_calls: list, last_tool_call: Optional[dict],
+                  last_tool_count: int, iteration: int,
+                  logger: Optional['AgenticLogger'], messages: list,
+                  response_text: str, api_tool_calls: list) -> tuple:
+        """Execute a list of tool calls, collecting observations.
+
+        Re-running the same tool can be legitimate, so the same-tool-loop guard
+        only aborts when the IDENTICAL call (name + arguments) is emitted
+        `AGENTIC_SAME_TOOL_MAX` times consecutively — e.g. a model stuck in a
+        loop. The streak resets whenever the call changes.
+
+        Args:
+            tool_calls: Normalized tool call list.
+            last_tool_call: Previous executed tool call (for same-tool-loop detection).
+            last_tool_count: Consecutive streak of `last_tool_call` so far.
+            iteration: Current ReAct iteration.
+            logger: Optional AgenticLogger.
+            messages: The conversation list.
+            response_text: The assistant's text for this step.
+            api_tool_calls: Native tool calls from the response.
+
+        Returns:
+            (observations, raw_observations, abort_loop, last_tool_call,
+             last_tool_count, final_answer).
+        """
+        observations = []
+        raw_observations = []
+        abort_loop = False
+        final_answer = ""
+        for tool_call in tool_calls:
+            tool_name = tool_call["tool"]
+            tool_args = tool_call.get("arguments", {})
+            current_call = (tool_name, json.dumps(tool_args, sort_keys=True))
+
+            # Consecutive-call guard: allow repeats (e.g. re-running the same
+            # command), but abort if the identical call is emitted
+            # AGENTIC_SAME_TOOL_MAX times in a row.
+            if current_call == last_tool_call:
+                last_tool_count += 1
+                if last_tool_count >= AGENTIC_SAME_TOOL_MAX:
+                    print(colorize(
+                        f"\n[Agentic] Same tool call emitted {last_tool_count} times "
+                        "in a row, breaking loop.", 'warning'), file=sys.stderr)
+                    final_answer = "[Agentic: model stuck in tool loop]"
+                    abort_loop = True
+                    break
+            else:
+                last_tool_count = 1
+            last_tool_call = current_call
+
+            exec_result = self.run_single(tool_name, tool_args, iteration, logger, messages)
+            if exec_result["cancelled"]:
+                print(colorize("[Agentic] Tool cancelled by user, aborting.", 'warning'), file=sys.stderr)
+                final_answer = "[Agentic query cancelled]"
+                abort_loop = True
+                break
+
+            observations.append(exec_result["observation"])
+            raw_observations.append(exec_result["raw"])
+
+        return observations, raw_observations, abort_loop, last_tool_call, last_tool_count, final_answer
+
+    # === Normalization ===
+    def parse_calls(self, response_text: str, api_tool_calls: list) -> list:
+        """Build normalized tool calls from either native API calls or inline JSON text.
+
+        Args:
+            response_text: Assistant text content (may embed JSON tool calls).
+            api_tool_calls: Native `tool_calls` from the response (already
+                backend-normalized), or an empty list.
+
+        Returns:
+            list of {"tool": name, "arguments": args} dicts (may be empty).
+        """
+        tool_calls = []
+        if api_tool_calls:
+            for tc in api_tool_calls:
+                func = tc.get('function', {})
+                name = func.get('name', '')
+                args_raw = func.get('arguments', {})
+                if isinstance(args_raw, str):
+                    try:
+                        args = json.loads(args_raw)
+                    except json.JSONDecodeError:
+                        args = {}
+                else:
+                    args = args_raw
+                tool_calls.append({"tool": name, "arguments": args})
+        elif response_text:
+            tool_calls = self.parser.parse_tool_calls(response_text)
+            if not tool_calls:
+                single = self.parser.parse_tool_call(response_text)
+                if single:
+                    tool_calls = [single]
+        return tool_calls
+
+    @staticmethod
+    def complete_calls(step_tool_calls: list) -> list:
+        """Filter accumulated stream tool calls down to the complete ones.
+
+        A tool call is complete when its arguments are already a dict (Ollama
+        full-object deltas) or a string that parses as JSON (OpenAI-style
+        deltas, which arrive as argument fragments — a fragment stream that has
+        not closed yet does not parse).
+
+        Args:
+            step_tool_calls: Tool calls accumulated during a (timed-out) step.
+
+        Returns:
+            The subset whose arguments parse as complete JSON.
+        """
+        complete = []
+        for tc in step_tool_calls or []:
+            fn = tc.get("function") or {}
+            args = fn.get("arguments", "")
+            if isinstance(args, dict):
+                complete.append(tc)
+            elif isinstance(args, str) and args.strip():
+                try:
+                    json.loads(args)
+                    complete.append(tc)
+                except json.JSONDecodeError:
+                    pass  # still mid-write — not complete
+        return complete
+
+    # === Conversation turns ===
+    @staticmethod
+    def append_messages(messages: list[Message], response_text: str, api_tool_calls: list,
+                        tool_calls: list, observations: list, raw_observations: list,
+                        send_tools_api: bool) -> None:
+        """Append the assistant turn and tool-result messages after executing tools.
+
+        Native-tools backends get `tool`-role messages keyed by `tool_call_id`;
+        inline-mode backends get a plain `Tool result:` user note.
+        """
+        combined = "\n---\n".join(observations) if observations else "[No tool output]"
+        assistant_content = response_text
+        # Inline-mode fallback only: when a model returned a native tool call but
+        # carries no text, inline backends need the call echoed in the assistant
+        # text (they ignore the `tool_calls` field). Native-tools backends must
+        # NOT get this — it would render a fake `{"tool": ...}` JSON *alongside*
+        # the real `<tool_call>`, the exact hybrid JSON/XML garbage the native
+        # format block exists to prevent.
+        if api_tool_calls and not response_text and tool_calls and not send_tools_api:
+            assistant_content = json.dumps(tool_calls[0])
+        assistant_msg = {'role': 'assistant', 'content': assistant_content}
+        if api_tool_calls:
+            assistant_msg['tool_calls'] = api_tool_calls
+        messages.append(assistant_msg)
+        if send_tools_api and api_tool_calls and observations:
+            for idx, tc in enumerate(api_tool_calls):
+                obs = raw_observations[idx] if idx < len(raw_observations) else "ERROR: Cancelled or skipped due to preceding tool sequence abort."
+                tool_msg = {'role': 'tool', 'tool_call_id': tc.get('id', ''), 'content': obs}
+                tool_msg['name'] = tc.get('function', {}).get('name', '')
+                messages.append(tool_msg)
+        else:
+            messages.append({'role': 'user', 'content': f"Tool result:\n{combined}"})
+
+    # === Observation sizing ===
+    @staticmethod
+    def cap_observation(tool_name: str, observation: str, cap: int = 4000) -> str:
+        """Truncate a tool observation to fit the context, self-bounding tools excepted.
+
+        `read_file` already bounds and paginates its own output and its header
+        carries the `next` offset, so a blanket cap would silently drop the
+        continuation pointer and defeat chunked reads of large files. `grep`
+        self-bounds via max_results + per-line truncation, and a blanket cap
+        would eat the "(Results capped...)" note that tells the model to narrow
+        the search.
+        """
+        if tool_name in ("read_file", "grep"):
+            return observation
+        if not observation:
+            return observation
+        if len(observation) > cap:
+            return observation[:cap] + f"\n... [truncated to {cap} chars]"
+        return observation
+
+    def observation_char_cap(self, messages: list) -> int:
+        """Progressive observation truncation cap based on context usage.
+
+        Args:
+            messages: The conversation list (for context-usage measurement).
+
+        Returns:
+            Max observation length in chars (4000/3000/2000 by usage).
+        """
+        if self.ctx.context_window_size <= 0:
+            return 4000
+        msg_tokens = self.ctx.calculate_context_tokens(messages)
+        usage_ratio = msg_tokens / self.ctx.context_window_size
+        if usage_ratio > 0.7:
+            return 2000
+        if usage_ratio > 0.5:
+            return 3000
+        return 4000
+
+# ============================================================================
+# ============= AGENTIC FINALIZER (final answer / stream tool calls) =========
+# ============================================================================
+
+class AgenticFinalizer:
+    """Finishes one ReAct query: stream the answer, or run the tool call it carried.
+
+    Extracted from `AgenticRunner` (which keeps the loop itself). This is the
+    phase after the last step: either the model produced its final answer (stream
+    it for the typing effect and persist the turn), or the final stream carried a
+    tool call, in which case the observations are appended and the loop is
+    re-entered — bounded by a re-entry counter.
+
+    The class holds no query state: `host` and `state` are passed per call, which
+    is what lets a test drive one phase without building a loop. `prompt_and_tools`
+    and `step_content` are the runner's own readers, injected as callables so the
+    finalizer cannot drift from the prompt the loop actually sends.
+    """
+
+    def __init__(self, query_handler: object, prompt_and_tools: object,
+                 step_content: object) -> None:
+        """Bind the finalizer to the runner's readers.
+
+        Args:
+            query_handler: The ModelQuery (final `query_stream` + tool calls).
+            prompt_and_tools: Callable returning the wire system prompt/tools.
+            step_content: Callable extracting (content, thought) from a response.
+        """
+        self.query_handler = query_handler
+        self.prompt_and_tools = prompt_and_tools
+        self.step_content = step_content
+        self._streaming_reentry_count = 0
+
+    def reset_reentry(self) -> None:
+        """Reset the streaming re-entry counter for a new query."""
+        self._streaming_reentry_count = 0
+
+    def finalize_agentic_query(self, host: object, state: 'ReActState',
+                               content_streamed: bool = False) -> None:
+        """Stream the final answer or execute a pending tool call, then persist.
+
+        Args:
+            host: The ChatLoop (conversation store, prompt builder, handlers).
+            state: The query state (messages, final answer, tool surface).
+            content_streamed: True when the step's answer was already streamed
+                live to the terminal (thinking mode) — skips the final
+                query_stream re-generation, which would display it twice and
+                burn a full re-generation.
+        """
+        stream_tool_used = False
+        final_answer = state.final_answer
+        if not final_answer:
+            final_answer = (state.response_text if state.response_text
+                            else "[Agentic: no answer produced]")
+
+        if state.logger:
+            state.logger.write(type="final", final_answer=final_answer)
+
+        pending_tool = host.parse_tool_call(final_answer)
+        if pending_tool:
+            observation = self.finalize_pending_tool(host, pending_tool)
+            print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
+            host.messages.append({'role': 'assistant', 'content': final_answer})
+            print()
+        else:
+            if not host.messages:
+                host.messages = [{'role': 'system', 'content': host.ctx.system_prompt}]
+            if content_streamed:
+                # The answer was already streamed live (thinking mode) — the
+                # final query_stream re-generation would display it twice and
+                # burn a full re-generation. Just record it.
+                host.messages.append({'role': 'assistant', 'content': final_answer})
+                print()
+            else:
+                final_messages = list(state.messages)
+                # Preserve the ReAct list's system message: `_init_agentic_query()`
+                # built it via `prompt_and_tools()`, so it carries the active
+                # plan/full prose AND the inline tool-definition block for
+                # non-native models. Overwriting it with `ctx.system_prompt` (the
+                # chat prompt, built without `tool_defs_block`) silently dropped
+                # the tool schemas from the final stream, so a late tool call had
+                # no current schema to form a reliable call.
+                if not (final_messages and final_messages[0].get('role') == 'system'):
+                    # No usable system message (unexpected): rebuild exactly what
+                    # `_init_agentic_query()` would have sent.
+                    system_content, _tools, _send_tools_api = self.prompt_and_tools()
+                    final_messages.insert(0, {'role': 'system', 'content': system_content})
+                if final_messages and final_messages[-1]['role'] != 'user':
+                    final_messages.append({'role': 'user', 'content':
+                        "Provide your final answer now, based on the tool results above. "
+                        "Do not repeat the original request or call any more tools."})
+
+                stream_kwargs = dict(get_inference_params(host.ctx.model))
+                stream_kwargs["apply_output_cap"] = True
+                stream_tool_calls_out = []
+                if state.send_tools_api:
+                    stream_kwargs["tools"] = state.openai_tools
+
+                response = self.query_handler.query_stream(
+                    final_messages, host.ctx.model,
+                    stream_enabled=host.ctx.stream_enabled,
+                    debug=host.ctx.debug_mode,
+                    show_thinking=(not host.ctx.force_no_thinking),
+                    context_size=host.ctx.context_size,
+                    images=([] if host.ctx.supports_vision is False else host.ctx.current_images),
+                    tool_calls_out=stream_tool_calls_out,
+                    no_thinking=host.ctx.force_no_thinking,
+                    reasoning_effort=host.ctx.reasoning_effort,
+                    preserve_thinking=host.ctx.preserve_thinking,
+                    **stream_kwargs
+                )
+                if response or stream_tool_calls_out:
+                    stream_tool_calls = self.collect_stream_tool_calls(
+                        host, stream_tool_calls_out, response)
+                    if stream_tool_calls:
+                        stream_tool_used = self.execute_stream_tool_calls(
+                            host, stream_tool_calls, stream_tool_calls_out,
+                            response, state.send_tools_api)
+                    else:
+                        host.messages.append({'role': 'assistant', 'content': response})
+                        print()
+                else:
+                    print(colorize(f"\n{final_answer}", 'success'), file=sys.stdout)
+
+        self.streaming_reentry(host, stream_tool_used, state.send_tools_api,
+                               state.openai_tools)
+
+    def finalize_pending_tool(self, host: object, pending_tool: dict) -> str:
+        """Execute a single pending tool call found in the final answer.
+
+        Returns the (possibly truncated) observation text.
+        """
+        tool_name = pending_tool["tool"]
+        tool_args = pending_tool.get("arguments", {})
+        args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+        print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr)
+        result = host.tool_registry.execute(tool_name, tool_args)
+        observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
+        if not observation:
+            observation = "[Tool returned no output]"
+        observation = host._cap_tool_observation(tool_name, observation)
+        return observation
+
+    def collect_stream_tool_calls(self, host: object, stream_tool_calls_out: list,
+                                  response: str) -> list:
+        """Normalize tool calls from the final streaming response.
+
+        Args:
+            host: The ChatLoop (inline parser doors).
+            stream_tool_calls_out: Accumulated native tool calls from the stream.
+            response: The streamed response text.
+
+        Returns:
+            List of {"tool", "arguments"} dicts.
+
+        Prefers native `tool_calls` out-params; falls back to parsing the text
+        response for inline JSON tool calls.
+        """
+        stream_tool_calls = []
+        if stream_tool_calls_out:
+            for tc in stream_tool_calls_out:
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                args_raw = func.get("arguments", "{}")
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except json.JSONDecodeError:
+                    args = {"raw": args_raw}
+                stream_tool_calls.append({"tool": name, "arguments": args})
+        if not stream_tool_calls and response:
+            stream_tool_calls = host.parse_tool_calls(response)
+            if not stream_tool_calls:
+                single = host.parse_tool_call(response)
+                if single:
+                    stream_tool_calls = [single]
+        return stream_tool_calls
+
+    def append_stream_observations(self, host: object, response: str,
+                                   stream_tool_calls_out: list,
+                                   stream_observations: list,
+                                   send_tools_api: bool) -> None:
+        """Record assistant tool_call + tool results into the stored history.
+
+        Args:
+            host: The ChatLoop (conversation store).
+            response: The streamed response text.
+            stream_tool_calls_out: Native tool calls from the stream.
+            stream_observations: Per-tool observation strings.
+            send_tools_api: Whether to use OpenAI `tool` role messages.
+        """
+        if stream_tool_calls_out:
+            stream_content = response or ""
+            if not stream_content:
+                inline_parts = []
+                for stc in stream_tool_calls_out:
+                    fn = stc.get("function", {})
+                    args_raw = fn.get("arguments", "{}")
+                    try:
+                        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    except json.JSONDecodeError:
+                        args = {"raw": args_raw}
+                    inline_parts.append(json.dumps({
+                        "tool": fn.get("name", ""),
+                        "arguments": args
+                    }))
+                stream_content = "\n".join(inline_parts)
+            assistant_msg = {'role': 'assistant', 'content': stream_content}
+            assistant_msg['tool_calls'] = stream_tool_calls_out
+            host.messages.append(assistant_msg)
+        else:
+            host.messages.append({'role': 'assistant', 'content': response})
+        if stream_observations:
+            if send_tools_api and stream_tool_calls_out:
+                for idx, tc in enumerate(stream_tool_calls_out):
+                    obs = stream_observations[idx] if idx < len(stream_observations) else "ERROR: Tool execution declined by the user."
+                    clean_obs = obs.split("] ", 1)[1] if "] " in obs else obs
+                    host.messages.append({
+                        'role': 'tool',
+                        'tool_call_id': tc.get('id', ''),
+                        'name': tc.get('function', {}).get('name', ''),
+                        'content': clean_obs
+                    })
+            else:
+                host.messages.append({'role': 'user', 'content': "Tool result:\n" + "\n---\n".join(stream_observations)})
+        elif send_tools_api and stream_tool_calls_out:
+            for tc in stream_tool_calls_out:
+                host.messages.append({
+                    'role': 'tool',
+                    'tool_call_id': tc.get('id', ''),
+                    'name': tc.get('function', {}).get('name', ''),
+                    'content': "ERROR: Tool execution declined by the user."
+                })
+
+    def execute_stream_tool_calls(self, host: object, stream_tool_calls: list,
+                                  stream_tool_calls_out: list, response: str,
+                                  send_tools_api: bool) -> bool:
+        """Execute tools produced by the final streaming answer; record history.
+
+        Args:
+            host: The ChatLoop (tool registry + observation cap + store).
+            stream_tool_calls: Normalized tool call list.
+            stream_tool_calls_out: Native tool calls from the stream.
+            response: The streamed response text.
+            send_tools_api: Whether to use OpenAI `tool` role messages.
+
+        Returns:
+            True if any tool ran (so the caller can re-enter the loop).
+        """
+        stream_observations = []
+        for stream_tc in stream_tool_calls:
+            tool_name = stream_tc["tool"]
+            tool_args = stream_tc.get("arguments", {})
+            args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+            print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
+            sys.stderr.flush()
+            t_start = time.time()
+            result = host.tool_registry.execute(tool_name, tool_args)
+            if not result["success"] and "Cancelled" in (result.get("error") or ""):
+                print(colorize("[Agentic] Streaming tool sequence cancelled by user, aborting.", 'warning'), file=sys.stderr)
+                break
+            elapsed = time.time() - t_start
+            status = "OK" if result["success"] else "ERROR"
+            print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
+            observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
+            if not observation:
+                observation = "[Tool returned no output]"
+            observation = host._cap_tool_observation(tool_name, observation)
+            print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
+            stream_observations.append(f"[{tool_name}] {observation}")
+
+        self.append_stream_observations(
+            host, response, stream_tool_calls_out, stream_observations, send_tools_api)
+        print()
+        return bool(stream_observations)
+
+    def streaming_reentry(self, host: object, stream_tool_used: bool,
+                          send_tools_api: bool, openai_tools: list) -> bool:
+        """Re-enter the loop if the final streaming answer itself carried a tool call.
+
+        Args:
+            host: The ChatLoop (store, prompt builder, parser).
+            stream_tool_used: Whether the final stream emitted a tool call.
+            send_tools_api: Whether native tools are in use.
+            openai_tools: Native tool definitions (for the tools API).
+
+        Returns:
+            The final `stream_tool_used` value.
+
+        Some models narrate intent in prose then emit the JSON tool call last, so
+        the streamed finalize can still carry a tool call. Run up to 3 bounded
+        rounds: re-query with updated history, parse tool calls, execute them,
+        feed observations back, until the model answers plainly.
+        """
+        reentry_round = 0
+        while stream_tool_used and reentry_round < 3:
+            reentry_round += 1
+            self._streaming_reentry_count = getattr(self, '_streaming_reentry_count', 0) + 1
+            tool_format = get_tool_format(host.ctx.model)
+            include_tool_defs = tool_format != "openai"
+            tool_defs_block = host.tool_registry.get_system_prompt_block() if include_tool_defs else ""
+            reentry_messages = [{'role': 'system', 'content': get_agentic_prompt(
+                host.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
+                plan_mode=host.ctx.plan_mode, plan_run=host.ctx.plan_run)}]
+            if len(host.messages) > 1:
+                reentry_messages.extend(host.messages[1:])
+            sync_kwargs = dict(get_inference_params(host.ctx.model))
+            sync_kwargs["apply_output_cap"] = True
+            if send_tools_api:
+                sync_kwargs["tools"] = openai_tools
+            # Stream the reentry like the ReAct steps: a bare query_sync is
+            # non-streaming (no bytes until the whole generation completes) and
+            # has no feedback closure, so a multi-minute reentry left the
+            # terminal silent and hit the 120s urlopen timeout on slow hosts.
+            feedback_r = host._make_agentic_step_feedback()
+            try:
+                reentry_response = self.query_handler.query_sync_stream(
+                    reentry_messages, host.ctx.model,
+                    stream_enabled=True,
+                    on_chunk=feedback_r.feed,
+                    timeout=(getattr(host.ctx, 'agentic_step_timeout', 300) or 300) + 30,
+                    context_size=host.ctx.context_size,
+                    images=([] if host.ctx.supports_vision is False else host.ctx.current_images),
+                    no_thinking=host.ctx.force_no_thinking,
+                    reasoning_effort=host.ctx.reasoning_effort,
+                    preserve_thinking=host.ctx.preserve_thinking,
+                    **sync_kwargs
+                )
+            finally:
+                feedback_r.finalize()
+            reentry_text, reentry_api_calls = self.step_content(reentry_response)
+            if not reentry_text and not reentry_api_calls:
+                break
+            reentry_tools = host._parse_agentic_tool_calls(reentry_text, reentry_api_calls)
+            if not reentry_tools:
+                if reentry_text:
+                    host.messages.append({'role': 'assistant', 'content': reentry_text})
+                    print(colorize(f"\n{reentry_text}", 'success'), file=sys.stdout)
+                    print()
+                break
+            if not reentry_api_calls:
+                # Inline mode: keep the call JSON in the assistant text.
+                host.messages.append({'role': 'assistant', 'content': reentry_text})
+            reentry_observations = []
+            reentry_raw = []
+            for rt in reentry_tools:
+                rt_name = rt["tool"]
+                rt_args = rt.get("arguments", {})
+                args_display = ", ".join(f"{k}={v!r}" for k, v in rt_args.items())
+                print(colorize(f"\n[Tool] {rt_name}({args_display})", 'warning'), file=sys.stderr, end="")
+                sys.stderr.flush()
+                rt_start = time.time()
+                rt_result = host.tool_registry.execute(rt_name, rt_args)
+                rt_elapsed = time.time() - rt_start
+                rt_status = "OK" if rt_result["success"] else "ERROR"
+                print(colorize(f" → {rt_status} ({rt_elapsed:.1f}s)", 'info' if rt_result["success"] else 'error'), file=sys.stderr)
+                rt_obs = rt_result["output"] if rt_result["success"] else f"ERROR: {rt_result['error']}"
+                if not rt_obs:
+                    rt_obs = "[Tool returned no output]"
+                rt_obs = host._cap_tool_observation(rt_name, rt_obs)
+                print(colorize(f"\n{rt_obs}", 'info'), file=sys.stdout)
+                reentry_observations.append(f"[{rt_name}] {rt_obs}")
+                reentry_raw.append(rt_obs)
+            if reentry_observations:
+                if reentry_api_calls:
+                    # Native reentry call — the loop's append machinery keeps
+                    # assistant tool_calls + tool-role pairing template-safe.
+                    host._append_tool_messages(
+                        host.messages, reentry_text, reentry_api_calls,
+                        reentry_tools, reentry_observations, reentry_raw, send_tools_api)
+                else:
+                    host.messages.append({'role': 'user', 'content': "Tool result:\n" + "\n---\n".join(reentry_observations)})
+                stream_tool_used = True
+            else:
+                stream_tool_used = False
+        return stream_tool_used
+
+# ============================================================================
+# ============= AGENTIC RUNNER ===============================================
+# ============================================================================
+#
+# Step machinery for one agentic query: build the prompt the ReAct loop sends,
+# run a single model call under a wall-clock timeout, salvage what a timed-out
+# generation already wrote (a complete tool call, a half-streamed write_file),
+# and — since 3.1 — drive the whole ReAct loop on a `ReActState`.
+#
+# The loop calls back into `host` (the ChatLoop) for everything that is not
+# step/loop machinery: the tool executor, the message store, the context bar
+# and the timeout policy doors. Those are the seams tests stub, so they stay on
+# the loop and the runner never bypasses them.
+
+
+class ReActState:
+    """Mutable state of one agentic ReAct query.
+
+    Replaces the nine locals `run_agentic_query` used to thread through eight
+    helpers (`iteration`, `final_answer`, `final_answer_streamed`,
+    `last_tool_call`, `last_tool_count`, `step_timeout`, `response_text`,
+    `api_error`, `send_tools_api`): they now live here, next to the query's
+    messages, logger and tool surface. A typo is an AttributeError instead of a
+    silently-wrong local.
+    """
+
+    def __init__(self, final_content: str, messages: list, logger: object,
+                 openai_tools: list, send_tools_api: bool, seed_len: int,
+                 ctx: 'CommandContext') -> None:
+        """Bind the query's immutable inputs and initialize counters."""
+        self.final_content = final_content
+        self.messages = messages
+        self.logger = logger
+        self.openai_tools = openai_tools
+        self.send_tools_api = send_tools_api
+        self.seed_len = seed_len
+        self.iteration = 0
+        self.max_iterations = ctx.agentic_max_iterations
+        self.final_answer = ""
+        self.final_answer_streamed = False
+        self.last_tool_call = None
+        self.last_tool_count = 0
+        self.step_timeout = ctx.agentic_step_timeout
+        self.response_text = ""
+        self.api_error = ""
+
+
+class AgenticRunner:
+    """Agentic step execution: prompt, model call, timeout recovery."""
+
+    def __init__(self, ctx: 'CommandContext', query_handler: 'ModelQuery',
+                 tool_registry: 'ToolRegistry', tool_execution: 'ToolExecution',
+                 parser: 'ToolCallParser', timeout_policy: 'AgenticTimeoutPolicy') -> None:
+        """Bind the step machinery to the session's collaborators."""
+        self.ctx = ctx
+        self.query_handler = query_handler
+        self.tool_registry = tool_registry
+        self.tool_execution = tool_execution
+        self.parser = parser
+        self.timeout_policy = timeout_policy
+
+    def _finalizer(self) -> 'AgenticFinalizer':
+        """Return the post-loop finalizer bound to this runner's readers."""
+        finalizer = getattr(self, 'finalizer', None)
+        if finalizer is None:
+            finalizer = AgenticFinalizer(self.query_handler, self.prompt_and_tools,
+                                         self.step_content)
+            self.finalizer = finalizer
+        return finalizer
+
+    def finalize_agentic_query(self, host: object, state: 'ReActState',
+                               content_streamed: bool = False) -> None:
+        """Stream the answer or run its tool call (door onto `AgenticFinalizer`)."""
+        self._finalizer().finalize_agentic_query(host, state,
+                                                content_streamed=content_streamed)
+
+    def finalize_pending_tool(self, host: object, pending_tool: dict) -> str:
+        """Run the pending tool call found in the answer (door onto `AgenticFinalizer`)."""
+        return self._finalizer().finalize_pending_tool(host, pending_tool)
+
+    def collect_stream_tool_calls(self, host: object, stream_tool_calls_out: list,
+                                  response: str) -> list:
+        """Normalize tool calls from the final stream (door onto `AgenticFinalizer`)."""
+        return self._finalizer().collect_stream_tool_calls(
+            host, stream_tool_calls_out, response)
+
+    def append_stream_observations(self, host: object, response: str,
+                                   stream_tool_calls_out: list,
+                                   stream_observations: list,
+                                   send_tools_api: bool) -> None:
+        """Record the final stream's tool turns (door onto `AgenticFinalizer`)."""
+        self._finalizer().append_stream_observations(
+            host, response, stream_tool_calls_out, stream_observations, send_tools_api)
+
+    def execute_stream_tool_calls(self, host: object, stream_tool_calls: list,
+                                  stream_tool_calls_out: list, response: str,
+                                  send_tools_api: bool) -> bool:
+        """Execute the final stream's tool calls (door onto `AgenticFinalizer`)."""
+        return self._finalizer().execute_stream_tool_calls(
+            host, stream_tool_calls, stream_tool_calls_out, response, send_tools_api)
+
+    def streaming_reentry(self, host: object, stream_tool_used: bool,
+                          send_tools_api: bool, openai_tools: list) -> bool:
+        """Re-enter the loop after a tool call (door onto `AgenticFinalizer`)."""
+        return self._finalizer().streaming_reentry(
+            host, stream_tool_used, send_tools_api, openai_tools)
+
+    @staticmethod
+    def is_stuck(text: str, threshold: float = 0.8) -> bool:
+        """Detect if the model is repeating itself using sliding-window frequency check.
+
+        Checks if the last ~400 chars contain a phrase that appears 3+ times.
+        Uses multiple window sizes to catch variable-length repetition periods.
+        """
+        if len(text) < 200:
+            return False
+        tail = text[-400:]
+        half_len = len(tail) // 2
+        for window_size in (30, 50, 80):
+            if window_size > half_len:
+                continue
+            match_tail = tail[-window_size:]
+            if not match_tail.strip():
+                continue  # whitespace/indentation window — not a stuck loop
+            if tail.count(match_tail) >= 3:
+                return True
+        return False
+
+    @staticmethod
+    def call_with_timeout(func: object, timeout_sec: int, *args: tuple, **kwargs: dict) -> object:
+        """Call a function with a wall-clock timeout using a daemon thread.
+
+        Args:
+            func: The callable to invoke.
+            timeout_sec: Timeout in seconds.
+            *args, **kwargs: Passed to func.
+
+        Returns:
+            The function's return value, or None on timeout.
+        """
+        result = [None]
+        exception = [None]
+
+        def worker() -> None:
+            """Run the target function in the daemon thread, capturing result/exception."""
+            try:
+                result[0] = func(*args, **kwargs)
+            except Exception as e:
+                exception[0] = e
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(timeout_sec)
+        if thread.is_alive():
+            return None  # timed out
+        if exception[0]:
+            raise exception[0]
+        return result[0]
+
+    def prompt_and_tools(self) -> tuple:
+        """Build the agentic system prompt and native `tools` array for a query.
+
+        Single source of truth for `/tokencount`: whatever this returns is
+        exactly what `_init_agentic_query` puts on the wire, so the preview cannot
+        drift from the request.
+
+        Returns:
+            (system content, native tools array or None, send_tools_api flag).
+        """
+        include_tool_defs = get_tool_format(self.ctx.model) != "openai"
+        tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
+        content = get_agentic_prompt(
+            self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
+            plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)
+        # Path policy up front, positive half only: the allowed roots (plus this
+        # session's grants) are what the model actually needs to plan. The
+        # ask/denied detail and the grant command live behind the `path_policy`
+        # tool, so a denial can stay one line.
+        policy = _acl_policy_block(
+            getattr(self.ctx, "path_acl", None),
+            plan_strict=(self.ctx.plan_mode and not getattr(self.ctx, "plan_run", False)),
+            detail="allowed")
+        if policy:
+            content += "\n\n## Path access\n" + policy
+        tools = None if include_tool_defs else self.tool_registry.openai_tools_spec()
+        return content, tools, not include_tool_defs
+
+    def call_step(self, messages: list, step_timeout: int, images_to_send: list,
+                  sync_kwargs: dict, on_chunk: object, finalize_step: object,
+                  step_cancel: dict, tool_calls_out: Optional[list] = None) -> tuple:
+        """Run one ReAct model call under a wall-clock timeout.
+
+        Args:
+            messages: The conversation list to send.
+            step_timeout: Timeout in seconds.
+            images_to_send: Images for the request (empty when vision unsupported).
+            sync_kwargs: Inference params / tools kwargs for the call.
+            on_chunk: Feedback callback from _make_agentic_step_feedback.
+            finalize_step: Closes feedback output on completion/interrupt.
+            step_cancel: Cancel token dict for aborting the request.
+            tool_calls_out: Optional by-ref list kept in sync with the
+                in-flight generation's accumulated tool calls, so a timed-out
+                step can salvage a call that finished writing before the
+                deadline.
+
+        Returns:
+            (response, step_start) where response is the sync-shaped dict, or
+            None on timeout. Raises KeyboardInterrupt after aborting the
+            in-flight request (so the [Interrupted] handler persists turns).
+        """
+        step_start = time.time()
+        try:
+            response = self.call_with_timeout(
+                self.query_handler.query_sync_stream, step_timeout,
+                messages, self.ctx.model,
+                context_size=self.ctx.context_size,
+                images=images_to_send,
+                on_chunk=on_chunk,
+                timeout=step_timeout + 30,
+                cancel=step_cancel,
+                tool_calls_out=tool_calls_out,
+                **sync_kwargs
+            )
+        except KeyboardInterrupt:
+            # F1: stop the zombie generation from streaming to the terminal AND
+            # abort the request, then let the [Interrupted] handler take over
+            # (F2 persists completed turns).
+            _signal_abort(step_cancel)
+            finalize_step()
+            raise
+        finalize_step()
+        return response, step_start
+
+    def find_partial_write(self, step_tool_calls: list, feedback: 'StepFeedback') -> tuple:
+        """Locate an interrupted `write_file` call and recover its content.
+
+        Checks native tool-call fragments first (OpenAI-style `arguments`
+        accumulation), then the inline text buffer (JSON-in-content models). Only
+        `write_file` is handled — it is the tool whose argument is both huge and
+        directly reusable as a file.
+
+        Args:
+            step_tool_calls: By-ref native tool calls from the timed-out step.
+            feedback: The step feedback buffer (partial content text).
+
+        Returns:
+            (content, file_path, content_closed): decoded content, the intended
+            target if it streamed, and whether the content string had closed.
+            ("", "", False) when no interrupted write_file was found.
+        """
+        for tc in step_tool_calls or []:
+            fn = tc.get("function") or {}
+            if fn.get("name") != "write_file":
+                continue
+            args = fn.get("arguments", "")
+            if not isinstance(args, str) or not args:
+                continue  # dict args = complete call (handled by salvage)
+            content, closed = _extract_json_string_field(args, "content")
+            if content:
+                file_path, _ = _extract_json_string_field(args, "file_path")
+                return content, file_path, closed
+        text = feedback.content or ""
+        if "write_file" in text and '"content"' in text:
+            content, closed = _extract_json_string_field(text, "content")
+            if content:
+                file_path, _ = _extract_json_string_field(text, "file_path")
+                return content, file_path, closed
+        return "", "", False
+
+    def spill_partial_write(self, step_tool_calls: list, feedback: 'StepFeedback',
+                            iteration: int) -> Optional[str]:
+        """Spill an interrupted `write_file` content and build the recovery nudge.
+
+        A timed-out `write_file` whose arguments never closed cannot be executed
+        (the JSON is unparsable and a partial file must not be written). Instead
+        the decoded content is saved to a fixed spill file the model can `cp`
+        when the content is complete, or read + finish when it was truncated.
+
+        Args:
+            step_tool_calls: By-ref native tool calls from the timed-out step.
+            feedback: The step feedback buffer (partial content text).
+            iteration: Current ReAct iteration (for the log line).
+
+        Returns:
+            The nudge message to append, or None when there is nothing to spill.
+        """
+        content, file_path, closed = self.find_partial_write(step_tool_calls, feedback)
+        if len(content) < UNFINISHED_WRITE_SPILL_MIN:
+            return None
+        try:
+            _ensure_private_dir(CLUSTER_SPILL_DIR)
+            acl = getattr(self.ctx, "path_acl", None)
+            if acl is not None:
+                acl.add("read", "allow", CLUSTER_SPILL_DIR, source="session")
+            spill_file = os.path.join(CLUSTER_SPILL_DIR, UNFINISHED_WRITE_SPILL_NAME)
+            with _open_private(spill_file, "w", encoding="utf-8") as f:
+                f.write(content)
+        except OSError:
+            return None
+        target = f" (intended target: {file_path})" if file_path else ""
+        print(colorize(
+            f"\n[Agentic] Step {iteration} timed out mid-write_file — "
+            f"{'complete' if closed else 'partial'} content ({len(content)} chars) "
+            f"spilled to {spill_file}.", 'warning'), file=sys.stderr)
+        if closed:
+            return (f"[Agentic] The timed-out write_file{target} had fully streamed its "
+                    f"content — only the message was cut off. The complete content "
+                    f"({len(content)} chars) was saved to {spill_file}. Do NOT regenerate "
+                    f'it: place it with run_command("cp {spill_file} <target>"), or '
+                    f"read_file it to verify, then continue.")
+        return (f"[Agentic] The timed-out write_file{target} was cut off mid-content. The "
+                f"partial content decoded so far ({len(content)} chars) was saved to "
+                f"{spill_file} — it is TRUNCATED. Do NOT copy it as-is: read_file it, "
+                f"resume writing the remaining content, and re-issue write_file with the "
+                f"full content.")
+
+    def timeout_continue(self, feedback: 'StepFeedback', step_cancel: dict,
+                         step_start: float, iteration: int, step_timeout: int,
+                         messages: list) -> tuple:
+        """Handle a timed-out step: abort the request and escalate the budget.
+
+        Args:
+            feedback: The step feedback buffer (accumulated thought/content).
+            step_cancel: Cancel token dict for the in-flight request.
+            step_start: Wall-clock timestamp when the step began.
+            iteration: Current iteration.
+            step_timeout: Timeout that just expired.
+            messages: The conversation list (may receive a nudge message).
+
+        Returns:
+            (should_break, new_step_timeout).
+        """
+        # Abort the still-running request so the daemon thread dies promptly
+        # and the server slot frees for a retry.
+        _signal_abort(step_cancel)
+        # F3: pass generation timing/rate so the timeout policy can distinguish
+        # "still generating" (extend budget) from "stalled" (conservative
+        # retry / abort), and so the nudge can report the model its speed and
+        # remaining token budget.
+        elapsed = time.time() - step_start
+        partial_tokens = self.ctx.estimate_tokens(
+            (feedback.thought + " " + feedback.content).strip())
+        return self.timeout_policy.on_timeout(
+            iteration, step_timeout, messages,
+            partial_text=feedback.content,
+            partial_thought=feedback.thought,
+            elapsed_sec=elapsed, partial_tokens=partial_tokens,
+            idle_sec=feedback.idle_sec(),
+            thinking_capped=feedback.thinking_capped)
+
+    def step_content(self, response: object) -> tuple:
+        """Extract response text + native tool calls from a step response.
+
+        Args:
+            response: The sync-shaped response dict.
+
+        Returns:
+            (response_text, api_tool_calls) tuple (verbose echo printed here
+            unless the text already streamed live under show_thinking).
+        """
+        response_text = _extract_sync_content(self.ctx, response)
+        api_tool_calls = _extract_sync_tool_calls(self.ctx, response)
+
+        # The [Verbose] echo is for when the step text is NOT already on screen.
+        # With show_thinking enabled, `_render_step_feedback` streams the visible
+        # text live to stdout, so echoing it here again would duplicate it.
+        if (self.ctx.agentic_verbose and response_text
+                and not self.ctx.agentic_show_thinking):
+            truncated = len(response_text) > 500
+            display = response_text[:500] + ("..." if truncated else "")
+            print(colorize(f"\n[Verbose] {display}", 'muted'), file=sys.stderr)
+            if truncated:
+                print(colorize(f"[Verbose] ({len(response_text)} total chars, showing first 500)", 'muted'), file=sys.stderr)
+        return response_text, api_tool_calls
+
+    # --- ReAct loop (TODO 3.1) ---------------------------------------------
+    # The loop body moved here from ChatLoop. Side effects that the rest of the
+    # loop and the tests reach through ChatLoop doors (`_execute_tool_calls`,
+    # `_append_tool_messages`, `_salvage_timed_out_tool_call`,
+    # `_persist_agentic_history`, `_make_agentic_step_feedback`, ...) are called
+    # on `host`, so stubbing them on the loop still intercepts the loop.
+
+    def run(self, host: object, full_input: str) -> None:
+        """Run one agentic ReAct query for `host` (the ChatLoop).
+
+        Query the model, parse tool calls, execute them, feed the observations
+        back, then stream the final answer. One `ReActState` carries the loop's
+        counters and buffers instead of nine threaded locals.
+
+        Call map:
+          run() → _start_query() → _run_step() per iteration → finish_query()
+
+        The try/except/finally stay HERE on purpose: they carry the interrupt
+        (F2: a ^C persists the completed tool turns) and internal-error
+        semantics, so keeping them around the phases means an interrupt during
+        setup, a step or finalize behaves exactly as it did when the loop was
+        inline.
+
+        Args:
+            host: The ChatLoop (composition root: ctx, messages, doors).
+            full_input: The raw user line.
+        """
+        self._finalizer().reset_reentry()
+        logger = None
+        state = None
+        try:
+            state, logger = self._start_query(host, full_input)
+            if state is None:
+                return
+
+            while state.iteration < state.max_iterations:
+                state.iteration += 1
+                if self._run_step(host, state) == "break":
+                    break
+
+            self.finish_query(host, state)
+
+        except KeyboardInterrupt:
+            # F2: a ^C aborts the current step but must NOT erase the completed
+            # tool work. Persist the finished turns before handing control back;
+            # ChatLoop.run prints the [Interrupted] banner and resumes the prompt.
+            if state is not None:
+                host._persist_agentic_history(state.messages, state.seed_len)
+                host._refresh_context_bar(state.messages, exact=False)
+            raise
+        except Exception as e:
+            print(colorize(f"\n[Agentic] Internal error: {e}", 'error'), file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+        finally:
+            if logger:
+                logger.close()
+
+    def _start_query(self, host: object, full_input: str) -> tuple:
+        """Seed the message list, logger and ReAct state for one query.
+
+        Args:
+            host: The ChatLoop (message store, prompt builder, tokenizer).
+            full_input: The raw user line.
+
+        Returns:
+            (state, logger). `state` is None when there is nothing to run (blank
+            input, or no agentic context): the caller returns without finalizing,
+            exactly as the inline version did.
+        """
+        final_content = process_inline_commands(full_input)
+        if not final_content.strip():
+            return None, None
+
+        if not host.messages:
+            sys_msg = {'role': 'system', 'content': host.ctx.system_prompt}
+            host.ctx.stamp_tokens(sys_msg)
+            host.messages = [sys_msg]
+        user_msg = {'role': 'user', 'content': final_content}
+        host.ctx.stamp_tokens(user_msg)
+        host.messages.append(user_msg)
+        agentic_seed_len = len(host.messages)
+        sanitize_tool_pairing(host.messages)
+
+        inited = host._init_agentic_query(final_content)
+        if inited is None:
+            return None, None
+        messages, logger, openai_tools, send_tools_api = inited
+        state = ReActState(final_content, messages, logger, openai_tools,
+                           send_tools_api, agentic_seed_len, host.ctx)
+
+        # Reset timeout escalation state at the start of each agentic query.
+        host.ctx.agentic_consecutive_timeouts = 0
+        host.ctx.agentic_has_executed_tool = False
+        host.ctx.agentic_last_tool_name = ""
+        return state, logger
+
+    def _run_step(self, host: object, state: 'ReActState') -> str:
+        """Run one ReAct iteration: call the model, then act on what came back.
+
+        Everything the inline loop did per iteration lives here — the step
+        header, the transport kwargs, the timeout salvage/escalation branch, the
+        response flags, per-step stats, stuck detection, tool execution and the
+        observation append.
+
+        Args:
+            host: The ChatLoop (doors for tool execution, stats and the store).
+            state: The query state (mutated: messages, counters, final answer).
+
+        Returns:
+            "break" to leave the loop (final answer, API error, stuck output,
+            aborted tool loop, or the iteration budget), "continue" for another
+            step.
+        """
+        state.iteration += 1
+        state.messages = self.step_header(host, state)
+
+        images_to_send = ([] if host.ctx.supports_vision is False
+                          else host.ctx.current_images)
+        sync_kwargs = dict(get_inference_params(host.ctx.model))
+        sync_kwargs["apply_output_cap"] = True
+        if state.send_tools_api:
+            sync_kwargs["tools"] = state.openai_tools
+        if host.ctx.force_no_thinking:
+            sync_kwargs["no_thinking"] = True
+        if host.ctx.reasoning_effort:
+            sync_kwargs["reasoning_effort"] = host.ctx.reasoning_effort
+        if host.ctx.preserve_thinking is not None:
+            sync_kwargs["preserve_thinking"] = host.ctx.preserve_thinking
+        step_usage = []
+        sync_kwargs["usage_out"] = step_usage
+        feedback = host._make_agentic_step_feedback()
+        step_cancel = {"event": threading.Event(), "close": None}
+        step_tool_calls = []   # by-ref view of the in-flight tool calls
+
+        response, step_start = self.call_step(
+            state.messages, state.step_timeout, images_to_send, sync_kwargs,
+            feedback.feed, feedback.finalize, step_cancel, step_tool_calls)
+
+        if response is None:
+            # Abort the in-flight request FIRST, before any salvage /
+            # escalation decision. `call_with_timeout` returns None on
+            # timeout without touching `step_cancel`, and the socket
+            # timeout is per-read (it never fires while deltas keep
+            # arriving), so without this the daemon worker keeps the
+            # generation alive and hogging the server slot. On a
+            # single-slot backend the next step would then queue behind
+            # the zombie. `_signal_abort` closes the response (server
+            # cancels) and sets the event so the worker loop exits.
+            _signal_abort(step_cancel)
+            # Timed out. If the generation had already finished writing a
+            # complete tool call before the deadline, execute it now
+            # instead of discarding it — a retry would burn another full
+            # generation re-producing the same JSON and often re-hit the
+            # timeout (a 20KB write_file takes ~2min at ~30 tok/s).
+            salvaged, salvaged_final = host._salvage_timed_out_tool_call(
+                step_tool_calls, feedback, state.messages,
+                state.send_tools_api, state.iteration, state.logger)
+            if salvaged_final:
+                state.final_answer = salvaged_final
+            if salvaged:
+                return "continue"
+            # Timed out — escalate (extend while generating, else retry/abort).
+            should_break, state.step_timeout = host._agentic_timeout_continue(
+                feedback, step_cancel, step_start, state.iteration,
+                state.step_timeout, state.messages)
+            if should_break:
+                return "break"
+            # Not salvageable and still running: if the interruption cut a
+            # write_file, spill its (possibly partial) content so it isn't
+            # discarded, and point the model at it. Appended after the
+            # timeout nudge so it is the freshest instruction.
+            spill_note = host._spill_partial_write(
+                step_tool_calls, feedback, state.iteration)
+            if spill_note:
+                state.messages.append({'role': 'user', 'content': spill_note,
+                                       '_system_nudge': True})
+            state.response_text = ""
+            return "continue"
+
+        status = self.handle_response_flags(host, state, response, images_to_send)
+        if status == "api_error":
+            return "break"
+        if status in ("vision", "tools"):
+            return "continue"
+
+        state.response_text, api_tool_calls = self.step_content(response)
+
+        if not state.response_text and not api_tool_calls:
+            state.messages.append({
+                'role': 'user',
+                'content': 'Please provide a tool call or your final answer.',
+                '_system_nudge': True})
+            return "continue"
+
+        # Per-step stats in the chat-mode format: time, prefill/think/
+        # answer rates, and the growing context size — so the user can
+        # interrupt (^C) before the context runs away. Server-reported
+        # timings flow out via `step_usage`; `ctx.update_stats` is
+        # intentionally NOT called (cumulative /stats only counts the
+        # final answer stream, unchanged).
+        stats = self.query_handler.calculate_stats(
+            time.time() - step_start, state.response_text,
+            step_usage[0] if step_usage else None, state.messages,
+            thought=feedback.thought)
+        self.query_handler.print_stats_display(stats)
+
+        if state.response_text and self.is_stuck(state.response_text):
+            print(colorize("\n[Agentic] Model appears stuck (repetitive output), aborting.", 'warning'), file=sys.stderr)
+            return "break"
+
+        tool_calls = host._parse_agentic_tool_calls(
+            state.response_text, api_tool_calls)
+
+        if state.logger:
+            first_call = tool_calls[0] if tool_calls else None
+            state.logger.write(type="turn", iteration=state.iteration,
+                               model_response=state.response_text,
+                               tool_call=first_call)
+
+        if not tool_calls:
+            state.final_answer = state.response_text
+            # The step's content may already be on the terminal
+            # (thinking mode streams it live) — finalize must then
+            # skip the final re-generation.
+            state.final_answer_streamed = bool(feedback.content_streamed)
+            host.ctx.agentic_consecutive_timeouts = 0
+            return "break"
+
+        (observations, raw_observations, abort_loop,
+         state.last_tool_call, state.last_tool_count,
+         tool_final) = host._execute_tool_calls(
+            tool_calls, state.last_tool_call, state.last_tool_count,
+            state.iteration, state.logger, state.messages,
+            state.response_text, api_tool_calls)
+        if tool_calls:
+            host.ctx.agentic_has_executed_tool = True
+            host.ctx.agentic_last_tool_name = tool_calls[0]["tool"]
+            host.ctx.agentic_consecutive_timeouts = 0
+        if tool_final:
+            state.final_answer = tool_final
+        if abort_loop:
+            return "break"
+
+        host._append_tool_messages(
+            state.messages, state.response_text, api_tool_calls, tool_calls,
+            observations, raw_observations, state.send_tools_api)
+        return "continue"
+
+
+    def step_header(self, host: object, state: 'ReActState') -> list:
+        """Print the ReAct step header and refresh compaction/nudge state.
+
+        Args:
+            host: The ChatLoop (wire doors + conversation store).
+            state: The query state.
+
+        Returns:
+            The (possibly compacted) message list.
+        """
+        if state.logger:
+            state.logger.write(type="iteration", iteration=state.iteration)
+        print(colorize(f"\r[Agentic] Step {state.iteration}/{state.max_iterations}…", 'muted'),
+              file=sys.stderr, end="")
+        sys.stderr.flush()
+
+        messages = host._maybe_auto_compact_agentic(state.messages)
+        messages = host._force_compact_if_no_output_room(messages)
+        messages = host._refresh_near_full_nudge(messages)
+
+        # Verbose: show payload token count
+        if host.ctx.agentic_verbose and host.ctx.context_window_size > 0:
+            payload_tokens = host.ctx.calculate_context_tokens(messages)
+            pct = payload_tokens / host.ctx.context_window_size
+            print(colorize(f" [{payload_tokens} tokens, {pct:.0%} of ctx]", 'muted'),
+                  file=sys.stderr, end="")
+        return messages
+
+    def handle_response_flags(self, host: object, state: 'ReActState',
+                              response: object, images_to_send: list) -> str:
+        """Track tokens and handle API/vision/tools errors for a step response.
+
+        Mutates `state.api_error` and `state.send_tools_api`; on the tools
+        fallback it also rewrites the step's system message with the inline
+        tool definitions.
+
+        Args:
+            host: The ChatLoop (ctx + wire doors).
+            state: The query state.
+            response: The sync-shaped response dict.
+            images_to_send: Images included in the request.
+
+        Returns:
+            One of "ok" / "api_error" / "vision" / "tools".
+        """
+        # Track tokens from sync response to keep context bar accurate
+        if isinstance(response, dict):
+            if host.ctx.backend == "ollama":
+                _pt = response.get("prompt_eval_count", 0)
+                _et = response.get("eval_count", 0)
+                if _pt > 0:
+                    host.ctx.current_context_tokens = _pt + _et
+            else:
+                # Same definition as the post-query bar: system prompt +
+                # conversation + tools + framing. Estimate only — this runs once
+                # per ReAct step, and an exact count would add a round-trip per
+                # step (llama.cpp re-renders the whole prompt).
+                host._refresh_context_bar(state.messages, exact=False)
+
+        # Check for API-level errors from query_sync
+        if (isinstance(response, dict) and "error" in response
+                and not response.get("choices")
+                and not response.get("message", {}).get("content")):
+            err_msg = (response["error"].get("message", "Unknown error")
+                       if isinstance(response["error"], dict) else str(response["error"]))
+            print(colorize(f"\n[Agentic] API error: {err_msg}", 'error'), file=sys.stderr)
+            state.api_error = err_msg
+            return "api_error"
+
+        if images_to_send and host.ctx.supports_vision is not False:
+            if check_vision_error(response):
+                host.ctx.supports_vision = False
+                print(colorize("\n[WARNING] Model does not support vision. Stripping images for subsequent queries.", 'warning'), file=sys.stderr)
+                return "vision"
+
+        if state.send_tools_api and check_tools_error(response):
+            state.send_tools_api = False
+            tool_defs_block = self.tool_registry.get_system_prompt_block()
+            state.messages[0] = {'role': 'system', 'content': get_agentic_prompt(
+                host.ctx.model, tool_defs_block, include_tool_defs=True,
+                plan_mode=host.ctx.plan_mode, plan_run=host.ctx.plan_run)}
+            print(colorize("\n[WARNING] Model does not support native tools API. Falling back to inline tool definitions.", 'warning'), file=sys.stderr)
+            return "tools"
+        return "ok"
+
+    def finish_query(self, host: object, state: 'ReActState') -> None:
+        """Post-loop finalize: persist the turns, then stream or report the answer.
+
+        The turn merge happens BEFORE the final stream so the final answer (and
+        its streaming re-entry) sees the completed tool work; the bar is
+        re-measured after the answer is appended.
+        """
+        host._persist_agentic_history(state.messages, state.seed_len, compact=True)
+
+        if state.api_error:
+            # Backend unreachable (connection refused, 5xx, ...). Do NOT re-query
+            # a dead endpoint for a final answer — the finalize path would launch
+            # a second doomed streaming request (another 3 retries) and print a
+            # misleading "[Agentic: no answer produced]". No final answer is
+            # merged, so repeated attempts while the server is down don't
+            # pollute the context.
+            print(colorize(
+                f"\n[Agentic] Backend unreachable ({state.api_error}). "
+                "Aborted without a final answer; conversation history untouched.",
+                'warning'), file=sys.stderr)
+        else:
+            if state.iteration >= state.max_iterations and not state.final_answer:
+                state.final_answer = state.response_text
+            self.finalize_agentic_query(
+                host, state, content_streamed=state.final_answer_streamed)
+        # The finalize path appends the answer to the stored history after the
+        # last request was measured, so re-measure once: otherwise the bar keeps
+        # the pre-answer value and disagrees with /tokencount. Skipped on
+        # api_error — the backend is unreachable and a count would stall.
+        if not state.api_error:
+            host._refresh_context_bar()
+
+        if state.logger:
+            state.logger.write(type="end", total_iterations=state.iteration)
+
+# ============================================================================
+# ============= OUTBOUND WIRE (request accounting + /promptshow) =============
+# ============================================================================
+
+class WireView:
+    """Describe, measure and print the request the next query will send.
+
+    The context bar, the per-query stats line, `/stats`, `/tokencount` and
+    `/promptshow` must all agree on one number: the **outbound request** — the
+    wire system prompt (with the /maxtokens cap line), the conversation, the
+    native `tools` array and the template framing. The stored message sum omits
+    the system-prompt swap and the tools array entirely (measured: 113 stored vs
+    2770 sent in `/agentic plan`), so the definition lives here once instead of
+    being repeated at every call site.
+
+    Collaborators are injected so the view can also be built for a bare
+    `ChatLoop` (tests): `ctx` (state + tokenizers), `query_handler` (cap line +
+    whole-request counters), `tool_registry` (the plan-mode tool surface that
+    `/promptshow` renders), `agentic_runner` (the mode-aware prompt/tools) and
+    `messages_provider` (late-bound, so assigning `loop.messages` after the view
+    was built is still seen).
+
+    Call map:
+      system_and_tools() → refresh_context_bar() / snapshot()
+      snapshot() → print_wire_totals() / promptshow_wire() → handle_promptshow()
+    """
+
+    def __init__(self, ctx: object, query_handler: object, tool_registry: object,
+                 agentic_runner: object, messages_provider: object) -> None:
+        """Store the collaborators; `messages_provider` is called on every read."""
+        self.ctx = ctx
+        self.query_handler = query_handler
+        self.tool_registry = tool_registry
+        self.agentic_runner = agentic_runner
+        self._messages_provider = messages_provider
+
+    def messages(self) -> list:
+        """Return the session's current message list (late-bound)."""
+        return self._messages_provider() or []
+
+    def system_and_tools(self) -> tuple:
+        """Return (system content, native tools array, short mode label).
+
+        Mirrors what the next query will send: chat mode uses
+        `ctx.system_prompt`, agentic and plan modes rebuild the prompt the same
+        way the ReAct loop does.
+
+        Returns:
+            (system content, tools array or None, label such as "agentic, plan").
+        """
+        if not self.ctx.agentic_mode and not self.ctx.plan_mode:
+            return self.ctx.system_prompt, None, "chat"
+        content, tools, _send_tools_api = self.agentic_runner.prompt_and_tools()
+        if self.ctx.plan_mode:
+            label = "agentic, plan run" if getattr(self.ctx, 'plan_run', False) else "agentic, plan"
+        else:
+            label = "agentic"
+        return content, tools, label
+
+    def refresh_context_bar(self, messages: Optional[list[Message]] = None,
+                            exact: bool = True) -> int:
+        """Recompute `ctx.current_context_tokens` from the outbound request.
+
+        Single definition for every context view: the status bar, the per-query
+        stats line, `/stats` and `/tokencount` all report the request as the
+        backend sees it — the wire system prompt (with the /maxtokens cap line),
+        the conversation, the native `tools` array and the template framing —
+        instead of the stored message sum, which omits the system-prompt swap and
+        the tools array entirely (measured: 113 stored vs 2770 sent in
+        `/agentic plan`).
+
+        Args:
+            messages: Message list to measure; defaults to the stored history.
+                A local ReAct list works too: its system message is replaced by
+                the wire prompt, never double-counted.
+            exact: Ask the backend for a whole-request count (one round-trip on
+                Strata). False uses the component estimate, for hot paths such as
+                the per-step ReAct bar refresh.
+
+        Returns:
+            The new `ctx.current_context_tokens`.
+        """
+        target = self.messages() if messages is None else messages
+        if not target:
+            self.ctx.current_context_tokens = 0
+            return 0
+        try:
+            system, tools, _mode = self.system_and_tools()
+            configured = int(getattr(self.ctx, 'max_output_tokens', DEFAULT_MAX_OUTPUT_TOKENS)
+                             or DEFAULT_MAX_OUTPUT_TOKENS)
+            system = self.query_handler._with_output_cap_line(
+                [{'role': 'system', 'content': system}], configured)[0]['content']
+            if not isinstance(system, str):
+                system = ''
+            self.ctx.current_context_tokens = self.ctx.outbound_tokens(
+                system, target, tools, exact=exact)
+        except (OSError, ValueError, KeyError, TypeError):
+            # Never let a failed *count* break the loop: the exact path makes a
+            # network round-trip (OSError/ValueError) and a backend payload can
+            # be shaped unexpectedly (KeyError/TypeError). A programmer error —
+            # AttributeError from a renamed collaborator, NameError — must
+            # surface instead of silently showing a wrong bar.
+            self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(target)
+        return self.ctx.current_context_tokens
+
+    def prompt_overhead_tokens(self, messages: Optional[list[Message]] = None) -> int:
+        """Tokens the request costs beyond the message sum in `messages`.
+
+        Compaction budgets must reserve room for whatever is sent but not stored
+        (system-prompt swap, `tools` array, framing), so the trigger point matches
+        the number the status bar shows.
+
+        Args:
+            messages: Message list to measure; defaults to the stored history.
+
+        Returns:
+            Non-negative overhead in tokens.
+        """
+        target = self.messages() if messages is None else messages
+        if not target:
+            return 0
+        stored = self.ctx.calculate_context_tokens(target)
+        return max(0, self.refresh_context_bar(target, exact=False) - stored)
+
+    def snapshot(self) -> Dict:
+        """Describe the request the next query would send, for `/tokencount`.
+
+        The system message and the `tools` array are built per query and never
+        stored in the message history, which is why a stored-history token count
+        under-reports the prompt. Everything here mirrors the payload: the system
+        prompt for the active mode (with the /maxtokens cap line), the
+        conversation body, the tools array and the template framing.
+
+        Returns:
+            dict with mode, system, system_tokens, conversation_tokens,
+            tools, tools_tokens, overhead, total and source.
+        """
+        system, tools, mode = self.system_and_tools()
+        configured = int(getattr(self.ctx, 'max_output_tokens', DEFAULT_MAX_OUTPUT_TOKENS)
+                         or DEFAULT_MAX_OUTPUT_TOKENS)
+        system = self.query_handler._with_output_cap_line(
+            [{'role': 'system', 'content': system}], configured)[0]['content']
+        stored = self.messages()
+        conversation = [m for m in stored if m.get('role') != 'system']
+        system_tokens = self.ctx.tokenize(system)
+        conversation_tokens = self.ctx.calculate_context_tokens(conversation)
+        counted = self.ctx.count_wire_tokens(system, conversation, tools)
+        total = counted['total']
+        source = counted['source']
+        tools_tokens = counted['tools']
+        if tools_tokens is None:
+            # No template-accurate measurement: fall back to tokenizing the
+            # serialized array (exact tokenizer, approximate rendering).
+            tools_tokens = self.ctx.count_tools_tokens(tools)
+        components = system_tokens + conversation_tokens + tools_tokens
+        if total is not None:
+            # Sanity-check the counter: a rendered prompt is not the sum of its
+            # parts (the template shares framing), so `total` may legitimately be
+            # slightly BELOW `components`. Only discard it when it clearly did not
+            # include the tools array (e.g. /apply-template on a build that drops
+            # `tools`), which is the case that would show negative framing.
+            included_tools = total - (system_tokens + conversation_tokens)
+            if (tools_tokens and included_tools < 0.5 * tools_tokens) or total < 0.5 * components:
+                total, source = None, 'none'
+        if total is None:
+            # No whole-request counter: each message carries ~2 role tokens.
+            overhead = 2 * len(conversation)
+            total = components + overhead
+        else:
+            overhead = total - components
+        return {
+            'mode': mode,
+            'system': system,
+            'system_tokens': system_tokens,
+            'conversation_messages': len(conversation),
+            'conversation_tokens': conversation_tokens,
+            'tools': tools,
+            'tools_tokens': tools_tokens,
+            'overhead': overhead,
+            'total': total,
+            'source': source,
+        }
+
+    def print_wire_totals(self) -> None:
+        """Print the token cost of the request the next query would send.
+
+        Components come from the backend tokenizer. Where the backend can count
+        the whole request, that count is authoritative and no framing line is
+        shown: a rendered prompt is not additive (the template shares framing
+        between messages and the tools block), so the components can differ from
+        the total by a few percent without either number being wrong.
+        """
+        try:
+            wire = self.snapshot()
+        except Exception as e:
+            print(colorize(f"  [wire] unavailable: {e}", 'warning'), file=sys.stderr)
+            return
+        exact = wire['source'] != 'none'
+        mark = "·" if exact else "~"
+        print(colorize("\n--- Next Request (sent to the server) ---", 'info'), file=sys.stderr)
+        rows = [
+            (f"system prompt ({wire['mode']})", wire['system_tokens']),
+            (f"conversation ({wire['conversation_messages']} msgs)", wire['conversation_tokens']),
+        ]
+        if wire['tools']:
+            size_kb = len(json.dumps(wire['tools'])) / 1024
+            rows.append((f"tools ({len(wire['tools'])} schemas, {size_kb:.1f} KB)", wire['tools_tokens']))
+        else:
+            rows.append(("tools (none in this mode)", 0))
+        for label, tokens in rows:
+            print(colorize(f"  {label:<40} ·{tokens:6d} tok", 'info'), file=sys.stderr)
+        if not exact:
+            print(colorize(f"  {'role/template overhead':<40} ~{wire['overhead']:6d} tok", 'info'), file=sys.stderr)
+        print(colorize(f"  {'-' * 50}", 'muted'), file=sys.stderr)
+        print(colorize(f"  {'Total sent':<40} {mark}{wire['total']:6d} tok", 'info'), file=sys.stderr)
+        source = {
+            'strata': "exact total: server count_tokens; components are counted independently, "
+                      "so shared template framing may make them differ slightly",
+            'llamacpp': "exact total: apply-template + tokenize; same caveat on the components",
+        }.get(wire['source'], "estimate: sum of the components; this backend has no whole-request counter")
+        print(colorize(f"  [{source}]", 'muted'), file=sys.stderr)
+        # Keep the status bar in lockstep with the view just printed: it is the
+        # same request, so there is nothing to reconcile.
+        self.ctx.current_context_tokens = wire['total']
+        if self.ctx.context_window_size > 0:
+            pct = wire['total'] / self.ctx.context_window_size
+            print(colorize(
+                f"  Context: {wire['total']}/{self.ctx.context_window_size} ({pct:.1%})",
+                'info'), file=sys.stderr)
+
+    def print_full_message(self, index: int) -> None:
+        """Print the complete content of message `index` to stderr."""
+        msg = self.messages()[index]
+        role = msg.get('role', 'unknown')
+        content = msg.get('content', '')
+        tokens = msg.get('_tokens') or self.ctx.estimate_tokens(content) + 2
+        print(colorize(f"\n--- Full Message [{index}] ({role}, {tokens} tok) ---", 'info'), file=sys.stderr)
+        if isinstance(content, str):
+            print(content, file=sys.stderr)
+        else:
+            print(json.dumps(content, indent=2, ensure_ascii=False), file=sys.stderr)
+        print(colorize(f"--- End Message [{index}] ---", 'info'), file=sys.stderr)
+
+    def force_compact_if_no_output_room(self, messages: list) -> list:
+        """Force-compact when the output reserve leaves no generation room.
+
+        The per-response cap keeps `min(4096, 5% window)` free for compaction;
+        when the prompt already fills the rest, generation has no room. Compact
+        harder (force=True) so the request can still produce a full answer. A
+        rare safety net — normal compaction triggers well before this.
+
+        Args:
+            messages: The conversation list.
+
+        Returns:
+            The (possibly force-compacted) message list.
+        """
+        window = self.ctx.context_window_size
+        if window <= 0:
+            return messages
+        reserve = min(MAX_OUTPUT_RESERVE, int(window * 0.05))
+        overhead = self.prompt_overhead_tokens(messages)
+        prompt_tokens = self.ctx.calculate_context_tokens(messages) + overhead
+        if window - prompt_tokens - reserve > 0:
+            return messages
+        before_len = len(messages)
+        messages = compact_messages(messages, self.ctx, force=True,
+                                    overhead_tokens=overhead)
+        print(colorize(
+            f"[Auto-compact] Forced (no output room): {before_len} → {len(messages)} msgs",
+            'warning'), file=sys.stderr)
+        return messages
+
+    def near_full_nudge_message(self, messages: list) -> Optional[dict]:
+        """Return a transient near-full `_system_nudge` message, or None.
+
+        Fires only past NEAR_FULL_THRESHOLD. Tagged `_system_nudge` so the
+        agentic history merge excludes it (and normal chat never stores it),
+        and `_near_full_nudge` so a prior copy can be replaced cleanly.
+
+        Args:
+            messages: The conversation list used to size the prompt.
+
+        Returns:
+            The nudge message dict, or None when not near full.
+        """
+        window = self.ctx.context_window_size
+        if window <= 0:
+            return None
+        # Include the tools array and system swap: at a 90% threshold a 2K
+        # `tools` block is 6% of a 32K window and the nudge would fire late.
+        prompt_tokens = (self.ctx.calculate_context_tokens(messages)
+                         + self.prompt_overhead_tokens(messages))
+        if prompt_tokens < int(window * NEAR_FULL_THRESHOLD):
+            return None
+        return {'role': 'user', 'content': context_budget_nudge(prompt_tokens, window),
+                '_system_nudge': True, '_near_full_nudge': True}
+
+    def refresh_near_full_nudge(self, messages: list) -> list:
+        """Replace any prior near-full nudge with a fresh one if still near full.
+
+        Args:
+            messages: The (agentic) conversation list.
+
+        Returns:
+            The message list with at most one current near-full nudge at the tail.
+        """
+        messages = [m for m in messages if not m.get('_near_full_nudge')]
+        nudge = self.near_full_nudge_message(messages)
+        if nudge:
+            messages.append(nudge)
+        return messages
+
+    def handle_promptshow(self, full_input: str) -> Optional[bool]:
+        """Handle /promptshow — display the prompt and tools the next query sends.
+
+        Read-only by construction: it renders the same snapshot `/tokencount`
+        uses (`snapshot` → `system_and_tools` + the /maxtokens cap line), so the
+        preview cannot drift from the payload. Nothing here writes to
+        `ctx.system_prompt`; the mutating sibling will be `/promptset`.
+
+        Args:
+            full_input: The raw command line.
+
+        Returns:
+            False when handled, None when the line is not a /promptshow command.
+        """
+        stripped = full_input.strip()
+        head = stripped.split(maxsplit=1)[0] if stripped else ""
+        if head not in ('/promptshow', '/showprompt'):
+            return None
+        parts = stripped.split(maxsplit=2)
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        arg = parts[2].strip() if len(parts) > 2 else ""
+        if sub in ("", "all"):
+            self._promptshow_all(self.promptshow_wire())
+        elif sub == "system":
+            print(self.promptshow_wire()['system'])
+        elif sub == "tools":
+            self._promptshow_tools(arg)
+        elif sub in ("json", "save"):
+            if sub == "save" and not arg:
+                print(colorize("[Usage: /promptshow save <path>]", 'warning'), file=sys.stderr)
+                return False
+            text = json.dumps(self._promptshow_payload(self.promptshow_wire()),
+                              indent=2, ensure_ascii=False)
+            if sub == "json":
+                print(text)
+            else:
+                self._promptshow_save(arg, text)
+        elif sub in ("help", "?"):
+            print_promptshow_usage()
+        else:
+            print(colorize(f"[ERROR] unknown /promptshow subcommand '{sub}'", 'error'),
+                  file=sys.stderr)
+            print_promptshow_usage()
+        return False
+
+    def promptshow_wire(self) -> Dict:
+        """Return the outbound system prompt and tools, with token counts.
+
+        Shares `snapshot()` with `/tokencount` so both report the same request.
+        The fallback covers the case where the snapshot raises (e.g. no live
+        backend to count the whole request): the two blocks are then built the
+        same way, just without the whole-request measurement.
+
+        Returns:
+            The `snapshot()` dict (mode, system, tools, token counts).
+        """
+        try:
+            return self.snapshot()
+        except Exception:
+            system, tools, mode = self.system_and_tools()
+            configured = int(getattr(self.ctx, 'max_output_tokens',
+                                     DEFAULT_MAX_OUTPUT_TOKENS) or DEFAULT_MAX_OUTPUT_TOKENS)
+            system = self.query_handler._with_output_cap_line(
+                [{'role': 'system', 'content': system}], configured)[0]['content']
+            return {'mode': mode, 'system': system,
+                    'system_tokens': self.ctx.tokenize(system),
+                    'conversation_messages': 0, 'conversation_tokens': 0,
+                    'tools': tools,
+                    'tools_tokens': self.ctx.count_tools_tokens(tools),
+                    'overhead': 0, 'total': 0, 'source': 'none'}
+
+    def _promptshow_tool_defs(self) -> Dict:
+        """Return the tool definitions the next request exposes, in order.
+
+        Goes through `_plan_allowed_tools()` — the single choke point the prompt
+        block and the native schema both read — so plan mode is reflected here
+        exactly as it is in the payload.
+        """
+        try:
+            return self.tool_registry._plan_allowed_tools()
+        except (TypeError, ValueError, KeyError):
+            # A malformed definition must not kill a read-only preview, but a
+            # *defect* (AttributeError from a renamed registry method) must not
+            # turn into "this request sends no tools" either — the preview is
+            # only worth having if it cannot lie about the payload.
+            return {}
+
+    def _promptshow_delivery(self, wire: Dict) -> str:
+        """Describe how the tool definitions reach the model in the active mode.
+
+        Three cases, not two: chat mode sends no tool definitions at all, native
+        models get a `tools` array, and inline models get the definitions inside
+        the system prompt.
+        """
+        tools = wire.get('tools')
+        if tools:
+            size_kb = len(json.dumps(tools)) / 1024
+            return f"sent as the native tools array ({size_kb:.1f} KB)"
+        if str(wire.get('mode', '')).startswith('chat'):
+            return "not sent — chat mode carries no tool definitions"
+        return "sent inline inside the system prompt (no separate tools array)"
+
+    def _promptshow_all(self, wire: Dict) -> None:
+        """Print the system prompt, a tool summary and the section sizes."""
+        mode = str(wire.get('mode', ''))
+        sends_tools = bool(wire.get('tools')) or mode.startswith('agentic')
+        tools_part = (f"{wire['tools_tokens']} tok — {self._promptshow_delivery(wire)}"
+                      if sends_tools else "none — chat mode")
+        print(colorize(
+            f"\n[promptshow] mode: {mode} | system: {wire['system_tokens']} tok"
+            f" | tools: {tools_part}", 'info'))
+        print(colorize("── system prompt ──", 'muted'))
+        print(wire['system'])
+        if not sends_tools:
+            print(colorize("(no tool definitions in this mode — /agentic on or "
+                           "/agentic plan adds them)", 'muted'))
+            return
+        defs = self._promptshow_tool_defs()
+        print(colorize(f"── tools ({len(defs)}) ──", 'muted'))
+        for name, defn in defs.items():
+            props = (defn.get('parameters') or {}).get('properties') or {}
+            print(f"  {name:<24} {', '.join(props) if props else '(no arguments)'}")
+        print(colorize("── /promptshow tools <name> for the argument schemas · "
+                       "/promptshow json for the exact payload ──", 'muted'))
+
+    def _promptshow_tools(self, name: str) -> None:
+        """Print tool definitions with their argument schemas.
+
+        `/listtool` shows name + description; this adds the argument types,
+        which is what you need to write a call by hand.
+        """
+        defs = self._promptshow_tool_defs()
+        total = len(defs)
+        if name:
+            if name not in defs:
+                print(colorize(f"[ERROR] unknown tool '{name}' "
+                               f"(available: {', '.join(sorted(defs))})", 'error'),
+                      file=sys.stderr)
+                return
+            defs = {name: defs[name]}
+        wire = self.promptshow_wire()
+        print(colorize(f"\n[promptshow] showing {len(defs)} of {total} tools — "
+                       f"{self._promptshow_delivery(wire)}", 'info'))
+        for tool_name, defn in defs.items():
+            print(colorize(f"\n### {tool_name}", 'success'))
+            print(defn.get('description', ''))
+            parameters = defn.get('parameters') or {}
+            props = parameters.get('properties') or {}
+            required = set(parameters.get('required') or [])
+            for arg_name, spec in props.items():
+                marker = " [required]" if arg_name in required else ""
+                kind = spec.get('type', 'any')
+                print(f"  - {arg_name} ({kind}){marker}: {spec.get('description', '')}")
+
+    def _promptshow_payload(self, wire: Dict) -> Dict:
+        """Build the JSON view shared by `/promptshow json` and `save`."""
+        return {
+            'mode': wire['mode'],
+            'system': wire['system'],
+            'system_tokens': wire['system_tokens'],
+            'tools': wire.get('tools'),
+            'tools_tokens': wire['tools_tokens'],
+            'tools_delivery': self._promptshow_delivery(wire),
+        }
+
+    def _promptshow_save(self, path: str, text: str) -> None:
+        """Write the payload JSON to `path`, expanding `~`."""
+        target = os.path.expanduser(path)
+        try:
+            with open(target, 'w', encoding='utf-8') as handle:
+                handle.write(text + "\n")
+        except OSError as e:
+            print(colorize(f"[ERROR] cannot write {target}: {e}", 'error'), file=sys.stderr)
+            return
+        print(colorize(f"[promptshow] wrote {len(text)} chars to {target}", 'success'),
+              file=sys.stderr)
+
+
+# ============================================================================
+# ============= CONVERSATION STORE (messages + session + compact) ============
+# ============================================================================
+
+class ConversationStore:
+    """Single source of truth for the conversation history.
+
+    Owns the message list, session persistence (`/save`, `/sessions`,
+    `/resume`, auto-save on exit) and compaction orchestration (auto-compact
+    for chat and for the ReAct loop, plus the `/compact` actions).
+
+    `ChatLoop.messages` is a property backed by this store (getter, setter and
+    deleter), so the ~120 test references — including
+    `loop.messages = []` on objects built with `object.__new__(ChatLoop)` —
+    keep working unchanged.
+
+    Two invariants live here:
+
+    - **The list has one owner.** The property returns the live list, so
+      `messages.append(...)` keeps working at every call site and in the tests;
+      replacement, removal and clearing go through the store
+      (`replace`/`drop`/`clear`), and a caller refreshes the bar *after* the
+      mutation. The v0.2.22 bug came from measuring the final answer before
+      appending it.
+    - **Collaborators are late-bound.** `ctx_provider` and `wire_provider` are
+      called per use, so the store can be built before either exists (bare
+      instances in tests) and a later `loop.ctx = …` is still seen.
+
+    Call map:
+      messages: replace/append/drop/clear
+      session:  save_session/list_sessions/load_session/autosave_on_exit
+      compact:  maybe_auto_compact_chat/…_agentic → compact_run → compact_truncate_largest
+    """
+
+    def __init__(self, ctx_provider: object, wire_provider: object) -> None:
+        """Store the providers; `messages` starts empty."""
+        self._ctx_provider = ctx_provider
+        self._wire_provider = wire_provider
+        self.messages: list[Message] = []
+
+    @property
+    def ctx(self) -> object:
+        """The shared CommandContext (resolved late)."""
+        return self._ctx_provider()
+
+    def wire(self) -> object:
+        """The WireView used for overhead/bar accounting (resolved late)."""
+        return self._wire_provider()
+
+    # --- list ownership ----------------------------------------------------
+
+    def replace(self, messages: Optional[list]) -> None:
+        """Replace the history (a new list, so a caller's list is not aliased)."""
+        self.messages = list(messages or [])
+
+    def clear(self) -> None:
+        """Drop every message."""
+        self.messages = []
+
+    def append(self, message: dict) -> None:
+        """Append one message."""
+        self.messages.append(message)
+
+    def drop(self, indices: list) -> tuple:
+        """Delete messages by index (system prompt excluded by the caller).
+
+        Args:
+            indices: Validated indices to remove (descending order is enforced
+                here, so earlier removals cannot shift a later one).
+
+        Returns:
+            (removed_count, freed_tokens).
+        """
+        freed = 0
+        for idx in sorted(indices, reverse=True):
+            msg = self.messages[idx]
+            freed += msg.get('_tokens', self.ctx.estimate_tokens(msg.get('content', '')) + 2)
+            del self.messages[idx]
+        return len(indices), freed
+
+    # --- session persistence ----------------------------------------------
+
+    def save_session(self) -> str:
+        """Save the current history via SessionManager; returns the session id."""
+        return SessionManager().save_session(self.messages, self.ctx)
+
+    def list_sessions(self, limit: int = 10) -> list:
+        """Return the most recent saved sessions."""
+        return SessionManager().list_sessions(limit=limit)
+
+    def load_session(self, session_id: str) -> Optional[dict]:
+        """Load a session into the store; returns the session data or None.
+
+        The model is not switched here (the handler reports it); only the
+        message history is adopted.
+        """
+        data = SessionManager().load_session(session_id)
+        if data is None:
+            return None
+        self.replace(data.get('messages', []))
+        return data
+
+    def autosave_on_exit(self) -> Optional[str]:
+        """Auto-save a meaningful conversation on exit; None when there is none.
+
+        A persistence failure must never block the exit path, so it is
+        swallowed here (the caller only prints the saved id).
+        """
+        if len(self.messages) <= 2:
+            return None
+        try:
+            return self.save_session()
+        except Exception:
+            return None
+
+    # --- compaction --------------------------------------------------------
+
+    def maybe_auto_compact_chat(self) -> None:
+        """Compact the stored history when it passes the chat threshold.
+
+        The trigger and the budget both include the wire-only overhead (system
+        swap + tools + framing) so they match the status bar instead of firing
+        late by that amount.
+        """
+        if self.ctx.context_window_size <= 0 or not self.messages:
+            return
+        overhead = self.wire().prompt_overhead_tokens()
+        msg_tokens = self.ctx.calculate_context_tokens(self.messages) + overhead
+        threshold = int(self.ctx.context_window_size * self.ctx.compaction_threshold)
+        if msg_tokens <= threshold:
+            return
+        before_len = len(self.messages)
+        self.messages = compact_messages(self.messages, self.ctx,
+                                         overhead_tokens=overhead)
+        after_tokens = self.ctx.calculate_context_tokens(self.messages)
+        print(colorize(
+            f"[Auto-compact] {before_len} → {len(self.messages)} msgs, "
+            f"{msg_tokens} → {after_tokens + overhead} tokens (incl. {overhead} request overhead)",
+            'warning'), file=sys.stderr)
+        self.wire().refresh_context_bar()
+
+    def maybe_auto_compact_agentic(self, messages: list[Message]) -> list[Message]:
+        """Auto-compact the ReAct loop's local messages near the context limit.
+
+        Agentic steps can balloon the local `messages` array (tool observations,
+        re-queries). When usage passes `ctx.agentic_compact_threshold` (default
+        85%, later than the regular `ctx.compaction_threshold`), mechanically
+        compact with a wider keep-recent window so the loop keeps working memory.
+
+        Returns the (possibly compacted) message list.
+        """
+        if self.ctx.context_window_size <= 0:
+            return messages
+        # The local list already carries the agentic system prompt, so the
+        # overhead here is the `tools` array plus template framing.
+        overhead = self.wire().prompt_overhead_tokens(messages)
+        msg_tokens = self.ctx.calculate_context_tokens(messages) + overhead
+        if msg_tokens <= int(self.ctx.context_window_size * self.ctx.agentic_compact_threshold):
+            return messages
+        before_len = len(messages)
+        messages = compact_messages(messages, self.ctx,
+                                    keep_recent=max(8, COMPACTION_KEEP_RECENT),
+                                    overhead_tokens=overhead)
+        print(colorize(f"\n[Auto-compact] Agentic context: {before_len} → {len(messages)} msgs",
+                       'warning'), file=sys.stderr)
+        return messages
+
+    def persist_agentic_history(self, messages: list[Message], agentic_seed_len: int,
+                                compact: bool = False) -> None:
+        """Merge the ReAct loop's local turns back into the stored history.
+
+        The local `messages` array is seeded as [agentic system] + stored[1:], so
+        the genuinely new turns begin at index `agentic_seed_len`. They are
+        inserted at that boundary — right after the current user query and BEFORE
+        any messages the streaming finalize appended — so the conversation stays
+        chronologically ordered (user query → tool work → final answer).
+
+        `_system_nudge` messages (loop-internal steering, e.g. the empty-response
+        "Please provide a tool call..." fallback) are excluded from persistent
+        history so repeated empty responses don't pile into context forever.
+
+        Also called from the `except KeyboardInterrupt` path so a ^C that aborts a
+        step still preserves every completed tool turn instead of erasing the
+        conversation (the interrupted step's partial output is never in `messages`
+        yet, so it is correctly not persisted).
+
+        Args:
+            messages: The local ReAct message list.
+            agentic_seed_len: Index in the stored history where new turns begin.
+            compact: Whether to auto-compact the merged history if over threshold.
+        """
+        if len(messages) > agentic_seed_len:
+            new_turns = [m for m in messages[agentic_seed_len:] if not m.get('_system_nudge')]
+            if new_turns:
+                self.messages[agentic_seed_len:agentic_seed_len] = new_turns
+        sanitize_tool_pairing(self.messages)
+
+        # Persist compaction savings: the ReAct loop may have auto-compacted its
+        # local `messages`, but that compaction is discarded by the merge above.
+        # Re-check the merged history and compact if it exceeds the threshold.
+        if compact and self.ctx.context_window_size > 0:
+            msg_tokens = self.ctx.calculate_context_tokens(self.messages)
+            threshold = int(self.ctx.context_window_size * self.ctx.compaction_threshold)
+            if msg_tokens > threshold:
+                before_len = len(self.messages)
+                self.messages = compact_messages(self.messages, self.ctx)
+                print(colorize(
+                    f"[Auto-compact] Agentic history persisted: {before_len} → {len(self.messages)} msgs",
+                    'warning'), file=sys.stderr)
+
+        # Recalculate context tokens after merging agentic history
+        self.wire().refresh_context_bar()
+
+    def compact_run(self, force: bool = False, use_llm: bool = False) -> bool:
+        """Perform compaction (`/compact now|force|llm`). Returns False for the loop."""
+        if len(self.messages) <= 2:
+            print(colorize("[Compact] Nothing to compact.", 'warning'), file=sys.stderr)
+            return False
+        before_len = len(self.messages)
+        before_tokens = self.ctx.calculate_context_tokens(self.messages)
+        # Reserve room for what is sent but not stored (system swap, tools,
+        # framing) so the budget matches the number the status bar shows.
+        overhead = self.wire().prompt_overhead_tokens()
+
+        # Repair any orphaned tool messages before summarizing/compacting so
+        # strict chat templates (gpt-oss) don't reject the resulting history.
+        sanitize_tool_pairing(self.messages)
+
+        # Optional: LLM-summarize large tool results before mechanical compaction.
+        if use_llm:
+            summarize_tool_results(self.messages, self.ctx, self.wire().query_handler)
+            summarized = len([m for m in self.messages
+                              if isinstance(m.get('content', ''), str)
+                              and m.get('content', '').startswith('[Summarized tool result')])
+            if summarized:
+                print(colorize(
+                    f"[Compact] LLM-summarized {summarized} tool result(s).",
+                    'info'), file=sys.stderr)
+            else:
+                print(colorize(
+                    "[Compact] No eligible tool results to summarize.",
+                    'muted'), file=sys.stderr)
+
+        # Overall post-compaction budget (0 = unknown context window).
+        target = (int(self.ctx.context_window_size * COMPACTION_TARGET)
+                  if self.ctx.context_window_size > 0 else 0)
+
+        # Phase 1: LLM memory consolidation (when requested) or sliding-window compaction
+        if use_llm:
+            self.messages = llm_compact_messages(
+                self.messages, self.ctx, self.wire().query_handler,
+                target_tokens=target, overhead_tokens=overhead)
+            llm_summary_used = (
+                len(self.messages) > 1
+                and isinstance(self.messages[1].get('content', ''), str)
+                and self.messages[1]['content'].startswith(LLM_COMPACT_SUMMARY_MARKER)
+            )
+            if llm_summary_used:
+                print(colorize(
+                    "[Compact] LLM-summarized the older conversation.",
+                    'info'), file=sys.stderr)
+            else:
+                print(colorize(
+                    "[Compact] LLM summarization failed; fell back to mechanical compaction.",
+                    'muted'), file=sys.stderr)
+        else:
+            self.messages = compact_messages(self.messages, self.ctx, force=force,
+                                             overhead_tokens=overhead)
+        after_tokens = self.ctx.calculate_context_tokens(self.messages)
+
+        # Phase 2 backstop: if LLM consolidation still could not fit the budget
+        # (e.g. the recent window alone is too large), truncate the largest
+        # message. The memory block itself is now bounded before this point.
+        if target and after_tokens > target and len(self.messages) > 1:
+            after_tokens = self.compact_truncate_largest(target)
+
+        self.wire().refresh_context_bar()
+        print(colorize(
+            f"[Compact] {before_len} → {len(self.messages)} messages, "
+            f"{before_tokens} → {after_tokens} tokens "
+            f"(saved {before_tokens - after_tokens} tokens)",
+            'success'), file=sys.stderr)
+        return False
+
+    def compact_truncate_largest(self, target: int) -> int:
+        """Phase 2: truncate the largest single message to fit the token budget.
+
+        If the total still exceeds `target` and one message is large enough to be
+        worth shrinking, cut roughly `excess * 4` characters from its tail.
+
+        Returns the updated total token count (unchanged if nothing was truncated).
+        """
+        total = self.ctx.calculate_context_tokens(self.messages)
+        if total <= target or len(self.messages) <= 1:
+            return total
+        largest_idx = -1
+        largest_tokens = 0
+        for i, msg in enumerate(self.messages):
+            if i == 0:
+                continue
+            t = msg.get('_tokens', self.ctx.estimate_tokens(msg.get('content', '')))
+            if t > largest_tokens:
+                largest_tokens = t
+                largest_idx = i
+        if largest_idx <= 0 or largest_tokens <= target * 0.3:
+            return total
+        msg = self.messages[largest_idx]
+        content = msg.get('content', '')
+        if not isinstance(content, str):
+            return total
+        excess = total - target
+        chars_to_cut = int(excess * 4)  # rough tokens→chars
+        if chars_to_cut <= 0 or chars_to_cut >= len(content):
+            return total
+        role = msg.get('role', 'unknown')
+        msg['content'] = content[:len(content) - chars_to_cut] + \
+            f"\n\n[... truncated {chars_to_cut} chars to fit context budget ...]"
+        msg.pop('_tokens', None)
+        self.ctx.stamp_tokens(msg)
+        updated = self.ctx.calculate_context_tokens(self.messages)
+        print(colorize(
+            f"[Compact] Truncated large {role} message (index {largest_idx}) to fit budget.",
+            'warning'), file=sys.stderr)
+        return updated
+
+    def compact_force_message(self, index_str: str) -> bool:
+        """Force-summarize (tool result) or truncate a single message by index."""
+        try:
+            idx = int(index_str)
+        except ValueError:
+            print(colorize(f"[Compact] '{index_str}' is not a valid index.", 'error'), file=sys.stderr)
+            return False
+        if not (0 < idx < len(self.messages)):
+            print(colorize(f"[Compact] Index {idx} out of range (1-{len(self.messages) - 1}).", 'error'), file=sys.stderr)
+            return False
+        msg = self.messages[idx]
+        content = msg.get('content', '')
+        if not isinstance(content, str) or len(content) <= SUMMARIZE_TOOL_MIN_CHARS:
+            print(colorize(f"[Compact] Message {idx} is already small ({len(content)} chars).", 'muted'), file=sys.stderr)
+            return False
+        before = len(content)
+        role = msg.get('role', 'unknown')
+        name = msg.get('name', '')
+        if role == 'tool' and name and name not in SUMMARIZE_TOOL_EXCLUDE:
+            summary = _llm_summarize_tool_result(self.ctx, self.wire().query_handler, name, content)
+            if summary:
+                msg['content'] = f"[Summarized tool result ({name})]\n{summary}"
+                msg.pop('_tokens', None)
+                self.ctx.stamp_tokens(msg)
+                print(colorize(
+                    f"[Compact] LLM-summarized message {idx} ({before} → {len(msg['content'])} chars).",
+                    'success'), file=sys.stderr)
+                return False
+            print(colorize(f"[Compact] LLM summarization failed for message {idx}; truncating instead.", 'warning'), file=sys.stderr)
+        max_chars = 2000
+        msg['content'] = content[:max_chars] + f"\n\n[... truncated {before - max_chars} chars by /compact force ...]"
+        msg.pop('_tokens', None)
+        self.ctx.stamp_tokens(msg)
+        print(colorize(
+            f"[Compact] Truncated message {idx} ({role}) from {before} → {len(msg['content'])} chars.",
+            'success'), file=sys.stderr)
+        return False
+
+    def compact_list(self) -> bool:
+        """List all messages with sizes (like /tokencount)."""
+        if not self.messages:
+            print(colorize("[Compact] No messages in session.", 'warning'), file=sys.stderr)
+            return False
+        total = 0
+        print(colorize("\n--- Conversation Messages ---", 'info'), file=sys.stderr)
+        for i, msg in enumerate(self.messages):
+            role = msg.get('role', 'unknown')
+            name = msg.get('name', '')
+            content = msg.get('content', '')
+            if '_tokens' in msg:
+                tokens = msg['_tokens']
+                marker = "·"
+            else:
+                tokens = self.ctx.estimate_tokens(content) + 2
+                marker = "~"
+            total += tokens
+            preview = content[:60].replace('\n', ' ') if isinstance(content, str) else str(content)[:60]
+            if len(content) > 60:
+                preview += '...'
+            tag = f" ({name})" if name else ""
+            print(colorize(f"  [{i:3d}] {role:10s}{tag:<14s}{marker}{tokens:6d} tok  {preview}",
+                           'info'), file=sys.stderr)
+        print(colorize(f"\n  Total: {total} tokens", 'info'), file=sys.stderr)
+        if self.ctx.context_window_size > 0:
+            pct = total / self.ctx.context_window_size
+            print(colorize(f"  Context: {total}/{self.ctx.context_window_size} ({pct:.1%})", 'info'), file=sys.stderr)
+        print(colorize("--- End ---\n", 'info'), file=sys.stderr)
+        return False
+
+    def compact_status(self) -> bool:
+        """Display current compaction settings like /agentic status."""
+        c = self.ctx
+        print(colorize("\n[Compaction Settings - Use /compact <option> [value]]", 'info'), file=sys.stderr)
+        print("  Subcommands: now, force [index], llm, threshold <v>, list, status", file=sys.stderr)
+        print(file=sys.stderr)
+
+        settings = [
+            ("threshold", "Auto-compact trigger", f"{c.compaction_threshold:.0%}"),
+            ("target",    "Compact down to",      f"{COMPACTION_TARGET:.0%}"),
+            ("keep",      "Recent messages kept", str(COMPACTION_KEEP_RECENT)),
+        ]
+        for name, desc, value in settings:
+            print(f"  > {name:<12} [{value:<8}] {desc}", file=sys.stderr)
+
+        total = c.calculate_context_tokens(self.messages)
+        if c.context_window_size > 0:
+            pct = total / c.context_window_size
+            threshold_tok = int(c.context_window_size * c.compaction_threshold)
+            print(f"\n  Window size:       {c.context_window_size}", file=sys.stderr)
+            print(f"  Current usage:     {total}/{c.context_window_size} ({pct:.1%})", file=sys.stderr)
+            print(f"  Auto-compact at:   {threshold_tok} tokens", file=sys.stderr)
+        else:
+            print(f"\n  Current usage:     {total} tokens", file=sys.stderr)
+            print("  Window size:       unknown (auto-compact disabled)", file=sys.stderr)
+        print(file=sys.stderr)
+        return False
+
+    def compact_threshold(self, parts: list) -> bool:
+        """Set the auto-compaction trigger threshold.
+
+        Args:
+            parts: Split /compact args (parts[2] is the threshold value).
+        """
+        if len(parts) < 3:
+            print(colorize("[Usage: /compact threshold <value>]  (e.g. 0.6 or 60)", 'warning'), file=sys.stderr)
+            return False
+        try:
+            val = float(parts[2])
+        except ValueError:
+            print(colorize(f"[Compact] '{parts[2]}' is not a number.", 'error'), file=sys.stderr)
+            return False
+        if val > 1:
+            val = val / 100.0
+        if not (0.0 < val < 1.0):
+            print(colorize("[Compact] Threshold must be between 0 and 1 (or 1-99 as percent).", 'error'), file=sys.stderr)
+            return False
+        self.ctx.compaction_threshold = val
+        print(colorize(f"[Compact] Auto-compaction threshold set to {val:.0%}.", 'success'), file=sys.stderr)
+        return False
+
+
+# ============================================================================
 # ============= CHAT LOOP CLASS ============================================
 # ============================================================================
 
@@ -12291,13 +16529,13 @@ class ChatLoop:
       run_agentic_query() → _init_agentic_query()
                           → query_handler.query_sync() (ReAct loop)
                           → parse_tool_call() / parse_tool_calls()
-                          → _execute_tool_calls() → tool_registry.execute()
+                          → _execute_tool_calls() → ToolExecution.run_calls()
+                             → tool_registry.execute()
                           → _finalize_agentic_query() → query_handler.query_stream()
 
-      parse_tool_call() → _normalize_tool_json() / _extract_json_balanced()
-      parse_tool_calls() → _find_tool_call_brace() / _extract_json_balanced()
-      _execute_tool_calls() → tool_registry.execute()
-      _finalize_agentic_query() → parse_tool_call() / parse_tool_calls()
+      Tool-call parsing lives in ToolCallParser, tool execution in ToolExecution
+      (see the sections above); the parse_tool_call() / _execute_tool_calls()
+      methods here are thin doors kept for the call sites and the tests.
     """
 
     def __init__(self, context: CommandContext) -> None:
@@ -12311,11 +16549,36 @@ class ChatLoop:
         self.query_handler = context.create_query_handler()
         self.executor = context.create_executor()
         self.tool_registry = context.create_tool_registry()
+        self.parser = ToolCallParser(context)
+        self.timeout_policy = AgenticTimeoutPolicy(context, self.parser)
         self.commands = get_command_aliases()
+
+    # --- Conversation state (implementation: ConversationStore, above) -----
+    def _conversation(self) -> 'ConversationStore':
+        """Return the conversation store, creating it for bare instances."""
+        store = getattr(self, 'conversation', None)
+        if store is None:
+            store = ConversationStore(lambda: getattr(self, 'ctx', None),
+                                      self._wire_view)
+            self.conversation = store
+        return store
+
+    @property
+    def messages(self) -> list:
+        """Conversation history (owned by ConversationStore)."""
+        return self._conversation().messages
+
+    @messages.setter
+    def messages(self, value: Optional[list]) -> None:
+        self._conversation().replace(value)
+
+    @messages.deleter
+    def messages(self) -> None:
+        self._conversation().clear()
 
     def dump_context_to_file(self, filepath: str) -> None:
         """Dump current conversation history to a JSON file for browsing."""
-        if not hasattr(self, 'messages') or not self.messages:
+        if not self.messages:
             raise ValueError("No conversation history to dump")
 
         history = []
@@ -12517,7 +16780,7 @@ class ChatLoop:
         if self.ctx.context_window_size <= 0:
             refresh_context_window_size(self.ctx)
         window = self.ctx.context_window_size
-        messages = getattr(self, 'messages', None) or []
+        messages = self.messages
         prompt_tokens = self.ctx.calculate_context_tokens(messages) if messages else 0
         effective, reserve = resolve_output_budget(configured, window, prompt_tokens)
         print(colorize("\n/maxtokens — per-response output cap (always on)", 'info'), file=sys.stderr)
@@ -12830,13 +17093,9 @@ class ChatLoop:
         """Handle exit/quit commands. Returns True to break loop."""
         if full_input.lower() in ['exit', 'quit', '/exit', '/quit']:
             # Auto-save session on exit if there's meaningful conversation
-            if hasattr(self, 'messages') and len(self.messages) > 2:
-                try:
-                    sm = SessionManager()
-                    session_id = sm.save_session(self.messages, self.ctx)
-                    print(colorize(f"[Auto-save] Session saved as {session_id}", 'muted'), file=sys.stderr)
-                except Exception:
-                    pass
+            session_id = self._conversation().autosave_on_exit()
+            if session_id:
+                print(colorize(f"[Auto-save] Session saved as {session_id}", 'muted'), file=sys.stderr)
             print(colorize("\n[Goodbye!]", 'info'), file=sys.stderr)
             return True
         return None
@@ -12876,7 +17135,7 @@ class ChatLoop:
         + template framing). The stored-history sum is shown next to it so the
         difference is visible instead of surprising.
         """
-        stored = self.ctx.calculate_context_tokens(getattr(self, 'messages', []) or [])
+        stored = self.ctx.calculate_context_tokens(self.messages)
         overhead = self._prompt_overhead_tokens()
         wire_total = self._refresh_context_bar()
         window = self.ctx.context_window_size
@@ -12930,8 +17189,7 @@ class ChatLoop:
         if full_input == '/clear':
             print(colorize("[Context memory wiped clean]", 'success'), file=sys.stderr)
             self.ctx.reset()
-            if hasattr(self, 'messages'):
-                del self.messages
+            self.messages = []
             refresh_context_window_size(self.ctx)
             return False
         return None
@@ -13262,7 +17520,7 @@ class ChatLoop:
                     self.ctx.model = new_model
                     self.ctx.context_window_size = 0
 
-                    if hasattr(self, 'messages') and self.messages:
+                    if self.messages:
                         self._refresh_context_bar()
                     else:
                         self.ctx.current_context_tokens = 0
@@ -13285,7 +17543,7 @@ class ChatLoop:
 
                     if self.ctx.backend not in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
                         # Warmup ping to trigger model loading (not needed for cloud APIs)
-                        if hasattr(self, 'messages') and self.messages:
+                        if self.messages:
                             ping_messages = list(self.messages)
                         else:
                             ping_messages = [{"role": "system", "content": self.ctx.system_prompt}]
@@ -13550,7 +17808,9 @@ class ChatLoop:
         new_mode = "container" if self.executor.mode != "container" else "host"
         self.executor.mode = new_mode
         self.tool_registry.executor.mode = new_mode
-        print(colorize(f"[Executor mode: {self.executor.mode}]", 'info'), file=sys.stderr)
+        detail = (f" — {self.executor.describe_target()}, {self.executor.describe_limits()}"
+                  if new_mode == "container" else "")
+        print(colorize(f"[Executor mode: {self.executor.mode}{detail}]", 'info'), file=sys.stderr)
         return False
 
     def _agentic_set_number(self, subcmd: str, parts: list) -> bool:
@@ -13691,7 +17951,7 @@ class ChatLoop:
             ("agentic",    "Master toggle",             str(c.agentic_mode).lower()),
             ("plan",       "Read-only planner (on=query/CWD-confined, run=+shell)", plan_value),
             ("auto",       "Skip destructive tool confirmation", str(c.auto_confirm).lower()),
-            ("sandbox",    "Run tool subprocesses in container", self.executor.mode),
+            ("sandbox",    f"Run tool subprocesses in {self.executor.describe()}", self.executor.mode),
             ("verbose",    "Show raw model responses during ReAct", str(c.agentic_verbose).lower()),
             ("thinking",   "Show model reasoning during ReAct", str(c.agentic_show_thinking).lower()),
             ("trace",      "Show full tool args and results", str(c.agentic_trace).lower()),
@@ -13722,177 +17982,15 @@ class ChatLoop:
         return False
 
     def run_handle_promptshow(self, full_input: str) -> Optional[bool]:
-        """Handle /promptshow — display the prompt and tools the next query sends.
+        """Handle /promptshow (rendered by WireView)."""
+        return self._wire_view().handle_promptshow(full_input)
 
-        Read-only by construction: it renders the same snapshot `/tokencount`
-        uses (`_wire_snapshot` → `_wire_system_and_tools` + the /maxtokens cap
-        line), so the preview cannot drift from the payload. Nothing here writes
-        to `ctx.system_prompt`; the mutating sibling will be `/promptset`.
 
-        Args:
-            full_input: The raw command line.
 
-        Returns:
-            False when handled, None when the line is not a /promptshow command.
-        """
-        stripped = full_input.strip()
-        head = stripped.split(maxsplit=1)[0] if stripped else ""
-        if head not in ('/promptshow', '/showprompt'):
-            return None
-        parts = stripped.split(maxsplit=2)
-        sub = parts[1].lower() if len(parts) > 1 else ""
-        arg = parts[2].strip() if len(parts) > 2 else ""
-        if sub in ("", "all"):
-            self._promptshow_all(self._promptshow_wire())
-        elif sub == "system":
-            print(self._promptshow_wire()['system'])
-        elif sub == "tools":
-            self._promptshow_tools(arg)
-        elif sub in ("json", "save"):
-            if sub == "save" and not arg:
-                print(colorize("[Usage: /promptshow save <path>]", 'warning'), file=sys.stderr)
-                return False
-            text = json.dumps(self._promptshow_payload(self._promptshow_wire()),
-                              indent=2, ensure_ascii=False)
-            if sub == "json":
-                print(text)
-            else:
-                self._promptshow_save(arg, text)
-        elif sub in ("help", "?"):
-            print_promptshow_usage()
-        else:
-            print(colorize(f"[ERROR] unknown /promptshow subcommand '{sub}'", 'error'),
-                  file=sys.stderr)
-            print_promptshow_usage()
-        return False
 
-    def _promptshow_wire(self) -> Dict:
-        """Return the outbound system prompt and tools, with token counts.
 
-        Shares `_wire_snapshot()` with `/tokencount` so both report the same
-        request. The fallback covers the case where the snapshot raises (e.g. no
-        live backend to count the whole request): the two blocks are then built
-        the same way, just without the whole-request measurement.
 
-        Returns:
-            The `_wire_snapshot()` dict (mode, system, tools, token counts).
-        """
-        try:
-            return self._wire_snapshot()
-        except Exception:
-            system, tools, mode = self._wire_system_and_tools()
-            configured = int(getattr(self.ctx, 'max_output_tokens',
-                                     DEFAULT_MAX_OUTPUT_TOKENS) or DEFAULT_MAX_OUTPUT_TOKENS)
-            system = self.query_handler._with_output_cap_line(
-                [{'role': 'system', 'content': system}], configured)[0]['content']
-            return {'mode': mode, 'system': system,
-                    'system_tokens': self.ctx.tokenize(system),
-                    'conversation_messages': 0, 'conversation_tokens': 0,
-                    'tools': tools,
-                    'tools_tokens': self.ctx.count_tools_tokens(tools),
-                    'overhead': 0, 'total': 0, 'source': 'none'}
 
-    def _promptshow_tool_defs(self) -> Dict:
-        """Return the tool definitions the next request exposes, in order.
-
-        Goes through `_plan_allowed_tools()` — the single choke point the prompt
-        block and the native schema both read — so plan mode is reflected here
-        exactly as it is in the payload.
-        """
-        try:
-            return self.tool_registry._plan_allowed_tools()
-        except Exception:
-            return {}
-
-    def _promptshow_delivery(self, wire: Dict) -> str:
-        """Describe how the tool definitions reach the model in the active mode.
-
-        Three cases, not two: chat mode sends no tool definitions at all, native
-        models get a `tools` array, and inline models get the definitions inside
-        the system prompt.
-        """
-        tools = wire.get('tools')
-        if tools:
-            size_kb = len(json.dumps(tools)) / 1024
-            return f"sent as the native tools array ({size_kb:.1f} KB)"
-        if str(wire.get('mode', '')).startswith('chat'):
-            return "not sent — chat mode carries no tool definitions"
-        return "sent inline inside the system prompt (no separate tools array)"
-
-    def _promptshow_all(self, wire: Dict) -> None:
-        """Print the system prompt, a tool summary and the section sizes."""
-        mode = str(wire.get('mode', ''))
-        sends_tools = bool(wire.get('tools')) or mode.startswith('agentic')
-        tools_part = (f"{wire['tools_tokens']} tok — {self._promptshow_delivery(wire)}"
-                      if sends_tools else "none — chat mode")
-        print(colorize(
-            f"\n[promptshow] mode: {mode} | system: {wire['system_tokens']} tok"
-            f" | tools: {tools_part}", 'info'))
-        print(colorize("── system prompt ──", 'muted'))
-        print(wire['system'])
-        if not sends_tools:
-            print(colorize("(no tool definitions in this mode — /agentic on or "
-                           "/agentic plan adds them)", 'muted'))
-            return
-        defs = self._promptshow_tool_defs()
-        print(colorize(f"── tools ({len(defs)}) ──", 'muted'))
-        for name, defn in defs.items():
-            props = (defn.get('parameters') or {}).get('properties') or {}
-            print(f"  {name:<24} {', '.join(props) if props else '(no arguments)'}")
-        print(colorize("── /promptshow tools <name> for the argument schemas · "
-                       "/promptshow json for the exact payload ──", 'muted'))
-
-    def _promptshow_tools(self, name: str) -> None:
-        """Print tool definitions with their argument schemas.
-
-        `/listtool` shows name + description; this adds the argument types,
-        which is what you need to write a call by hand.
-        """
-        defs = self._promptshow_tool_defs()
-        total = len(defs)
-        if name:
-            if name not in defs:
-                print(colorize(f"[ERROR] unknown tool '{name}' "
-                               f"(available: {', '.join(sorted(defs))})", 'error'),
-                      file=sys.stderr)
-                return
-            defs = {name: defs[name]}
-        wire = self._promptshow_wire()
-        print(colorize(f"\n[promptshow] showing {len(defs)} of {total} tools — "
-                       f"{self._promptshow_delivery(wire)}", 'info'))
-        for tool_name, defn in defs.items():
-            print(colorize(f"\n### {tool_name}", 'success'))
-            print(defn.get('description', ''))
-            parameters = defn.get('parameters') or {}
-            props = parameters.get('properties') or {}
-            required = set(parameters.get('required') or [])
-            for arg_name, spec in props.items():
-                marker = " [required]" if arg_name in required else ""
-                kind = spec.get('type', 'any')
-                print(f"  - {arg_name} ({kind}){marker}: {spec.get('description', '')}")
-
-    def _promptshow_payload(self, wire: Dict) -> Dict:
-        """Build the JSON view shared by `/promptshow json` and `save`."""
-        return {
-            'mode': wire['mode'],
-            'system': wire['system'],
-            'system_tokens': wire['system_tokens'],
-            'tools': wire.get('tools'),
-            'tools_tokens': wire['tools_tokens'],
-            'tools_delivery': self._promptshow_delivery(wire),
-        }
-
-    def _promptshow_save(self, path: str, text: str) -> None:
-        """Write the payload JSON to `path`, expanding `~`."""
-        target = os.path.expanduser(path)
-        try:
-            with open(target, 'w', encoding='utf-8') as handle:
-                handle.write(text + "\n")
-        except OSError as e:
-            print(colorize(f"[ERROR] cannot write {target}: {e}", 'error'), file=sys.stderr)
-            return
-        print(colorize(f"[promptshow] wrote {len(text)} chars to {target}", 'success'),
-              file=sys.stderr)
 
     def run_handle_mcp(self, full_input: str) -> Optional[bool]:
         """Handle /mcp — status, tool listings, and connect/disconnect.
@@ -13972,838 +18070,129 @@ class ChatLoop:
             print_mcp_usage()
         return False
 
-    @staticmethod
-    def _normalize_tool_json(json_text: str) -> Optional[dict]:
-        """Parse JSON and normalize any tool call format to {"tool": ..., "arguments": ...}.
+    # --- Tool-call parsing (implementation: ToolCallParser, above) ----------
+    # The class keeps these doors so existing call sites (`self.parse_tool_call`)
+    # and tests that call them unbound (`ChatLoop._extract_json_balanced(...)`)
+    # keep working unchanged. The parser instance is built in __init__.
+    def _tool_parser(self) -> 'ToolCallParser':
+        """Return the tool-call parser, creating it for instances built without __init__.
 
-        Supports:
-        - Internal:  {"tool": "name", "arguments": {...}}
-        - OpenAI:    {"type": "function", "function": {"name": "name", "arguments": {...}}}
-        - Compact:   {"function": {"name": "name", "arguments": {...}}}
-        Arguments can be a dict or a JSON string.
+        Some tests build a bare `object.__new__(ChatLoop)` and set only the
+        attributes the method under test needs. Creating the parser on demand
+        keeps those call sites working instead of raising an AttributeError that
+        `_partial_tool_call_pending` would swallow (and misread as "no tool call
+        pending").
         """
-        try:
-            obj = json.loads(json_text)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(obj, dict):
-            return None
-        if "tool" in obj:
-            return obj
-        tool_name = None
-        tool_args = {}
-        if "function" in obj and isinstance(obj["function"], dict):
-            fn = obj["function"]
-            if "name" in fn:
-                tool_name = fn["name"]
-                raw_args = fn.get("arguments", {})
-                if isinstance(raw_args, str):
-                    try:
-                        tool_args = json.loads(raw_args)
-                    except json.JSONDecodeError:
-                        tool_args = {"raw": raw_args}
-                elif isinstance(raw_args, dict):
-                    tool_args = raw_args
-        # OpenAI format without function wrapper: {"type": "function", "name": "...", "arguments": {...}}
-        if not tool_name and obj.get("type") == "function" and isinstance(obj.get("name"), str):
-            tool_name = obj["name"]
-            raw_args = obj.get("arguments", {})
-            if isinstance(raw_args, str):
-                try:
-                    tool_args = json.loads(raw_args)
-                except json.JSONDecodeError:
-                    tool_args = {"raw": raw_args}
-            elif isinstance(raw_args, dict):
-                tool_args = raw_args
-        if tool_name:
-            return {"tool": tool_name, "arguments": tool_args}
-        return None
-
-    @staticmethod
-    def _find_tool_call_brace(text: str, pos: int = 0) -> int:
-        """Find the next { that introduces a tool call JSON (with tool/function/type key).
-
-        Args:
-            text: The response text to search.
-            pos: Starting offset.
-
-        Returns:
-            Index of the opening brace, or -1 if none found.
-        """
-        idx = text.find('{', pos)
-        while idx != -1:
-            rest = text[idx+1:].lstrip()
-            if rest.startswith(('"tool"', '"function"', '"type"')):
-                return idx
-            idx = text.find('{', idx + 1)
-        return -1
-
-    @staticmethod
-    def _rfind_tool_call_brace(text: str) -> int:
-        """Find the last { that introduces a tool call JSON, scanning right-to-left.
-
-        Args:
-            text: The response text to search.
-
-        Returns:
-            Index of the last tool-call opening brace, or -1 if none found.
-        """
-        idx = text.rfind('{')
-        while idx != -1:
-            rest = text[idx+1:].lstrip()
-            if rest.startswith(('"tool"', '"function"', '"type"')):
-                return idx
-            if idx == 0:
-                break
-            idx = text.rfind('{', 0, idx)
-        return -1
-
-    @staticmethod
-    def _extract_json_balanced(text: str, start: int) -> Optional[str]:
-        """Extract balanced JSON from text starting at an opening brace.
-
-        Args:
-            text: The response text.
-            start: Index of the opening brace.
-
-        Returns:
-            The balanced JSON substring, or None if unbalanced.
-
-        Handles braces inside JSON string values correctly by tracking
-        string boundaries and escape sequences.
-        """
-        depth = 0
-        in_string = False
-        escaped = False
-        for i, ch in enumerate(text[start:], start):
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == '\\':
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-            else:
-                if ch == '"':
-                    in_string = True
-                elif ch == '{':
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        return text[start:i + 1]
-        return None
-
-    @staticmethod
-    def _tool_call_json_acceptable(result: Optional[dict]) -> bool:
-        """Reject tool-call JSON that looks like an XML/HTML hybrid fragment.
-
-        Args:
-            result: Normalized tool call dict (or None).
-
-        Returns:
-            True when the result should be accepted.
-        """
-        if not result:
-            return False
-        args_str = json.dumps(result.get("arguments", {}))
-        return not ('<' in args_str and '>' in args_str)
-
-    def _parse_fenced_tool_call(self, text: str, lazy: bool) -> Optional[dict]:
-        """Pass 2: extract a tool call from a fenced ```json code block.
-
-        Args:
-            text: The response text.
-            lazy: Whether lazy extraction is enabled.
-
-        Returns:
-            A normalized tool call dict, or None.
-        """
-        parts = text.split("```")
-        for i in range(1, len(parts), 2):
-            block = parts[i].strip()
-            if block.startswith("json"):
-                block = block[4:].strip()
-            elif block.startswith("text"):
-                block = block[4:].strip()
-            brace_idx = ChatLoop._find_tool_call_brace(block)
-            if brace_idx != -1:
-                prefix = "```".join(parts[:i])
-                suffix = "```".join(parts[i+1:])
-                accept = lazy
-                if not accept:
-                    accept = ((not prefix or len(prefix) <= 100) and not suffix)
-                if accept:
-                    json_str = self._extract_json_balanced(block, brace_idx)
-                    if json_str:
-                        result = self._normalize_tool_json(json_str)
-                        if self._tool_call_json_acceptable(result):
-                            return result
-        return None
-
-    def _parse_bare_tool_call(self, text: str, lazy: bool) -> Optional[dict]:
-        """Pass 3: extract a bare JSON tool call (anywhere in lazy mode).
-
-        Args:
-            text: The response text.
-            lazy: Whether lazy extraction is enabled.
-
-        Returns:
-            A normalized tool call dict, or None.
-        """
-        if lazy:
-            brace_idx = ChatLoop._find_tool_call_brace(text)
-            if brace_idx != -1:
-                json_str = self._extract_json_balanced(text, brace_idx)
-                if json_str:
-                    result = self._normalize_tool_json(json_str)
-                    if self._tool_call_json_acceptable(result):
-                        return result
-        else:
-            # Strict mode: only at START of the text
-            stripped = text.lstrip()
-            if stripped.startswith('{') and stripped[1:].lstrip().startswith(('"tool"', '"function"', '"type"')):
-                start = text.index('{')
-                json_str = self._extract_json_balanced(text, start)
-                if json_str:
-                    result = self._normalize_tool_json(json_str)
-                    if result:
-                        return result
-            # Pass 4: bare JSON tool call at the END of the text (strict mode only).
-            # The JSON must be the final content (no trailing text), but a short
-            # prose preamble is allowed — models often narrate intent ("Let me
-            # check...") then emit the JSON tool call as the last thing.
-            idx = ChatLoop._rfind_tool_call_brace(text)
-            if idx >= 0:
-                json_str = self._extract_json_balanced(text, idx)
-                if json_str:
-                    end = idx + len(json_str)
-                    if not text[end:].strip():
-                        result = self._normalize_tool_json(json_str)
-                        if self._tool_call_json_acceptable(result):
-                            return result
-        return None
+        parser = getattr(self, 'parser', None)
+        if parser is None:
+            parser = ToolCallParser(getattr(self, 'ctx', None))
+            self.parser = parser
+        return parser
 
     def parse_tool_call(self, text: str) -> Optional[dict]:
-        """Extract tool call JSON from LLM response. Returns {"tool": ..., "arguments": ...} or None.
-
-        Args:
-            text: The response text to parse.
-        """
-        lazy = getattr(self.ctx, 'lazy_tool', False)
-        text = text.strip()
-        # Pass 1: full JSON parse
-        result = self._normalize_tool_json(text)
-        if result:
-            return result
-        # Pass 2: fenced JSON code block
-        result = self._parse_fenced_tool_call(text, lazy)
-        if result:
-            return result
-        # Pass 3: bare JSON object with "tool" key
-        return self._parse_bare_tool_call(text, lazy)
-
-    def _extract_tool_calls_lazy(self, text: str) -> list:
-        """Lazy mode: find ALL tool call JSONs anywhere in the text (deduped).
-
-        Args:
-            text: The response text.
-
-        Returns:
-            List of normalized tool call dicts.
-        """
-        results = []
-        seen_keys = set()
-        pos = 0
-        while pos < len(text):
-            idx = ChatLoop._find_tool_call_brace(text, pos)
-            if idx == -1:
-                break
-            json_str = self._extract_json_balanced(text, idx)
-            if not json_str:
-                pos = idx + 1
-                continue
-            result = self._normalize_tool_json(json_str)
-            if result:
-                key = (result["tool"], json.dumps(result.get("arguments", {}), sort_keys=True))
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    results.append(result)
-            pos = idx + len(json_str) if json_str else idx + 1
-        return results
-
-    def _extract_tool_calls_strict(self, text: str) -> list:
-        """Strict mode: only consecutive tool calls from the start.
-
-        Args:
-            text: The response text.
-
-        Returns:
-            List of normalized tool call dicts (empty when the text has preamble).
-        """
-        results = []
-        # Strict mode: only consecutive tool calls from the start
-        stripped = text.lstrip()
-        if not (stripped.startswith('{') and stripped[1:].lstrip().startswith(('"tool"', '"function"', '"type"'))):
-            return []
-        pos = 0
-        while pos < len(text):
-            # Skip whitespace between consecutive tool calls
-            while pos < len(text) and text[pos] in (' ', '\t', '\n', '\r'):
-                pos += 1
-            if pos >= len(text):
-                break
-            # Check if next non-whitespace is a tool call
-            if not (text[pos] == '{' and text[pos+1:].lstrip().startswith(('"tool"', '"function"', '"type"'))):
-                break
-            json_str = self._extract_json_balanced(text, pos)
-            if not json_str:
-                break
-            result = self._normalize_tool_json(json_str)
-            if result:
-                results.append(result)
-            else:
-                break
-            pos += len(json_str)
-        return results
+        """Extract a single tool call from a model response."""
+        return self._tool_parser().parse_tool_call(text)
 
     def parse_tool_calls(self, text: str) -> list[dict]:
-        """Extract ALL tool call JSONs from the response.
+        """Extract every tool call from a model response."""
+        return self._tool_parser().parse_tool_calls(text)
 
-        First tries direct JSON parse (works for clean tool calls at start of text).
-        Falls back to strict/lazy extraction for embedded or malformed JSON.
+    _normalize_tool_json = staticmethod(normalize_tool_json)
+    _find_tool_call_brace = staticmethod(find_tool_call_brace)
+    _rfind_tool_call_brace = staticmethod(rfind_tool_call_brace)
+    _extract_json_balanced = staticmethod(extract_json_balanced)
+    _tool_call_json_acceptable = staticmethod(tool_call_json_acceptable)
 
-        In strict mode (default): only matches consecutive tool calls starting
-        from the beginning of the response (no preamble).
-        In lazy mode (/agentic lazytool): finds tool calls anywhere in the text.
-        Returns list of {"tool": ..., "arguments": ...} dicts.
+    # --- Agentic step machinery (implementation: AgenticRunner, above) -----
+    # Thin doors kept for the call sites, the wire helpers (which ask for the
+    # agentic prompt) and for tests that drive a helper directly.
+    _is_stuck = staticmethod(AgenticRunner.is_stuck)
+    _call_with_timeout = staticmethod(AgenticRunner.call_with_timeout)
 
-        Args:
-            text: The response text to parse.
+    def _agentic_runner(self) -> 'AgenticRunner':
+        """Return the step runner, creating it for instances built without __init__."""
+        runner = getattr(self, 'runner', None)
+        if runner is None:
+            runner = AgenticRunner(
+                getattr(self, 'ctx', None),
+                getattr(self, 'query_handler', None),
+                getattr(self, 'tool_registry', None),
+                self._tool_exec(),
+                self._tool_parser(),
+                self._timeout_policy())
+            self.runner = runner
+        return runner
+
+    def _agentic_prompt_and_tools(self) -> tuple:
+        """Build the agentic system prompt + native `tools` array for a query."""
+        return self._agentic_runner().prompt_and_tools()
+
+    def _agentic_call_step(self, messages: list, step_timeout: int, images_to_send: list,
+                           sync_kwargs: dict, on_chunk: object, finalize_step: object,
+                           step_cancel: dict, tool_calls_out: Optional[list] = None) -> tuple:
+        """Run one ReAct model call under a wall-clock timeout."""
+        return self._agentic_runner().call_step(
+            messages, step_timeout, images_to_send, sync_kwargs,
+            on_chunk, finalize_step, step_cancel, tool_calls_out)
+
+    def _find_partial_write(self, step_tool_calls: list, feedback: 'StepFeedback') -> tuple:
+        """Recover the content of an interrupted `write_file` call."""
+        return self._agentic_runner().find_partial_write(step_tool_calls, feedback)
+
+    def _spill_partial_write(self, step_tool_calls: list, feedback: 'StepFeedback',
+                             iteration: int) -> Optional[str]:
+        """Spill an interrupted `write_file` content and build the recovery nudge."""
+        return self._agentic_runner().spill_partial_write(step_tool_calls, feedback, iteration)
+
+    def _agentic_timeout_continue(self, feedback: 'StepFeedback', step_cancel: dict,
+                                  step_start: float, iteration: int, step_timeout: int,
+                                  messages: list) -> tuple:
+        """Handle a timed-out step: abort the request and escalate the budget."""
+        return self._agentic_runner().timeout_continue(
+            feedback, step_cancel, step_start, iteration, step_timeout, messages)
+
+    def _agentic_step_content(self, response: object) -> tuple:
+        """Extract response text + native tool calls from a step response."""
+        return self._agentic_runner().step_content(response)
+
+    def _make_agentic_step_feedback(self) -> 'StepFeedback':
+        """Build and start live feedback for an agentic ReAct step.
+
+        Returns a started `StepFeedback` (module-level class above): `feed` is
+        the `on_chunk` callback, `finalize()` closes the thinking block and
+        stops the watchdog (plus any lingering worker thread) from writing more
+        feedback. Heartbeat dots are token-driven — one dot per
+        `ctx.agentic_heartbeat_tokens` (default 10) streamed tokens — with an
+        idle-fallback watchdog (~1/s once the step has been silent for ~2s) for
+        generations that deliver no chunks at all (e.g. llama.cpp buffering a
+        tool-call response). The accumulated `thought`/`content` and the
+        `content_streamed` flag are read after a timeout to decide
+        abort-vs-continue and whether the answer was already displayed.
         """
-        lazy = getattr(self.ctx, 'lazy_tool', False)
-        text = text.strip()
+        feedback = StepFeedback(
+            self.ctx,
+            show_thinking=self.ctx.agentic_show_thinking,
+            heartbeat_tokens=getattr(self.ctx, 'agentic_heartbeat_tokens', 10) or 10)
+        feedback.start()
+        return feedback
 
-        # Pass 0: Quick check — if text starts with '{', try direct JSON parse.
-        # A proper JSON parser handles braces inside string values correctly,
-        # unlike brace-counting approaches.
-        if text.startswith('{'):
-            try:
-                obj = json.loads(text)
-                if isinstance(obj, dict) and 'tool' in obj:
-                    return [obj]
-            except (json.JSONDecodeError, ValueError):
-                pass
+    # --- Timeout escalation (implementation: AgenticTimeoutPolicy, above) ---
+    # Thin doors kept for the ReAct call site and for tests that drive the
+    # policy through ChatLoop (tests/test_agentic_timeout.py).
+    _timeout_nudge = staticmethod(AgenticTimeoutPolicy.build_nudge)
+    _looks_like_truncated_tool_call = staticmethod(looks_like_truncated_tool_call)
 
-        if lazy:
-            return self._extract_tool_calls_lazy(text)
-        return self._extract_tool_calls_strict(text)
-
-    @staticmethod
-    def _is_stuck(text: str, threshold: float = 0.8) -> bool:
-        """Detect if the model is repeating itself using sliding-window frequency check.
-
-        Checks if the last ~400 chars contain a phrase that appears 3+ times.
-        Uses multiple window sizes to catch variable-length repetition periods.
-        """
-        if len(text) < 200:
-            return False
-        tail = text[-400:]
-        half_len = len(tail) // 2
-        for window_size in (30, 50, 80):
-            if window_size > half_len:
-                continue
-            match_tail = tail[-window_size:]
-            if not match_tail.strip():
-                continue  # whitespace/indentation window — not a stuck loop
-            if tail.count(match_tail) >= 3:
-                return True
-        return False
-
-    @staticmethod
-    def _call_with_timeout(func: object, timeout_sec: int, *args: tuple, **kwargs: dict) -> object:
-        """Call a function with a wall-clock timeout using a daemon thread.
-
-        Args:
-            func: The callable to invoke.
-            timeout_sec: Timeout in seconds.
-            *args, **kwargs: Passed to func.
-
-        Returns:
-            The function's return value, or None on timeout.
-        """
-        result = [None]
-        exception = [None]
-
-        def worker() -> None:
-            """Run the target function in the daemon thread, capturing result/exception."""
-            try:
-                result[0] = func(*args, **kwargs)
-            except Exception as e:
-                exception[0] = e
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-        thread.join(timeout_sec)
-        if thread.is_alive():
-            return None  # timed out
-        if exception[0]:
-            raise exception[0]
-        return result[0]
-
-    def _accumulate_step_feedback(self, state: dict, thought: str, content: str) -> None:
-        """Accumulate thought/content into the step buffer with F5 cap tracking.
-
-        Args:
-            state: The step feedback buffer dict (mutated in place).
-            thought: Reasoning text for this chunk.
-            content: Assistant text for this chunk.
-        """
-        if thought:
-            state["thought"] += thought
-            state["last_activity"] = time.time()
-            # F5: track an estimate of total thinking tokens so a single step
-            # can't silently burn the whole budget on reasoning undetected.
-            # Detection + flag only — we keep accumulating (F4 tail-caps the
-            # nudge) and keep streaming live thinking; the flag is surfaced to
-            # the timeout nudge so a verbose thinker is told to be concise.
-            cap = int(getattr(self.ctx, 'agentic_max_thinking_tokens', 0) or 0)
-            if cap > 0:
-                state["thinking_tokens"] += max(1, len(thought) // 4)
-                if state["thinking_tokens"] >= cap:
-                    state["thinking_capped"] = True
-        if content:
-            state["content"] += content
-            state["last_activity"] = time.time()
-
-    def _render_step_feedback(self, state: dict, thought: str, content: str,
-                              show_thinking: bool) -> None:
-        """Render live feedback for a chunk (thinking stream or heartbeat dot).
-
-        Args:
-            state: The step feedback buffer dict (mutated in place).
-            thought: Reasoning text for this chunk.
-            content: Assistant text for this chunk.
-            show_thinking: Whether to stream the reasoning live.
-
-        Note: when thinking is not streamed, liveness dots come from the
-        watchdog thread started in `_make_agentic_step_feedback`, not from
-        chunk arrival — long tool-call generations may deliver no chunks at
-        all, so a chunk-driven heartbeat would leave the terminal silent.
-        """
-        if show_thinking:
-            if thought:
-                with state["write_lock"]:
-                    if not state["thinking_open"]:
-                        state["thinking_open"] = True
-                        sys.stderr.write(_thinking_open_tag())
-                    sys.stderr.write(thought)
-                    sys.stderr.flush()
-                    state["last_visible"] = time.time()
-            if content:
-                with state["write_lock"]:
-                    if state["thinking_open"]:
-                        sys.stderr.write(_thinking_close_tag())
-                        state["thinking_open"] = False
-                    # Stream the model's visible text live too (chat-style:
-                    # the user chose to see thinking AND what the model says).
-                    # stdout so the answer stays pipeable; the thinking stays
-                    # on stderr as diagnostics. `finalize` skips the final
-                    # re-stream when this already displayed the answer.
-                    sys.stdout.write(content)
-                    sys.stdout.flush()
-                    state["content_streamed"] = True
-                    state["last_visible"] = time.time()
-
-    def _make_agentic_step_feedback(self) -> tuple:
-        """Build live feedback callbacks for an agentic ReAct step.
-
-        Returns (on_chunk, finalize, buffer). `on_chunk(thought, content, is_final)`
-        streams model thinking to stderr in real time when `agentic_show_thinking`
-        is enabled. Heartbeat dots are token-driven: one dot per
-        `ctx.agentic_heartbeat_tokens` (default 10) streamed tokens, so the
-        cadence reflects real generation progress rather than wall-clock. Dots
-        fire in thinking-off mode only — with show_thinking the user already
-        sees reasoning stream live. Because some generations deliver no chunks
-        at all (e.g. llama.cpp buffering a tool-call response for tens of
-        seconds), a daemon watchdog thread also emits a dot (~1/s) once the
-        step has been silent for ~2s, resuming as soon as tokens flow again.
-        While thinking is being streamed live the watchdog holds off (the user
-        already sees progress) unless the step goes truly silent: then the
-        open `<thinking>` block is closed and the watchdog dots keep the user
-        informed. `buffer` is a dict with accumulated `content`/`thought` —
-        used after a timeout to decide abort-vs-continue. `finalize()` closes
-        any open `<thinking>` block and stops the watchdog + lingering worker
-        thread (on timeout) from writing further feedback.
-
-        Returns:
-            (on_chunk, finalize, buffer) tuple of callables + state dict.
-        """
-        state = {
-            "thinking_open": False,
-            "last_activity": time.time(),
-            "last_visible": time.time(),
-            "cancelled": False,
-            "heartbeat_shown": False,
-            "content": "",
-            "thought": "",
-            "thinking_tokens": 0,
-            "thinking_capped": False,
-            "tok_acc": 0,
-            "content_streamed": False,
-            "write_lock": threading.Lock(),
-        }
-        show_thinking = self.ctx.agentic_show_thinking
-        heartbeat_tokens = max(1, int(getattr(self.ctx, 'agentic_heartbeat_tokens', 10) or 10))
-
-        def watchdog() -> None:
-            """Idle-fallback liveness: dot ~1/s while the step is silent.
-
-            Token-driven dots (see on_chunk) cover active streaming; generations
-            that deliver no chunks at all would otherwise leave the terminal
-            silent, so after ~2s without VISIBLE output the watchdog ticks once
-            per second until something is rendered again. This fires even while
-            the `<thinking>` block is open: a silent thinking phase usually means
-            the model has switched to a tool call (native tool-call deltas carry
-            no content, so the block never closes on its own) — the block is
-            closed and the dots keep the user informed. If thinking later
-            resumes, the block reopens. The idle test tracks the last RENDERED
-            output (`last_visible`), not raw chunk arrival: native tool-call
-            deltas stream continuously but render nothing, so chunk activity
-            alone must not starve the heartbeat.
-            """
-            idle_grace = 2.0
-            while not state["cancelled"]:
-                time.sleep(1.0)
-                if state["cancelled"]:
-                    return
-                if time.time() - state["last_visible"] < idle_grace:
-                    continue
-                with state["write_lock"]:
-                    if state["cancelled"]:
-                        return
-                    if state["thinking_open"]:
-                        sys.stderr.write(_thinking_close_tag())
-                        state["thinking_open"] = False
-                    state["heartbeat_shown"] = True
-                    state["last_visible"] = time.time()
-                    sys.stderr.write(".")
-                    sys.stderr.flush()
-
-        threading.Thread(target=watchdog, daemon=True).start()
-
-        def on_chunk(thought: str, content: str, is_final: bool) -> None:
-            """Handle a parsed stream chunk: accumulate + render feedback.
-
-            Args:
-                thought: Reasoning text for this chunk.
-                content: Assistant text for this chunk.
-                is_final: Whether this is the final chunk.
-            """
-            if state["cancelled"]:
-                return
-            # Any chunk counts as generation activity — including native
-            # tool-call deltas, which carry no thought/content. Without this,
-            # the timeout policy would see a busy tool-call write (120s of
-            # silent deltas at ~30 tok/s) as a stalled step and abort.
-            state["last_activity"] = time.time()
-            self._accumulate_step_feedback(state, thought, content)
-            self._render_step_feedback(state, thought, content, show_thinking)
-            # Token-driven dots are the liveness signal for thinking-off mode
-            # only. With show_thinking the user already sees reasoning stream
-            # live; dots after the block closes (while hidden content streams,
-            # re-rendered later by the final query_stream) read as noise.
-            if ((not show_thinking) and (thought or content)
-                    and not state["thinking_open"]):
-                state["tok_acc"] += max(1, len(thought) // 4) + max(1, len(content) // 4)
-                while state["tok_acc"] >= heartbeat_tokens:
-                    state["tok_acc"] -= heartbeat_tokens
-                    state["heartbeat_shown"] = True
-                    with state["write_lock"]:
-                        state["last_visible"] = time.time()
-                        sys.stderr.write(".")
-                        sys.stderr.flush()
-
-        def finalize() -> None:
-            """Close any open thinking block and stop further feedback output."""
-            with state["write_lock"]:
-                if state["thinking_open"]:
-                    sys.stderr.write(_thinking_close_tag())
-                    sys.stderr.flush()
-                    state["thinking_open"] = False
-                elif state["heartbeat_shown"]:
-                    sys.stderr.write("\n")
-                    sys.stderr.flush()
-                    state["heartbeat_shown"] = False
-                state["cancelled"] = True
-
-        return on_chunk, finalize, state
+    def _timeout_policy(self) -> 'AgenticTimeoutPolicy':
+        """Return the timeout policy, creating it for instances built without __init__."""
+        policy = getattr(self, 'timeout_policy', None)
+        if policy is None:
+            policy = AgenticTimeoutPolicy(getattr(self, 'ctx', None), self._tool_parser())
+            self.timeout_policy = policy
+        return policy
 
     def _partial_tool_call_pending(self, partial_text: str) -> bool:
-        """Check whether a timed-out generation contains a parseable tool call.
-
-        Distinguishes "model was narrating prose (safe to retry)" from "model was
-        about to emit a tool call that a retry could re-execute".
-        """
-        if not partial_text or not partial_text.strip():
-            return False
-        try:
-            calls = self.parse_tool_calls(partial_text)
-            if not calls:
-                single = self.parse_tool_call(partial_text)
-                if single:
-                    calls = [single]
-        except Exception:
-            return False
-        return bool(calls)
-
-    @staticmethod
-    def _looks_like_truncated_tool_call(text: str) -> bool:
-        """Detect an in-flight (unbalanced) tool-call JSON opening in partial text.
-
-        `_partial_tool_call_pending` only sees *parseable* tool calls. A model cut
-        off mid-emission leaves an unbalanced `{"tool": ...` opening that would
-        parse as nothing — but echoing that prefix back invites the model to
-        continue the JSON from the middle and emit a malformed call. This catches
-        the unbalanced opening so the nudge can omit partial content.
-        """
-        if not text or not text.strip():
-            return False
-        try:
-            idx = ChatLoop._find_tool_call_brace(text)
-            if idx == -1:
-                return False
-            return ChatLoop._extract_json_balanced(text, idx) is None
-        except Exception:
-            return False
-
-    @staticmethod
-    def _timeout_nudge(partial_content: str, partial_thought: str, pending_tool: bool,
-                       metrics: Optional[dict] = None) -> str:
-        """Build the timeout-continuation nudge message for the model.
-
-        Feeds the model's partial reasoning/content back so it continues from
-        where it left off instead of restarting its analysis from scratch
-        (re-thinking the same problem burns a full generation budget). Partial
-        *content* is omitted when a tool call was pending — feeding a cut-off
-        JSON prefix back invites a malformed JSON continuation. The reasoning is
-        always included; it is the model's internal monologue, not the output
-        channel, so echoing it is safe and preserves the in-flight train of
-        thought.
-
-        Two refinements:
-          - F4: the echoed reasoning is capped from the **tail** (`[-4000:]`,
-            where the model was cut off) rather than the head, so a resumed step
-            continues instead of re-deriving the earlier analysis.
-          - F3: an optional `metrics` dict (`tok_per_sec`, `expired_sec`,
-            `budget_sec`) tells the model its actual generation speed, the timeout
-            it hit, and the new budget in seconds/tokens so it can self-throttle
-            and finish within budget instead of getting killed again.
-
-        Args:
-            partial_content: Partial text content from the step buffer.
-            partial_thought: Partial reasoning (`reasoning_content`) from the step buffer.
-            pending_tool: True if the partial content contained a parseable tool call.
-            metrics: Optional dict with tok_per_sec / expired_sec / budget_sec.
-
-        Returns:
-            str: The nudge message to append as a user turn.
-        """
-        def _cap_tail(text: str, cap: int = 4000) -> str:
-            """Cap text from the tail, marking omitted leading content."""
-            text = text.strip()
-            if len(text) <= cap:
-                return text
-            return "…[earlier reasoning omitted]\n" + text[-cap:]
-
-        lines = []
-        thought = partial_thought.strip()
-        if thought:
-            lines.append("Your reasoning before the interruption:\n" + _cap_tail(thought))
-        if not pending_tool:
-            content = partial_content.strip()
-            if content:
-                lines.append("Your response before the interruption:\n" + _cap_tail(content))
-        base = ("You were interrupted by a timeout while generating your response. "
-                "Please continue your previous response.")
-
-        if metrics and metrics.get("budget_sec"):
-            tps = metrics.get("tok_per_sec", 0.0) or 0.0
-            expired = metrics.get("expired_sec", 0) or 0
-            budget = metrics.get("budget_sec", 0) or 0
-            est_tokens = int(budget * tps)
-            base += ("\n\nGeneration metrics:\n"
-                     f"- ~{tps:.1f} tokens/second\n"
-                     f"- cut off after {expired}s (step timeout)\n"
-                     f"- new budget: {budget}s (~{est_tokens} tokens at your current speed)\n")
-            if metrics.get("thinking_capped"):
-                cap = metrics.get("thinking_cap") or 0
-                if cap:
-                    base += (f"- note: your reasoning exceeded the {cap}-token cap — be more "
-                             "concise and move to a tool call or final answer\n")
-                else:
-                    base += ("- note: your reasoning is very long — be more concise and move to "
-                             "a tool call or final answer\n")
-            base += ("Keep your total thinking + output within that budget — finish as soon "
-                     "as you have enough to act, and prefer a tool call or final answer over "
-                     "re-deriving your full analysis.")
-        if lines:
-            return base + "\n\n" + "\n\n".join(lines)
-        return base
-
-    def _agentic_timeout_state_c(self, iteration: int, expired: int, last_tool: str,
-                                 pending_tool: bool, step_timeout: int, messages: list,
-                                 partial_text: str, partial_thought: str,
-                                 content_is_tool: bool, _nudge_metrics: object) -> tuple:
-        """State C policy: last tool was destructive.
-
-        Args:
-            iteration: Current iteration.
-            expired: The timeout that just expired (seconds).
-            last_tool: Name of the last executed tool.
-            pending_tool: Whether a tool call was in flight in the partial output.
-            step_timeout: The current step budget.
-            messages: Conversation list (nudge appended on continue).
-            partial_text / partial_thought / content_is_tool: Nudge inputs.
-            _nudge_metrics: Callable building the metrics dict for the nudge.
-
-        Returns:
-            (should_break, step_timeout).
-        """
-        if pending_tool:
-            # State C: destructive last tool AND a tool call was in flight —
-            # retrying risks re-executing it.
-            print(colorize(
-                f"\n[Agentic] Step {iteration} timed out after {expired}s. "
-                f"Last tool was '{last_tool}' (destructive) and a tool call was "
-                "pending. Aborting to avoid re-execution.",
-                'error'), file=sys.stderr)
-            return True, step_timeout
-        # Destructive tool already completed; the model was only narrating.
-        # Continue with State B backoff.
-        print(colorize(
-            f"\n[Agentic] Step {iteration} timed out after {expired}s. "
-            f"Last tool was '{last_tool}' (destructive) but no tool call was "
-            "pending — continuing with backoff.",
-            'warning'), file=sys.stderr)
-        return self._agentic_timeout_state_b(
-            iteration, expired, messages, step_timeout,
-            partial_text, partial_thought, content_is_tool, _nudge_metrics)
-
-    def _agentic_timeout_state_a(self, iteration: int, expired: int, messages: list,
-                                 step_timeout: int, making_progress: bool, tok_per_sec: float,
-                                 partial_text: str, partial_thought: str,
-                                 content_is_tool: bool, _nudge_metrics: object) -> tuple:
-        """State A policy: no tool executed yet.
-
-        Extends the budget while the model is actively generating (F3), doubling
-        `agentic_timeout_max` up to `AGENTIC_TIMEOUT_MAX_CEILING` when the ceiling
-        is reached; otherwise retries once and aborts after two consecutive
-        timeouts.
-
-        Args:
-            iteration: Current iteration.
-            expired: The timeout that just expired.
-            messages: Conversation list (nudge appended on continue).
-            step_timeout: The current step budget.
-            making_progress: Whether tokens were still flowing when the timer fired.
-            tok_per_sec: Estimated generation speed.
-            partial_text / partial_thought / content_is_tool: Nudge inputs.
-            _nudge_metrics: Callable building the metrics dict for the nudge.
-
-        Returns:
-            (should_break, step_timeout).
-        """
-        if making_progress and step_timeout < self.ctx.agentic_timeout_max:
-            # F3: model is actively generating (tokens flowing) — extend the
-            # budget instead of retrying at the same (insufficient) timeout,
-            # which would just fail again. Only thinking-only steps benefit
-            # from this; a stalled step falls through to the retry/abort.
-            step_timeout = min(step_timeout * 2, self.ctx.agentic_timeout_max)
-            print(colorize(
-                f"\n[Agentic] Step {iteration} timed out after {expired}s but still "
-                f"generating ({tok_per_sec:.1f} tok/s) — extending to {step_timeout}s.",
-                'warning'), file=sys.stderr)
-            messages.append({'role': 'user', 'content': self._timeout_nudge(
-                partial_text, partial_thought, content_is_tool,
-                metrics=_nudge_metrics(step_timeout)), '_system_nudge': True})
-            return False, step_timeout
-        if making_progress and self.ctx.agentic_timeout_max < AGENTIC_TIMEOUT_MAX_CEILING:
-            # At the ceiling but still generating — raise the ceiling (capped at
-            # the hard ceiling) so a genuinely long think can finish.
-            self.ctx.agentic_timeout_max = min(
-                self.ctx.agentic_timeout_max * 2, AGENTIC_TIMEOUT_MAX_CEILING)
-            step_timeout = self.ctx.agentic_timeout_max
-            print(colorize(
-                f"\n[Agentic] Step {iteration} timed out after {expired}s but still "
-                f"generating ({tok_per_sec:.1f} tok/s) — raising max timeout to "
-                f"{self.ctx.agentic_timeout_max}s.", 'warning'), file=sys.stderr)
-            messages.append({'role': 'user', 'content': self._timeout_nudge(
-                partial_text, partial_thought, content_is_tool,
-                metrics=_nudge_metrics(step_timeout)), '_system_nudge': True})
-            return False, step_timeout
-        # No recent progress, or the hard timeout ceiling is reached →
-        # conservative; abort after two timeouts.
-        if self.ctx.agentic_consecutive_timeouts >= 2:
-            print(colorize(
-                f"\n[Agentic] Step {iteration} timed out twice. Model may be stuck. Aborting.",
-                'error'), file=sys.stderr)
-            return True, step_timeout
-        print(colorize(
-            f"\n[Agentic] Step {iteration} timed out after {expired}s. "
-            "Model may be thinking — retrying.",
-            'warning'), file=sys.stderr)
-        messages.append({'role': 'user', 'content': self._timeout_nudge(
-            partial_text, partial_thought, content_is_tool,
-            metrics=_nudge_metrics(step_timeout)), '_system_nudge': True})
-        return False, step_timeout
-
-    def _agentic_timeout_state_b(self, iteration: int, expired: int, messages: list,
-                                 step_timeout: int, partial_text: str, partial_thought: str,
-                                 content_is_tool: bool, _nudge_metrics: object) -> tuple:
-        """State B policy: a tool already ran — exponential backoff, raising the
-        max ceiling (doubling it, capped at `AGENTIC_TIMEOUT_MAX_CEILING`) when
-        the current budget has reached it.
-
-        Args:
-            iteration: Current iteration.
-            expired: The timeout that just expired.
-            messages: Conversation list (nudge appended on continue).
-            step_timeout: The current step budget.
-            partial_text / partial_thought / content_is_tool: Nudge inputs.
-            _nudge_metrics: Callable building the metrics dict for the nudge.
-
-        Returns:
-            (should_break, step_timeout).
-        """
-        if step_timeout >= self.ctx.agentic_timeout_max:
-            if self.ctx.agentic_timeout_max >= AGENTIC_TIMEOUT_MAX_CEILING:
-                # Hard ceiling reached — stop growing and abort.
-                print(colorize(
-                    f"\n[Agentic] Max timeout ceiling ({AGENTIC_TIMEOUT_MAX_CEILING}s) "
-                    "reached. Aborting agentic query.", 'error'), file=sys.stderr)
-                return True, step_timeout
-            # Already at the ceiling — raise the ceiling by doubling it (capped
-            # at the hard ceiling) rather than aborting, so a slow-but-progressing
-            # model can finish.
-            self.ctx.agentic_timeout_max = min(
-                self.ctx.agentic_timeout_max * 2, AGENTIC_TIMEOUT_MAX_CEILING)
-            step_timeout = self.ctx.agentic_timeout_max
-            print(colorize(
-                f"\n[Agentic] Step {iteration} timed out after {expired}s. "
-                f"Model was executing tools — raising max timeout to {self.ctx.agentic_timeout_max}s.",
-                'warning'), file=sys.stderr)
-        else:
-            step_timeout = min(step_timeout * 2, self.ctx.agentic_timeout_max)
-            print(colorize(
-                f"\n[Agentic] Step {iteration} timed out after {expired}s. "
-                f"Model was executing tools — extending to {step_timeout}s.",
-                'warning'), file=sys.stderr)
-
-        messages.append({'role': 'user', 'content': self._timeout_nudge(
-            partial_text, partial_thought, content_is_tool,
-            metrics=_nudge_metrics(step_timeout)), '_system_nudge': True})
-        return False, step_timeout
+        """Whether a timed-out generation contains a parseable tool call."""
+        return self._tool_parser().has_tool_call(partial_text)
 
     def _handle_agentic_timeout(self, iteration: int, step_timeout: int, messages: list,
                                 partial_text: str = "", partial_thought: str = "",
@@ -14811,240 +18200,46 @@ class ChatLoop:
                                 partial_tokens: Optional[int] = None,
                                 idle_sec: Optional[float] = None,
                                 thinking_capped: bool = False) -> tuple:
-        """Handle a step timeout in the ReAct loop.
+        """Handle a step timeout in the ReAct loop (delegates to AgenticTimeoutPolicy).
 
-        Applies the escalation policy based on model state:
-          State C — last tool was destructive → abort ONLY if a tool call was
-                    pending in the timed-out generation (a retry could re-execute
-                    it). If the model was mid-narration with no tool call pending,
-                    the destructive tool already completed, so continue with backoff.
-          State A — no tool executed yet       → extend if generating, else retry once / abort after two.
-          State B — a tool already ran         → exponential backoff; doubles the max ceiling (up to AGENTIC_TIMEOUT_MAX_CEILING) when reached.
-
-        On any continue, the nudge message includes the model's partial reasoning
-        (and partial content when no tool call was pending) so it resumes rather
-        than regenerating the same analysis — long-thinking models that time out
-        mid-thought would otherwise restart from scratch and hit the same wall.
-        It also reports the model's generation speed and the new budget (F3
-        budget-awareness) so it can self-throttle within the extended timeout.
-        Nudges are tagged `_system_nudge` so they steer the in-flight loop but are
-        excluded from the persisted conversation history.
-
-        Args:
-            iteration: Current ReAct iteration number.
-            step_timeout: The timeout (seconds) that just expired.
-            messages: The conversation list (a nudge message is appended on continue).
-            partial_text: Content generated before the timeout (from the step buffer).
-            partial_thought: Reasoning generated before the timeout (from the step buffer).
-            elapsed_sec: Wall-clock seconds the step actually ran (for tok/s).
-            partial_tokens: Estimated tokens generated before the timeout (for tok/s).
-            idle_sec: Seconds since the last chunk arrived (progress/stall signal).
-
-        Returns:
-            (should_break: bool, new_step_timeout: int)
+        The 3-state escalation (C: destructive last tool, A: no tool yet, B: a
+        tool already ran) and the nudge/backoff rules live in the policy; this
+        door keeps the ReAct call site and the tests on the same path.
         """
-        self.ctx.agentic_consecutive_timeouts += 1
-        last_tool = self.ctx.agentic_last_tool_name
-        expired = step_timeout
-        pending_tool = self._partial_tool_call_pending(partial_text)
-        content_is_tool = pending_tool or self._looks_like_truncated_tool_call(partial_text)
+        return self._timeout_policy().on_timeout(
+            iteration, step_timeout, messages, partial_text=partial_text,
+            partial_thought=partial_thought, elapsed_sec=elapsed_sec,
+            partial_tokens=partial_tokens, idle_sec=idle_sec,
+            thinking_capped=thinking_capped)
 
-        # F3: generation-rate + progress signal from the step buffer.
-        tok_per_sec = 0.0
-        if elapsed_sec and elapsed_sec > 0 and partial_tokens and partial_tokens > 0:
-            tok_per_sec = partial_tokens / elapsed_sec
-        grace = max(0, int(getattr(self.ctx, 'agentic_progress_grace', 15)))
-        making_progress = (idle_sec is not None and idle_sec <= grace and tok_per_sec > 0)
-
-        def _nudge_metrics(budget_sec: int) -> dict:
-            """Build the metrics dict for the timeout nudge message.
-
-            Args:
-                budget_sec: The new extended step budget in seconds.
-            """
-            m = {"tok_per_sec": tok_per_sec, "expired_sec": expired, "budget_sec": budget_sec}
-            if thinking_capped:
-                m["thinking_capped"] = True
-                m["thinking_cap"] = int(getattr(self.ctx, 'agentic_max_thinking_tokens', 0) or 0)
-            return m
-
-        if last_tool in AGENTIC_TIMEOUT_ABORT_TOOLS:
-            return self._agentic_timeout_state_c(
-                iteration, expired, last_tool, pending_tool, step_timeout, messages,
-                partial_text, partial_thought, content_is_tool, _nudge_metrics)
-        if not self.ctx.agentic_has_executed_tool:
-            return self._agentic_timeout_state_a(
-                iteration, expired, messages, step_timeout, making_progress, tok_per_sec,
-                partial_text, partial_thought, content_is_tool, _nudge_metrics)
-        return self._agentic_timeout_state_b(
-            iteration, expired, messages, step_timeout,
-            partial_text, partial_thought, content_is_tool, _nudge_metrics)
-
-    def _agentic_prompt_and_tools(self) -> tuple:
-        """Build the agentic system prompt and native `tools` array for a query.
-
-        Single source of truth for `/tokencount`: whatever this returns is
-        exactly what `_init_agentic_query` puts on the wire, so the preview cannot
-        drift from the request.
-
-        Returns:
-            (system content, native tools array or None, send_tools_api flag).
-        """
-        include_tool_defs = get_tool_format(self.ctx.model) != "openai"
-        tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
-        content = get_agentic_prompt(
-            self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
-            plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)
-        # Path policy up front, positive half only: the allowed roots (plus this
-        # session's grants) are what the model actually needs to plan. The
-        # ask/denied detail and the grant command live behind the `path_policy`
-        # tool, so a denial can stay one line.
-        policy = _acl_policy_block(
-            getattr(self.ctx, "path_acl", None),
-            plan_strict=(self.ctx.plan_mode and not getattr(self.ctx, "plan_run", False)),
-            detail="allowed")
-        if policy:
-            content += "\n\n## Path access\n" + policy
-        tools = None if include_tool_defs else self.tool_registry.openai_tools_spec()
-        return content, tools, not include_tool_defs
+    # --- Outbound wire (implementation: WireView, above) -------------------
+    # Thin doors: the ReAct loop, the command handlers and the tests keep
+    # calling these names; the request accounting lives in one class.
+    def _wire_view(self) -> 'WireView':
+        """Build the request/wire view for the current session state."""
+        return WireView(
+            getattr(self, 'ctx', None),
+            getattr(self, 'query_handler', None),
+            getattr(self, 'tool_registry', None),
+            self._agentic_runner(),
+            lambda: getattr(self, 'messages', None))
 
     def _wire_system_and_tools(self) -> tuple:
-        """Return (system content, native tools array, short mode label).
-
-        Mirrors what the next query will send: chat mode uses `ctx.system_prompt`,
-        agentic and plan modes rebuild the prompt the same way the ReAct loop does.
-
-        Returns:
-            (system content, tools array or None, label such as "agentic, plan").
-        """
-        if not self.ctx.agentic_mode and not self.ctx.plan_mode:
-            return self.ctx.system_prompt, None, "chat"
-        content, tools, _send_tools_api = self._agentic_prompt_and_tools()
-        if self.ctx.plan_mode:
-            label = "agentic, plan run" if getattr(self.ctx, 'plan_run', False) else "agentic, plan"
-        else:
-            label = "agentic"
-        return content, tools, label
+        """Return (system content, native tools array, mode label)."""
+        return self._wire_view().system_and_tools()
 
     def _refresh_context_bar(self, messages: Optional[list[Message]] = None,
                              exact: bool = True) -> int:
-        """Recompute `ctx.current_context_tokens` from the outbound request.
-
-        Single definition for every context view: the status bar, the per-query
-        stats line, `/stats` and `/tokencount` all report the request as the
-        backend sees it — the wire system prompt (with the /maxtokens cap line),
-        the conversation, the native `tools` array and the template framing —
-        instead of the stored message sum, which omits the system-prompt swap and
-        the tools array entirely (measured: 113 stored vs 2770 sent in
-        `/agentic plan`).
-
-        Args:
-            messages: Message list to measure; defaults to the stored history.
-                A local ReAct list works too: its system message is replaced by
-                the wire prompt, never double-counted.
-            exact: Ask the backend for a whole-request count (one round-trip on
-                Strata). False uses the component estimate, for hot paths such as
-                the per-step ReAct bar refresh.
-
-        Returns:
-            The new `ctx.current_context_tokens`.
-        """
-        target = getattr(self, 'messages', None) if messages is None else messages
-        if not target:
-            self.ctx.current_context_tokens = 0
-            return 0
-        try:
-            system, tools, _mode = self._wire_system_and_tools()
-            configured = int(getattr(self.ctx, 'max_output_tokens', DEFAULT_MAX_OUTPUT_TOKENS)
-                             or DEFAULT_MAX_OUTPUT_TOKENS)
-            system = self.query_handler._with_output_cap_line(
-                [{'role': 'system', 'content': system}], configured)[0]['content']
-            if not isinstance(system, str):
-                system = ''
-            self.ctx.current_context_tokens = self.ctx.outbound_tokens(
-                system, target, tools, exact=exact)
-        except Exception:
-            # Never let a failed count break the loop; fall back to the stored sum.
-            self.ctx.current_context_tokens = self.ctx.calculate_context_tokens(target)
-        return self.ctx.current_context_tokens
+        """Recompute the context bar from the outbound request."""
+        return self._wire_view().refresh_context_bar(messages, exact=exact)
 
     def _prompt_overhead_tokens(self, messages: Optional[list[Message]] = None) -> int:
-        """Tokens the request costs beyond the message sum in `messages`.
-
-        Compaction budgets must reserve room for whatever is sent but not stored
-        (system-prompt swap, `tools` array, framing), so the trigger point matches
-        the number the status bar shows.
-
-        Args:
-            messages: Message list to measure; defaults to the stored history.
-
-        Returns:
-            Non-negative overhead in tokens.
-        """
-        target = getattr(self, 'messages', None) if messages is None else messages
-        if not target:
-            return 0
-        stored = self.ctx.calculate_context_tokens(target)
-        return max(0, self._refresh_context_bar(target, exact=False) - stored)
+        """Tokens sent beyond the stored message sum."""
+        return self._wire_view().prompt_overhead_tokens(messages)
 
     def _wire_snapshot(self) -> Dict:
-        """Describe the request the next query would send, for `/tokencount`.
-
-        The system message and the `tools` array are built per query and never
-        stored in `self.messages`, which is why a stored-history token count
-        under-reports the prompt. Everything here mirrors the payload: the system
-        prompt for the active mode (with the /maxtokens cap line), the
-        conversation body, the tools array and the template framing.
-
-        Returns:
-            dict with mode, system, system_tokens, conversation_tokens,
-            tools, tools_tokens, overhead, total and source.
-        """
-        system, tools, mode = self._wire_system_and_tools()
-        configured = int(getattr(self.ctx, 'max_output_tokens', DEFAULT_MAX_OUTPUT_TOKENS)
-                         or DEFAULT_MAX_OUTPUT_TOKENS)
-        system = self.query_handler._with_output_cap_line(
-            [{'role': 'system', 'content': system}], configured)[0]['content']
-        stored = getattr(self, 'messages', None) or []
-        conversation = [m for m in stored if m.get('role') != 'system']
-        system_tokens = self.ctx.tokenize(system)
-        conversation_tokens = self.ctx.calculate_context_tokens(conversation)
-        counted = self.ctx.count_wire_tokens(system, conversation, tools)
-        total = counted['total']
-        source = counted['source']
-        tools_tokens = counted['tools']
-        if tools_tokens is None:
-            # No template-accurate measurement: fall back to tokenizing the
-            # serialized array (exact tokenizer, approximate rendering).
-            tools_tokens = self.ctx.count_tools_tokens(tools)
-        components = system_tokens + conversation_tokens + tools_tokens
-        if total is not None:
-            # Sanity-check the counter: a rendered prompt is not the sum of its
-            # parts (the template shares framing), so `total` may legitimately be
-            # slightly BELOW `components`. Only discard it when it clearly did not
-            # include the tools array (e.g. /apply-template on a build that drops
-            # `tools`), which is the case that would show negative framing.
-            included_tools = total - (system_tokens + conversation_tokens)
-            if (tools_tokens and included_tools < 0.5 * tools_tokens) or total < 0.5 * components:
-                total, source = None, 'none'
-        if total is None:
-            # No whole-request counter: each message carries ~2 role tokens.
-            overhead = 2 * len(conversation)
-            total = components + overhead
-        else:
-            overhead = total - components
-        return {
-            'mode': mode,
-            'system': system,
-            'system_tokens': system_tokens,
-            'conversation_messages': len(conversation),
-            'conversation_tokens': conversation_tokens,
-            'tools': tools,
-            'tools_tokens': tools_tokens,
-            'overhead': overhead,
-            'total': total,
-            'source': source,
-        }
+        """Describe the next request (mode, system, tools, token counts)."""
+        return self._wire_view().snapshot()
 
     def _init_agentic_query(self, final_content: str) -> Optional[tuple]:
         """Initialize messages, logger, and tool format for an agentic query.
@@ -15055,7 +18250,7 @@ class ChatLoop:
         Returns:
             (messages, logger, openai_tools, send_tools_api) or None on early exit.
         """
-        if not getattr(self, 'messages', None):
+        if not self.messages:
             self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
 
         content, openai_tools, send_tools_api = self._agentic_prompt_and_tools()
@@ -15069,820 +18264,86 @@ class ChatLoop:
 
         return messages, logger, openai_tools, send_tools_api
 
-    @staticmethod
-    def _cap_tool_observation(tool_name: str, observation: str, cap: int = 4000) -> str:
-        """Truncate a tool observation to fit the context, self-bounding tools excepted.
+    # --- Tool execution (implementation: ToolExecution, above) --------------
+    # Thin doors kept for the ReAct call sites and for tests that stub them
+    # (`loop._execute_tool_calls = ...` on a bare instance still shadows these).
+    _cap_tool_observation = staticmethod(ToolExecution.cap_observation)
+    _complete_stream_tool_calls = staticmethod(ToolExecution.complete_calls)
 
-        `read_file` already bounds and paginates its own output and its header
-        carries the `next` offset, so a blanket cap would silently drop the
-        continuation pointer and defeat chunked reads of large files. `grep`
-        self-bounds via max_results + per-line truncation, and a blanket cap
-        would eat the "(Results capped...)" note that tells the model to narrow
-        the search.
-        """
-        if tool_name in ("read_file", "grep"):
-            return observation
-        if not observation:
-            return observation
-        if len(observation) > cap:
-            return observation[:cap] + f"\n... [truncated to {cap} chars]"
-        return observation
+    def _tool_exec(self) -> 'ToolExecution':
+        """Return the tool executor, creating it for instances built without __init__."""
+        executor = getattr(self, 'tool_execution', None)
+        if executor is None:
+            executor = ToolExecution(getattr(self, 'ctx', None),
+                                     getattr(self, 'tool_registry', None),
+                                     self._tool_parser())
+            self.tool_execution = executor
+        return executor
 
     def _observation_char_cap(self, messages: list) -> int:
-        """Progressive observation truncation cap based on context usage.
-
-        Args:
-            messages: The conversation list (for context-usage measurement).
-
-        Returns:
-            Max observation length in chars (4000/3000/2000 by usage).
-        """
-        if self.ctx.context_window_size <= 0:
-            return 4000
-        msg_tokens = self.ctx.calculate_context_tokens(messages)
-        usage_ratio = msg_tokens / self.ctx.context_window_size
-        if usage_ratio > 0.7:
-            return 2000
-        if usage_ratio > 0.5:
-            return 3000
-        return 4000
+        """Max observation length for the current context usage."""
+        return self._tool_exec().observation_char_cap(messages)
 
     def _execute_single_tool(self, tool_name: str, tool_args: dict, iteration: int,
                              logger: Optional['AgenticLogger'], messages: list) -> dict:
-        """Run one tool, returning a normalized observation dict.
-
-        Args:
-            tool_name: Tool to execute.
-            tool_args: Tool arguments.
-            iteration: Current iteration.
-            logger: Optional AgenticLogger.
-            messages: The conversation list (for truncation measurement).
-
-        Returns:
-            {"observation": str, "raw": str, "success": bool, "cancelled": bool}.
-        """
-        args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-        print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
-        sys.stderr.flush()
-
-        if self.ctx.agentic_trace:
-            print(colorize(f"\n[Trace] Full args: {json.dumps(tool_args, default=str)[:2000]}", 'muted'), file=sys.stderr)
-
-        t_start = time.time()
-        result = self.tool_registry.execute(tool_name, tool_args)
-        elapsed = time.time() - t_start
-        status = "OK" if result["success"] else "ERROR"
-        print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
-
-        if result["success"]:
-            observation = result["output"]
-        else:
-            full = result["output"] or ""
-            lines = full.split("\n")[:4]
-            context = "\n".join(lines).strip()
-            error_msg = result.get("error", "") or ""
-            observation = f"{context}\nERROR: {error_msg}" if context else f"ERROR: {error_msg}"
-        if not observation:
-            observation = "[Tool returned no output]"
-
-        # read_file pages are exempt — they self-bound and carry a `next`
-        # offset that a blanket cap would silently drop.
-        max_obs_chars = self._observation_char_cap(messages)
-        observation = self._cap_tool_observation(tool_name, observation, max_obs_chars)
-
-        timed_observation = json.dumps({"tool": tool_name, "duration_s": round(elapsed, 1), "success": result["success"], "output": observation})
-        if self.ctx.agentic_trace:
-            trace_out = result["output"] if len(result["output"]) < 2000 else result["output"][:2000] + "..."
-            print(colorize(f"[Trace] Result: {json.dumps({'success': result['success'], 'output': trace_out, 'error': result['error']}, default=str)}", 'muted'), file=sys.stderr)
-
-        if self.ctx.agentic_logging and logger:
-            logger.write(type="result", iteration=iteration, tool_name=tool_name, tool_args=tool_args, result=result)
-
-        cancelled = (not result["success"]) and "Cancelled" in (result.get("error") or "")
-        return {"observation": f"[{tool_name}] {timed_observation}", "raw": observation,
-                "success": result["success"], "cancelled": cancelled}
+        """Run one tool and return a normalized observation dict."""
+        return self._tool_exec().run_single(tool_name, tool_args, iteration, logger, messages)
 
     def _execute_tool_calls(self, tool_calls: list, last_tool_call: Optional[dict],
                             last_tool_count: int, iteration: int,
                             logger: Optional['AgenticLogger'], messages: list,
                             response_text: str, api_tool_calls: list) -> tuple:
-        """Execute a list of tool calls, collecting observations.
+        """Execute a list of tool calls (including the same-tool-loop guard)."""
+        return self._tool_exec().run_calls(
+            tool_calls, last_tool_call, last_tool_count, iteration, logger, messages,
+            response_text, api_tool_calls)
 
-        Re-running the same tool can be legitimate, so the same-tool-loop guard
-        only aborts when the IDENTICAL call (name + arguments) is emitted
-        `AGENTIC_SAME_TOOL_MAX` times consecutively — e.g. a model stuck in a
-        loop. The streak resets whenever the call changes.
+    def _parse_agentic_tool_calls(self, response_text: str, api_tool_calls: list) -> list:
+        """Build normalized tool calls from native API calls or inline JSON text."""
+        return self._tool_exec().parse_calls(response_text, api_tool_calls)
 
-        Args:
-            tool_calls: Normalized tool call list.
-            last_tool_call: Previous executed tool call (for same-tool-loop detection).
-            last_tool_count: Consecutive streak of `last_tool_call` so far.
-            iteration: Current ReAct iteration.
-            logger: Optional AgenticLogger.
-            messages: The conversation list.
-            response_text: The assistant's text for this step.
-            api_tool_calls: Native tool calls from the response.
-
-        Returns:
-            (observations, raw_observations, abort_loop, last_tool_call,
-             last_tool_count, final_answer).
-        """
-        observations = []
-        raw_observations = []
-        abort_loop = False
-        final_answer = ""
-        for tool_call in tool_calls:
-            tool_name = tool_call["tool"]
-            tool_args = tool_call.get("arguments", {})
-            current_call = (tool_name, json.dumps(tool_args, sort_keys=True))
-
-            # Consecutive-call guard: allow repeats (e.g. re-running the same
-            # command), but abort if the identical call is emitted
-            # AGENTIC_SAME_TOOL_MAX times in a row.
-            if current_call == last_tool_call:
-                last_tool_count += 1
-                if last_tool_count >= AGENTIC_SAME_TOOL_MAX:
-                    print(colorize(
-                        f"\n[Agentic] Same tool call emitted {last_tool_count} times "
-                        "in a row, breaking loop.", 'warning'), file=sys.stderr)
-                    final_answer = "[Agentic: model stuck in tool loop]"
-                    abort_loop = True
-                    break
-            else:
-                last_tool_count = 1
-            last_tool_call = current_call
-
-            exec = self._execute_single_tool(tool_name, tool_args, iteration, logger, messages)
-            if exec["cancelled"]:
-                print(colorize("[Agentic] Tool cancelled by user, aborting.", 'warning'), file=sys.stderr)
-                final_answer = "[Agentic query cancelled]"
-                abort_loop = True
-                break
-
-            observations.append(exec["observation"])
-            raw_observations.append(exec["raw"])
-
-        return observations, raw_observations, abort_loop, last_tool_call, last_tool_count, final_answer
+    def _append_tool_messages(self, messages: list[Message], response_text: str, api_tool_calls: list,
+                              tool_calls: list, observations: list, raw_observations: list,
+                              send_tools_api: bool) -> None:
+        """Append the assistant turn and the tool-result messages after executing tools."""
+        self._tool_exec().append_messages(
+            messages, response_text, api_tool_calls, tool_calls,
+            observations, raw_observations, send_tools_api)
 
     def _finalize_agentic_query(self, messages: list, final_answer: str, final_content: str,
                                 send_tools_api: bool, openai_tools: list,
                                 logger: Optional['AgenticLogger'],
                                 iteration: int, response_text: str,
                                 content_streamed: bool = False) -> None:
-        """Stream final answer or execute pending tool call, then update self.messages.
+        """Stream the final answer or run a pending tool call (door, 3.1).
 
-        Args:
-            messages: The ephemeral ReAct message list.
-            final_answer: The answer produced by the loop (may be "").
-            final_content: The user's processed query text.
-            send_tools_api: Whether native tools are in use.
-            openai_tools: Native tool definitions.
-            logger: Optional AgenticLogger.
-            iteration: Final ReAct iteration count.
-            response_text: The last step's response text.
-            content_streamed: True when the step's answer was already streamed
-                live to the terminal (thinking mode) — skips the final
-                query_stream re-generation, which would display it twice and
-                burn a full re-generation.
+        Kept with the legacy signature: tests drive it directly, and the door
+        builds the one-query `ReActState` the runner expects.
         """
-        stream_tool_used = False
-        if not final_answer:
-            final_answer = response_text if response_text else "[Agentic: no answer produced]"
+        state = ReActState(final_content, messages, logger, openai_tools,
+                           send_tools_api, len(self.messages), self.ctx)
+        state.final_answer = final_answer
+        state.iteration = iteration
+        state.response_text = response_text
+        self._agentic_runner().finalize_agentic_query(
+            self, state, content_streamed=content_streamed)
 
-        if logger:
-            logger.write(type="final", final_answer=final_answer)
 
-        pending_tool = self.parse_tool_call(final_answer)
-        if pending_tool:
-            observation = self._finalize_pending_tool(pending_tool)
-            print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
-            self.messages.append({'role': 'assistant', 'content': final_answer})
-            print()
-        else:
-            if not getattr(self, 'messages', None):
-                self.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
-            if content_streamed:
-                # The answer was already streamed live (thinking mode) — the
-                # final query_stream re-generation would display it twice and
-                # burn a full re-generation. Just record it.
-                self.messages.append({'role': 'assistant', 'content': final_answer})
-                print()
-            else:
-                final_messages = list(messages)
-                # Preserve the ReAct list's system message: `_init_agentic_query()`
-                # built it via `_agentic_prompt_and_tools()`, so it carries the
-                # active plan/full prose AND the inline tool-definition block for
-                # non-native models. Overwriting it with `ctx.system_prompt` (the
-                # chat prompt, built without `tool_defs_block`) silently dropped
-                # the tool schemas from the final stream, so a late tool call had
-                # no current schema to form a reliable call.
-                if not (final_messages and final_messages[0].get('role') == 'system'):
-                    # No usable system message (unexpected): rebuild exactly what
-                    # `_init_agentic_query()` would have sent.
-                    system_content, _tools, _send_tools_api = self._agentic_prompt_and_tools()
-                    final_messages.insert(0, {'role': 'system', 'content': system_content})
-                if final_messages and final_messages[-1]['role'] != 'user':
-                    final_messages.append({'role': 'user', 'content':
-                        "Provide your final answer now, based on the tool results above. "
-                        "Do not repeat the original request or call any more tools."})
 
-                stream_kwargs = dict(get_inference_params(self.ctx.model))
-                stream_kwargs["apply_output_cap"] = True
-                stream_tool_calls_out = []
-                if send_tools_api:
-                    stream_kwargs["tools"] = openai_tools
 
-                response = self.query_handler.query_stream(
-                    final_messages, self.ctx.model,
-                    stream_enabled=self.ctx.stream_enabled,
-                    debug=self.ctx.debug_mode,
-                    show_thinking=(not self.ctx.force_no_thinking),
-                    context_size=self.ctx.context_size,
-                    images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
-                    tool_calls_out=stream_tool_calls_out,
-                    no_thinking=self.ctx.force_no_thinking,
-                    reasoning_effort=self.ctx.reasoning_effort,
-                    preserve_thinking=self.ctx.preserve_thinking,
-                    **stream_kwargs
-                )
-                if response or stream_tool_calls_out:
-                    stream_tool_calls = self._collect_stream_tool_calls(stream_tool_calls_out, response)
-                    if stream_tool_calls:
-                        stream_tool_used = self._execute_stream_tool_calls(
-                            stream_tool_calls, stream_tool_calls_out, response, send_tools_api)
-                    else:
-                        self.messages.append({'role': 'assistant', 'content': response})
-                        print()
-                else:
-                    print(colorize(f"\n{final_answer}", 'success'), file=sys.stdout)
 
-        stream_tool_used = self._agentic_streaming_reentry(stream_tool_used, send_tools_api, openai_tools)
-
-    def _finalize_pending_tool(self, pending_tool: dict) -> str:
-        """Execute a single pending tool call found in the final answer.
-
-        Returns the (possibly truncated) observation text.
-        """
-        tool_name = pending_tool["tool"]
-        tool_args = pending_tool.get("arguments", {})
-        args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-        print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr)
-        result = self.tool_registry.execute(tool_name, tool_args)
-        observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
-        if not observation:
-            observation = "[Tool returned no output]"
-        observation = self._cap_tool_observation(tool_name, observation)
-        return observation
-
-    def _collect_stream_tool_calls(self, stream_tool_calls_out: list, response: str) -> list:
-        """Normalize tool calls from the final streaming response.
-
-        Args:
-            stream_tool_calls_out: Accumulated native tool calls from the stream.
-            response: The streamed response text.
-
-        Returns:
-            List of {"tool", "arguments"} dicts.
-
-        Prefers native `tool_calls` out-params; falls back to parsing the text
-        response for inline JSON tool calls.
-        """
-        stream_tool_calls = []
-        if stream_tool_calls_out:
-            for tc in stream_tool_calls_out:
-                func = tc.get("function", {})
-                name = func.get("name", "")
-                args_raw = func.get("arguments", "{}")
-                try:
-                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                except json.JSONDecodeError:
-                    args = {"raw": args_raw}
-                stream_tool_calls.append({"tool": name, "arguments": args})
-        if not stream_tool_calls and response:
-            stream_tool_calls = self.parse_tool_calls(response)
-            if not stream_tool_calls:
-                single = self.parse_tool_call(response)
-                if single:
-                    stream_tool_calls = [single]
-        return stream_tool_calls
-
-    def _append_stream_observations(self, response: str, stream_tool_calls_out: list,
-                                    stream_observations: list, send_tools_api: bool) -> None:
-        """Record assistant tool_call + tool results into self.messages.
-
-        Args:
-            response: The streamed response text.
-            stream_tool_calls_out: Native tool calls from the stream.
-            stream_observations: Per-tool observation strings.
-            send_tools_api: Whether to use OpenAI `tool` role messages.
-        """
-        if stream_tool_calls_out:
-            stream_content = response or ""
-            if not stream_content:
-                inline_parts = []
-                for stc in stream_tool_calls_out:
-                    fn = stc.get("function", {})
-                    args_raw = fn.get("arguments", "{}")
-                    try:
-                        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                    except json.JSONDecodeError:
-                        args = {"raw": args_raw}
-                    inline_parts.append(json.dumps({
-                        "tool": fn.get("name", ""),
-                        "arguments": args
-                    }))
-                stream_content = "\n".join(inline_parts)
-            assistant_msg = {'role': 'assistant', 'content': stream_content}
-            assistant_msg['tool_calls'] = stream_tool_calls_out
-            self.messages.append(assistant_msg)
-        else:
-            self.messages.append({'role': 'assistant', 'content': response})
-        if stream_observations:
-            if send_tools_api and stream_tool_calls_out:
-                for idx, tc in enumerate(stream_tool_calls_out):
-                    obs = stream_observations[idx] if idx < len(stream_observations) else "ERROR: Tool execution declined by the user."
-                    clean_obs = obs.split("] ", 1)[1] if "] " in obs else obs
-                    self.messages.append({
-                        'role': 'tool',
-                        'tool_call_id': tc.get('id', ''),
-                        'name': tc.get('function', {}).get('name', ''),
-                        'content': clean_obs
-                    })
-            else:
-                self.messages.append({'role': 'user', 'content': "Tool result:\n" + "\n---\n".join(stream_observations)})
-        elif send_tools_api and stream_tool_calls_out:
-            for tc in stream_tool_calls_out:
-                self.messages.append({
-                    'role': 'tool',
-                    'tool_call_id': tc.get('id', ''),
-                    'name': tc.get('function', {}).get('name', ''),
-                    'content': "ERROR: Tool execution declined by the user."
-                })
-
-    def _execute_stream_tool_calls(self, stream_tool_calls: list, stream_tool_calls_out: list,
-                                   response: str, send_tools_api: bool) -> bool:
-        """Execute tools produced by the final streaming answer; record self.messages.
-
-        Args:
-            stream_tool_calls: Normalized tool call list.
-            stream_tool_calls_out: Native tool calls from the stream.
-            response: The streamed response text.
-            send_tools_api: Whether to use OpenAI `tool` role messages.
-
-        Returns:
-            True if any tool ran (so the caller can re-enter the loop).
-
-        Runs each tool, prints results, and appends the assistant tool_call and the
-        observations to `self.messages` (OpenAI `tool` role when `send_tools_api`,
-        otherwise a `Tool result:` user note).
-        """
-        stream_observations = []
-        for stream_tc in stream_tool_calls:
-            tool_name = stream_tc["tool"]
-            tool_args = stream_tc.get("arguments", {})
-            args_display = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-            print(colorize(f"\n[Tool] {tool_name}({args_display})", 'warning'), file=sys.stderr, end="")
-            sys.stderr.flush()
-            t_start = time.time()
-            result = self.tool_registry.execute(tool_name, tool_args)
-            if not result["success"] and "Cancelled" in (result.get("error") or ""):
-                print(colorize("[Agentic] Streaming tool sequence cancelled by user, aborting.", 'warning'), file=sys.stderr)
-                break
-            elapsed = time.time() - t_start
-            status = "OK" if result["success"] else "ERROR"
-            print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
-            observation = result["output"] if result["success"] else f"ERROR: {result['error']}"
-            if not observation:
-                observation = "[Tool returned no output]"
-            observation = self._cap_tool_observation(tool_name, observation)
-            print(colorize(f"\n{observation}", 'info'), file=sys.stdout)
-            stream_observations.append(f"[{tool_name}] {observation}")
-
-        self._append_stream_observations(response, stream_tool_calls_out, stream_observations, send_tools_api)
-        print()
-        return bool(stream_observations)
-
-    def _agentic_streaming_reentry(self, stream_tool_used: bool, send_tools_api: bool, openai_tools: list) -> bool:
-        """Re-enter the loop if the final streaming answer itself carried a tool call.
-
-        Args:
-            stream_tool_used: Whether the final stream emitted a tool call.
-            send_tools_api: Whether native tools are in use.
-            openai_tools: Native tool definitions (for the tools API).
-
-        Returns:
-            The final `stream_tool_used` value.
-
-        Some models narrate intent in prose then emit the JSON tool call last, so
-        the streamed finalize can still carry a tool call. Run up to 3 bounded
-        rounds: re-query with updated history, parse tool calls, execute them, feed
-        observations back, until the model answers plainly.
-        """
-        reentry_round = 0
-        while stream_tool_used and reentry_round < 3:
-            reentry_round += 1
-            self._agentic_streaming_reentry_count = getattr(self, '_agentic_streaming_reentry_count', 0) + 1
-            tool_format = get_tool_format(self.ctx.model)
-            include_tool_defs = tool_format != "openai"
-            tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
-            reentry_messages = [{'role': 'system', 'content': get_agentic_prompt(
-                self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
-                plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)}]
-            if len(self.messages) > 1:
-                reentry_messages.extend(self.messages[1:])
-            sync_kwargs = dict(get_inference_params(self.ctx.model))
-            sync_kwargs["apply_output_cap"] = True
-            if send_tools_api:
-                sync_kwargs["tools"] = openai_tools
-            # Stream the reentry like the ReAct steps: a bare query_sync is
-            # non-streaming (no bytes until the whole generation completes) and
-            # has no feedback closure, so a multi-minute reentry left the
-            # terminal silent and hit the 120s urlopen timeout on slow hosts.
-            on_chunk_r, finalize_r, r_buf = self._make_agentic_step_feedback()
-            try:
-                reentry_response = self.query_handler.query_sync_stream(
-                    reentry_messages, self.ctx.model,
-                    stream_enabled=True,
-                    on_chunk=on_chunk_r,
-                    timeout=(getattr(self.ctx, 'agentic_step_timeout', 300) or 300) + 30,
-                    context_size=self.ctx.context_size,
-                    images=([] if self.ctx.supports_vision is False else self.ctx.current_images),
-                    no_thinking=self.ctx.force_no_thinking,
-                    reasoning_effort=self.ctx.reasoning_effort,
-                    preserve_thinking=self.ctx.preserve_thinking,
-                    **sync_kwargs
-                )
-            finally:
-                finalize_r()
-            reentry_text, reentry_api_calls = self._agentic_step_content(reentry_response)
-            if not reentry_text and not reentry_api_calls:
-                break
-            reentry_tools = self._parse_agentic_tool_calls(reentry_text, reentry_api_calls)
-            if not reentry_tools:
-                if reentry_text:
-                    self.messages.append({'role': 'assistant', 'content': reentry_text})
-                    print(colorize(f"\n{reentry_text}", 'success'), file=sys.stdout)
-                    print()
-                break
-            if not reentry_api_calls:
-                # Inline mode: keep the call JSON in the assistant text.
-                self.messages.append({'role': 'assistant', 'content': reentry_text})
-            reentry_observations = []
-            reentry_raw = []
-            for rt in reentry_tools:
-                rt_name = rt["tool"]
-                rt_args = rt.get("arguments", {})
-                args_display = ", ".join(f"{k}={v!r}" for k, v in rt_args.items())
-                print(colorize(f"\n[Tool] {rt_name}({args_display})", 'warning'), file=sys.stderr, end="")
-                sys.stderr.flush()
-                rt_start = time.time()
-                rt_result = self.tool_registry.execute(rt_name, rt_args)
-                rt_elapsed = time.time() - rt_start
-                rt_status = "OK" if rt_result["success"] else "ERROR"
-                print(colorize(f" → {rt_status} ({rt_elapsed:.1f}s)", 'info' if rt_result["success"] else 'error'), file=sys.stderr)
-                rt_obs = rt_result["output"] if rt_result["success"] else f"ERROR: {rt_result['error']}"
-                if not rt_obs:
-                    rt_obs = "[Tool returned no output]"
-                rt_obs = self._cap_tool_observation(rt_name, rt_obs)
-                print(colorize(f"\n{rt_obs}", 'info'), file=sys.stdout)
-                reentry_observations.append(f"[{rt_name}] {rt_obs}")
-                reentry_raw.append(rt_obs)
-            if reentry_observations:
-                if reentry_api_calls:
-                    # Native reentry call — the loop's append machinery keeps
-                    # assistant tool_calls + tool-role pairing template-safe.
-                    self._append_tool_messages(
-                        self.messages, reentry_text, reentry_api_calls,
-                        reentry_tools, reentry_observations, reentry_raw, send_tools_api)
-                else:
-                    self.messages.append({'role': 'user', 'content': "Tool result:\n" + "\n---\n".join(reentry_observations)})
-                stream_tool_used = True
-            else:
-                stream_tool_used = False
-        return stream_tool_used
 
     def _maybe_auto_compact_agentic(self, messages: list[Message]) -> list[Message]:
-        """Auto-compact the ReAct loop's local messages near the context limit.
+        """Auto-compact the ReAct loop's local message list."""
+        return self._conversation().maybe_auto_compact_agentic(messages)
 
-        Agentic steps can balloon the local `messages` array (tool observations,
-        re-queries). When usage passes `ctx.agentic_compact_threshold` (default
-        85%, later than the regular `ctx.compaction_threshold`), mechanically
-        compact with a wider keep-recent window so the loop keeps working memory.
+    def _persist_agentic_history(self, messages: list[Message], agentic_seed_len: int,
+                                 compact: bool = False) -> None:
+        """Merge the ReAct loop's new turns into the stored history."""
+        self._conversation().persist_agentic_history(messages, agentic_seed_len, compact)
 
-        Returns the (possibly compacted) message list.
-        """
-        if self.ctx.context_window_size <= 0:
-            return messages
-        # The local list already carries the agentic system prompt, so the
-        # overhead here is the `tools` array plus template framing.
-        overhead = self._prompt_overhead_tokens(messages)
-        msg_tokens = self.ctx.calculate_context_tokens(messages) + overhead
-        if msg_tokens <= int(self.ctx.context_window_size * self.ctx.agentic_compact_threshold):
-            return messages
-        before_len = len(messages)
-        messages = compact_messages(messages, self.ctx,
-                                    keep_recent=max(8, COMPACTION_KEEP_RECENT),
-                                    overhead_tokens=overhead)
-        print(colorize(f"\n[Auto-compact] Agentic context: {before_len} → {len(messages)} msgs",
-                       'warning'), file=sys.stderr)
-        return messages
 
-    def _persist_agentic_history(self, messages: list[Message], agentic_seed_len: int, compact: bool = False) -> None:
-        """Merge the ReAct loop's local turns back into `self.messages`.
-
-        The local `messages` array is seeded as [agentic system] + self.messages[1:],
-        so the genuinely new turns begin at index `agentic_seed_len`. They are
-        inserted at that boundary — right after the current user query and BEFORE
-        any messages the streaming finalize appended — so the conversation stays
-        chronologically ordered (user query → tool work → final answer).
-
-        `_system_nudge` messages (loop-internal steering, e.g. the empty-response
-        "Please provide a tool call..." fallback) are excluded from persistent
-        history so repeated empty responses don't pile into context forever.
-
-        Also called from the `except KeyboardInterrupt` path so a ^C that aborts a
-        step still preserves every completed tool turn instead of erasing the
-        conversation (the interrupted step's partial output is never in `messages`
-        yet, so it is correctly not persisted).
-
-        Args:
-            messages: The local ReAct message list.
-            agentic_seed_len: Index in `self.messages` where new turns begin.
-            compact: Whether to auto-compact the merged history if over threshold.
-        """
-        if len(messages) > agentic_seed_len:
-            new_turns = [m for m in messages[agentic_seed_len:] if not m.get('_system_nudge')]
-            if new_turns:
-                self.messages[agentic_seed_len:agentic_seed_len] = new_turns
-        sanitize_tool_pairing(self.messages)
-
-        # Persist compaction savings: the ReAct loop may have auto-compacted its
-        # local `messages`, but that compaction is discarded by the merge above.
-        # Re-check the merged history and compact if it exceeds the threshold.
-        if compact and self.ctx.context_window_size > 0:
-            msg_tokens = self.ctx.calculate_context_tokens(self.messages)
-            threshold = int(self.ctx.context_window_size * self.ctx.compaction_threshold)
-            if msg_tokens > threshold:
-                before_len = len(self.messages)
-                self.messages = compact_messages(self.messages, self.ctx)
-                print(colorize(
-                    f"[Auto-compact] Agentic history persisted: {before_len} → {len(self.messages)} msgs",
-                    'warning'), file=sys.stderr)
-
-        # Recalculate context tokens after merging agentic history
-        self._refresh_context_bar()
-
-    def _parse_agentic_tool_calls(self, response_text: str, api_tool_calls: list) -> list:
-        """Build normalized tool calls from either native API calls or inline JSON text.
-
-        Args:
-            response_text: Assistant text content (may embed JSON tool calls).
-            api_tool_calls: Native `tool_calls` from the response (already
-                backend-normalized), or an empty list.
-
-        Returns:
-            list of {"tool": name, "arguments": args} dicts (may be empty).
-        """
-        tool_calls = []
-        if api_tool_calls:
-            for tc in api_tool_calls:
-                func = tc.get('function', {})
-                name = func.get('name', '')
-                args_raw = func.get('arguments', {})
-                if isinstance(args_raw, str):
-                    try:
-                        args = json.loads(args_raw)
-                    except json.JSONDecodeError:
-                        args = {}
-                else:
-                    args = args_raw
-                tool_calls.append({"tool": name, "arguments": args})
-        elif response_text:
-            tool_calls = self.parse_tool_calls(response_text)
-            if not tool_calls:
-                single = self.parse_tool_call(response_text)
-                if single:
-                    tool_calls = [single]
-        return tool_calls
-
-    def _append_tool_messages(self, messages: list[Message], response_text: str, api_tool_calls: list,
-                              tool_calls: list, observations: list, raw_observations: list,
-                              send_tools_api: bool) -> None:
-        """Append the assistant turn and tool-result messages after executing tools.
-
-        Native-tools backends get `tool`-role messages keyed by `tool_call_id`;
-        inline-mode backends get a plain `Tool result:` user note.
-        """
-        combined = "\n---\n".join(observations) if observations else "[No tool output]"
-        assistant_content = response_text
-        # Inline-mode fallback only: when a model returned a native tool call but
-        # carries no text, inline backends need the call echoed in the assistant
-        # text (they ignore the `tool_calls` field). Native-tools backends must
-        # NOT get this — it would render a fake `{"tool": ...}` JSON *alongside*
-        # the real `<tool_call>`, the exact hybrid JSON/XML garbage the native
-        # format block exists to prevent.
-        if api_tool_calls and not response_text and tool_calls and not send_tools_api:
-            assistant_content = json.dumps(tool_calls[0])
-        assistant_msg = {'role': 'assistant', 'content': assistant_content}
-        if api_tool_calls:
-            assistant_msg['tool_calls'] = api_tool_calls
-        messages.append(assistant_msg)
-        if send_tools_api and api_tool_calls and observations:
-            for idx, tc in enumerate(api_tool_calls):
-                obs = raw_observations[idx] if idx < len(raw_observations) else "ERROR: Cancelled or skipped due to preceding tool sequence abort."
-                tool_msg = {'role': 'tool', 'tool_call_id': tc.get('id', ''), 'content': obs}
-                tool_msg['name'] = tc.get('function', {}).get('name', '')
-                messages.append(tool_msg)
-        else:
-            messages.append({'role': 'user', 'content': f"Tool result:\n{combined}"})
-
-    def _agentic_step_header(self, iteration: int, max_iterations: int, logger: Optional['AgenticLogger'], messages: list) -> list:
-        """Print the ReAct step header and auto-compact messages if needed.
-
-        Args:
-            iteration: Current loop iteration (1-based).
-            max_iterations: Loop ceiling.
-            logger: Optional AgenticLogger.
-            messages: The conversation list (returned compacted).
-
-        Returns:
-            The (possibly compacted) message list.
-        """
-        if logger:
-            logger.write(type="iteration", iteration=iteration)
-        print(colorize(f"\r[Agentic] Step {iteration}/{max_iterations}…", 'muted'), file=sys.stderr, end="")
-        sys.stderr.flush()
-
-        messages = self._maybe_auto_compact_agentic(messages)
-        messages = self._force_compact_if_no_output_room(messages)
-        messages = self._refresh_near_full_nudge(messages)
-
-        # Verbose: show payload token count
-        if self.ctx.agentic_verbose and self.ctx.context_window_size > 0:
-            payload_tokens = self.ctx.calculate_context_tokens(messages)
-            pct = payload_tokens / self.ctx.context_window_size
-            print(colorize(f" [{payload_tokens} tokens, {pct:.0%} of ctx]", 'muted'), file=sys.stderr, end="")
-        return messages
-
-    def _agentic_call_step(self, messages: list, step_timeout: int, images_to_send: list,
-                           sync_kwargs: dict, on_chunk: object, finalize_step: object,
-                           step_cancel: dict, tool_calls_out: Optional[list] = None) -> tuple:
-        """Run one ReAct model call under a wall-clock timeout.
-
-        Args:
-            messages: The conversation list to send.
-            step_timeout: Timeout in seconds.
-            images_to_send: Images for the request (empty when vision unsupported).
-            sync_kwargs: Inference params / tools kwargs for the call.
-            on_chunk: Feedback callback from _make_agentic_step_feedback.
-            finalize_step: Closes feedback output on completion/interrupt.
-            step_cancel: Cancel token dict for aborting the request.
-            tool_calls_out: Optional by-ref list kept in sync with the
-                in-flight generation's accumulated tool calls, so a timed-out
-                step can salvage a call that finished writing before the
-                deadline.
-
-        Returns:
-            (response, step_start) where response is the sync-shaped dict, or
-            None on timeout. Raises KeyboardInterrupt after aborting the
-            in-flight request (so the [Interrupted] handler persists turns).
-        """
-        step_start = time.time()
-        try:
-            response = self._call_with_timeout(
-                self.query_handler.query_sync_stream, step_timeout,
-                messages, self.ctx.model,
-                context_size=self.ctx.context_size,
-                images=images_to_send,
-                on_chunk=on_chunk,
-                timeout=step_timeout + 30,
-                cancel=step_cancel,
-                tool_calls_out=tool_calls_out,
-                **sync_kwargs
-            )
-        except KeyboardInterrupt:
-            # F1: stop the zombie generation from streaming to the terminal AND
-            # abort the request, then let the [Interrupted] handler take over
-            # (F2 persists completed turns).
-            _signal_abort(step_cancel)
-            finalize_step()
-            raise
-        finalize_step()
-        return response, step_start
-
-    @staticmethod
-    def _complete_stream_tool_calls(step_tool_calls: list) -> list:
-        """Filter accumulated stream tool calls down to the complete ones.
-
-        A tool call is complete when its arguments are already a dict (Ollama
-        full-object deltas) or a string that parses as JSON (OpenAI-style
-        deltas, which arrive as argument fragments — a fragment stream that has
-        not closed yet does not parse).
-
-        Args:
-            step_tool_calls: Tool calls accumulated during a (timed-out) step.
-
-        Returns:
-            The subset whose arguments parse as complete JSON.
-        """
-        complete = []
-        for tc in step_tool_calls or []:
-            fn = tc.get("function") or {}
-            args = fn.get("arguments", "")
-            if isinstance(args, dict):
-                complete.append(tc)
-            elif isinstance(args, str) and args.strip():
-                try:
-                    json.loads(args)
-                    complete.append(tc)
-                except json.JSONDecodeError:
-                    pass  # still mid-write — not complete
-        return complete
-
-    def _find_partial_write(self, step_tool_calls: list, step_buf: dict) -> tuple:
-        """Locate an interrupted `write_file` call and recover its content.
-
-        Checks native tool-call fragments first (OpenAI-style `arguments`
-        accumulation), then the inline text buffer (JSON-in-content models). Only
-        `write_file` is handled — it is the tool whose argument is both huge and
-        directly reusable as a file.
-
-        Args:
-            step_tool_calls: By-ref native tool calls from the timed-out step.
-            step_buf: The step feedback buffer (partial content text).
-
-        Returns:
-            (content, file_path, content_closed): decoded content, the intended
-            target if it streamed, and whether the content string had closed.
-            ("", "", False) when no interrupted write_file was found.
-        """
-        for tc in step_tool_calls or []:
-            fn = tc.get("function") or {}
-            if fn.get("name") != "write_file":
-                continue
-            args = fn.get("arguments", "")
-            if not isinstance(args, str) or not args:
-                continue  # dict args = complete call (handled by salvage)
-            content, closed = _extract_json_string_field(args, "content")
-            if content:
-                file_path, _ = _extract_json_string_field(args, "file_path")
-                return content, file_path, closed
-        text = (step_buf or {}).get("content", "") or ""
-        if "write_file" in text and '"content"' in text:
-            content, closed = _extract_json_string_field(text, "content")
-            if content:
-                file_path, _ = _extract_json_string_field(text, "file_path")
-                return content, file_path, closed
-        return "", "", False
-
-    def _spill_partial_write(self, step_tool_calls: list, step_buf: dict,
-                             iteration: int) -> Optional[str]:
-        """Spill an interrupted `write_file` content and build the recovery nudge.
-
-        A timed-out `write_file` whose arguments never closed cannot be executed
-        (the JSON is unparsable and a partial file must not be written). Instead
-        the decoded content is saved to a fixed spill file the model can `cp`
-        when the content is complete, or read + finish when it was truncated.
-
-        Args:
-            step_tool_calls: By-ref native tool calls from the timed-out step.
-            step_buf: The step feedback buffer (partial content text).
-            iteration: Current ReAct iteration (for the log line).
-
-        Returns:
-            The nudge message to append, or None when there is nothing to spill.
-        """
-        content, file_path, closed = self._find_partial_write(step_tool_calls, step_buf)
-        if len(content) < UNFINISHED_WRITE_SPILL_MIN:
-            return None
-        try:
-            _ensure_private_dir(CLUSTER_SPILL_DIR)
-            acl = getattr(self.ctx, "path_acl", None)
-            if acl is not None:
-                acl.add("read", "allow", CLUSTER_SPILL_DIR, source="session")
-            spill_file = os.path.join(CLUSTER_SPILL_DIR, UNFINISHED_WRITE_SPILL_NAME)
-            with _open_private(spill_file, "w", encoding="utf-8") as f:
-                f.write(content)
-        except OSError:
-            return None
-        target = f" (intended target: {file_path})" if file_path else ""
-        print(colorize(
-            f"\n[Agentic] Step {iteration} timed out mid-write_file — "
-            f"{'complete' if closed else 'partial'} content ({len(content)} chars) "
-            f"spilled to {spill_file}.", 'warning'), file=sys.stderr)
-        if closed:
-            return (f"[Agentic] The timed-out write_file{target} had fully streamed its "
-                    f"content — only the message was cut off. The complete content "
-                    f"({len(content)} chars) was saved to {spill_file}. Do NOT regenerate "
-                    f'it: place it with run_command("cp {spill_file} <target>"), or '
-                    f"read_file it to verify, then continue.")
-        return (f"[Agentic] The timed-out write_file{target} was cut off mid-content. The "
-                f"partial content decoded so far ({len(content)} chars) was saved to "
-                f"{spill_file} — it is TRUNCATED. Do NOT copy it as-is: read_file it, "
-                f"resume writing the remaining content, and re-issue write_file with the "
-                f"full content.")
-
-    def _salvage_timed_out_tool_call(self, step_tool_calls: list, step_buf: dict,
+    def _salvage_timed_out_tool_call(self, step_tool_calls: list, feedback: 'StepFeedback',
                                      messages: list, send_tools_api: bool,
                                      iteration: int,
                                      logger: Optional['AgenticLogger']) -> tuple:
@@ -15899,7 +18360,7 @@ class ChatLoop:
 
         Args:
             step_tool_calls: By-ref tool calls accumulated by the timed-out step.
-            step_buf: The step feedback buffer (partial narration for history).
+            feedback: The step feedback buffer (partial narration for history).
             messages: Conversation list (assistant turn + tool result appended).
             send_tools_api: Whether native tools are in use.
             iteration: Current iteration (for logging).
@@ -15916,7 +18377,7 @@ class ChatLoop:
         if api_calls:
             unified = self._parse_agentic_tool_calls("", api_calls)
         else:
-            text = step_buf.get("content", "") or ""
+            text = feedback.content or ""
             if text:
                 parsed = self.parse_tool_calls(text)
                 if not parsed:
@@ -15934,7 +18395,7 @@ class ChatLoop:
             logger.write(type="turn", iteration=iteration,
                          model_response="(salvaged from timeout)",
                          tool_call=unified[0])
-        response_text = "" if api_calls else (step_buf.get("content", "") or "")
+        response_text = "" if api_calls else (feedback.content or "")
         observations, raw_observations, abort_loop, _last_call, _last_count, tool_final = self._execute_tool_calls(
             unified, None, 0, iteration, logger, messages, response_text, api_calls)
         if api_calls:
@@ -15950,354 +18411,11 @@ class ChatLoop:
             observations, raw_observations, send_tools_api)
         return True, tool_final
 
-    def _agentic_timeout_continue(self, step_buf: dict, step_cancel: dict, step_start: float,
-                                  iteration: int, step_timeout: int, messages: list) -> tuple:
-        """Handle a timed-out step: abort the request and escalate the budget.
 
-        Args:
-            step_buf: The step feedback buffer (accumulated thought/content).
-            step_cancel: Cancel token dict for the in-flight request.
-            step_start: Wall-clock timestamp when the step began.
-            iteration: Current iteration.
-            step_timeout: Timeout that just expired.
-            messages: The conversation list (may receive a nudge message).
-
-        Returns:
-            (should_break, new_step_timeout).
-        """
-        # Abort the still-running request so the daemon thread dies promptly
-        # and the server slot frees for a retry.
-        _signal_abort(step_cancel)
-        # F3: pass generation timing/rate so the timeout policy can distinguish
-        # "still generating" (extend budget) from "stalled" (conservative
-        # retry / abort), and so the nudge can report the model its speed and
-        # remaining token budget.
-        elapsed = time.time() - step_start
-        partial_tokens = self.ctx.estimate_tokens(
-            (step_buf.get("thought", "") + " " + step_buf.get("content", "")).strip())
-        last_activity = step_buf.get("last_activity")
-        idle_sec = (time.time() - last_activity) if last_activity else None
-        return self._handle_agentic_timeout(
-            iteration, step_timeout, messages,
-            partial_text=step_buf.get("content", ""),
-            partial_thought=step_buf.get("thought", ""),
-            elapsed_sec=elapsed, partial_tokens=partial_tokens, idle_sec=idle_sec,
-            thinking_capped=step_buf.get("thinking_capped", False))
-
-    def _agentic_handle_response_flags(self, response: object, images_to_send: list,
-                                       send_tools_api: bool, messages: list) -> tuple:
-        """Track tokens and handle API/vision/tools errors for a step response.
-
-        Args:
-            response: The sync-shaped response dict.
-            images_to_send: Images included in the request.
-            send_tools_api: Whether native tools are currently enabled.
-            messages: The conversation list (mutated on tools fallback).
-
-        Returns:
-            (status, api_error, send_tools_api) where status is one of
-            "ok" / "api_error" / "vision" / "tools".
-        """
-        # Track tokens from sync response to keep context bar accurate
-        if isinstance(response, dict):
-            if self.ctx.backend == "ollama":
-                _pt = response.get("prompt_eval_count", 0)
-                _et = response.get("eval_count", 0)
-                if _pt > 0:
-                    self.ctx.current_context_tokens = _pt + _et
-            else:
-                # Same definition as the post-query bar: system prompt +
-                # conversation + tools + framing. Estimate only — this runs once
-                # per ReAct step, and an exact count would add a round-trip per
-                # step (llama.cpp re-renders the whole prompt).
-                self._refresh_context_bar(messages, exact=False)
-
-        # Check for API-level errors from query_sync
-        if isinstance(response, dict) and "error" in response and not response.get("choices") and not response.get("message", {}).get("content"):
-            err_msg = response["error"].get("message", "Unknown error") if isinstance(response["error"], dict) else str(response["error"])
-            print(colorize(f"\n[Agentic] API error: {err_msg}", 'error'), file=sys.stderr)
-            return "api_error", err_msg, send_tools_api
-
-        if images_to_send and self.ctx.supports_vision is not False:
-            if check_vision_error(response):
-                self.ctx.supports_vision = False
-                print(colorize("\n[WARNING] Model does not support vision. Stripping images for subsequent queries.", 'warning'), file=sys.stderr)
-                return "vision", "", send_tools_api
-
-        if send_tools_api and check_tools_error(response):
-            send_tools_api = False
-            tool_defs_block = self.tool_registry.get_system_prompt_block()
-            messages[0] = {'role': 'system', 'content': get_agentic_prompt(
-                self.ctx.model, tool_defs_block, include_tool_defs=True,
-                plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)}
-            print(colorize("\n[WARNING] Model does not support native tools API. Falling back to inline tool definitions.", 'warning'), file=sys.stderr)
-            return "tools", "", send_tools_api
-        return "ok", "", send_tools_api
-
-    def _agentic_step_content(self, response: object) -> tuple:
-        """Extract response text + native tool calls from a step response.
-
-        Args:
-            response: The sync-shaped response dict.
-
-        Returns:
-            (response_text, api_tool_calls) tuple (verbose echo printed here
-            unless the text already streamed live under show_thinking).
-        """
-        response_text = _extract_sync_content(self.ctx, response)
-        api_tool_calls = _extract_sync_tool_calls(self.ctx, response)
-
-        # The [Verbose] echo is for when the step text is NOT already on screen.
-        # With show_thinking enabled, `_render_step_feedback` streams the visible
-        # text live to stdout, so echoing it here again would duplicate it.
-        if (self.ctx.agentic_verbose and response_text
-                and not self.ctx.agentic_show_thinking):
-            truncated = len(response_text) > 500
-            display = response_text[:500] + ("..." if truncated else "")
-            print(colorize(f"\n[Verbose] {display}", 'muted'), file=sys.stderr)
-            if truncated:
-                print(colorize(f"[Verbose] ({len(response_text)} total chars, showing first 500)", 'muted'), file=sys.stderr)
-        return response_text, api_tool_calls
-
-    def _agentic_finish_query(self, messages: list, final_answer: str, final_content: str,
-                              send_tools_api: bool, openai_tools: list, logger: Optional['AgenticLogger'],
-                              iteration: int, max_iterations: int, response_text: str,
-                              api_error: str, agentic_seed_len: int,
-                              content_streamed: bool = False) -> None:
-        """Post-loop finalize: print the API-error banner or stream the final answer.
-
-        Args:
-            messages: The loop's message list.
-            final_answer: The answer produced by the loop (may be "").
-            final_content: The user's processed query text.
-            send_tools_api: Whether native tools are in use.
-            openai_tools: Native tool definitions.
-            logger: Optional AgenticLogger.
-            iteration: Final iteration count.
-            max_iterations: Loop ceiling.
-            response_text: The last response text.
-            api_error: Set when the loop aborted on an API error.
-            agentic_seed_len: Seed boundary for history persistence.
-            content_streamed: True when the final answer was already streamed
-                live to the terminal (thinking mode).
-        """
-        # Merge the ReAct loop turns into self.messages BEFORE finalizing so the
-        # final answer stream (and its streaming re-entry) sees the completed
-        # tool work. `_persist_agentic_history` inserts at the seed boundary, so
-        # finalize-appended messages still land after the tool turns.
-        self._persist_agentic_history(messages, agentic_seed_len, compact=True)
-
-        if api_error:
-            # Backend unreachable (connection refused, 5xx, ...). Do NOT re-query
-            # a dead endpoint for a final answer — the finalize path would launch
-            # a second doomed streaming request (another 3 retries) and print a
-            # misleading "[Agentic: no answer produced]". No final answer is
-            # merged, so repeated attempts while the server is down don't
-            # pollute the context.
-            print(colorize(
-                f"\n[Agentic] Backend unreachable ({api_error}). "
-                "Aborted without a final answer; conversation history untouched.",
-                'warning'), file=sys.stderr)
-        else:
-            if iteration >= max_iterations and not final_answer:
-                final_answer = response_text
-
-            self._finalize_agentic_query(messages, final_answer, final_content, send_tools_api, openai_tools, logger, iteration, response_text,
-                                         content_streamed=content_streamed)
-        # The finalize path appends the answer to `self.messages` after the last
-        # request was measured, so re-measure once: otherwise the bar keeps the
-        # pre-answer value and disagrees with /tokencount. Skipped on api_error —
-        # the backend is unreachable and a count round-trip would stall.
-        if not api_error:
-            self._refresh_context_bar()
-
-        if logger:
-            logger.write(type="end", total_iterations=iteration)
 
     def run_agentic_query(self, full_input: str) -> None:
         """ReAct loop: query model, parse tool calls, execute tools, stream final answer."""
-        self._agentic_streaming_reentry_count = 0
-        logger = None
-        try:
-            final_content = process_inline_commands(full_input)
-            if not final_content.strip():
-                return
-
-            if not getattr(self, 'messages', None):
-                sys_msg = {'role': 'system', 'content': self.ctx.system_prompt}
-                self.ctx.stamp_tokens(sys_msg)
-                self.messages = [sys_msg]
-            user_msg = {'role': 'user', 'content': final_content}
-            self.ctx.stamp_tokens(user_msg)
-            self.messages.append(user_msg)
-            agentic_seed_len = len(self.messages)
-            sanitize_tool_pairing(self.messages)
-
-            inited = self._init_agentic_query(final_content)
-            if inited is None:
-                return
-            messages, logger, openai_tools, send_tools_api = inited
-
-            iteration = 0
-            max_iterations = self.ctx.agentic_max_iterations
-            final_answer = ""
-            final_answer_streamed = False
-            last_tool_call = None
-            last_tool_count = 0
-            step_timeout = self.ctx.agentic_step_timeout
-            response_text = ""
-            api_error = ""
-
-            # Reset timeout escalation state at the start of each agentic query.
-            self.ctx.agentic_consecutive_timeouts = 0
-            self.ctx.agentic_has_executed_tool = False
-            self.ctx.agentic_last_tool_name = ""
-
-            while iteration < max_iterations:
-                iteration += 1
-                messages = self._agentic_step_header(iteration, max_iterations, logger, messages)
-
-                images_to_send = [] if self.ctx.supports_vision is False else self.ctx.current_images
-                sync_kwargs = dict(get_inference_params(self.ctx.model))
-                sync_kwargs["apply_output_cap"] = True
-                if send_tools_api:
-                    sync_kwargs["tools"] = openai_tools
-                if self.ctx.force_no_thinking:
-                    sync_kwargs["no_thinking"] = True
-                if self.ctx.reasoning_effort:
-                    sync_kwargs["reasoning_effort"] = self.ctx.reasoning_effort
-                if self.ctx.preserve_thinking is not None:
-                    sync_kwargs["preserve_thinking"] = self.ctx.preserve_thinking
-                step_usage = []
-                sync_kwargs["usage_out"] = step_usage
-                on_chunk, finalize_step, step_buf = self._make_agentic_step_feedback()
-                step_cancel = {"event": threading.Event(), "close": None}
-                step_tool_calls = []   # by-ref view of the in-flight generation's tool calls
-
-                response, step_start = self._agentic_call_step(
-                    messages, step_timeout, images_to_send, sync_kwargs,
-                    on_chunk, finalize_step, step_cancel, step_tool_calls)
-
-                if response is None:
-                    # Abort the in-flight request FIRST, before any salvage /
-                    # escalation decision. `_call_with_timeout` returns None on
-                    # timeout without touching `step_cancel`, and the socket
-                    # timeout is per-read (it never fires while deltas keep
-                    # arriving), so without this the daemon worker keeps the
-                    # generation alive and hogging the server slot. On a
-                    # single-slot backend the next step would then queue behind
-                    # the zombie. `_signal_abort` closes the response (server
-                    # cancels) and sets the event so the worker loop exits.
-                    _signal_abort(step_cancel)
-                    # Timed out. If the generation had already finished writing a
-                    # complete tool call before the deadline, execute it now
-                    # instead of discarding it — a retry would burn another full
-                    # generation re-producing the same JSON and often re-hit the
-                    # timeout (a 20KB write_file takes ~2min at ~30 tok/s).
-                    salvaged, salvaged_final = self._salvage_timed_out_tool_call(
-                        step_tool_calls, step_buf, messages, send_tools_api,
-                        iteration, logger)
-                    if salvaged_final:
-                        final_answer = salvaged_final
-                    if salvaged:
-                        continue
-                    # Timed out — escalate (extend while generating, else retry/abort).
-                    should_break, step_timeout = self._agentic_timeout_continue(
-                        step_buf, step_cancel, step_start, iteration, step_timeout, messages)
-                    if should_break:
-                        break
-                    # Not salvageable and still running: if the interruption cut a
-                    # write_file, spill its (possibly partial) content so it isn't
-                    # discarded, and point the model at it. Appended after the
-                    # timeout nudge so it is the freshest instruction.
-                    spill_note = self._spill_partial_write(
-                        step_tool_calls, step_buf, iteration)
-                    if spill_note:
-                        messages.append({'role': 'user', 'content': spill_note,
-                                         '_system_nudge': True})
-                    response_text = ""
-                    continue
-
-                status, api_error, send_tools_api = self._agentic_handle_response_flags(
-                    response, images_to_send, send_tools_api, messages)
-                if status == "api_error":
-                    break
-                if status in ("vision", "tools"):
-                    continue
-
-                response_text, api_tool_calls = self._agentic_step_content(response)
-
-                if not response_text and not api_tool_calls:
-                    messages.append({'role': 'user', 'content': 'Please provide a tool call or your final answer.',
-                                     '_system_nudge': True})
-                    continue
-
-                # Per-step stats in the chat-mode format: time, prefill/think/
-                # answer rates, and the growing context size — so the user can
-                # interrupt (^C) before the context runs away. Server-reported
-                # timings flow out via `step_usage`; `ctx.update_stats` is
-                # intentionally NOT called (cumulative /stats only counts the
-                # final answer stream, unchanged).
-                stats = self.query_handler.calculate_stats(
-                    time.time() - step_start, response_text,
-                    step_usage[0] if step_usage else None, messages,
-                    thought=step_buf.get("thought", ""))
-                self.query_handler.print_stats_display(stats)
-
-                if response_text and self._is_stuck(response_text):
-                    print(colorize("\n[Agentic] Model appears stuck (repetitive output), aborting.", 'warning'), file=sys.stderr)
-                    break
-
-                tool_calls = self._parse_agentic_tool_calls(response_text, api_tool_calls)
-
-                if logger:
-                    first_call = tool_calls[0] if tool_calls else None
-                    logger.write(type="turn", iteration=iteration, model_response=response_text, tool_call=first_call)
-
-                if not tool_calls:
-                    final_answer = response_text
-                    # The step's content may already be on the terminal
-                    # (thinking mode streams it live) — finalize must then
-                    # skip the final re-generation.
-                    final_answer_streamed = bool(step_buf.get("content_streamed"))
-                    self.ctx.agentic_consecutive_timeouts = 0
-                    break
-
-                observations, raw_observations, abort_loop, last_tool_call, last_tool_count, tool_final = self._execute_tool_calls(
-                    tool_calls, last_tool_call, last_tool_count, iteration, logger, messages, response_text, api_tool_calls
-                )
-                if tool_calls:
-                    self.ctx.agentic_has_executed_tool = True
-                    self.ctx.agentic_last_tool_name = tool_calls[0]["tool"]
-                    self.ctx.agentic_consecutive_timeouts = 0
-                if tool_final:
-                    final_answer = tool_final
-                if abort_loop:
-                    break
-
-                self._append_tool_messages(
-                    messages, response_text, api_tool_calls, tool_calls,
-                    observations, raw_observations, send_tools_api)
-
-            self._agentic_finish_query(
-                messages, final_answer, final_content, send_tools_api, openai_tools,
-                logger, iteration, max_iterations, response_text, api_error, agentic_seed_len,
-                content_streamed=final_answer_streamed)
-
-        except KeyboardInterrupt:
-            # F2: a ^C aborts the current step but must NOT erase the completed
-            # tool work. Persist the finished turns before handing control back;
-            # ChatLoop.run prints the [Interrupted] banner and resumes the prompt.
-            if 'messages' in locals() and 'agentic_seed_len' in locals():
-                self._persist_agentic_history(messages, agentic_seed_len)
-                self._refresh_context_bar(messages, exact=False)
-            raise
-        except Exception as e:
-            print(colorize(f"\n[Agentic] Internal error: {e}", 'error'), file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-        finally:
-            if logger:
-                logger.close()
+        self._agentic_runner().run(self, full_input)
 
     def run_handle_spawnshell(self, full_input: str) -> Optional[bool]:
         """Handle /spawnshell command. Captures shell session and lets user choose what to send."""
@@ -16315,255 +18433,39 @@ class ChatLoop:
         parts = full_input.split()
         subcmd = parts[1] if len(parts) > 1 else ""
 
+        store = self._conversation()
         if subcmd == "list":
-            return self._compact_list()
+            return store.compact_list()
         if subcmd == "threshold":
-            return self._compact_threshold(parts)
+            return store.compact_threshold(parts)
         if subcmd == "now":
-            return self._compact_run()
+            return store.compact_run()
         if subcmd == "force":
             if len(parts) > 2:
-                return self._compact_force_message(parts[2])
-            return self._compact_run(force=True)
+                return store.compact_force_message(parts[2])
+            return store.compact_run(force=True)
         if subcmd == "llm":
-            return self._compact_run(use_llm=True)
+            return store.compact_run(use_llm=True)
         if subcmd in ("", "status"):
-            return self._print_compact_status()
+            return store.compact_status()
 
         print(colorize("[Usage: /compact [now|force [index]|llm|threshold <v>|list|status]]", 'warning'), file=sys.stderr)
         return False
 
-    def _compact_run(self, force: bool = False, use_llm: bool = False) -> bool:
-        """Perform compaction. Returns False to keep the loop running."""
-        if not hasattr(self, 'messages') or len(self.messages) <= 2:
-            print(colorize("[Compact] Nothing to compact.", 'warning'), file=sys.stderr)
-            return False
-        before_len = len(self.messages)
-        before_tokens = self.ctx.calculate_context_tokens(self.messages)
-        # Reserve room for what is sent but not stored (system swap, tools,
-        # framing) so the budget matches the number the status bar shows.
-        overhead = self._prompt_overhead_tokens()
-
-        # Repair any orphaned tool messages before summarizing/compacting so
-        # strict chat templates (gpt-oss) don't reject the resulting history.
-        sanitize_tool_pairing(self.messages)
-
-        # Optional: LLM-summarize large tool results before mechanical compaction.
-        if use_llm:
-            summarize_tool_results(self.messages, self.ctx, self.query_handler)
-            summarized = len([m for m in self.messages
-                              if isinstance(m.get('content', ''), str)
-                              and m.get('content', '').startswith('[Summarized tool result')])
-            if summarized:
-                print(colorize(
-                    f"[Compact] LLM-summarized {summarized} tool result(s).",
-                    'info'), file=sys.stderr)
-            else:
-                print(colorize(
-                    "[Compact] No eligible tool results to summarize.",
-                    'muted'), file=sys.stderr)
-
-        # Overall post-compaction budget (0 = unknown context window).
-        target = (int(self.ctx.context_window_size * COMPACTION_TARGET)
-                  if self.ctx.context_window_size > 0 else 0)
-
-        # Phase 1: LLM memory consolidation (when requested) or sliding-window compaction
-        if use_llm:
-            self.messages = llm_compact_messages(
-                self.messages, self.ctx, self.query_handler,
-                target_tokens=target, overhead_tokens=overhead)
-            llm_summary_used = (
-                len(self.messages) > 1
-                and isinstance(self.messages[1].get('content', ''), str)
-                and self.messages[1]['content'].startswith(LLM_COMPACT_SUMMARY_MARKER)
-            )
-            if llm_summary_used:
-                print(colorize(
-                    "[Compact] LLM-summarized the older conversation.",
-                    'info'), file=sys.stderr)
-            else:
-                print(colorize(
-                    "[Compact] LLM summarization failed; fell back to mechanical compaction.",
-                    'muted'), file=sys.stderr)
-        else:
-            self.messages = compact_messages(self.messages, self.ctx, force=force,
-                                             overhead_tokens=overhead)
-        after_tokens = self.ctx.calculate_context_tokens(self.messages)
-
-        # Phase 2 backstop: if LLM consolidation still could not fit the budget
-        # (e.g. the recent window alone is too large), truncate the largest
-        # message. The memory block itself is now bounded before this point.
-        if target and after_tokens > target and len(self.messages) > 1:
-            after_tokens = self._compact_truncate_largest(target)
-
-        self._refresh_context_bar()
-        print(colorize(
-            f"[Compact] {before_len} → {len(self.messages)} messages, "
-            f"{before_tokens} → {after_tokens} tokens "
-            f"(saved {before_tokens - after_tokens} tokens)",
-            'success'), file=sys.stderr)
-        return False
 
     def _compact_truncate_largest(self, target: int) -> int:
-        """Phase 2: truncate the largest single message to fit the token budget.
+        """Phase 2: truncate the largest message to fit the budget."""
+        return self._conversation().compact_truncate_largest(target)
 
-        If the total still exceeds `target` and one message is large enough to be
-        worth shrinking, cut roughly `excess * 4` characters from its tail.
 
-        Returns the updated total token count (unchanged if nothing was truncated).
-        """
-        total = self.ctx.calculate_context_tokens(self.messages)
-        if total <= target or len(self.messages) <= 1:
-            return total
-        largest_idx = -1
-        largest_tokens = 0
-        for i, msg in enumerate(self.messages):
-            if i == 0:
-                continue
-            t = msg.get('_tokens', self.ctx.estimate_tokens(msg.get('content', '')))
-            if t > largest_tokens:
-                largest_tokens = t
-                largest_idx = i
-        if largest_idx <= 0 or largest_tokens <= target * 0.3:
-            return total
-        msg = self.messages[largest_idx]
-        content = msg.get('content', '')
-        if not isinstance(content, str):
-            return total
-        excess = total - target
-        chars_to_cut = int(excess * 4)  # rough tokens→chars
-        if chars_to_cut <= 0 or chars_to_cut >= len(content):
-            return total
-        role = msg.get('role', 'unknown')
-        msg['content'] = content[:len(content) - chars_to_cut] + \
-            f"\n\n[... truncated {chars_to_cut} chars to fit context budget ...]"
-        msg.pop('_tokens', None)
-        self.ctx.stamp_tokens(msg)
-        updated = self.ctx.calculate_context_tokens(self.messages)
-        print(colorize(
-            f"[Compact] Truncated large {role} message (index {largest_idx}) to fit budget.",
-            'warning'), file=sys.stderr)
-        return updated
-
-    def _compact_list(self) -> bool:
-        """List all messages with sizes (like /tokencount)."""
-        if not hasattr(self, 'messages') or not self.messages:
-            print(colorize("[Compact] No messages in session.", 'warning'), file=sys.stderr)
-            return False
-        total = 0
-        print(colorize("\n--- Conversation Messages ---", 'info'), file=sys.stderr)
-        for i, msg in enumerate(self.messages):
-            role = msg.get('role', 'unknown')
-            name = msg.get('name', '')
-            content = msg.get('content', '')
-            if '_tokens' in msg:
-                tokens = msg['_tokens']
-                marker = "·"
-            else:
-                tokens = self.ctx.estimate_tokens(content) + 2
-                marker = "~"
-            total += tokens
-            preview = content[:60].replace('\n', ' ') if isinstance(content, str) else str(content)[:60]
-            if len(content) > 60:
-                preview += '...'
-            tag = f" ({name})" if name else ""
-            print(colorize(f"  [{i:3d}] {role:10s}{tag:<14s}{marker}{tokens:6d} tok  {preview}",
-                           'info'), file=sys.stderr)
-        print(colorize(f"\n  Total: {total} tokens", 'info'), file=sys.stderr)
-        if self.ctx.context_window_size > 0:
-            pct = total / self.ctx.context_window_size
-            print(colorize(f"  Context: {total}/{self.ctx.context_window_size} ({pct:.1%})", 'info'), file=sys.stderr)
-        print(colorize("--- End ---\n", 'info'), file=sys.stderr)
-        return False
-
-    def _print_compact_status(self) -> bool:
-        """Display current compaction settings like /agentic status."""
-        c = self.ctx
-        print(colorize("\n[Compaction Settings - Use /compact <option> [value]]", 'info'), file=sys.stderr)
-        print("  Subcommands: now, force [index], llm, threshold <v>, list, status", file=sys.stderr)
-        print(file=sys.stderr)
-
-        settings = [
-            ("threshold", "Auto-compact trigger", f"{c.compaction_threshold:.0%}"),
-            ("target",    "Compact down to",      f"{COMPACTION_TARGET:.0%}"),
-            ("keep",      "Recent messages kept", str(COMPACTION_KEEP_RECENT)),
-        ]
-        for name, desc, value in settings:
-            print(f"  > {name:<12} [{value:<8}] {desc}", file=sys.stderr)
-
-        total = c.calculate_context_tokens(getattr(self, 'messages', [])) if hasattr(self, 'messages') else 0
-        if c.context_window_size > 0:
-            pct = total / c.context_window_size
-            threshold_tok = int(c.context_window_size * c.compaction_threshold)
-            print(f"\n  Window size:       {c.context_window_size}", file=sys.stderr)
-            print(f"  Current usage:     {total}/{c.context_window_size} ({pct:.1%})", file=sys.stderr)
-            print(f"  Auto-compact at:   {threshold_tok} tokens", file=sys.stderr)
-        else:
-            print(f"\n  Current usage:     {total} tokens", file=sys.stderr)
-            print("  Window size:       unknown (auto-compact disabled)", file=sys.stderr)
-        print(file=sys.stderr)
-        return False
 
     def _compact_threshold(self, parts: list) -> bool:
-        """Set the auto-compaction trigger threshold.
-
-        Args:
-            parts: Split /compact args (parts[2] is the threshold value).
-        """
-        if len(parts) < 3:
-            print(colorize("[Usage: /compact threshold <value>]  (e.g. 0.6 or 60)", 'warning'), file=sys.stderr)
-            return False
-        try:
-            val = float(parts[2])
-        except ValueError:
-            print(colorize(f"[Compact] '{parts[2]}' is not a number.", 'error'), file=sys.stderr)
-            return False
-        if val > 1:
-            val = val / 100.0
-        if not (0.0 < val < 1.0):
-            print(colorize("[Compact] Threshold must be between 0 and 1 (or 1-99 as percent).", 'error'), file=sys.stderr)
-            return False
-        self.ctx.compaction_threshold = val
-        print(colorize(f"[Compact] Auto-compaction threshold set to {val:.0%}.", 'success'), file=sys.stderr)
-        return False
+        """Set the auto-compaction threshold from /compact args."""
+        return self._conversation().compact_threshold(parts)
 
     def _compact_force_message(self, index_str: str) -> bool:
-        """Force-summarize (tool result) or truncate a single message by index."""
-        try:
-            idx = int(index_str)
-        except ValueError:
-            print(colorize(f"[Compact] '{index_str}' is not a valid index.", 'error'), file=sys.stderr)
-            return False
-        if not hasattr(self, 'messages') or not (0 < idx < len(self.messages)):
-            print(colorize(f"[Compact] Index {idx} out of range (1-{len(self.messages) - 1}).", 'error'), file=sys.stderr)
-            return False
-        msg = self.messages[idx]
-        content = msg.get('content', '')
-        if not isinstance(content, str) or len(content) <= SUMMARIZE_TOOL_MIN_CHARS:
-            print(colorize(f"[Compact] Message {idx} is already small ({len(content)} chars).", 'muted'), file=sys.stderr)
-            return False
-        before = len(content)
-        role = msg.get('role', 'unknown')
-        name = msg.get('name', '')
-        if role == 'tool' and name and name not in SUMMARIZE_TOOL_EXCLUDE:
-            summary = _llm_summarize_tool_result(self.ctx, self.query_handler, name, content)
-            if summary:
-                msg['content'] = f"[Summarized tool result ({name})]\n{summary}"
-                msg.pop('_tokens', None)
-                self.ctx.stamp_tokens(msg)
-                print(colorize(
-                    f"[Compact] LLM-summarized message {idx} ({before} → {len(msg['content'])} chars).",
-                    'success'), file=sys.stderr)
-                return False
-            print(colorize(f"[Compact] LLM summarization failed for message {idx}; truncating instead.", 'warning'), file=sys.stderr)
-        max_chars = 2000
-        msg['content'] = content[:max_chars] + f"\n\n[... truncated {before - max_chars} chars by /compact force ...]"
-        msg.pop('_tokens', None)
-        self.ctx.stamp_tokens(msg)
-        print(colorize(
-            f"[Compact] Truncated message {idx} ({role}) from {before} → {len(msg['content'])} chars.",
-            'success'), file=sys.stderr)
-        return False
+        """Force-summarize or truncate one message by index."""
+        return self._conversation().compact_force_message(index_str)
 
     def run_handle_drop(self, full_input: str) -> Optional[bool]:
         """Handle /drop command to remove specific messages by index."""
@@ -16572,7 +18474,7 @@ class ChatLoop:
             if len(parts) < 2:
                 print(colorize("[Drop] Usage: /drop <index> [index2 ...] — use /tokencount to see indices", 'warning'), file=sys.stderr)
                 return False
-            if not hasattr(self, 'messages') or not self.messages:
+            if not self.messages:
                 print(colorize("[Drop] No messages in session.", 'warning'), file=sys.stderr)
                 return False
 
@@ -16592,17 +18494,11 @@ class ChatLoop:
                     print(colorize(f"[Drop] '{p}' is not a valid index.", 'error'), file=sys.stderr)
                     return False
 
-            indices.sort(reverse=True)
-            dropped_tokens = 0
-            for idx in indices:
-                msg = self.messages[idx]
-                tokens = msg.get('_tokens', self.ctx.estimate_tokens(msg.get('content', '')) + 2)
-                dropped_tokens += tokens
-                del self.messages[idx]
+            removed, dropped_tokens = self._conversation().drop(indices)
 
             self._refresh_context_bar()
             print(colorize(
-                f"[Drop] Removed {len(indices)} message(s), freed ~{dropped_tokens} tokens. "
+                f"[Drop] Removed {removed} message(s), freed ~{dropped_tokens} tokens. "
                 f"Now: {len(self.messages)} msgs, {self.ctx.current_context_tokens} tokens.",
                 'success'), file=sys.stderr)
             return False
@@ -16621,7 +18517,7 @@ class ChatLoop:
         """
         if not full_input.startswith('/tokencount'):
             return None
-        messages = getattr(self, 'messages', None) or []
+        messages = self.messages
         parts = full_input.split()
         unfold_index = None
         if len(parts) > 1:
@@ -16669,64 +18565,12 @@ class ChatLoop:
         return False
 
     def _print_wire_totals(self) -> None:
-        """Print the token cost of the request the next query would send.
-
-        Components come from the backend tokenizer. Where the backend can count
-        the whole request, that count is authoritative and no framing line is
-        shown: a rendered prompt is not additive (the template shares framing
-        between messages and the tools block), so the components can differ from
-        the total by a few percent without either number being wrong.
-        """
-        try:
-            wire = self._wire_snapshot()
-        except Exception as e:
-            print(colorize(f"  [wire] unavailable: {e}", 'warning'), file=sys.stderr)
-            return
-        exact = wire['source'] != 'none'
-        mark = "·" if exact else "~"
-        print(colorize("\n--- Next Request (sent to the server) ---", 'info'), file=sys.stderr)
-        rows = [
-            (f"system prompt ({wire['mode']})", wire['system_tokens']),
-            (f"conversation ({wire['conversation_messages']} msgs)", wire['conversation_tokens']),
-        ]
-        if wire['tools']:
-            size_kb = len(json.dumps(wire['tools'])) / 1024
-            rows.append((f"tools ({len(wire['tools'])} schemas, {size_kb:.1f} KB)", wire['tools_tokens']))
-        else:
-            rows.append(("tools (none in this mode)", 0))
-        for label, tokens in rows:
-            print(colorize(f"  {label:<40} ·{tokens:6d} tok", 'info'), file=sys.stderr)
-        if not exact:
-            print(colorize(f"  {'role/template overhead':<40} ~{wire['overhead']:6d} tok", 'info'), file=sys.stderr)
-        print(colorize(f"  {'-' * 50}", 'muted'), file=sys.stderr)
-        print(colorize(f"  {'Total sent':<40} {mark}{wire['total']:6d} tok", 'info'), file=sys.stderr)
-        source = {
-            'strata': "exact total: server count_tokens; components are counted independently, "
-                      "so shared template framing may make them differ slightly",
-            'llamacpp': "exact total: apply-template + tokenize; same caveat on the components",
-        }.get(wire['source'], "estimate: sum of the components; this backend has no whole-request counter")
-        print(colorize(f"  [{source}]", 'muted'), file=sys.stderr)
-        # Keep the status bar in lockstep with the view just printed: it is the
-        # same request, so there is nothing to reconcile.
-        self.ctx.current_context_tokens = wire['total']
-        if self.ctx.context_window_size > 0:
-            pct = wire['total'] / self.ctx.context_window_size
-            print(colorize(
-                f"  Context: {wire['total']}/{self.ctx.context_window_size} ({pct:.1%})",
-                'info'), file=sys.stderr)
+        """Print the next request's token totals."""
+        self._wire_view().print_wire_totals()
 
     def _print_full_message(self, index: int) -> None:
-        """Print the complete content of message `index` to stderr."""
-        msg = self.messages[index]
-        role = msg.get('role', 'unknown')
-        content = msg.get('content', '')
-        tokens = msg.get('_tokens') or self.ctx.estimate_tokens(content) + 2
-        print(colorize(f"\n--- Full Message [{index}] ({role}, {tokens} tok) ---", 'info'), file=sys.stderr)
-        if isinstance(content, str):
-            print(content, file=sys.stderr)
-        else:
-            print(json.dumps(content, indent=2, ensure_ascii=False), file=sys.stderr)
-        print(colorize(f"--- End Message [{index}] ---", 'info'), file=sys.stderr)
+        """Print the full content of message `index`."""
+        self._wire_view().print_full_message(index)
 
     def run_handle_sessions(self, full_input: str) -> Optional[bool]:
         """Handle /sessions command to list saved sessions."""
@@ -16738,8 +18582,7 @@ class ChatLoop:
                     limit = int(parts[1])
                 except ValueError:
                     pass
-            sm = SessionManager()
-            sessions = sm.list_sessions(limit=limit)
+            sessions = self._conversation().list_sessions(limit)
             if not sessions:
                 print(colorize("[Sessions] No saved sessions found.", 'warning'), file=sys.stderr)
                 return False
@@ -16762,12 +18605,10 @@ class ChatLoop:
                 print(colorize("[Resume] Usage: /resume <session_id>", 'warning'), file=sys.stderr)
                 return False
             session_id = parts[1]
-            sm = SessionManager()
-            session_data = sm.load_session(session_id)
+            session_data = self._conversation().load_session(session_id)
             if not session_data:
                 print(colorize(f"[Resume] Session '{session_id}' not found.", 'error'), file=sys.stderr)
                 return False
-            self.messages = session_data.get('messages', [])
             msg_count = len(self.messages)
             self._refresh_context_bar()
             model = session_data.get('model', '')
@@ -16781,84 +18622,25 @@ class ChatLoop:
     def run_handle_save(self, full_input: str) -> Optional[bool]:
         """Handle /save command to save current session."""
         if full_input.startswith('/save'):
-            if not hasattr(self, 'messages') or len(self.messages) <= 1:
+            if len(self.messages) <= 1:
                 print(colorize("[Save] Nothing to save (empty session).", 'warning'), file=sys.stderr)
                 return False
-            sm = SessionManager()
-            session_id = sm.save_session(self.messages, self.ctx)
+            session_id = self._conversation().save_session()
             print(colorize(f"[Save] Session saved as {session_id}", 'success'), file=sys.stderr)
             return False
         return None
 
     def _force_compact_if_no_output_room(self, messages: list) -> list:
-        """Force-compact when the output reserve leaves no generation room.
-
-        The per-response cap keeps `min(4096, 5% window)` free for compaction;
-        when the prompt already fills the rest, generation has no room. Compact
-        harder (force=True) so the request can still produce a full answer. A
-        rare safety net — normal compaction triggers well before this.
-
-        Args:
-            messages: The conversation list.
-
-        Returns:
-            The (possibly force-compacted) message list.
-        """
-        window = self.ctx.context_window_size
-        if window <= 0:
-            return messages
-        reserve = min(MAX_OUTPUT_RESERVE, int(window * 0.05))
-        overhead = self._prompt_overhead_tokens(messages)
-        prompt_tokens = self.ctx.calculate_context_tokens(messages) + overhead
-        if window - prompt_tokens - reserve > 0:
-            return messages
-        before_len = len(messages)
-        messages = compact_messages(messages, self.ctx, force=True,
-                                    overhead_tokens=overhead)
-        print(colorize(
-            f"[Auto-compact] Forced (no output room): {before_len} → {len(messages)} msgs",
-            'warning'), file=sys.stderr)
-        return messages
+        """Force-compact when generation has no output room."""
+        return self._wire_view().force_compact_if_no_output_room(messages)
 
     def _near_full_nudge_message(self, messages: list) -> Optional[dict]:
-        """Return a transient near-full `_system_nudge` message, or None.
-
-        Fires only past NEAR_FULL_THRESHOLD. Tagged `_system_nudge` so the
-        agentic history merge excludes it (and normal chat never stores it),
-        and `_near_full_nudge` so a prior copy can be replaced cleanly.
-
-        Args:
-            messages: The conversation list used to size the prompt.
-
-        Returns:
-            The nudge message dict, or None when not near full.
-        """
-        window = self.ctx.context_window_size
-        if window <= 0:
-            return None
-        # Include the tools array and system swap: at a 90% threshold a 2K
-        # `tools` block is 6% of a 32K window and the nudge would fire late.
-        prompt_tokens = (self.ctx.calculate_context_tokens(messages)
-                         + self._prompt_overhead_tokens(messages))
-        if prompt_tokens < int(window * NEAR_FULL_THRESHOLD):
-            return None
-        return {'role': 'user', 'content': context_budget_nudge(prompt_tokens, window),
-                '_system_nudge': True, '_near_full_nudge': True}
+        """Return a transient near-full nudge, or None."""
+        return self._wire_view().near_full_nudge_message(messages)
 
     def _refresh_near_full_nudge(self, messages: list) -> list:
-        """Replace any prior near-full nudge with a fresh one if still near full.
-
-        Args:
-            messages: The (agentic) conversation list.
-
-        Returns:
-            The message list with at most one current near-full nudge at the tail.
-        """
-        messages = [m for m in messages if not m.get('_near_full_nudge')]
-        nudge = self._near_full_nudge_message(messages)
-        if nudge:
-            messages.append(nudge)
-        return messages
+        """Replace a prior near-full nudge with a fresh one."""
+        return self._wire_view().refresh_near_full_nudge(messages)
 
     def run_process_query(self, full_input: str) -> None:
         """Process regular user query (non-command input)."""
@@ -16869,7 +18651,7 @@ class ChatLoop:
         if not final_content.strip():
             return
 
-        if not hasattr(self, 'messages'):
+        if not self.messages:
             sys_msg = {'role': 'system', 'content': self.ctx.system_prompt}
             self.ctx.stamp_tokens(sys_msg)
             self.messages = [sys_msg]
@@ -16879,23 +18661,9 @@ class ChatLoop:
         sanitize_tool_pairing(self.messages)
 
         # Auto-compaction: compact if approaching context limit. The trigger and
-        # the budget both include the wire-only overhead (system swap + tools +
-        # framing) so they match the status bar instead of firing late by that
-        # amount.
-        if self.ctx.context_window_size > 0:
-            overhead = self._prompt_overhead_tokens()
-            msg_tokens = self.ctx.calculate_context_tokens(self.messages) + overhead
-            threshold = int(self.ctx.context_window_size * self.ctx.compaction_threshold)
-            if msg_tokens > threshold:
-                before_len = len(self.messages)
-                self.messages = compact_messages(self.messages, self.ctx,
-                                                 overhead_tokens=overhead)
-                after_tokens = self.ctx.calculate_context_tokens(self.messages)
-                print(colorize(
-                    f"[Auto-compact] {before_len} → {len(self.messages)} msgs, "
-                    f"{msg_tokens} → {after_tokens + overhead} tokens (incl. {overhead} request overhead)",
-                    'warning'), file=sys.stderr)
-                self._refresh_context_bar()
+        # the budget include the wire-only overhead (system swap + tools +
+        # framing), so they match the status bar instead of firing late.
+        self._conversation().maybe_auto_compact_chat()
 
         self.messages = self._force_compact_if_no_output_room(self.messages)
 
@@ -17231,12 +18999,14 @@ def check_backend_with_get(url: str, server_marker: str, timeout: float = 1) -> 
     try:
         request = Request(url, method='GET')
         with urlopen(request, timeout=timeout) as response:  # startup-probe
-            my_response = response.read().decode('utf-8', errors='replace')
+            raw_body, _truncated = _bounded_read(response, MAX_PROBE_READ_BYTES)
+            my_response = raw_body.decode('utf-8', errors='replace')
             my_response = my_response.lower()
             if server_marker.lower() in my_response:
                 return True
     except Exception:
         return False
+    return False
 
 
 
@@ -17651,6 +19421,27 @@ def _build_parser() -> argparse.ArgumentParser:
                              '~/.ollamaquery.d/mcp.json)')
     parser.add_argument('--no-mcp', action="store_true",
                         help='Disable MCP tool servers for this session')
+    sandbox_group = parser.add_argument_group('Container sandbox (/agentic sandbox)')
+    sandbox_group.add_argument('--sandbox-image', metavar='IMAGE', default=None,
+                               help='Image for sandboxed tool commands (default: '
+                                    f'{DEFAULT_CONTAINER_IMAGE}, or OLLAMAQUERY_CONTAINER_IMAGE). '
+                                    'Implies container mode.')
+    sandbox_group.add_argument('--sandbox-container', metavar='NAME', default=None,
+                               help='Exec into this already-running container instead of starting '
+                                    'a throwaway one (implies container mode; no pull, and nothing '
+                                    'inside it is created or removed by us)')
+    sandbox_group.add_argument('--sandbox-runtime', choices=['podman', 'docker'], default=None,
+                               help='Container runtime (default: podman, or OLLAMAQUERY_CONTAINER_RT)')
+    sandbox_group.add_argument('--sandbox-memory', metavar='SIZE', default=None,
+                               help=f'Memory ceiling for the throwaway sandbox container '
+                                    f'(default: {DEFAULT_CONTAINER_MEMORY}, or '
+                                    f'OLLAMAQUERY_CONTAINER_MEMORY); ignored with '
+                                    f'--sandbox-container')
+    sandbox_group.add_argument('--sandbox-cpus', metavar='N', default=None,
+                               help=f'CPU ceiling for the throwaway sandbox container '
+                                    f'(default: {DEFAULT_CONTAINER_CPUS}, or '
+                                    f'OLLAMAQUERY_CONTAINER_CPUS); ignored with '
+                                    f'--sandbox-container')
     parser.add_argument('--shell-timeout', type=int, default=5, help='Timeout in seconds for shell commands (default: 5)')
 
     return parser
@@ -17936,6 +19727,31 @@ def _attach_mcp_manager(ctx: CommandContext, args: argparse.Namespace) -> None:
           file=sys.stderr)
 
 
+def _apply_sandbox_args(ctx: 'CommandContext', args: argparse.Namespace) -> None:
+    """Store the --sandbox-* flags on the context, choosing the executor mode.
+
+    Passing an image or a container name means the user wants commands to run
+    there, so container mode is enabled here instead of demanding a second
+    `/agentic sandbox` step (`/agentic sandbox` can still toggle it off).
+
+    Args:
+        ctx: The shared CommandContext.
+        args: Parsed CLI arguments.
+    """
+    if args.sandbox_runtime:
+        ctx.container_runtime = args.sandbox_runtime
+    if args.sandbox_image:
+        ctx.container_image = args.sandbox_image
+    if args.sandbox_container:
+        ctx.container_name = args.sandbox_container
+    if args.sandbox_memory:
+        ctx.container_memory = args.sandbox_memory
+    if args.sandbox_cpus:
+        ctx.container_cpus = args.sandbox_cpus
+    if args.sandbox_image or args.sandbox_container:
+        ctx.executor_mode = "container"
+
+
 def _run_chat(backend: str, base_url: str, target_model: str, args: argparse.Namespace) -> None:
     """Run the interactive chat loop and exit.
 
@@ -17953,6 +19769,7 @@ def _run_chat(backend: str, base_url: str, target_model: str, args: argparse.Nam
     ctx.shell_timeout = args.shell_timeout
     ctx.api_key = _cloud_api_key(backend, args.api_key)
     _attach_mcp_manager(ctx, args)
+    _apply_sandbox_args(ctx, args)
 
     images_list = _prepare_images_list(args)
     if images_list:
@@ -17960,6 +19777,9 @@ def _run_chat(backend: str, base_url: str, target_model: str, args: argparse.Nam
 
     should_stream = not args.no_stream and sys.stdout.isatty()
     loop = ChatLoop(ctx)
+    if ctx.executor_mode == "container":
+        print(colorize(f"[Sandbox] tool commands run in {loop.executor.describe()}"
+                       f" — /agentic sandbox switches back to host", 'info'), file=sys.stderr)
     loop.run(stream_enabled=should_stream, debug=args.debug, images=images_list)
     sys.exit(0)
 

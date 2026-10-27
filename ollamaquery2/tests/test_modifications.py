@@ -5,6 +5,7 @@ Discovery order: environment variable -> localhost -> local network IPs.
 """
 
 import io
+import gzip
 import os
 import re
 import sys
@@ -12,6 +13,7 @@ import time
 import json
 import types
 import signal
+import contextlib
 import socket
 import termios
 import inspect
@@ -1395,6 +1397,41 @@ class TestPreserveThinking(unittest.TestCase):
         self.assertGreater(with_reasoning['_tokens'], plain['_tokens'])
 
 
+def _feedback(content):
+    """Minimal StepFeedback carrying streamed content (no terminal, no thread)."""
+    fb = m.StepFeedback(m.CommandContext(), show_thinking=False)
+    fb.content = content
+    return fb
+
+
+class TestWriteFileUnits(unittest.TestCase):
+    """write_file counts characters, and its messages must say so.
+
+    The cap is a character budget (tokens scale with characters); the success
+    message used to claim "bytes", which is wrong for any non-ASCII content.
+    """
+
+    def _write(self, content, target):
+        fake = types.SimpleNamespace(_ctx=None)
+        with patch.object(m, "_resolve_tool_path", return_value=(target, True, "")), \
+             patch.object(m, "_path_acl_decision", return_value=("allow", "")):
+            return m._tool_handle_write_file(fake, {"file_path": target, "content": content})
+
+    def test_success_message_reports_chars(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = os.path.join(td, "a.txt")
+            result = self._write("héllo", target)
+            self.assertTrue(result["success"], result.get("error"))
+            self.assertEqual(result["output"], f"Written 5 chars to {target}")
+
+    def test_cap_is_expressed_in_chars(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = os.path.join(td, "big.txt")
+            result = self._write("x" * (m.MAX_WRITE_FILE_SIZE + 1), target)
+            self.assertFalse(result["success"])
+            self.assertIn("max 1M chars", result["error"])
+
+
 class TestTimeoutToolSalvage(unittest.TestCase):
     """Salvage of a complete tool call from a timed-out agentic step."""
 
@@ -1436,7 +1473,7 @@ class TestTimeoutToolSalvage(unittest.TestCase):
                        "function": {"name": "write_file",
                                     "arguments": '{"path": "a.md", "content": "# hi"}'}}]
         executed, tool_final = loop._salvage_timed_out_tool_call(
-            step_calls, {"content": ""}, [], True, 2, None)
+            step_calls, _feedback(""), [], True, 2, None)
         self.assertTrue(executed)
         self.assertIsNone(tool_final)
         self.assertEqual(exec_calls, [["write_file"]])
@@ -1452,7 +1489,7 @@ class TestTimeoutToolSalvage(unittest.TestCase):
         step_calls = [{"function": {"name": "write_file",
                                     "arguments": '{"path": "a.md", "content": "# hel'}}]
         executed, tool_final = loop._salvage_timed_out_tool_call(
-            step_calls, {"content": ""}, [], True, 2, None)
+            step_calls, _feedback(""), [], True, 2, None)
         self.assertFalse(executed)
         self.assertIsNone(tool_final)
         loop._execute_tool_calls.assert_not_called()
@@ -1472,7 +1509,7 @@ class TestTimeoutToolSalvage(unittest.TestCase):
         content = ('Let me write the file now.\n'
                    '{"tool": "write_file", "arguments": {"path": "a.md", "content": "# hi"}}')
         executed, _ = loop._salvage_timed_out_tool_call(
-            [], {"content": content}, [], False, 2, None)
+            [], _feedback(content), [], False, 2, None)
         self.assertTrue(executed)
         self.assertEqual(exec_calls, [["write_file"]])
 
@@ -1481,7 +1518,7 @@ class TestTimeoutToolSalvage(unittest.TestCase):
         loop = self._loop()
         loop._execute_tool_calls = MagicMock()
         executed, tool_final = loop._salvage_timed_out_tool_call(
-            [], {"content": "plain narration, no tool call"}, [], True, 2, None)
+            [], _feedback("plain narration, no tool call"), [], True, 2, None)
         self.assertFalse(executed)
         self.assertIsNone(tool_final)
         loop._execute_tool_calls.assert_not_called()
@@ -1570,7 +1607,7 @@ class TestUnfinishedWriteSpill(unittest.TestCase):
         step_calls = [{"function": {
             "name": "write_file",
             "arguments": '{"file_path": "a.md", "content": "# hello'}}]
-        content, file_path, closed = loop._find_partial_write(step_calls, {"content": ""})
+        content, file_path, closed = loop._find_partial_write(step_calls, _feedback(""))
         self.assertEqual(content, "# hello")
         self.assertEqual(file_path, "a.md")
         self.assertFalse(closed)
@@ -1578,7 +1615,7 @@ class TestUnfinishedWriteSpill(unittest.TestCase):
     def test_find_partial_write_inline(self):
         loop = self._loop()
         text = '{"tool": "write_file", "arguments": {"file_path": "a.md", "content": "# hi"}}'
-        content, file_path, closed = loop._find_partial_write([], {"content": text})
+        content, file_path, closed = loop._find_partial_write([], _feedback(text))
         self.assertEqual(content, "# hi")
         self.assertTrue(closed)
 
@@ -1589,7 +1626,7 @@ class TestUnfinishedWriteSpill(unittest.TestCase):
                 step_calls = [{"function": {
                     "name": "write_file",
                     "arguments": '{"content": "' + "x" * 300}}]
-                note = loop._spill_partial_write(step_calls, {"content": ""}, 3)
+                note = loop._spill_partial_write(step_calls, _feedback(""), 3)
                 self.assertIsNotNone(note)
                 self.assertIn("TRUNCATED", note)
                 path = os.path.join(d, m.UNFINISHED_WRITE_SPILL_NAME)
@@ -1604,7 +1641,7 @@ class TestUnfinishedWriteSpill(unittest.TestCase):
                 step_calls = [{"function": {
                     "name": "write_file",
                     "arguments": '{"file_path": "a.py", "content": "' + "y" * 300 + '"}'}}]
-                note = loop._spill_partial_write(step_calls, {"content": ""}, 2)
+                note = loop._spill_partial_write(step_calls, _feedback(""), 2)
                 self.assertIn("cp", note)
                 self.assertIn("a.py", note)
                 self.assertNotIn("TRUNCATED", note)
@@ -1613,13 +1650,13 @@ class TestUnfinishedWriteSpill(unittest.TestCase):
         loop = self._loop()
         step_calls = [{"function": {"name": "write_file",
                                     "arguments": '{"content": "tiny'}}]
-        self.assertIsNone(loop._spill_partial_write(step_calls, {"content": ""}, 1))
+        self.assertIsNone(loop._spill_partial_write(step_calls, _feedback(""), 1))
 
     def test_spill_partial_write_skips_non_write_tool(self):
         loop = self._loop()
         step_calls = [{"function": {"name": "run_command",
                                     "arguments": '{"command": "' + "x" * 300}}]
-        self.assertIsNone(loop._spill_partial_write(step_calls, {"content": ""}, 1))
+        self.assertIsNone(loop._spill_partial_write(step_calls, _feedback(""), 1))
 
     def test_cleanup_removes_unfinished_write(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1886,8 +1923,6 @@ class TestLiveQuery(unittest.TestCase):
         loop = m.ChatLoop(self.ctx)
         loop.run_process_query('Say hello')
         # run_process_query stores assistant response in self.messages
-        self.assertTrue(hasattr(loop, 'messages'),
-                        "messages should be populated after a query")
         self.assertGreaterEqual(len(loop.messages), 2,
                                 "Should have system + user + assistant messages")
         self.assertEqual(loop.messages[-1]['role'], 'assistant')
@@ -2082,7 +2117,50 @@ class TestInputHelpers(unittest.TestCase):
             self.assertTrue(watchdog.is_alive())
         finally:
             m._stop_sigcont_watchdog(watchdog, stop_event, old_mask)
+        # _stop_sigcont_watchdog joins for 1 s internally. Under a loaded machine
+        # (a full suite that also runs live-backend E2E tests in-process, ~9 min,
+        # dozens of threads) the daemon can still be on its way out at that
+        # point, which is scheduling, not a leak — give it a bounded second
+        # chance before calling it one. A watchdog genuinely stuck in sigwait
+        # still fails here, just 5 s later.
+        watchdog.join(timeout=5)
         self.assertFalse(watchdog.is_alive())
+
+    def test_stop_watchdog_is_thread_directed(self):
+        """A process-directed SIGCONT can land elsewhere, so stop must not hang.
+
+        Regression (2026-10-27, seen only when the suite runs with a live
+        backend): `os.kill(getpid(), SIGCONT)` is delivered to *any* thread that
+        does not block SIGCONT — and tool/agentic threads inherit an unblocked
+        mask. The watchdog then stayed blocked in `sigwait` forever, surfacing as
+        `test_start_stop_watchdog_lifecycle` failing on `is_alive()` after the
+        internal 1 s join. Deterministic repro: 3/3 stuck with one such thread
+        alive, 5/5 clean once the signal is thread-directed.
+        """
+        fake = MagicMock()
+        fake.isatty.return_value = True
+        fake.fileno.return_value = 0
+        in_read = threading.Event()
+        release = threading.Event()
+
+        def _unblock_sigcont():
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGCONT})
+            release.wait(5)
+
+        witness = threading.Thread(target=_unblock_sigcont, daemon=True)
+        witness.start()
+        try:
+            time.sleep(0.2)
+            with patch('sys.stdin', fake):
+                watchdog, stop_event, old_mask = m._start_sigcont_watchdog(in_read)
+            time.sleep(0.4)  # let the watchdog reach sigwait
+            m._stop_sigcont_watchdog(watchdog, stop_event, old_mask)
+            watchdog.join(timeout=5)
+            self.assertFalse(watchdog.is_alive(),
+                             "watchdog stuck in sigwait: SIGCONT must be thread-directed")
+        finally:
+            release.set()
+            witness.join(1)
 
     def test_stop_watchdog_noop_when_not_started(self):
         """(None, None, None) from a skipped start must be a safe no-op."""
@@ -2391,6 +2469,20 @@ class TestContextBarConsistency(unittest.TestCase):
         # The bar only needs the total: one round-trip, no tools decomposition.
         self.assertFalse(counter.call_args.kwargs.get('decompose', True))
 
+    def test_bar_falls_back_to_the_stored_sum_on_a_count_failure(self):
+        """A failed count (network/parse) degrades to the stored sum, no crash."""
+        with patch.object(m.CommandContext, 'outbound_tokens',
+                          side_effect=OSError('backend unreachable')):
+            total = self.loop._refresh_context_bar()
+        self.assertEqual(total, self.ctx.calculate_context_tokens(self.loop.messages))
+
+    def test_bar_surfaces_a_collaborator_defect(self):
+        """A broken collaborator (AttributeError) is a bug, not a short bar."""
+        with patch.object(m.CommandContext, 'outbound_tokens',
+                          side_effect=AttributeError('renamed counter')):
+            with self.assertRaises(AttributeError):
+                self.loop._refresh_context_bar()
+
     def test_bar_ignores_the_system_message_in_a_local_react_list(self):
         """A ReAct list carries the agentic prompt at [0]; it must not be added twice."""
         self.ctx.agentic_mode = True
@@ -2400,7 +2492,7 @@ class TestContextBarConsistency(unittest.TestCase):
             captured['system'] = 'AGENTIC PROMPT ' * 8
             return captured['system'], None, 'agentic'
 
-        with patch.object(m.ChatLoop, '_wire_system_and_tools',
+        with patch.object(m.WireView, 'system_and_tools',
                           side_effect=fake_wire_system_and_tools):
             local = [
                 {'role': 'system', 'content': captured.get('system', ''), '_tokens': 1},
@@ -2416,7 +2508,7 @@ class TestContextBarConsistency(unittest.TestCase):
     def test_bar_matches_wire_snapshot(self):
         """Both views share one definition, so they cannot drift apart."""
         self.ctx.agentic_mode = True
-        with patch.object(m.ChatLoop, '_wire_system_and_tools',
+        with patch.object(m.WireView, 'system_and_tools',
                           return_value=('prompt ' * 20, [{'type': 'function'}], 'agentic')), \
              patch.object(m.CommandContext, 'count_tools_tokens', return_value=700):
             snapshot_total = self.loop._wire_snapshot()['total']
@@ -2429,7 +2521,10 @@ class TestContextBarConsistency(unittest.TestCase):
         self.assertEqual(self.loop._refresh_context_bar(), 0)
 
     def test_bar_falls_back_to_stored_sum_when_the_system_build_fails(self):
-        with patch.object(m.ChatLoop, '_wire_system_and_tools', side_effect=RuntimeError('boom')):
+        # OSError is the realistic failure (the exact-count path is a network
+        # round-trip). A programmer error must surface instead — see
+        # test_bar_surfaces_a_collaborator_defect.
+        with patch.object(m.WireView, 'system_and_tools', side_effect=OSError('boom')):
             bar = self.loop._refresh_context_bar()
         self.assertEqual(bar, 12)  # 10 + 2, no crash
 
@@ -2568,6 +2663,23 @@ class TestPromptShow(unittest.TestCase):
         self.assertIn('showing 1 of', out)
         self.assertNotIn('### read_file', out)
 
+    def test_tool_defs_preview_tolerates_bad_data_but_not_a_defect(self):
+        """A malformed definition degrades to {}; a broken registry must surface.
+
+        The preview exists so the request cannot be misrepresented, so a
+        programmer error turning into "this request sends no tools" is a lie —
+        the blind `except Exception` this replaced would have printed exactly
+        that.
+        """
+        with patch.object(m.ToolRegistry, '_plan_allowed_tools',
+                          side_effect=KeyError('shape')):
+            self.assertEqual(self.loop._wire_view()._promptshow_tool_defs(), {})
+
+        with patch.object(m.ToolRegistry, '_plan_allowed_tools',
+                          side_effect=AttributeError('renamed method')):
+            with self.assertRaises(AttributeError):
+                self.loop._wire_view()._promptshow_tool_defs()
+
     def test_unknown_tool_and_subcommand_report_errors(self):
         _, _, err = self._run('/promptshow tools nope')
         self.assertIn("unknown tool 'nope'", err)
@@ -2607,8 +2719,8 @@ class TestPromptShow(unittest.TestCase):
 
     def test_snapshot_failure_falls_back_to_the_direct_build(self):
         """No whole-request counter must not make the command unusable."""
-        with patch.object(m.ChatLoop, '_wire_snapshot', side_effect=RuntimeError('no backend')):
-            wire = self.loop._promptshow_wire()
+        with patch.object(m.WireView, 'snapshot', side_effect=RuntimeError('no backend')):
+            wire = self.loop._wire_view().promptshow_wire()
         self.assertEqual(wire['mode'], 'chat')
         self.assertIn('at most', wire['system'])
         self.assertIsNone(wire['tools'])
@@ -2630,6 +2742,328 @@ class TestPromptShow(unittest.TestCase):
         self.assertEqual(candidates('/promptshow to', 'to'), ['tools'])
         self.assertEqual(candidates('/promptshow tools ', ''), [])
         self.assertEqual(candidates('/showprompt ', ''), m.PROMPTSHOW_SUBCOMMANDS)
+
+
+class _ExplodingFile:
+    """Stand-in for a log stream whose every operation fails."""
+
+    def __init__(self, exc):
+        """Store the exception to raise on each operation."""
+        self.exc = exc
+        self.writes = 0
+
+    def write(self, _data):
+        """Raise the configured exception instead of writing."""
+        self.writes += 1
+        raise self.exc
+
+    def flush(self):
+        """Raise the configured exception instead of flushing."""
+        raise self.exc
+
+    def close(self):
+        """Raise the configured exception instead of closing."""
+        raise self.exc
+
+
+class TestAgenticLoggerResilience(unittest.TestCase):
+    """A logging failure must never abort the agentic loop (TODO 4.3).
+
+    `AgenticLogger.write` sits on the ReAct step path (step header, turn,
+    every tool result, finalize), so an OSError escaping it killed a working
+    query mid-tool-use. Logging is now best-effort: one warning, then a
+    disabled logger, and every later call is a no-op.
+    """
+
+    def _disabled_warning_count(self, stderr_text):
+        """Count the single-shot warning in captured stderr."""
+        return stderr_text.count("[Agentic] logging disabled")
+
+    def test_write_failure_is_swallowed_and_warns_once(self):
+        """A failing write returns normally, disables logging, warns once."""
+        log = object.__new__(m.AgenticLogger)
+        log.disabled = False
+        log.path = "somewhere.jsonl"
+        log.file = _ExplodingFile(OSError(28, "No space left on device"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for _ in range(3):
+                log.write(type="turn", iteration=1)
+        self.assertTrue(log.disabled)
+        self.assertIsNone(log.file)
+        self.assertEqual(self._disabled_warning_count(err.getvalue()), 1)
+        self.assertIn("No space left on device", err.getvalue())
+
+    def test_open_failure_disables_instead_of_raising(self):
+        """An unpullable log directory constructs a disabled logger."""
+        with tempfile.TemporaryDirectory() as td, \
+             patch.dict(os.environ, {"HOME": td}), \
+             patch.object(m, "_open_private", side_effect=OSError(30, "Read-only file system")):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                log = m.AgenticLogger()
+                log.write(type="start", user_input="hi")
+                log.close()
+        self.assertTrue(log.disabled)
+        self.assertIsNone(log.file)
+        self.assertEqual(log.path, "")
+        self.assertEqual(self._disabled_warning_count(err.getvalue()), 1)
+
+    def test_disabled_logger_write_and_close_are_noops(self):
+        """write()/close() on a disabled logger never touch the filesystem."""
+        log = object.__new__(m.AgenticLogger)
+        log.disabled = True
+        log.path = ""
+        log.file = None
+        with contextlib.redirect_stderr(io.StringIO()):
+            log.write(type="turn")
+            log.close()
+            log.close()
+        self.assertTrue(log.disabled)
+        self.assertIsNone(log.file)
+
+    def test_close_failure_is_swallowed(self):
+        """A failing close() on the exit path does not raise."""
+        log = object.__new__(m.AgenticLogger)
+        log.disabled = False
+        log.path = "somewhere.jsonl"
+        log.file = _ExplodingFile(OSError(5, "Input/output error"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            log.close()
+        self.assertTrue(log.disabled)
+        self.assertIsNone(log.file)
+        self.assertEqual(self._disabled_warning_count(err.getvalue()), 1)
+
+    def test_unserializable_payload_disables_logging(self):
+        """A circular payload (ValueError) is treated like an I/O failure."""
+        log = object.__new__(m.AgenticLogger)
+        log.disabled = False
+        log.path = "somewhere.jsonl"
+        log.file = io.StringIO()
+        cyclic = {}
+        cyclic["self"] = cyclic
+        with contextlib.redirect_stderr(io.StringIO()):
+            log.write(type="result", result=cyclic)
+        self.assertTrue(log.disabled)
+        self.assertIsNone(log.file)
+
+    def test_working_logger_still_writes_jsonl(self):
+        """The healthy path is unchanged: one timestamped JSON line per write."""
+        with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {"HOME": td}):
+            log = m.AgenticLogger()
+            try:
+                self.assertFalse(log.disabled)
+                log.write(type="turn", iteration=2)
+            finally:
+                log.close()
+            self.assertFalse(log.disabled)
+            with open(log.path, encoding="utf-8") as f:
+                entries = [json.loads(line) for line in f if line.strip()]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["type"], "turn")
+        self.assertEqual(entries[0]["iteration"], 2)
+        self.assertIn("timestamp", entries[0])
+
+
+# ============================================================================
+# 1.1 — bounded network reads
+# ============================================================================
+
+class _Body:
+    """Binary file-like body whose read(n) honours n and records the sizes."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.sizes = []
+
+    def read(self, size: int = -1) -> bytes:
+        self.sizes.append(size)
+        if size < 0:
+            chunk, self.data = self.data, b""
+            return chunk
+        chunk, self.data = self.data[:size], self.data[size:]
+        return chunk
+
+
+class TestBoundedNetworkReads(unittest.TestCase):
+    """The four read sites stop at a ceiling: spill protects context, not RAM."""
+
+    def test_bounded_read_returns_prefix_and_flag(self):
+        body = _Body(b"A" * 150)
+        data, truncated = m._bounded_read(body, 100)
+        self.assertEqual(len(data), 100)
+        self.assertTrue(truncated)
+        self.assertEqual(body.sizes, [101])
+
+    def test_bounded_read_exact_limit_is_complete(self):
+        data, truncated = m._bounded_read(_Body(b"B" * 100), 100)
+        self.assertEqual(data, b"B" * 100)
+        self.assertFalse(truncated)
+
+    def test_bounded_read_empty_source(self):
+        self.assertEqual(m._bounded_read(_Body(b""), 10), (b"", False))
+
+    def test_fetch_and_convert_url_marks_a_truncated_page(self):
+        resp = MagicMock()
+        resp.__enter__.return_value = resp
+        resp.info.return_value.get_content_charset.return_value = "utf-8"
+        resp.read.side_effect = [b"<html><body><p>" + (b"A" * 200) + b"</p></body></html>"]
+        with patch.object(m, "MAX_URL_FETCH_BYTES", 60), \
+             patch("ollamaquery2._request_with_retry", return_value=resp):
+            text, tool = m.fetch_and_convert_url("https://big.example")
+        self.assertEqual(tool, "htmlstrip")
+        self.assertIn("[truncated at 60 bytes", text)
+        self.assertEqual(resp.read.call_args[0][0], 61)
+
+    def test_fetch_and_convert_url_small_page_has_no_marker(self):
+        resp = MagicMock()
+        resp.__enter__.return_value = resp
+        resp.info.return_value.get_content_charset.return_value = "utf-8"
+        resp.read.side_effect = [b"<html><body>small page</body></html>"]
+        with patch("ollamaquery2._request_with_retry", return_value=resp):
+            text, tool = m.fetch_and_convert_url("https://small.example")
+        self.assertIn("small page", text)
+        self.assertNotIn("[truncated", text)
+
+    @staticmethod
+    def _fake_curl(body=b"", returncode=0):
+        """A stand-in for the Popen curl process (wait() returns the code)."""
+        fake = MagicMock()
+        fake.stdout = io.BytesIO(body)
+
+        def _wait(timeout=None):
+            return returncode
+        fake.wait.side_effect = _wait
+        return fake
+
+    def test_curl_fetch_text_uses_max_filesize(self):
+        """--max-filesize stays as an early abort, but the read is what bounds."""
+        fake = self._fake_curl(b"<html>ok</html>")
+        with patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
+             patch.object(m.subprocess, "Popen", return_value=fake) as popen:
+            text, truncated = m._curl_fetch_text("https://x.example", limit=1234)
+        self.assertEqual((text, truncated), ("<html>ok</html>", False))
+        argv = popen.call_args[0][0]
+        self.assertIn("--max-filesize", argv)
+        self.assertEqual(argv[argv.index("--max-filesize") + 1], "1234")
+
+    def test_curl_fetch_text_bounds_the_body_and_kills_curl(self):
+        """A body over the cap is a prefix and curl is killed, not buffered.
+
+        Regression for the review's P1: `--max-filesize` counts wire bytes, so
+        a `--compressed` body that inflates past the limit passed the check and
+        was decompressed into capture_output — unbounded memory, limit ignored.
+        """
+        fake = self._fake_curl(b"x" * 5000)
+        with patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
+             patch.object(m.subprocess, "Popen", return_value=fake):
+            text, truncated = m._curl_fetch_text("https://x.example", limit=100)
+        self.assertEqual(len(text), 100)
+        self.assertTrue(truncated)
+        fake.kill.assert_called_once()
+
+    def test_curl_fetch_text_bounds_a_gzip_bomb_end_to_end(self):
+        """A small gzip body inflating past the limit stays bounded (live curl).
+
+        The compressed size is far under the limit, so curl's wire-byte check
+        never fires — only the bounded read can stop it.
+        """
+        if not m.shutil.which("curl"):
+            self.skipTest("curl not installed")
+        body = gzip.compress(b"<html><body>" + b"y" * (2 * 1024 * 1024) + b"</body></html>", 9)
+        limit = 100_000
+        self.assertLess(len(body), limit)          # wire size under the limit
+        self.assertGreater(2 * 1024 * 1024, limit)  # inflated size way over it
+
+        import socket
+        import threading
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("127.0.0.1", 0))
+        except OSError as exc:      # sandboxed CI: binding a port is forbidden
+            srv.close()
+            self.skipTest(f"cannot bind a local port here: {exc}")
+        srv.listen(4)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                try:
+                    conn.recv(65536)
+                    conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n"
+                                 b"Content-Encoding: gzip\r\n"
+                                 b"Content-Length: %d\r\n\r\n" % len(body) + body)
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            text, truncated = m._curl_fetch_text(
+                "http://127.0.0.1:%d/x" % srv.getsockname()[1], limit=limit, timeout=10)
+        finally:
+            srv.close()
+        self.assertLessEqual(len(text), limit)
+        self.assertTrue(truncated)
+
+    def test_curl_fetch_text_empty_body_is_a_failure(self):
+        """A declared Content-Length over the cap aborts before any body."""
+        fake = self._fake_curl(b"", returncode=63)
+        with patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
+             patch.object(m.subprocess, "Popen", return_value=fake):
+            self.assertEqual(m._curl_fetch_text("https://x.example"), ("", False))
+
+    def test_curl_fetch_text_nonzero_exit_without_prefix_is_a_failure(self):
+        fake = self._fake_curl(b"", returncode=22)   # --fail: HTTP error
+        with patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
+             patch.object(m.subprocess, "Popen", return_value=fake):
+            self.assertEqual(m._curl_fetch_text("https://x.example"), ("", False))
+
+    def test_git_capture_bounds_stderr(self):
+        class _Proc:
+            def __init__(self):
+                self.stdout = io.StringIO("ok\n")
+                self.returncode = 0
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        def _popen(argv, **kwargs):
+            kwargs["stderr"].write(b"E" * 500)
+            return _Proc()
+
+        with patch.object(m, "GIT_INSPECT_MAX_STDERR_CHARS", 100), \
+             patch.object(m.subprocess, "Popen", side_effect=_popen):
+            capture = m._git_capture(["git", "status"], {}, 1000)
+        self.assertTrue(capture["stderr_truncated"])
+        self.assertIn("stderr truncated at 100 bytes", capture["stderr"])
+        self.assertEqual(capture["stderr"].count("E"), 100)
+
+    def test_check_backend_with_get_stops_at_the_probe_ceiling(self):
+        resp = MagicMock()
+        resp.__enter__.return_value = resp
+        resp.read.return_value = b"x" * 5 + b"ollama" + b"y" * 10
+        with patch.object(m, "MAX_PROBE_READ_BYTES", 5), \
+             patch.object(m, "urlopen", return_value=resp):
+            self.assertFalse(m.check_backend_with_get("http://probe", "ollama"))
+        self.assertEqual(resp.read.call_args[0][0], 6)
+
+    def test_check_backend_with_get_finds_the_marker_under_the_ceiling(self):
+        resp = MagicMock()
+        resp.__enter__.return_value = resp
+        resp.read.return_value = b'{"name": "ollama"}'
+        with patch.object(m, "urlopen", return_value=resp):
+            self.assertTrue(m.check_backend_with_get("http://probe", "ollama"))
 
 
 # ============================================================================

@@ -233,17 +233,19 @@ oversight.
 ### Running Agentic in a Container Sandbox
 
 `/agentic sandbox` toggles shell tool execution (`run_command`, `run_python`)
-into a throwaway container (podman/docker, image
-`python:3.12-alpine` by default — override with `OLLAMAQUERY_CONTAINER_RT` /
-`OLLAMAQUERY_CONTAINER_IMAGE`). Your working directory is mounted read-write
-at `/workspace`; the rest of the system is isolated.
+into a container. Two flavours:
+
+**A throwaway container per command** (default). Your working directory is
+mounted read-write at `/workspace`, the rest of the system is isolated, and
+each command gets a fresh `--rm` container — so nothing installed in one
+command survives the next, only `/workspace` persists.
 
 ```text
 > /agentic on
 Agentic mode enabled.
 
 > /agentic sandbox
-Executor mode: container
+[Executor mode: container — image docker.io/library/python:3.12-alpine, 1 cpu, 1g memory]
 
 > what OS does this container run?
 [Agentic] Step 1/50…
@@ -252,15 +254,59 @@ Executor mode: container
 NAME="Alpine Linux"
 ```
 
+**An already-running container** (`exec`). Whatever you prepared inside it —
+compilers, packages, credentials, its own mounts and state — is what the model
+uses, and nothing is created or destroyed by the tool:
+
+```bash
+# start a box you control, with your project mounted
+podman run -d --name dev-box -v "$PWD":/src -w /src my-dev-image sleep infinity
+
+# then point ollamaquery2 at it (implies container mode)
+python3 ollamaquery2.py -c --sandbox-container dev-box
+```
+
+`--sandbox-container` also asks the runtime which of the container's mounts
+contains your current directory and runs commands there (`-w`), so the model's
+relative paths hit your files. With no matching mount it keeps the container's
+own workdir and relative writes land inside the container.
+
+Selection (CLI beats env beats default):
+
+| Setting | CLI | Environment | Default |
+|---|---|---|---|
+| Image | `--sandbox-image IMAGE` | `OLLAMAQUERY_CONTAINER_IMAGE` | `docker.io/library/python:3.12-alpine` |
+| Running container | `--sandbox-container NAME` | `OLLAMAQUERY_CONTAINER_NAME` | — |
+| Runtime | `--sandbox-runtime podman\|docker` | `OLLAMAQUERY_CONTAINER_RT` | `podman` |
+| Memory ceiling | `--sandbox-memory SIZE` | `OLLAMAQUERY_CONTAINER_MEMORY` | `1g` |
+| CPU ceiling | `--sandbox-cpus N` | `OLLAMAQUERY_CONTAINER_CPUS` | `1` |
+
+Passing `--sandbox-image` or `--sandbox-container` starts the session in
+container mode (the startup banner says which target; `/agentic sandbox`
+switches back to host). The image is probed once per session and pulled only
+if it is absent — a locally built `localhost/...` image is never pulled (podman
+would treat `localhost/` as a registry and fail).
+
 Notes:
 - Only `run_command` / `run_python` run inside the container; the file tools
   (`read_file`, `write_file`, ...) still operate on host paths and stay
-  governed by the Path ACL.
+  governed by the Path ACL. That is also how a file reaches the sandbox: write
+  it on the host in the mounted directory.
 - Container commands skip the shell approval gate and the path-ACL operand
   scan (the container is the sandbox — `cat /etc/passwd` reads the
-  container's `/etc`).
-- Requires a working podman/docker setup and network to pull the image on
-  first use.
+  container's `/etc`). With `--sandbox-container` the model runs commands
+  inside *your* container, so point it at a disposable one.
+- The throwaway container is capped at **1 CPU and 1 GiB** by default
+  (`--memory 1g --cpus 1`), so a runaway command cannot take the host down;
+  raise it with `--sandbox-memory 4g --sandbox-cpus 2`. The ceiling is shown
+  wherever the mode is (`/agentic status`, the startup banner, the
+  `/agentic sandbox` message). With `--sandbox-container` no ceiling is
+  applied — that container's limits are whoever started it.
+- Network: with podman's default (pasta) the container shares the host's
+  addresses but has its own loopback, so `127.0.0.1` inside is **not** the
+  host's loopback.
+- Requires a working podman/docker setup (and network only if the image is
+  missing).
 
 ### MCP servers (tool providers)
 

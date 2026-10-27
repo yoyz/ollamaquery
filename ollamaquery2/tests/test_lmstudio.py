@@ -185,7 +185,6 @@ class TestLmStudioQuery(_LMStudioTestBase):
     def test_chat_loop_processes_query(self):
         loop = q.ChatLoop(self.ctx)
         loop.run_process_query('Count to 3 slowly')
-        self.assertTrue(hasattr(loop, 'messages'))
         self.assertGreaterEqual(len(loop.messages), 2)
         self.assertIn(loop.messages[-1]['role'], ('assistant', 'user'),
                       "Should have assistant response or pending response")

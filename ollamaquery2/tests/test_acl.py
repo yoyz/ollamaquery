@@ -534,7 +534,7 @@ class TestFetchUrlSchemeGuard(unittest.TestCase):
                 self.assertTrue(text.startswith("[Failed to fetch URL:"), text)
 
     def test_curl_fallback_rejects_file_scheme(self):
-        self.assertEqual(m._curl_fetch_text("file:///etc/hostname"), "")
+        self.assertEqual(m._curl_fetch_text("file:///etc/hostname"), ("", False))
 
     def test_fetch_tool_reports_scheme_rejection(self):
         out = m._tool_handle_fetch_url(None, {"url": "file:///etc/hostname"})
@@ -546,7 +546,7 @@ class TestFetchUrlSchemeGuard(unittest.TestCase):
             with self.subTest(url=url):
                 with patch("ollamaquery2._request_with_retry",
                            side_effect=Exception("transport-reached")), \
-                     patch("ollamaquery2._curl_fetch_text", return_value=""):
+                     patch("ollamaquery2._curl_fetch_text", return_value=("", False)):
                     text, tool = m.fetch_and_convert_url(url)
                 self.assertIn("transport-reached", text)
 

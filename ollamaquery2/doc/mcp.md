@@ -168,7 +168,7 @@ dry-run config parsing and validation without contacting any server.
   eligible MCP tools, grouped per server and stripped of the `<prefix>__`
   namespace; `/mcp tools --plan` shows them with descriptions.
 - **Results spill like other tools.** Output over the effective cap is written
-  to `~/.ollamaquery.d/spill/mcp_result_*.json` (mode `0600`) and the model gets
+  to `~/.ollamaquery.d/spill/pid-<n>/mcp_result_*.json` (mode `0600`) and the model gets
   a pure pointer; a session Path-ACL read-allow rule is registered first so the
   pointer is followable even in strict plan mode.
 - **HTTP/OAuth are not implemented.** An `http`/`streamable-http`/`sse`

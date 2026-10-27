@@ -902,6 +902,43 @@ class TestSpill(unittest.TestCase):
                 ctx, {"content": [{"type": "text", "text": "y" * 200}]}, cfg, "pods_list")
         self.assertIn("read_file(file_path=", result["output"])
 
+    def test_spill_failure_degrades_to_a_bounded_explicit_truncation(self):
+        """A failed spill says so instead of returning a silently cut body.
+
+        Regression (TODO 4.4): `except OSError: pass` claimed to "fall through
+        with the truncated-in-context text", but nothing truncated there — the
+        full result went back and the model got a prefix with no `next`
+        pointer and no hint that it was a prefix.
+        """
+        ctx = _ctx()
+        cfg = m.MCPServerConfig(name="k8s", command=["x"], max_result_chars=500)
+        body = "A" * 5000
+        with tempfile.TemporaryDirectory() as td, \
+             patch.object(m, "CLUSTER_SPILL_DIR", td), \
+             patch.object(m, "_open_private",
+                          side_effect=OSError(28, "No space left on device")):
+            result = m._mcp_result_to_output(
+                ctx, {"content": [{"type": "text", "text": body}]}, cfg, "pods_list")
+        output = result["output"]
+        self.assertLessEqual(len(output), 500)
+        self.assertIn("spill file could not be written", output)
+        self.assertIn("No space left on device", output)
+        self.assertNotIn("read_file(file_path=", output)
+        self.assertIn("AAAA", output)
+        self.assertTrue(result["success"])
+
+    def test_spill_failure_note_stays_within_a_tiny_cap(self):
+        """Even a cap smaller than the note is honoured (no unbounded output)."""
+        ctx = _ctx()
+        cfg = m.MCPServerConfig(name="k8s", command=["x"], max_result_chars=40)
+        with tempfile.TemporaryDirectory() as td, \
+             patch.object(m, "CLUSTER_SPILL_DIR", td), \
+             patch.object(m, "_open_private", side_effect=OSError(5, "Input/output error")):
+            output = m._mcp_result_to_output(
+                ctx, {"content": [{"type": "text", "text": "Z" * 400}]}, cfg, "t")["output"]
+        self.assertLessEqual(len(output), 40)
+        self.assertNotIn("read_file(file_path=", output)
+
 
 class TestToolListingLayout(unittest.TestCase):
     """`/listtool` renders aligned columns with hanging-indented descriptions."""

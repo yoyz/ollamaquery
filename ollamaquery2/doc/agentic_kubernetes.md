@@ -81,10 +81,12 @@ one constant so the tool and the allow-list cannot drift.
 "oc logs *": "allow",
 "oc describe *": "allow",
 "oc config current-context": "allow",
+"oc api-resources *": "allow",   # resource-name discovery probe (see §5.1)
 "kubectl get *": "allow",
 "kubectl logs *": "allow",
 "kubectl describe *": "allow",
 "kubectl config current-context": "allow",
+"kubectl api-resources *": "allow",
 # Offline — local must-gather reads
 "omc use *": "allow",           # select a local must-gather dir (local config write)
 "omc get *": "allow",
@@ -122,8 +124,8 @@ GKE, k3s, ... are all clusters), and the resource vocabulary differs per platfor
 kubernetes_cluster_query
   cluster_type   enum: omc | openshift | kubernetes | auto   (default: auto)
   verb           enum: get | logs | describe | events | current-context   (default: get)
-  resource       string   (required for get/logs/describe; logs: "pods" with
-                           name, or "pod/<pod>")
+  resource       string   (required for get/logs/describe; sent verbatim — see
+                           §5.1; logs: "pods" with name, or "pod/<pod>")
   name           string   (optional, resource instance; logs: the pod name,
                            folded into a single TYPE/NAME target)
   namespace      string   (optional, `-n`)
@@ -175,6 +177,31 @@ Handler behaviour:
    record which cluster and vocabulary were consulted.
 8. Rely on the existing observation cap (`_cap_tool_observation`, ~4K chars);
    `tail=50` keeps raw logs bounded at the source.
+
+### 5.1 Resource names: validated, never rewritten
+
+The model's `resource` string is sent to the backend **exactly as given**. A typo
+(`pvs`, `podss`) is the model's input; silently correcting it would hide the
+mismatch between what was asked and what ran. The handler only decides whether to
+run it:
+
+| situation                              | behaviour |
+|----------------------------------------|-----------|
+| online, `api-resources` knows the name | run it unchanged |
+| online, name unknown                   | refuse with the closest real types (`pvs` → `persistentvolumes (pv)`, `claims` → `persistentvolumeclaims (pvc)`); no query runs |
+| offline (`omc`)                        | pass through: omc 3.17 has **no** `api-resources` subcommand (measured); it knows the real short names (`pv`, `pvc`, `cm`, `sc` — verified against a must-gather) and returns its own `resource type "..." not known` |
+| probe failed (auth/timeout/empty table) | pass through; the backend's error is the answer |
+| `TYPE/NAME` target                     | the TYPE is checked, the text is unchanged |
+| `all`, comma lists, shell-ish strings  | not checked, passed through unchanged (`shlex.quote` protects them) |
+
+The probe is `<cli> api-resources`; NAME/SHORTNAMES/KIND are parsed with the
+APIVERSION cell as the anchor (the SHORTNAMES cell is empty for many resources),
+and the kind is matched too, so `pod/<name>` and `pv` are accepted. It runs
+lazily on the first resource-bearing query, at most once per session per client,
+and the result — **including "unavailable"** — is cached on the `ToolRegistry`
+(not on the `CommandContext` singleton, where it leaked across tests). Both
+commands are allow-listed in §4 so strict `/agentic plan` never prompts for the
+probe. `omc` is never probed.
 
 ## 6. Security posture
 
@@ -244,7 +271,7 @@ Status (v0.2.12):
       ask the server for a JSON chunk/offset).
    2. **Temp-file spill — IMPLEMENTED.** Results over `CLUSTER_SPILL_THRESHOLD`
       (~3500 chars) are written to per-query files
-      `~/.ollamaquery.d/spill/cluster_result_<verb>_<resource>.json` (scoped by
+      `~/.ollamaquery.d/spill/pid-<n>/cluster_result_<verb>_<resource>.json` (scoped by
       verb + resource so one query never clobbers another being paged; removed at
       process exit via atexit). The tool returns a PURE POINTER — size in
       chars/lines + a `read_file(file_path="...")` instruction — with NO content

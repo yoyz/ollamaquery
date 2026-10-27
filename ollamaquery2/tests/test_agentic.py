@@ -6,8 +6,12 @@ import os
 import re
 import sys
 import json
+import time
+import shutil
 import tempfile
 import threading
+import contextlib
+import types
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -748,8 +752,8 @@ class TestToolRegistry(unittest.TestCase):
         is a pointer (path + preview, no content) and read_file can page it."""
         with tempfile.TemporaryDirectory() as tmp:
             spill_dir = os.path.join(tmp, "spill")
-            spill_file = os.path.join(spill_dir, "fetch_result_https_xyz_example_page.txt")
             with patch.object(q, "CLUSTER_SPILL_DIR", spill_dir):
+                spill_file = q._fetch_spill_path("https://xyz.example/page")
                 big = ("PREVIEW-ONLY-HERE-PAGE-TITLE-LONG-ENOUGH\n"
                        + ("PARAGRAPH-7f3a9c\n" * 800))  # ~13KB, over threshold
                 with patch("ollamaquery2.fetch_and_convert_url",
@@ -804,7 +808,7 @@ class TestToolRegistry(unittest.TestCase):
         with patch("ollamaquery2._request_with_retry",
                    side_effect=Exception("HTTP Error 403: Forbidden")):
             with patch("ollamaquery2._curl_fetch_text",
-                       return_value="<html><body>curl rescued content</body></html>"):
+                       return_value=("<html><body>curl rescued content</body></html>", False)):
                 text, tool = q.fetch_and_convert_url("https://blocked.example")
         self.assertIn("curl rescued content", text)
         self.assertEqual(tool, "htmlstrip")
@@ -1067,6 +1071,302 @@ class TestToolRegistry(unittest.TestCase):
                 os.chdir(old_cwd)
 
 
+class TestGrepReliability(unittest.TestCase):
+    """grep must be trustworthy for an audit, not merely non-crashing.
+
+    A false negative is worse than an error here: the model writes a conclusion
+    on "pattern absent", so a silent skip turns into a confident wrong answer.
+    TestToolRegistry's 17 grep cases cover the happy paths, argument handling,
+    the ACL and the caps; this class owns the fixtures that made the three
+    backends disagree (binary, unreadable, CRLF, a 4.5 MB file, a 20k-char line,
+    symlinks) plus the two blocking properties: nothing is skipped silently, and
+    a pathological scan is bounded.
+
+    The external branch asserts the pure-Python fallback did NOT run, so a
+    "backend parity" claim cannot be satisfied by both sides accidentally
+    executing the same code.
+    """
+
+    BASE_PATTERN = r"HIT_(TEXT|LATIN|CRLF|NEWLINE)"
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.auto_confirm = True
+        self.reg = q.ToolRegistry(ctx=self.ctx)
+        self.tree = tempfile.mkdtemp()
+        self._old_cwd = os.getcwd()
+        os.chdir(self.tree)
+        self._write("text.py", "import os\nHIT_TEXT alpha\nno match here\n")
+        self._write("latin1.txt", b"caf\xe9 HIT_LATIN latin1\n")
+        self._write("crlf.txt", b"HIT_CRLF windows line\r\nplain\r\n")
+        self._write("nonewline.txt", "before\nHIT_NEWLINE tail")
+        self._write("empty.txt", "")
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        shutil.rmtree(self.tree, ignore_errors=True)
+
+    # -- fixtures ---------------------------------------------------------
+    def _write(self, name, data):
+        """Write a fixture file, bytes or text."""
+        with open(name, "wb" if isinstance(data, bytes) else "w") as fh:
+            fh.write(data)
+
+    def _make_big_log(self):
+        """4.5 MB with a match on the first, middle and last line."""
+        with open("big.log", "w") as fh:
+            fh.write("HIT_FIRST first line\n")
+            for i in range(70000):
+                fh.write(f"filler {i} " + "y" * 50 + "\n")
+                if i == 35000:
+                    fh.write("HIT_MIDDLE middle line\n")
+            fh.write("HIT_LAST last line\n")
+
+    def _make_unreadable(self, name, content):
+        """Create a file, then make it unreadable (no-op for root)."""
+        self._write(name, content)
+        os.chmod(name, 0o000)
+
+    # -- backend harness --------------------------------------------------
+    @contextlib.contextmanager
+    def _backend(self, name):
+        """Force one backend; report whether the Python fallback ran.
+
+        Args:
+            name: "python" (both external tools missing), "external" (only rg,
+                or else only grep, exists) or "default" (nothing patched).
+        """
+        used = {"fallback": False}
+
+        def _fallback(*_args, **_kwargs):
+            used["fallback"] = True
+            return [], False, "python fallback ran unexpectedly", {"unreadable": 0, "binary": 0}
+
+        if name == "python":
+            with patch("ollamaquery2.shutil.which", return_value=None):
+                yield used
+            return
+        if name == "default":
+            yield used
+            return
+        real_which = shutil.which
+        tool = "rg" if real_which("rg") else ("grep" if real_which("grep") else None)
+        if tool is None:
+            self.skipTest("neither rg nor grep is installed")
+
+        def _which(name_to_find):
+            return real_which(name_to_find) if name_to_find == tool else None
+
+        with patch("ollamaquery2.shutil.which", side_effect=_which), \
+             patch("ollamaquery2._grep_search_python_bounded", side_effect=_fallback):
+            yield used
+
+    def _run(self, backend, pattern=None, **args):
+        """Execute the grep tool through one backend."""
+        with self._backend(backend) as used:
+            result = self.reg.execute("grep", {"pattern": pattern or self.BASE_PATTERN, **args})
+        return result, used
+
+    # -- row 2: parity ----------------------------------------------------
+    def test_backend_parity_on_the_same_tree(self):
+        """Same tree + same pattern: identical hits and identical rendering."""
+        outputs = {}
+        for backend in ("external", "python"):
+            result, used = self._run(backend)
+            self.assertTrue(result["success"], msg=f"{backend}: {result.get('error')}")
+            self.assertFalse(used["fallback"], msg=f"{backend} ran the wrong backend")
+            outputs[backend] = result["output"]
+        self.assertEqual(outputs["python"], outputs["external"])
+        self.assertIn("Found 4 matches", outputs["external"])
+        for token in ("HIT_TEXT", "HIT_LATIN", "HIT_CRLF", "HIT_NEWLINE"):
+            self.assertIn(token, outputs["external"])
+
+    # -- row 1: the audit's scenario --------------------------------------
+    def test_large_file_matches_first_middle_and_last(self):
+        """A 4.5 MB file is searched whole: first, middle and last match."""
+        self._make_big_log()
+        for backend in ("external", "python"):
+            result, used = self._run(backend, r"HIT_(FIRST|MIDDLE|LAST)")
+            self.assertTrue(result["success"], msg=f"{backend}: {result.get('error')}")
+            self.assertFalse(used["fallback"])
+            for token in ("HIT_FIRST", "HIT_MIDDLE", "HIT_LAST"):
+                self.assertIn(token, result["output"])
+            self.assertEqual(result["output"].count("  Line "), 3)
+
+    # -- rows 3 and 4: binary + encoding ----------------------------------
+    def test_binary_file_is_skipped_by_every_backend(self):
+        """A NUL-containing file must not be matched by only one backend."""
+        self._write("with_nul.bin", b"prefix\x00HIT_BINARY text\n")
+        for backend in ("external", "python"):
+            result, _ = self._run(backend, r"HIT_BINARY")
+            self.assertTrue(result["success"], msg=f"{backend}: {result.get('error')}")
+            self.assertNotIn("with_nul.bin", result["output"])
+            self.assertTrue(result["output"].startswith("No files found"), msg=result["output"])
+            if backend == "python":
+                self.assertIn("+1 binary file(s) skipped", result["output"])
+
+    def test_latin1_file_is_matched_not_lost(self):
+        """Invalid UTF-8 must not cost the line (errors='replace' on both sides)."""
+        for backend in ("external", "python"):
+            result, _ = self._run(backend, r"HIT_LATIN")
+            self.assertIn("latin1.txt:", result["output"])
+            self.assertIn("HIT_LATIN latin1", result["output"])
+
+    # -- row 5: CRLF ------------------------------------------------------
+    def test_crlf_lines_render_without_a_stray_carriage_return(self):
+        for backend in ("external", "python"):
+            result, _ = self._run(backend, r"HIT_CRLF")
+            self.assertIn("HIT_CRLF windows line", result["output"])
+            self.assertNotIn("\r", result["output"])
+
+    # -- row 6: unreadable files ------------------------------------------
+    def test_unreadable_file_is_counted_never_silent(self):
+        """A match is reported AND the unreadable file is counted."""
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("chmod 000 does not block root")
+        self._make_unreadable("locked.txt", "HIT_LOCKED inside\n")
+        result, _ = self._run("python")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertIn("HIT_TEXT", result["output"])
+        self.assertIn("+1 file(s) could not be read", result["output"])
+        # Only the unreadable file matches: count, never a bare "No files found".
+        result, _ = self._run("python", r"HIT_LOCKED")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertTrue(result["output"].startswith("No files found"), msg=result["output"])
+        self.assertIn("+1 file(s) could not be read", result["output"])
+
+    def test_unreadable_file_degrades_to_the_counting_backend(self):
+        """Default path: rg/grep exit 2 on EACCES, so the scan runs and counts."""
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("chmod 000 does not block root")
+        self._make_unreadable("locked.txt", "HIT_LOCKED inside\n")
+        result, _ = self._run("default", r"HIT_TEXT")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertIn("HIT_TEXT", result["output"])
+        self.assertIn("could not be read", result["output"])
+
+    # -- row 7: long lines ------------------------------------------------
+    def test_long_line_match_is_reported(self):
+        """The match is beyond MAX_GREP_LINE_LENGTH: report it, say it is cut."""
+        self._write("long_line.txt", "a" * 15000 + "HIT_LONG" + "b" * 5000 + "\n")
+        for backend in ("external", "python"):
+            result, _ = self._run(backend, r"HIT_LONG")
+            self.assertTrue(result["success"], msg=f"{backend}: {result.get('error')}")
+            self.assertIn("long_line.txt:", result["output"])
+            self.assertIn("Line 1:", result["output"])
+            self.assertIn("chars]", result["output"])
+
+    # -- rows 8 and 9: caps -----------------------------------------------
+    def test_match_on_every_line_terminates_and_caps(self):
+        self._make_big_log()
+        for backend in ("external", "python"):
+            started = time.monotonic()
+            result, _ = self._run(backend, r"filler")
+            self.assertLess(time.monotonic() - started, q.GREP_SEARCH_TIMEOUT)
+            self.assertIn("capped at", result["output"])
+            self.assertEqual(result["output"].count("  Line "), q.MAX_GREP_RESULTS)
+
+    def test_output_char_cap_keeps_the_match_count(self):
+        with open("wide.txt", "w") as fh:
+            for _ in range(100):
+                fh.write("HIT_WIDE " + "x" * 500 + "\n")
+        for backend in ("external", "python"):
+            result, _ = self._run(backend, r"HIT_WIDE")
+            self.assertLessEqual(len(result["output"]), q.MAX_GREP_OUTPUT_CHARS)
+            self.assertIn("Found 100 matches", result["output"])
+            self.assertIn("Output capped", result["output"])
+
+    # -- row 10: empty file, no trailing newline --------------------------
+    def test_last_line_without_trailing_newline_is_searched(self):
+        for backend in ("external", "python"):
+            result, _ = self._run(backend, r"HIT_NEWLINE")
+            self.assertIn("nonewline.txt:", result["output"])
+            self.assertIn("HIT_NEWLINE tail", result["output"])
+
+    # -- row 11: symlinks -------------------------------------------------
+    def test_symlinks_do_not_hang_or_leak_outside_the_tree(self):
+        """A loop, a dangling link, and a link out of the CWD."""
+        os.symlink(".", "loop")
+        os.symlink("missing-target", "dangling.txt")
+        os.symlink("/etc/passwd", "outside_link.txt")
+        result, _ = self._run("python", r"root:")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertNotIn("root:x:", result["output"])
+        self.assertIn("hidden by the path ACL", result["output"])
+        result, _ = self._run("external", r"root:")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertNotIn("root:x:", result["output"])
+
+    # -- row 12: filenames ------------------------------------------------
+    def test_spaced_and_non_ascii_filenames_are_verbatim(self):
+        self._write("unicode name ü.txt", "HIT_UNICODE\n")
+        self._write("with space.txt", "HIT_SPACE\n")
+        for backend in ("external", "python"):
+            result, _ = self._run(backend, r"HIT_(UNICODE|SPACE)")
+            self.assertIn("unicode name ü.txt:", result["output"])
+            self.assertIn("with space.txt:", result["output"])
+
+    # -- row 13: determinism ----------------------------------------------
+    def test_repeated_query_is_byte_identical(self):
+        self._make_big_log()
+        for backend in ("external", "python"):
+            first, _ = self._run(backend, r"filler")
+            second, _ = self._run(backend, r"filler")
+            self.assertEqual(first["output"], second["output"])
+
+    # -- row 14: bounded work ---------------------------------------------
+    def test_python_scan_honours_the_deadline(self):
+        """Finding B: the fallback gets the deadline rg/grep already had."""
+        self._make_big_log()
+        with patch.object(q, "GREP_SEARCH_TIMEOUT", 0.0):
+            _hits, _trunc, err, _stats = q._grep_search_python(
+                ".", r"filler", None, False, 100)
+        self.assertTrue(err and err.startswith(q.GREP_TIMEOUT_PREFIX), msg=err)
+
+    def test_python_scan_thread_abandons_a_call_that_outlasts_the_budget(self):
+        """A single long call (I/O) is bounded by the wrapper, not the loop."""
+
+        def _slow(*_args, **_kwargs):
+            time.sleep(0.4)
+            return [], False, None, {"unreadable": 0, "binary": 0}
+
+        with patch.object(q, "GREP_SEARCH_TIMEOUT", 0.05), \
+             patch.object(q, "_grep_search_python", side_effect=_slow):
+            _hits, _trunc, err, _stats = q._grep_search_python_bounded(
+                ".", r"filler", None, False, 100)
+        self.assertTrue(err and err.startswith(q.GREP_TIMEOUT_PREFIX), msg=err)
+
+    def test_timeout_stops_the_backend_chain(self):
+        """A timeout must not be re-run with a slower engine."""
+        ran = {"python": False}
+
+        def _fallback(*_args, **_kwargs):
+            ran["python"] = True
+            return [], False, None, {"unreadable": 0, "binary": 0}
+
+        timeout_err = q._grep_timeout_error(q.GREP_SEARCH_TIMEOUT)
+        with patch.object(q, "_grep_run_external", return_value=([], timeout_err)), \
+             patch.object(q, "_grep_search_python_bounded", side_effect=_fallback):
+            _hits, _trunc, err, _stats = q._grep_search(".", "x", None, False, 10)
+        self.assertEqual(err, timeout_err)
+        self.assertFalse(ran["python"])
+
+    # -- row 15: include glob, recursion, explicit file -------------------
+    def test_include_glob_and_explicit_path_agree(self):
+        os.mkdir("nested")
+        self._write(os.path.join("nested", "inner.md"), "HIT_TEXT nested\n")
+        for backend in ("external", "python"):
+            globbed, _ = self._run(backend, r"HIT_TEXT", include="*.md")
+            self.assertIn("nested" + os.sep + "inner.md:", globbed["output"])
+            self.assertNotIn("text.py", globbed["output"])
+            single, _ = self._run(backend, r"HIT_TEXT",
+                                  path=os.path.join("nested", "inner.md"))
+            self.assertIn("HIT_TEXT nested", single["output"])
+            recursive, _ = self._run(backend, r"HIT_TEXT", path=".")
+            self.assertIn("nested" + os.sep + "inner.md:", recursive["output"])
+            self.assertIn("text.py:", recursive["output"])
+
+
 class TestRunPythonPath(unittest.TestCase):
     """run_python tool must handle file_path without host absolute paths."""
 
@@ -1121,6 +1421,314 @@ class TestExecutorContainerModeSafety(unittest.TestCase):
             _, kwargs = mock_shell.call_args
             self.assertTrue(kwargs.get('is_container', False),
                             "_run_shell should be called with is_container=True in container mode")
+
+
+class TestContainerSandboxConfig(unittest.TestCase):
+    """Image/container selection, pull memoization and exec mode (offline).
+
+    Real podman runs are not required: what is pinned here is the argv we build
+    and how many times we pay for a pull, which is where the ~3 s/command cost
+    and the "wrong container" bugs live.
+    """
+
+    def _executor(self, **kwargs):
+        """Build an Executor with an explicit runtime, ignoring the environment."""
+        kwargs.setdefault("container_runtime", "podman")
+        return q.Executor(**kwargs)
+
+    def _fake_run(self, seen, image_present=False, pull_rc=0, pull_err="",
+                  inspect_stdout="[]", cmd_rc=0, cmd_out="ok"):
+        """subprocess.run stand-in that records argv per subcommand."""
+        def _run(argv, **_kwargs):
+            argv = list(argv)
+            seen.append(argv)
+            if argv[1:3] == ["image", "inspect"]:
+                return types.SimpleNamespace(
+                    returncode=0 if image_present else 1, stdout="", stderr="")
+            if argv[1:2] == ["pull"]:
+                return types.SimpleNamespace(returncode=pull_rc, stdout="", stderr=pull_err)
+            if argv[1:2] == ["inspect"]:
+                return types.SimpleNamespace(returncode=0, stdout=inspect_stdout, stderr="")
+            return types.SimpleNamespace(returncode=cmd_rc, stdout=cmd_out, stderr="")
+        return _run
+
+    def test_local_image_is_never_pulled(self):
+        """A locally built `localhost/...` image must not be pulled at all.
+
+        Regression: pulling it makes podman treat `localhost/` as a registry and
+        fail after a TCP timeout, which looked like a broken image even though
+        `run` used the local copy happily.
+        """
+        seen = []
+        with patch("ollamaquery2.subprocess.run",
+                   side_effect=self._fake_run(seen, image_present=True)):
+            ex = self._executor(mode="container", container_image="localhost/img:1")
+            for _ in range(3):
+                ex.run("true")
+        self.assertEqual([a for a in seen if a[1:2] == ["pull"]], [])
+        self.assertEqual(len([a for a in seen if a[1:3] == ["image", "inspect"]]), 1)
+        self.assertEqual(ex._pull_state, "done")
+
+    def test_absent_image_is_pulled_once_per_session(self):
+        """The probe/pull pair is memoized: one per session, not one per command."""
+        seen = []
+        with patch("ollamaquery2.subprocess.run", side_effect=self._fake_run(seen)):
+            ex = self._executor(mode="container", container_image="img:1")
+            for _ in range(3):
+                ex.run("true")
+        pulls = [argv for argv in seen if argv[1:2] == ["pull"]]
+        self.assertEqual(len(pulls), 1)
+        self.assertEqual(pulls[0][2], "img:1")
+        self.assertEqual(len([a for a in seen if a[1:3] == ["image", "inspect"]]), 1)
+
+    def test_failed_pull_warns_once_and_is_not_retried(self):
+        seen = []
+        err = io.StringIO()
+        fake = self._fake_run(seen, pull_rc=125, pull_err="Error: image not found",
+                             cmd_rc=125, cmd_out="")
+        with patch("ollamaquery2.subprocess.run", side_effect=fake), \
+             contextlib.redirect_stderr(err):
+            ex = self._executor(mode="container", container_image="nope:1")
+            ex.run("true")
+            ex.run("true")
+        self.assertEqual(len([a for a in seen if a[1:2] == ["pull"]]), 1)
+        self.assertEqual(len([a for a in seen if a[1:3] == ["image", "inspect"]]), 1)
+        self.assertEqual(err.getvalue().count("[Sandbox] cannot pull"), 1)
+        self.assertIn("nope:1", err.getvalue())
+        self.assertIn("image not found", err.getvalue())
+
+    def test_pull_exception_disables_further_pulls(self):
+        seen = []
+
+        def _run(argv, **_kwargs):
+            argv = list(argv)
+            seen.append(argv)
+            if argv[1:3] == ["image", "inspect"]:
+                raise OSError("podman missing")  # probe fails -> treated as absent
+            if argv[1:2] == ["pull"]:
+                raise OSError("podman missing")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        err = io.StringIO()
+        with patch("ollamaquery2.subprocess.run", side_effect=_run), \
+             contextlib.redirect_stderr(err):
+            ex = self._executor(mode="container", container_image="img:2")
+            ex.run("true")
+            ex.run("true")
+        self.assertEqual(len([a for a in seen if a[1:2] == ["pull"]]), 1)
+        self.assertEqual(len([a for a in seen if a[1:3] == ["image", "inspect"]]), 1)
+        self.assertEqual(err.getvalue().count("[Sandbox] cannot pull"), 1)
+
+    def test_running_container_uses_exec_and_never_pulls(self):
+        seen = []
+        with patch("ollamaquery2.subprocess.run", side_effect=self._fake_run(seen)):
+            ex = self._executor(mode="container", container_name="dev-box")
+            result = ex.run("echo hi")
+        self.assertEqual(result["stdout"], "ok")
+        self.assertFalse([a for a in seen if a[1:2] == ["pull"]])
+        exec_argv = [a for a in seen if a[1:2] == ["exec"]][0]
+        self.assertEqual(exec_argv[:3], ["podman", "exec", "dev-box"])
+        self.assertNotIn("--rm", exec_argv)
+        self.assertNotIn("-v", exec_argv)
+        self.assertEqual(exec_argv[-3:], ["sh", "-c", "echo hi"])
+
+    def test_running_container_uses_the_mount_of_the_cwd_as_workdir(self):
+        cwd = os.path.realpath(os.getcwd())
+        mounts = json.dumps([{"Source": "/tmp", "Destination": "/tmp"},
+                             {"Source": cwd, "Destination": "/src/project"}])
+        seen = []
+        with patch("ollamaquery2.subprocess.run",
+                   side_effect=self._fake_run(seen, inspect_stdout=mounts)):
+            ex = self._executor(mode="container", container_name="dev-box")
+            ex.run("pwd")
+        exec_argv = [a for a in seen if a[1:2] == ["exec"]][0]
+        self.assertEqual(exec_argv[2:5], ["-w", "/src/project", "dev-box"])
+
+    def test_cwd_in_a_subdirectory_of_a_mounted_volume_maps_to_the_dest(self):
+        """A CWD under a mounted volume maps to dest + the relative path.
+
+        Exact-match-only resolution returned None here, so `exec` kept the
+        container's workdir and the model's relative writes silently landed
+        inside the container instead of the host project (GPT-5.6 review, P2).
+        """
+        cwd = os.path.realpath(os.getcwd())
+        mounts = json.dumps([{"Source": os.path.dirname(cwd), "Destination": "/w"}])
+        seen = []
+        with patch("ollamaquery2.subprocess.run",
+                   side_effect=self._fake_run(seen, inspect_stdout=mounts)):
+            ex = self._executor(mode="container", container_name="dev-box")
+            ex.run("pwd")
+        exec_argv = [a for a in seen if a[1:2] == ["exec"]][0]
+        expected = "/w/" + os.path.basename(cwd)
+        self.assertEqual(exec_argv[2:5], ["-w", expected, "dev-box"])
+
+    def test_deepest_matching_mount_wins(self):
+        """Nested mounts resolve to the most specific source, not the first one."""
+        cwd = os.path.realpath(os.getcwd())
+        mounts = json.dumps([
+            {"Source": os.path.dirname(cwd), "Destination": "/outer"},
+            {"Source": cwd, "Destination": "/exact"},
+        ])
+        seen = []
+        with patch("ollamaquery2.subprocess.run",
+                   side_effect=self._fake_run(seen, inspect_stdout=mounts)):
+            ex = self._executor(mode="container", container_name="dev-box")
+            ex.run("pwd")
+        exec_argv = [a for a in seen if a[1:2] == ["exec"]][0]
+        self.assertEqual(exec_argv[2:5], ["-w", "/exact", "dev-box"])
+
+    def test_a_root_source_mount_matches_any_cwd(self):
+        """A mount of `/` covers every CWD (its prefix must not become "//").
+
+        Review P3: `cwd.startswith(source + os.sep)` produced "//" for a source of
+        "/", so mounting the whole filesystem (e.g. -v /:/host) never matched and
+        exec silently kept the container workdir.
+        """
+        cwd = os.path.realpath(os.getcwd())
+        mounts = json.dumps([{"Source": "/", "Destination": "/host"}])
+        seen = []
+        with patch("ollamaquery2.subprocess.run",
+                   side_effect=self._fake_run(seen, inspect_stdout=mounts)):
+            ex = self._executor(mode="container", container_name="dev-box")
+            ex.run("pwd")
+        exec_argv = [a for a in seen if a[1:2] == ["exec"]][0]
+        expected = "/host" + cwd.rstrip("/")
+        self.assertEqual(exec_argv[2:5], ["-w", expected, "dev-box"])
+
+    def test_a_specific_mount_beats_the_root_mount(self):
+        """With `/` and a nested volume both mounted, the specific one wins."""
+        cwd = os.path.realpath(os.getcwd())
+        mounts = json.dumps([{"Source": "/", "Destination": "/host"},
+                             {"Source": cwd, "Destination": "/exact"}])
+        seen = []
+        with patch("ollamaquery2.subprocess.run",
+                   side_effect=self._fake_run(seen, inspect_stdout=mounts)):
+            ex = self._executor(mode="container", container_name="dev-box")
+            ex.run("pwd")
+        exec_argv = [a for a in seen if a[1:2] == ["exec"]][0]
+        self.assertEqual(exec_argv[2:5], ["-w", "/exact", "dev-box"])
+
+    def test_running_container_without_a_matching_mount_keeps_its_workdir(self):
+        seen = []
+        with patch("ollamaquery2.subprocess.run",
+                   side_effect=self._fake_run(seen, inspect_stdout='[{"Source": "/elsewhere"}]')):
+            ex = self._executor(mode="container", container_name="dev-box")
+            ex.run("pwd")
+        exec_argv = [a for a in seen if a[1:2] == ["exec"]][0]
+        self.assertNotIn("-w", exec_argv)
+
+    def test_run_with_an_image_mounts_the_cwd_at_workspace(self):
+        seen = []
+        with patch("ollamaquery2.subprocess.run", side_effect=self._fake_run(seen)):
+            ex = self._executor(mode="container", container_image="img:3")
+            ex.run("id")
+        argv = seen[-1]
+        self.assertEqual(argv[1:4], ["run", "--rm", "--memory"])
+        self.assertEqual(argv[5:7], ["--cpus", q.DEFAULT_CONTAINER_CPUS])
+        self.assertEqual(argv[7], "-v")
+        self.assertTrue(argv[8].endswith(":/workspace:Z"))
+        self.assertEqual(argv[9:12], ["-w", "/workspace", "img:3"])
+        self.assertEqual(argv[12:], ["sh", "-c", "id"])
+
+    def test_throwaway_container_has_a_default_resource_ceiling(self):
+        """1 cpu / 1g by default: a stray model process must not cost the host."""
+        seen = []
+        with patch("ollamaquery2.subprocess.run", side_effect=self._fake_run(seen)):
+            ex = self._executor(mode="container", container_image="img:7")
+            ex.run("true")
+        argv = seen[-1]
+        self.assertEqual(argv[3:7], ["--memory", "1g", "--cpus", "1"])
+        self.assertEqual(argv[argv.index("--memory") + 1], q.DEFAULT_CONTAINER_MEMORY)
+        self.assertEqual(ex.describe_limits(), "1 cpu, 1g memory")
+        self.assertEqual(ex.describe(), "container (image img:7; 1 cpu, 1g memory)")
+
+    def test_limits_can_be_overridden(self):
+        seen = []
+        with patch("ollamaquery2.subprocess.run", side_effect=self._fake_run(seen)):
+            ex = self._executor(mode="container", container_image="img:8",
+                                container_memory="4g", container_cpus="2")
+            ex.run("true")
+        argv = seen[-1]
+        self.assertEqual(argv[3:7], ["--memory", "4g", "--cpus", "2"])
+        self.assertEqual(ex.describe_limits(), "2 cpu, 4g memory")
+
+    def test_exec_mode_never_sets_limits(self):
+        """The running container's limits belong to whoever started it."""
+        seen = []
+        with patch("ollamaquery2.subprocess.run", side_effect=self._fake_run(seen)):
+            ex = self._executor(mode="container", container_name="dev-box",
+                                container_memory="4g", container_cpus="2")
+            ex.run("true")
+        exec_argv = [a for a in seen if a[1:2] == ["exec"]][0]
+        self.assertNotIn("--memory", exec_argv)
+        self.assertNotIn("--cpus", exec_argv)
+        self.assertEqual(ex.describe_limits(), "the container's own limits")
+        self.assertEqual(ex.describe(),
+                         "container (exec into dev-box; the container's own limits)")
+
+    def test_cli_flags_reach_the_executor_via_the_context(self):
+        args = q._build_parser().parse_args(
+            ["--sandbox-image", "img:4", "--sandbox-runtime", "docker",
+             "--sandbox-memory", "3g", "--sandbox-cpus", "1.5"])
+        ctx = types.SimpleNamespace()
+        q._apply_sandbox_args(ctx, args)
+        self.assertEqual(ctx.executor_mode, "container")
+        ex = q.CommandContext.create_executor(ctx)
+        self.assertEqual((ex.mode, ex.image, ex.runtime, ex.container_name),
+                         ("container", "img:4", "docker", None))
+        self.assertEqual((ex.memory, ex.cpus), ("3g", "1.5"))
+
+    def test_limit_env_vars_still_work(self):
+        with patch.dict(os.environ, {"OLLAMAQUERY_CONTAINER_MEMORY": "512m",
+                                     "OLLAMAQUERY_CONTAINER_CPUS": "0.5"}):
+            ex = q.Executor(mode="container")
+        self.assertEqual((ex.memory, ex.cpus), ("512m", "0.5"))
+
+    def test_sandbox_container_flag_beats_the_image(self):
+        args = q._build_parser().parse_args(
+            ["--sandbox-container", "dev-box", "--sandbox-image", "img:5"])
+        ctx = types.SimpleNamespace()
+        q._apply_sandbox_args(ctx, args)
+        ex = q.CommandContext.create_executor(ctx)
+        self.assertTrue(ex.describe().startswith("container (exec into dev-box;"))
+        self.assertEqual(ex.mode, "container")
+
+    def test_no_sandbox_flag_keeps_host_mode(self):
+        args = q._build_parser().parse_args([])
+        ctx = types.SimpleNamespace()
+        q._apply_sandbox_args(ctx, args)
+        self.assertFalse(hasattr(ctx, "executor_mode"))
+        ex = q.CommandContext.create_executor(
+            types.SimpleNamespace(executor_mode="host", container_runtime=None,
+                                  container_image=None, container_name=None))
+        self.assertEqual(ex.mode, "host")
+
+    def test_env_vars_still_configure_the_executor(self):
+        with patch.dict(os.environ, {"OLLAMAQUERY_CONTAINER_IMAGE": "env:9",
+                                     "OLLAMAQUERY_CONTAINER_RT": "docker"}):
+            ex = q.Executor(mode="container")
+            explicit = q.Executor(mode="container", container_image="arg:1")
+        self.assertEqual((ex.image, ex.runtime), ("env:9", "docker"))
+        self.assertEqual(explicit.image, "arg:1")
+
+    def test_default_image_and_runtime(self):
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("OLLAMAQUERY_CONTAINER")}
+        with patch.dict(os.environ, env, clear=True):
+            ex = q.Executor(mode="container")
+        self.assertEqual(ex.image, q.DEFAULT_CONTAINER_IMAGE)
+        self.assertEqual(ex.runtime, q.DEFAULT_CONTAINER_RUNTIME)
+
+    def test_sandbox_toggle_reports_the_target(self):
+        loop = object.__new__(q.ChatLoop)
+        loop.executor = self._executor(mode="host", container_image="img:6")
+        loop.tool_registry = types.SimpleNamespace(executor=loop.executor)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop._agentic_toggle_sandbox()
+        self.assertEqual(loop.executor.mode, "container")
+        self.assertEqual(loop.tool_registry.executor.mode, "container")
+        self.assertIn("img:6", err.getvalue())
 
 
 class TestAgenticStreamObservations(unittest.TestCase):
@@ -1379,7 +1987,6 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
         """Query that should be answered directly without tools."""
         result = self.loop.run_agentic_query("Say hello in one word")
         # Should have an assistant response in messages
-        self.assertTrue(hasattr(self.loop, 'messages'))
         self.assertGreater(len(self.loop.messages), 1)
         last = self.loop.messages[-1]
         self.assertEqual(last["role"], "assistant")
@@ -1394,7 +2001,6 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
         """
         self.loop.run_agentic_query("My name is Alex")
         # self.messages must contain the user prompt
-        self.assertTrue(hasattr(self.loop, 'messages'))
         user_msgs = [m for m in self.loop.messages if m['role'] == 'user']
         self.assertGreaterEqual(len(user_msgs), 1,
                                 "User prompt was not saved to self.messages")
@@ -1425,7 +2031,6 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
         result = self.loop.run_agentic_query(
             "Fetch http://example.com and tell me what the page title is"
         )
-        self.assertTrue(hasattr(self.loop, 'messages'))
         # Observations are now stored in history, so the last message may be a
         # tool result (user role). Verify an assistant response exists somewhere.
         assistant_msgs = [m for m in self.loop.messages if m['role'] == 'assistant']
@@ -1448,7 +2053,6 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
                     "Then read it back using the read_file tool. "
                     "IMPORTANT: You MUST use the write_file and read_file tools, do NOT simulate."
                 )
-                self.assertTrue(hasattr(self.loop, 'messages'))
                 # Observations are now stored, so the last message may be a
                 # tool result. Check that an assistant response exists.
                 assistant_msgs = [m for m in self.loop.messages if m['role'] == 'assistant']
@@ -1592,7 +2196,6 @@ class TestAgenticReActEndToEnd(unittest.TestCase):
                     "and tell me what's in it. "
                     "IMPORTANT: Actually use the read_file tool, do not simulate."
                 )
-                self.assertTrue(hasattr(self.loop, 'messages'))
                 last = self.loop.messages[-1]
                 self.assertEqual(last["role"], "assistant")
                 # The assistant should report that the path was denied,
@@ -1634,6 +2237,19 @@ class TestReActLoopUnit(unittest.TestCase):
         self._wire_patch.start()
         self.addCleanup(self._wire_patch.stop)
         self.loop = q.ChatLoop(self.ctx)
+        # These are *unit* tests, but they drive the real tool handlers with
+        # relative paths (`write_file("x.txt")`). Point the CWD at a throwaway
+        # directory: pre-fix they dropped hello.txt / x.txt / z.txt at the
+        # repository root on every suite run.
+        self._repo_cwd = os.getcwd()
+        self._workdir = tempfile.TemporaryDirectory(prefix="aq_react_")
+        os.chdir(self._workdir.name)
+        self.addCleanup(self._leave_workdir)
+
+    def _leave_workdir(self):
+        """Restore the caller's CWD and delete the scratch directory."""
+        os.chdir(self._repo_cwd)
+        self._workdir.cleanup()
 
     def _make_sync_response(self, content):
         """Create a mock llama.cpp sync response."""
@@ -1721,10 +2337,9 @@ class TestReActLoopUnit(unittest.TestCase):
 
         # On cancellation, no new assistant message is appended
         # (only the original system prompt message exists)
-        if hasattr(self.loop, 'messages'):
-            assistant_msgs = [m for m in self.loop.messages if m["role"] == "assistant"]
-            self.assertEqual(len(assistant_msgs), 0,
-                             "No assistant message should be added on cancellation")
+        assistant_msgs = [m for m in self.loop.messages if m["role"] == "assistant"]
+        self.assertEqual(len(assistant_msgs), 0,
+                         "No assistant message should be added on cancellation")
 
     def test_max_iterations_reached(self):
         """When loop hits max_iterations, it stops and returns last response."""
@@ -1740,8 +2355,8 @@ class TestReActLoopUnit(unittest.TestCase):
 
         self.loop.run_agentic_query("Keep using tools")
 
-        self.assertTrue(hasattr(self.loop, 'messages'))
-        # Should have terminated, no crash
+        # Terminated at the cap without crashing, and the turn was persisted.
+        self.assertGreater(len(self.loop.messages), 2)
 
     def test_parse_tool_call_with_real_usage(self):
         """Real parse_tool_call usage within the loop."""
@@ -1757,7 +2372,7 @@ class TestReActLoopUnit(unittest.TestCase):
 
         self.loop.run_agentic_query("Read a file")
 
-        last = self.loop.messages[-1] if hasattr(self.loop, 'messages') else {"role": "system", "content": ""}
+        last = self.loop.messages[-1]
         self.assertEqual(last["role"], "assistant")
 
     def test_api_error_skips_finalize_and_preserves_history(self):
@@ -1855,7 +2470,10 @@ class TestReActLoopUnit(unittest.TestCase):
                 return tool_resp          # step 1 produces a tool call → executed
             raise KeyboardInterrupt()     # step 2 interrupted by ^C
 
-        with patch.object(self.loop, '_call_with_timeout', side_effect=fake_timeout):
+        # The step call lives on AgenticRunner; patch it there so the fake
+        # timeout drives the loop's timeout/^C paths.
+        runner = self.loop._agentic_runner()
+        with patch.object(runner, 'call_with_timeout', side_effect=fake_timeout):
             with self.assertRaises(KeyboardInterrupt):
                 self.loop.run_agentic_query("read this project")
 
@@ -1897,6 +2515,45 @@ class TestReActLoopUnit(unittest.TestCase):
 
         self.assertEqual(resp.get("error", {}).get("message"), "cancelled")
         self.assertNotIn("[ERROR]", stderr.getvalue())
+
+
+class TestReActLoopDoesNotLitterTheCheckout(unittest.TestCase):
+    """The mocked ReAct tests must leave the repository checkout untouched.
+
+    They drive the *real* tool handlers with relative paths, so an earlier
+    version wrote `hello.txt`, `x.txt` and `z.txt` at the repo root after every
+    suite run (visible in `git status` as untracked files). The class now runs
+    inside a TemporaryDirectory; this pins the contract by running the
+    write-heaviest case and comparing the checkout listing before/after.
+    """
+
+    REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_write_case_leaves_no_file_in_the_checkout(self):
+        before = set(os.listdir(self.REPO_ROOT))
+        cwd_before = os.getcwd()
+        try:
+            result = unittest.TestResult()
+            TestReActLoopUnit("test_tool_call_triggers_execution").run(result)
+            self.assertTrue(
+                result.wasSuccessful(),
+                msg=f"representative case failed: {result.failures or result.errors}")
+            self.assertEqual(
+                set(os.listdir(self.REPO_ROOT)), before,
+                "mocked ReAct tests must not create files in the repository checkout")
+        finally:
+            os.chdir(cwd_before)
+
+    def test_cwd_is_restored_after_the_case(self):
+        cwd_before = os.getcwd()
+        try:
+            result = unittest.TestResult()
+            TestReActLoopUnit("test_max_iterations_reached").run(result)
+            self.assertTrue(result.wasSuccessful())
+            self.assertEqual(os.path.realpath(os.getcwd()), os.path.realpath(cwd_before),
+                             "setUp/tearDown must restore the caller's working directory")
+        finally:
+            os.chdir(cwd_before)
 
 
 class TestStuckDetection(unittest.TestCase):
@@ -1962,9 +2619,42 @@ class TestStuckDetection(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TestToolCallParserExtraction(unittest.TestCase):
+    """Pin the ToolCallParser extraction (parsing moved out of ChatLoop).
+
+    `ChatLoop` keeps thin doors for the existing call sites; these tests pin
+    both the delegation and the compatibility surfaces other tests rely on.
+    """
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.lazy_tool = False
+        self.loop = q.ChatLoop(self.ctx)
+
+    def test_parser_is_the_implementation(self):
+        self.assertIsInstance(self.loop.parser, q.ToolCallParser)
+
+    def test_unbound_static_aliases_still_work(self):
+        """Tests call these on the class, not on an instance."""
+        self.assertIsInstance(q.ChatLoop.__dict__['_extract_json_balanced'], staticmethod)
+        self.assertEqual(q.ChatLoop._extract_json_balanced('{"a": 1}', 0), '{"a": 1}')
+        text = '{"tool": 1} {"tool": 2}'
+        self.assertEqual(q.ChatLoop._find_tool_call_brace('x {"tool": 1}'), 2)
+        self.assertEqual(text[q.ChatLoop._rfind_tool_call_brace(text):], '{"tool": 2}')
+        self.assertEqual(q.ChatLoop._normalize_tool_json('{"tool": "a", "arguments": {}}'),
+                         {"tool": "a", "arguments": {}})
+
+    def test_doors_work_on_an_instance_built_without_init(self):
+        """`object.__new__(ChatLoop)` fixtures have no `.parser` attribute."""
+        bare = object.__new__(q.ChatLoop)
+        bare.ctx = self.ctx
+        self.assertEqual(bare.parse_tool_call('{"tool": "a", "arguments": {}}'),
+                         {"tool": "a", "arguments": {}})
+        self.assertEqual(len(bare.parse_tool_calls('{"tool": "a", "arguments": {}}')), 1)
+
+
 class TestNormalizeToolJson(unittest.TestCase):
     """Test _normalize_tool_json with various formats."""
-
     def setUp(self):
         self.ctx = q.CommandContext()
         self.loop = q.ChatLoop(self.ctx)
@@ -2184,7 +2874,8 @@ class TestSameToolLoopGuard(unittest.TestCase):
         self.ctx = q.CommandContext()
         self.loop = object.__new__(q.ChatLoop)
         self.loop.ctx = self.ctx
-        self.loop._execute_single_tool = MagicMock(return_value={
+        # The guard counts calls; execution itself is stubbed out.
+        self.loop._tool_exec().run_single = MagicMock(return_value={
             "observation": "[read_file] ok", "raw": "ok",
             "success": True, "cancelled": False})
 
@@ -2242,8 +2933,129 @@ class TestSameToolLoopGuard(unittest.TestCase):
         self.assertEqual(len(obs), 4)
 
 
+class TestToolExecutionExtraction(unittest.TestCase):
+    """Pin the ToolExecution extraction: usable without ChatLoop, doors intact."""
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.lazy_tool = False
+
+    def test_usable_without_chatloop(self):
+        executor = q.ToolExecution(self.ctx, None, q.ToolCallParser(self.ctx))
+        calls = executor.parse_calls('{"tool": "read_file", "arguments": {"file_path": "x"}}', [])
+        self.assertEqual(calls[0]["tool"], "read_file")
+        messages = []
+        executor.append_messages(messages, "text", [], calls, ["[read_file] ok"], ["ok"], False)
+        self.assertEqual(messages[0]["role"], "assistant")
+        self.assertTrue(messages[1]["content"].startswith("Tool result:"))
+
+    def test_unbound_static_aliases(self):
+        self.assertIsInstance(q.ChatLoop.__dict__['_cap_tool_observation'], staticmethod)
+        self.assertIsInstance(q.ChatLoop.__dict__['_complete_stream_tool_calls'], staticmethod)
+        self.assertEqual(q.ChatLoop._cap_tool_observation("read_file", "x" * 9000), "x" * 9000)
+        self.assertEqual(q.ChatLoop._complete_stream_tool_calls(
+            [{"function": {"name": "a", "arguments": '{"x": 1}'}}])[0]["function"]["name"], "a")
+
+    def test_doors_resolve_one_lazy_executor(self):
+        loop = object.__new__(q.ChatLoop)
+        loop.ctx = self.ctx
+        first = loop._tool_exec()
+        self.assertIsInstance(first, q.ToolExecution)
+        self.assertIs(first, loop._tool_exec())
+
+
+class TestSpillIsolation(unittest.TestCase):
+    """Spill files are per-process.
+
+    Several sessions legitimately run at once and share the spill root; before
+    this, closing one session purged *every* session's files by prefix, so a
+    model paging a spilled page got "not found" on a path handed out a turn
+    earlier. Per-process directories also stop fixed names
+    (unfinished_write_file, git_result_<action>) from overwriting each other.
+    """
+
+    def test_spill_dir_is_per_process(self):
+        self.assertEqual(os.path.basename(q.CLUSTER_SPILL_DIR), f"pid-{os.getpid()}")
+        self.assertEqual(os.path.dirname(q.CLUSTER_SPILL_DIR), q.SPILL_ROOT)
+
+    def test_cleanup_is_scoped_to_this_process_and_sweeps_dead_sessions(self):
+        with tempfile.TemporaryDirectory() as td:
+            ours = os.path.join(td, f"pid-{os.getpid()}")
+            dead = os.path.join(td, "pid-999999")
+            live = os.path.join(td, "pid-1")
+            for directory in (ours, dead, live):
+                os.makedirs(directory)
+                with open(os.path.join(directory, "fetch_result_x.txt"), "w") as f:
+                    f.write("x")
+            # pid 1 stays alive; 999999 is declared dead so the test does not
+            # depend on the host's PID space.
+            with patch.object(q, "CLUSTER_SPILL_DIR", ours), \
+                 patch.object(q, "_pid_alive", side_effect=lambda pid: pid == 1):
+                q._cleanup_spill_files()
+            self.assertFalse(os.path.exists(ours), "own spill dir must be removed")
+            self.assertFalse(os.path.exists(dead), "dead session's dir must be swept")
+            self.assertTrue(os.path.exists(live), "a live session's dir must survive")
+
+    def test_long_urls_do_not_collide_on_one_spill_file(self):
+        """Two URLs sharing their first 64 sanitized chars must not overwrite."""
+        prefix = "https://example.com/very/deep/path/" + "x" * 120
+        alpha = q._fetch_spill_path(prefix + "/alpha")
+        beta = q._fetch_spill_path(prefix + "/beta")
+        self.assertNotEqual(alpha, beta)
+        # ...and the name stays stable for a re-fetch of the same URL.
+        self.assertEqual(alpha, q._fetch_spill_path(prefix + "/alpha"))
+
+
+class TestAgenticRunnerExtraction(unittest.TestCase):
+    """Pin the AgenticRunner extraction: step helpers usable without ChatLoop."""
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.lazy_tool = False
+        # CommandContext is a singleton shared with the rest of the suite: pin the
+        # backend so `_extract_sync_content` reads the Ollama response shape.
+        self.ctx.backend = "ollama"
+        self.runner = q.AgenticRunner(self.ctx, None, None, None,
+                                      q.ToolCallParser(self.ctx), None)
+
+    def test_static_helpers(self):
+        self.assertTrue(q.AgenticRunner.is_stuck("ab" * 400))
+        self.assertFalse(q.AgenticRunner.is_stuck("hello"))
+        self.assertEqual(q.AgenticRunner.call_with_timeout(lambda x: x + 1, 5, 41), 42)
+
+    def test_step_content_without_chatloop(self):
+        text, calls = self.runner.step_content({"message": {"content": "hello"}})
+        self.assertEqual(text, "hello")
+        self.assertEqual(calls, [])
+
+    def test_loop_door_reuses_one_runner(self):
+        loop = object.__new__(q.ChatLoop)
+        loop.ctx = self.ctx
+        first = loop._agentic_runner()
+        self.assertIsInstance(first, q.AgenticRunner)
+        self.assertIs(first, loop._agentic_runner())
+
+
 class TestClusterQueryTool(unittest.TestCase):
     """kubernetes_cluster_query tool: verb whitelist, backend auto-detect, command build."""
+
+    # Realistic `oc api-resources` output (columns separated by 2+ spaces, the
+    # SHORTNAMES cell empty for `bindings`). Resource validation is driven by
+    # this table, so a change here changes which names are accepted.
+    API_RESOURCES = (
+        "NAME                     SHORTNAMES   APIVERSION          NAMESPACED   KIND\n"
+        "bindings                              v1                  true         Binding\n"
+        "configmaps               cm           v1                  true         ConfigMap\n"
+        "deployments              deploy       apps/v1             true         Deployment\n"
+        "events                   ev           v1                  true         Event\n"
+        "namespaces               ns           v1                  false        Namespace\n"
+        "nodes                    no           v1                  false        Node\n"
+        "persistentvolumeclaims   pvc          v1                  true         PersistentVolumeClaim\n"
+        "persistentvolumes        pv           v1                  false        PersistentVolume\n"
+        "pods                     po           v1                  true         Pod\n"
+        "services                 svc          v1                  true         Service\n"
+        "storageclasses           sc           storage.k8s.io/v1   false        StorageClass\n"
+    )
 
     def setUp(self):
         self.ctx = q.CommandContext()
@@ -2254,9 +3066,17 @@ class TestClusterQueryTool(unittest.TestCase):
 
     def _fake_run(self, command, timeout=120):
         self.commands.append(command)
+        if "api-resources" in command:
+            return {"stdout": self.API_RESOURCES, "stderr": "", "returncode": 0}
         if "current-context" in command:
             return {"stdout": "api.cluster.example\n", "stderr": "", "returncode": 0}
         return {"stdout": "NAME READY\npod/a 1/1 Running\n", "stderr": "", "returncode": 0}
+
+    def _cmd(self, prefix):
+        """Return the last command starting with `prefix` (order-independent)."""
+        matches = [c for c in self.commands if c.startswith(prefix)]
+        self.assertTrue(matches, msg=f"no command starting with {prefix!r}: {self.commands!r}")
+        return matches[-1]
 
     def _run(self, **args):
         return self.reg.execute("kubernetes_cluster_query", args)
@@ -2281,8 +3101,8 @@ class TestClusterQueryTool(unittest.TestCase):
              patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
             result = self._run(verb="get", resource="pods", namespace="default")
         self.assertTrue(result["success"], msg=result.get("error"))
-        self.assertTrue(self.commands[0].startswith("oc config current-context"))
-        self.assertTrue(self.commands[1].startswith("oc get pods -n default -o json"))
+        self.assertIn("oc config current-context", self.commands)
+        self.assertIn("oc get pods -n default -o json", self.commands)
         self.assertIn("platform: oc", result["output"])
         self.assertIn("context: api.cluster.example", result["output"])
 
@@ -2409,7 +3229,7 @@ class TestClusterQueryTool(unittest.TestCase):
                                output="custom-columns",
                                fields="NAME:.metadata.name,SIZE:.spec.capacity.storage")
         self.assertTrue(result["success"], msg=result.get("error"))
-        self.assertTrue(self.commands[1].startswith(
+        self.assertTrue(self._cmd("oc get pv").startswith(
             "oc get pv -o custom-columns=NAME:.metadata.name,SIZE:.spec.capacity.storage"))
 
     def test_custom_columns_requires_fields(self):
@@ -2424,7 +3244,7 @@ class TestClusterQueryTool(unittest.TestCase):
                                fields="{.items[*].metadata.name}")
         self.assertTrue(result["success"], msg=result.get("error"))
         # The jsonpath token carries shell metacharacters -> shlex.quote'd.
-        self.assertTrue(self.commands[1].startswith(
+        self.assertTrue(self._cmd("oc get pv").startswith(
             "oc get pv -o 'jsonpath={.items[*].metadata.name}'"))
 
     def test_jsonpath_requires_fields(self):
@@ -2447,7 +3267,7 @@ class TestClusterQueryTool(unittest.TestCase):
              patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
             result = self._run(verb="get", resource="pods", selector="app=nginx")
         self.assertTrue(result["success"], msg=result.get("error"))
-        self.assertTrue(self.commands[1].startswith("oc get pods -l app=nginx -o json"))
+        self.assertTrue(self._cmd("oc get pods").startswith("oc get pods -l app=nginx -o json"))
 
     def test_selector_rejected_for_describe(self):
         result = self._run(verb="describe", resource="pods", selector="app=nginx")
@@ -2461,7 +3281,7 @@ class TestClusterQueryTool(unittest.TestCase):
             result = self._run(verb="get", resource="pods",
                                field_selector="status.phase=Running")
         self.assertTrue(result["success"], msg=result.get("error"))
-        self.assertTrue(self.commands[1].startswith(
+        self.assertTrue(self._cmd("oc get pods").startswith(
             "oc get pods --field-selector=status.phase=Running -o json"))
 
     def test_field_selector_rejected_for_logs(self):
@@ -2535,8 +3355,8 @@ class TestClusterQueryTool(unittest.TestCase):
              patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
             result = self._run(verb="get", resource="pods; touch /tmp/opencode/pwned")
         self.assertTrue(result["success"], msg=result.get("error"))
-        self.assertIn("'pods; touch /tmp/opencode/pwned'", self.commands[1])
-        self.assertNotIn("pods; touch /tmp/opencode/pwned -o", self.commands[1])
+        self.assertIn("'pods; touch /tmp/opencode/pwned'", self._cmd("oc get"))
+        self.assertNotIn("pods; touch /tmp/opencode/pwned -o", self._cmd("oc get"))
 
     def test_injection_command_substitution_is_quoted(self):
         """A `$()`-injected resource is quoted into a literal operand (was approved + executed pre-fix)."""
@@ -2544,7 +3364,7 @@ class TestClusterQueryTool(unittest.TestCase):
              patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
             result = self._run(verb="get", resource="pods $(id > /tmp/opencode/pwned2)")
         self.assertTrue(result["success"], msg=result.get("error"))
-        self.assertIn("'pods $(id > /tmp/opencode/pwned2)'", self.commands[1])
+        self.assertIn("'pods $(id > /tmp/opencode/pwned2)'", self._cmd("oc get"))
 
     def test_small_result_stays_inline(self):
         with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
@@ -2553,6 +3373,108 @@ class TestClusterQueryTool(unittest.TestCase):
         self.assertTrue(result["success"], msg=result.get("error"))
         self.assertNotIn("written to", result["output"])
         self.assertIn("pod/a 1/1 Running", result["output"])
+
+    # --- Resource-name validation (a refusal, never a rewrite) --------------
+
+    def test_unknown_resource_is_refused_with_closest_real_name(self):
+        """`pvs` exists nowhere: refuse, name the real type, run no query."""
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="get", resource="pvs")
+        self.assertFalse(result["success"])
+        self.assertIn("unknown resource 'pvs'", result["error"])
+        self.assertIn("persistentvolumes", result["error"])
+        self.assertFalse([c for c in self.commands if " oc get " in c],
+                         msg=f"the query must not run: {self.commands!r}")
+
+    def test_resource_is_sent_verbatim(self):
+        """A valid short name is not rewritten to its full name."""
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="get", resource="pv")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertEqual(self._cmd("oc get"), "oc get pv -o json")
+
+    def test_type_name_target_is_checked_but_not_rewritten(self):
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            ok = self._run(verb="get", resource="pod/mypod")
+            bad = self._run(verb="get", resource="poddss/mypod")
+        self.assertTrue(ok["success"], msg=ok.get("error"))
+        self.assertEqual(self._cmd("oc get"), "oc get pod/mypod -o json")
+        self.assertFalse(bad["success"])
+        self.assertIn("poddss", bad["error"])
+
+    def test_offline_passes_the_name_through(self):
+        """omc has no api-resources: the backend decides, nothing is rewritten."""
+        with patch.object(q.shutil, "which", return_value="/usr/bin/omc"):
+            result = self._run(cluster_type="omc", verb="get", resource="pvs",
+                               offline_dir="/tmp/mg")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertEqual(self.commands, ["omc use /tmp/mg", "omc get pvs -o json"])
+
+    def test_failed_discovery_passes_the_name_through(self):
+        """A discovery failure disables validation; the backend's error is the answer."""
+        def fake_run(command, timeout=120):
+            self.commands.append(command)
+            if "api-resources" in command:
+                return {"stdout": "", "stderr": "forbidden", "returncode": 1}
+            if "current-context" in command:
+                return {"stdout": "api.cluster.example\n", "stderr": "", "returncode": 0}
+            return {"stdout": "ok", "stderr": "", "returncode": 0}
+        self.reg.executor.run = MagicMock(side_effect=fake_run)
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="get", resource="poddsss")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertEqual(self._cmd("oc get"), "oc get poddsss -o json")
+
+    def test_discovery_runs_once_per_session(self):
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            self._run(verb="get", resource="pods")
+            self._run(verb="get", resource="nodes")
+        self.assertEqual(sum("api-resources" in c for c in self.commands), 1)
+
+    def test_pseudo_and_complex_resources_skip_discovery(self):
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            for resource in ("all", "pods,services", "pods; touch /tmp/x"):
+                result = self._run(verb="get", resource=resource)
+                self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertFalse([c for c in self.commands if "api-resources" in c])
+
+    def test_events_skip_discovery(self):
+        with patch.dict(os.environ, {"KUBECONFIG": "/tmp/kube"}, clear=False), \
+             patch.object(q.shutil, "which", return_value="/usr/bin/oc"):
+            result = self._run(verb="events", namespace="default")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertFalse([c for c in self.commands if "api-resources" in c])
+
+    def test_parse_api_resources_table(self):
+        known = q._cluster_parse_api_resources(self.API_RESOURCES)
+        self.assertEqual(known["pods"], "pods")
+        self.assertEqual(known["po"], "pods")
+        self.assertEqual(known["pod"], "pods")
+        self.assertEqual(known["binding"], "bindings")  # empty SHORTNAMES row
+        self.assertEqual(known["pvc"], "persistentvolumeclaims")
+        self.assertEqual(known["sc"], "storageclasses")
+        self.assertEqual(known["storageclass"], "storageclasses")
+
+    def test_parse_api_resources_ignores_header_and_junk(self):
+        self.assertEqual(q._cluster_parse_api_resources(""), {})
+        self.assertEqual(q._cluster_parse_api_resources("NAME SHORTNAMES\n"), {})
+
+    def test_api_resources_probe_is_allow_listed(self):
+        """The probe must not prompt in strict plan mode (no shell, no TTY)."""
+        for command in ("oc api-resources", "kubectl api-resources"):
+            verdict = q.shell_check_command(command, q.DEFAULT_SHELL_PERMISSION)
+            self.assertEqual(verdict["effect"], "allow", msg=command)
+
+    def test_description_has_no_invented_name_prose(self):
+        text = q.AGENTIC_TOOL_DEFS["kubernetes_cluster_query"]["description"]
+        self.assertNotIn("do NOT invent", text)
+        self.assertIn("full resource name", text)
 
 
 HAS_GIT = q.shutil.which("git") is not None

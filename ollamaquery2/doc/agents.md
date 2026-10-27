@@ -84,8 +84,30 @@ Tools that spawn subprocesses (fetch_url, write_file, run_python, patch) can run
 /agentic sandbox  → toggle host ↔ container
 ```
 
-Uses `podman` by default (or `docker` via `OLLAMAQUERY_CONTAINER_RT` env var).
-The current working directory is bind-mounted to `/workspace` inside the container.
+Two targets: an image (a throwaway `--rm` container per command, CWD bind-mounted
+to `/workspace`) or an already-running container (`--sandbox-container NAME`, which
+execs into it instead — state, packages and mounts you set up are what the model
+gets, and nothing is created or destroyed). Select from the CLI:
+
+```
+--sandbox-image IMAGE        (or OLLAMAQUERY_CONTAINER_IMAGE; default python:3.12-alpine)
+--sandbox-container NAME     (or OLLAMAQUERY_CONTAINER_NAME; implies container mode)
+--sandbox-runtime podman|docker  (or OLLAMAQUERY_CONTAINER_RT; default podman)
+--sandbox-memory SIZE           (or OLLAMAQUERY_CONTAINER_MEMORY; default 1g)
+--sandbox-cpus N                (or OLLAMAQUERY_CONTAINER_CPUS; default 1)
+```
+
+The throwaway container is capped at 1 CPU / 1 GiB by default (`--memory 1g
+--cpus 1`) so a runaway command cannot consume the host; the ceiling is shown in
+the banner, in `/agentic status` and in the `/agentic sandbox` message. With
+`--sandbox-container` no ceiling is applied — that container keeps the limits of
+whoever started it.
+
+The image is probed once per session and pulled only when absent (a locally built
+`localhost/...` image is never pulled: podman would treat `localhost/` as a
+registry). With `--sandbox-container`, the runtime's mounts are inspected and the
+mount containing the current CWD becomes the workdir, so relative paths hit your
+files; without such a mount the container's own workdir is kept.
 
 ## Logging
 

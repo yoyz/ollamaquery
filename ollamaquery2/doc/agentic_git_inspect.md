@@ -159,7 +159,7 @@ deadlock the read), and a watchdog kills the child at `GIT_INSPECT_TIMEOUT` so a
 hung `read()` cannot wedge the ReAct loop.
 
 Results above `CLUSTER_SPILL_THRESHOLD` (3500 chars) then spill to
-`~/.ollamaquery.d/spill/git_result_<action>.txt`, and the model receives a pure
+`~/.ollamaquery.d/spill/pid-<n>/git_result_<action>.txt`, and the model receives a pure
 pointer (size + `read_file` path), never the payload inline. `read_file` pages it
 via its `next` offset, and the session Path-ACL read-allow rule for the spill dir
 is registered **before** the path is handed over (strict plan mode confines every
