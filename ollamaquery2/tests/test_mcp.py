@@ -850,6 +850,15 @@ class TestListingAndCommand(unittest.TestCase):
 
 class TestSpill(unittest.TestCase):
     def test_oversized_result_spills_and_registers_acl(self):
+        """The spill lands in a tempdir, never in the real $HOME state dir.
+
+        Hermeticity matters twice over: on a read-only or absent HOME the old
+        version failed (the spill raised and the model got the degraded copy),
+        and on a writable one it wrote into `~/.ollamaquery.d/spill/pid-<pid>`.
+        `_sweep_dead_spill_dirs()` already treats a patched dir as "not ours"
+        (it only reaps names matching `pid-<n>`), so patching is the supported
+        path — `test_small_result_not_spilled_when_cap_is_small` does the same.
+        """
         class Acl:
             def __init__(self):
                 self.calls = []
@@ -859,17 +868,23 @@ class TestSpill(unittest.TestCase):
         ctx = _ctx()
         ctx.path_acl = Acl()
         cfg = m.MCPServerConfig(name="k8s", command=["x"], max_result_chars=10)
-        result = m._mcp_result_to_output(
-            ctx, {"content": [{"type": "text", "text": "x" * 200}]}, cfg, "pods_list")
-        self.assertIn("read_file(file_path=", result["output"])
-        self.assertIn(("read", "allow", os.path.realpath(m.CLUSTER_SPILL_DIR)),
-                      [(op, action, os.path.realpath(path))
-                       for op, action, path in ctx.path_acl.calls])
-        m._cleanup_spill_files()
-        leftovers = [name for name in os.listdir(m.CLUSTER_SPILL_DIR)
-                     if name.startswith(m.MCP_SPILL_PREFIX)] if os.path.isdir(
-                         m.CLUSTER_SPILL_DIR) else []
-        self.assertEqual(leftovers, [])
+        with tempfile.TemporaryDirectory() as spill_dir:
+            with patch.object(m, "CLUSTER_SPILL_DIR", spill_dir):
+                result = m._mcp_result_to_output(
+                    ctx, {"content": [{"type": "text", "text": "x" * 200}]},
+                    cfg, "pods_list")
+                self.assertIn("read_file(file_path=", result["output"])
+                self.assertIn(("read", "allow", os.path.realpath(spill_dir)),
+                              [(op, action, os.path.realpath(path))
+                               for op, action, path in ctx.path_acl.calls])
+                written = [name for name in os.listdir(spill_dir)
+                           if name.startswith(m.MCP_SPILL_PREFIX)]
+                self.assertEqual(len(written), 1, written)
+                m._cleanup_spill_files()
+                # Cleanup unlinks the page then rmdir()s the per-process dir;
+                # either end state is "nothing left behind".
+                self.assertEqual(
+                    [] if not os.path.isdir(spill_dir) else os.listdir(spill_dir), [])
 
     def test_cap_follows_context_window(self):
         self.assertEqual(m._mcp_resolve_max_result_chars(_ctx(), 100000), 100000)

@@ -172,7 +172,16 @@ caps the echoed reasoning from the end (`_cap_tail`, `[-4000:]`, prefixed
   to the main thread during `thread.join()`) is exercised manually; the offline unit test drives
   the same code path by raising `KeyboardInterrupt` from a mocked step executor.
 
-### 5.1 Preserving the interrupted step without polluting context (proposal, to think about)
+### 5.1 Preserving the interrupted step without polluting context (partially landed)
+
+> **Status 2026-11-12 (`0.4.1`):** mechanism **C landed for the highest-value
+> case** — `AgenticRunner.find_partial_write()` / `spill_partial_write()` decode
+> a cut-off `write_file` from the native `arguments` fragments (or the inline text
+> buffer) and spill the recovered content to the session scratch dir instead of
+> losing it. Still open: **A** (the nudge still echoes up to ~4K chars of the
+> model's own reasoning into a user message) and **B** (`remember`/`set_status`),
+> plus C for any tool other than `write_file` (a cut-off `run_command`/`patch` is
+> still discarded).
 
 On a step timeout (or `^C`) the model is cut mid-generation. Today `_timeout_nudge`
 echoes up to 4000 chars of the *tail* of the reasoning (and partial content) inline

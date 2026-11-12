@@ -154,24 +154,51 @@ while `ollamaquery2.py` refuses to infer "safe" from an absent `readOnlyHint`
 
 ## 4. Findings
 
-| ID    | Severity | Area            | Effect                                                                |
-| ----- | -------- | --------------- | --------------------------------------------------------------------- |
-| P1-1  | High     | Cancellation    | `initialize` is cancelled on timeout — spec violation                 |
-| P1-2  | High     | Connect         | Tools-less server can never connect; session torn down                |
-| P1-3  | High     | Errors          | `error.data` discarded (validation detail, URL elicitation)           |
-| P1-4  | High     | Pagination      | Repeating `nextCursor` hangs connect indefinitely                     |
-| P1-5  | High     | Tasks           | `taskSupport: required` always fails; task ack reads as empty success |
-| P1-6  | High     | Cancellation    | Inbound `notifications/cancelled` ignored — 120 s stall               |
-| P2-7  | Medium   | Staleness       | `tools/list_changed` notice written to a field nothing reads          |
-| P2-8  | Medium   | Progress        | No `progressToken`, no `notifications/progress` — silent calls        |
-| P2-9  | Medium   | Prompt          | `serverInfo.instructions` captured, never used                        |
-| P2-10 | Medium   | Diagnostics     | `_stderr_tail` collected, never surfaced                              |
-| P2-11 | Medium   | Framing         | Non-string `method` answered; batch arrays dropped while advertised   |
-| P2-12 | Medium   | Env             | Child env narrower than mainstream clients (breaks real servers)      |
-| P2-13 | Medium   | Schema fidelity | Normalization leaks into the native `tools` array                     |
-| P3-14 | Low      | Spill           | Deterministic filename overwrites an earlier pointer                  |
-| P3-15 | Low      | Content         | image/audio flattened, never reaches a vision model                   |
-| P3-16 | Low      | Logging         | `notifications/message` dropped, no debug sink                        |
+Status verified against the code at `0.4.1` (2026-11-12). Only **P1-4** has
+landed; every other row was re-read and is still present.
+
+| ID    | Severity | Area            | Effect                                                                | Status |
+| ----- | -------- | --------------- | --------------------------------------------------------------------- | ------ |
+| P1-1  | High     | Cancellation    | `initialize` is cancelled on timeout — spec violation                 | open   |
+| P1-2  | High     | Connect         | Tools-less server can never connect; session torn down                | open   |
+| P1-3  | High     | Errors          | `error.data` discarded (validation detail, URL elicitation)           | open   |
+| P1-4  | High     | Pagination      | Repeating `nextCursor` hangs connect indefinitely                     | fixed  |
+| P1-5  | High     | Tasks           | `taskSupport: required` always fails; task ack reads as empty success | open   |
+| P1-6  | High     | Cancellation    | Inbound `notifications/cancelled` ignored — 120 s stall               | open   |
+| P2-7  | Medium   | Staleness       | `tools/list_changed` notice written to a field nothing reads          | open   |
+| P2-8  | Medium   | Progress        | No `progressToken`, no `notifications/progress` — silent calls        | open   |
+| P2-9  | Medium   | Prompt          | `serverInfo.instructions` captured, never used                        | open   |
+| P2-10 | Medium   | Diagnostics     | `_stderr_tail` collected, never surfaced                              | open   |
+| P2-11 | Medium   | Framing         | Non-string `method` answered; batch arrays dropped while advertised   | open   |
+| P2-12 | Medium   | Env             | Child env narrower than mainstream clients (breaks real servers)      | open   |
+| P2-13 | Medium   | Schema fidelity | Normalization leaks into the native `tools` array                     | open   |
+| P3-14 | Low      | Spill           | Deterministic filename overwrites an earlier pointer                  | open   |
+| P3-15 | Low      | Content         | image/audio flattened, never reaches a vision model                   | open   |
+| P3-16 | Low      | Logging         | `notifications/message` dropped, no debug sink                        | open   |
+
+**What "fixed" means for P1-4** (`10cc9a0`): `MCPClient.list_tools()` now raises
+on a repeated `nextCursor`, and adds a page ceiling (`MCP_LIST_MAX_PAGES`), a
+catalog-size ceiling (`MCP_LIST_MAX_TOOLS`) and one deadline for the whole
+refresh (`MCP_LIST_DEADLINE_MIN` × `MCP_LIST_DEADLINE_FACTOR`), so a hostile
+server fails fast instead of hanging `connect()` while the manager holds its lock.
+
+**Re-verified as still open** (one line each, so the next pass does not have to
+re-derive it):
+
+- P1-1 — `MCPConnection.request()` sends `notifications/cancelled` for every
+  method, including `initialize` (no carve-out).
+- P1-2 — `MCPClient.connect()` closes the transport on any `list_tools()` error.
+- P1-3 — `MCPProtocolError` keeps only code + message; `error.data` is dropped.
+- P1-6 / P2-7 — `_handle_notification` records `tools/list_changed` into
+  `MCPClient.errors` (a list nothing reads) and ignores inbound cancellation.
+- P2-9 / P2-10 — `instructions` and `_stderr_tail` are stored on the client and
+  never rendered or printed.
+- P2-12 — the child env is still a fixed five-variable allowlist
+  (`PATH, HOME, LANG, LC_ALL, TERM`).
+- P2-13 — the normalized schema still feeds `build_openai_specs()`, not the raw
+  `inputSchema`.
+- P3-14 — `_mcp_spill_path()` is still deterministic per server/tool (a digest,
+  but no call counter), so a second call overwrites the first pointer's file.
 
 ### P1-1 — `initialize` must never be cancelled
 
@@ -352,6 +379,11 @@ Group 1 specifics: an init timeout must emit no `notifications/cancelled`; a `-3
 from `tools/list` must leave the session connected with an empty catalog; a repeated
 `nextCursor` must raise instead of looping; an inbound cancellation must abort the wait;
 `error.data` must reach the tool-result text.
+
+> **2026-11-12 note:** the `nextCursor` item of group 1 already landed (P1-4,
+> `10cc9a0`), together with a page ceiling, a catalog-size ceiling and a total
+> refresh deadline — a hostile server now fails fast instead of hanging
+> `connect()`. The remaining group-1 work is P1-1, P1-2, P1-3, P1-6.
 
 Group 1 is self-contained, has obvious test hooks in `tests/test_mcp.py`, and is the
 recommended first pass. P1-5's full task engine should stay out until a server that

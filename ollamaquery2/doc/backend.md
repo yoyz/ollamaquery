@@ -1,24 +1,33 @@
 # Backend Support Reference
 
-ollamaquery2 supports four backends: **Ollama**, **Llama.cpp**, **Strata**, and **LM Studio**.
-Each exposes a different API surface despite all serving LLMs.
+ollamaquery2 supports four **local** backends: **Ollama**, **Llama.cpp**, **Strata**,
+and **LM Studio**. Each exposes a different API surface despite all serving LLMs.
+
+It also speaks OpenAI-compatible **cloud** backends (Gemini, OpenCode Zen, OpenCode Go,
+Mistral, DeepSeek): those reuse the OpenAI-family request/stream path, are selected
+explicitly with `-b <name>` (+ an API key env var), and are documented in the README
+rather than here, because there is no local probing to describe.
 
 ## Quick Comparison
 
-| Feature                  | Ollama                      | Llama.cpp                         | Strata                             | LM Studio                        |
-|--------------------------|-----------------------------|-----------------------------------|------------------------------------|----------------------------------|
-| Chat endpoint            | `/api/chat`                 | `/v1/chat/completions`            | `/v1/chat/completions`             | `/v1/chat/completions`           |
-| Model list               | `/api/tags`                 | `/v1/models`                      | `/v1/models`                       | `/v1/models`                     |
-| Model ID format          | `qwen3.5:9b`                | `Qwen3.5-9B-Q4_K_M.gguf`          | `qwen3.8-flash-next-ud-q2_k_xl`    | `openai/gpt-oss-20b`             |
-| Context size             | `/api/ps` or `/api/show`    | `/slots`                          | `/slots`                           | None (use default)               |
-| Token counting           | `/api/tokenize`             | `/tokenize`                       | `/v1/messages/count_tokens`        | None (use estimation)            |
-| Thinking/reasoning field | `message.reasoning_content` | `delta.reasoning_content`         | `delta.reasoning_content`          | `delta.reasoning`                |
-| Image support            | `message.images` array      | `content` array with `image_url`  | `content` array with `image_url`   | `content` array with `image_url` |
-| SSE streaming            | JSON lines, no prefix       | `data: ` prefix + `[DONE]`        | `data: ` prefix + `[DONE]`         | `data: ` prefix + `[DONE]`       |
-| Default port             | 11434                       | 8080                              | 8080                               | 1234                             |
-| Server header            | `ollama`                    | `llama.cpp`                       | `BaseHTTP/...` (generic)           | (no reliable marker)             |
-| Detection method         | GET `/` for `ollama` string | HEAD check for `llama.cpp` header | GET `/health` for `service=strata` | GET `/v1/models` for model list  |
-| Auto-discovery           | GET `/` + host IP scan      | HEAD + host IP scan               | GET `/health` + host IP scan       | GET `/v1/models` + host IP scan  |
+| Feature                    | Ollama                        | Llama.cpp                           | Strata                               | LM Studio                          |
+| -------------------------- | ----------------------------- | ----------------------------------- | ------------------------------------ | ---------------------------------- |
+| Chat endpoint              | `/api/chat`                   | `/v1/chat/completions`              | `/v1/chat/completions`               | `/v1/chat/completions`             |
+| Model list                 | `/api/tags`                   | `/v1/models`                        | `/v1/models`                         | `/v1/models`                       |
+| Model ID format            | `qwen3.5:9b`                  | `Qwen3.5-9B-Q4_K_M.gguf`            | `qwen3.8-flash-next-ud-q2_k_xl`      | `openai/gpt-oss-20b`               |
+| Context size               | `/api/ps` or `/api/show`      | `/slots`                            | `/slots`                             | None (use default)                 |
+| Token counting             | `/api/tokenize`               | `/tokenize`                         | `/v1/messages/count_tokens`          | None (use estimation)              |
+| Thinking/reasoning field   | `message.thought`             | `delta.reasoning_content`           | `delta.reasoning_content`            | `delta.reasoning`                  |
+| Image support              | `message.images` array        | `content` array with `image_url`    | `content` array with `image_url`     | `content` array with `image_url`   |
+| SSE streaming              | JSON lines, no prefix         | `data: ` prefix + `[DONE]`          | `data: ` prefix + `[DONE]`           | `data: ` prefix + `[DONE]`         |
+| Default port               | 11434                         | 8080                                | 8080                                 | 1234                               |
+| Server header              | `ollama`                      | `llama.cpp`                         | `BaseHTTP/...` (generic)             | (no reliable marker)               |
+| Detection method           | GET `/` for `ollama` string   | HEAD check for `llama.cpp` header   | GET `/health` for `service=strata`   | GET `/v1/models` for model list    |
+| Auto-discovery             | GET `/` + host IP scan        | HEAD + host IP scan                 | GET `/health` + host IP scan         | GET `/v1/models` + host IP scan    |
+
+Ollama sends the reasoning text as `message.thought` and falls back to
+`message.thinking`; the parser normalizes both into the internal
+`reasoning_content` key used by the rest of the code.
 
 ## Backend-Specific Details
 
@@ -66,31 +75,47 @@ Each exposes a different API surface despite all serving LLMs.
 - **Detection: GET `/health` and check for `"service": "strata"`.** Its HTTP `Server` header is generic (`BaseHTTP/...`), so the llama.cpp header check fails on it.
 - Inference parameters: same set as llama.cpp (`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `repeat_penalty`).
 
-## Architecture: 4 Streaming Helpers
+## Architecture: four seams (since 0.4.0)
 
-A new backend requires implementing 4 methods in `ModelQuery`:
+Adding a backend touches four places. They are reached through thin doors on
+`ModelQuery`, but the implementations live in the extracted collaborators:
 
 ```
-_build_stream_request()     → URL, payload, headers
-_parse_chunk()              → (thought, content, is_final, usage)
-_iter_stream_lines()        → yields decoded JSON per line
-_update_context_tokens()    → updates ctx.current_context_tokens
+RequestBuilder.build_request_payload() / _get_chat_url()   → URL, payload, headers
+StreamParser._parse_chunk()        → (thought, content, is_final, usage, tool_calls)
+StreamParser._iter_stream_lines()  → SSE `data:` stripping vs raw NDJSON
+CommandContext.get_message_token_count_* / count_wire_tokens
+                                    → token counting (and window discovery)
 ```
 
-Plus: auto-detection, model listing, reachability check, CLI argument.
+`StreamParser._aggregate_sync_stream()` reads lines through a **late-bound**
+provider (a lambda resolving the `ModelQuery` door), so a test that replaces
+`query_handler._iter_stream_lines` still intercepts parsing — do not bind the
+method at construction (`TestStreamParserSeam` pins this).
+
+Plus: auto-detection (`_probe_backend`, `auto_detect_backend`), model listing,
+reachability check, and the CLI argument (`-b` choices + `CLOUD_BACKENDS` for the
+cloud ones).
 
 ## Known Pitfalls
 
-### `reasoning` vs `reasoning_content`
-Llama.cpp uses `delta.reasoning_content` in streaming and `message.reasoning_content` in non-streaming.
-Strata uses `delta.reasoning_content` / `message.reasoning_content` too (same as llama.cpp).
-LM Studio uses `delta.reasoning` and `message.reasoning` instead.
-Ollama uses `message.reasoning_content` (in `/api/chat` response).
+### `thought` / `reasoning_content` / `reasoning`
+The three names are not interchangeable, and the divergence is resolved in one
+place — `StreamParser._parse_chunk()` — never in the loop:
 
-The code in `run_agentic_query` handles this with fallback:
-```python
-thinking = msg.get('reasoning_content', '') or msg.get('reasoning', '')
-```
+| Backend                   | Chunk field read                           | Notes                                          |
+| ------------------------- | ------------------------------------------ | ---------------------------------------------- |
+| Ollama                    | `message.thought`, else `message.thinking` | NDJSON, whole message object per line          |
+| Llama.cpp                 | `delta.reasoning_content`                  | also non-streaming `message.reasoning_content` |
+| Strata                    | `delta.reasoning_content`                  | same as llama.cpp                              |
+| LM Studio                 | `delta.reasoning`                          | different field name, same idea                |
+| Cloud (OpenAI-compatible) | `delta.reasoning_content`                  | provider-dependent; falls back to no thinking  |
+
+Everything downstream (message history, `/preservethinking`, token counting, the
+thinking display) sees the normalized key `reasoning_content`; the aggregated
+sync shape is built by `StreamParser._synthesize_sync_response()`, which writes
+`reasoning_content` for both the Ollama `message` shape and the OpenAI `choices`
+shape.
 
 ### Response format differences
 Ollama returns `{"message": {"content": "..."}}` at top level.
