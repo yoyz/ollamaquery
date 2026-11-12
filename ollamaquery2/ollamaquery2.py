@@ -24,6 +24,7 @@ import subprocess
 import shlex
 import shutil
 import signal
+import stat
 import tempfile
 import termios
 import textwrap
@@ -66,7 +67,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 
 # ============================================================================
@@ -245,6 +246,9 @@ GREP_SEARCH_TIMEOUT = 30       # wall-clock seconds before a grep/rg subprocess 
 GREP_BINARY_SNIFF_BYTES = 8192 # NUL-check window; the same heuristic rg and `grep -I` use
 GREP_SCAN_CHECK_LINES = 200    # deadline check interval inside the pure-Python scan
 GREP_TIMEOUT_PREFIX = "search timed out"  # shared by both backends, so the chain can stop
+# rg --no-heading / grep -n emit `path:LINE:text`; the text routinely contains
+# colons, so it must be anchored from the left and the path kept non-greedy.
+GREP_MATCH_LINE_RE = re.compile(r"^(?P<path>.+?):(?P<line>[0-9]+):(?P<text>.*)$")
 MAX_WRITE_FILE_SIZE = 1048576  # 1M chars max for write_file (UTF-8 bytes on disk can exceed it)
 MAX_FILE_INCLUSION_SIZE = 5 * 1024 * 1024  # 5MB max for @file inclusions
 # Network read budgets. The spill threshold protects the *context*; these bound
@@ -1476,8 +1480,17 @@ class CommandContext:
         self.agentic_trace: bool = False
         self.agentic_logging: bool = True
         self.agentic_max_iterations: int = 50
-        self.agentic_step_timeout: int = 300
-        self.agentic_timeout_max: int = 600
+        # Per-step generation budget. The budget covers reasoning AND answer, so
+        # a reasoning-heavy model writing a large file pays for its thinking out
+        # of the same clock: at ~45 tok/s, 600 s is ~27K tokens, roughly 5K of
+        # reasoning plus a 1500-line file. 300 s was half that and spilled
+        # mid-write on the first long file of a session.
+        self.agentic_step_timeout: int = 600
+        # Ceiling the escalation policy doubles when the step budget is reached.
+        # Kept at 2x the step budget so the ladder keeps its middle rung
+        # (extend to the ceiling, then raise the ceiling) instead of jumping
+        # straight to a doubled maximum on the first timeout.
+        self.agentic_timeout_max: int = 1200
         self.agentic_progress_grace: int = 15
         self.agentic_max_thinking_tokens: int = 2048
         self.agentic_heartbeat_tokens: int = 10
@@ -2833,6 +2846,7 @@ AGENTIC_EXAMPLE_NATIVE = """## ReAct protocol (Think → Act → Observe → Ans
 AGENTIC_RULES_BLOCK = """## General rules
 - Be precise with file paths. If you create a file in a subdirectory, use the same path when compiling or reading it later.
 - Mirror the user's language — if they write in French, reply in French.
+- Use the dedicated tools instead of shell equivalents (`cat`, `head`, `tail`, `find`, `sed -i`, `echo >`): read_file pages large files and returns the `next` offset, grep/glob/list_directory are path-ACL checked, their output is not cut off by the observation cap, and they act on the host project even in sandbox mode. Write with write_file/edit_file whenever writing is allowed. Use run_command (when a shell is available) to RUN things — compilers, builds, tests, binaries, system inspection — and for what no tool covers.
 - A path refused by the path ACL (`[path ACL denied]`) means stop that attempt: do NOT retry it with run_command/run_python. Call path_policy once to see what you may use, then continue with an allowed path or tell the user what to grant.
 - The user's message may already include file contents they referenced (marked `[Content of local file ...]`). If the information you need is already in the conversation, answer directly — do NOT call tools merely to confirm, re-read, or "explore" what you were already given."""
 
@@ -2926,7 +2940,7 @@ def get_prompt_style(model_name: str) -> str:
 
 def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
                        include_tool_defs: bool = True, plan_mode: bool = False,
-                       plan_run: bool = False) -> str:
+                       plan_run: bool = False, persona: str = "") -> str:
     """Assemble the agentic system prompt from composable blocks.
 
     Args:
@@ -2938,6 +2952,15 @@ def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
             model knows it may only inspect and plan (never modify state).
         plan_run: If True (only meaningful with plan_mode), use the deeper
             `/agentic plan run` block that allows run_command with confirmation.
+        persona: The chat system prompt (a `-P` profile or a custom prompt) to
+            keep in front of the agentic blocks. The persona is user
+            configuration (voice, depth, language) while these blocks are a
+            protocol layer; replacing one with the other silently changes the
+            assistant the moment `/agentic on` is typed. They are concatenated
+            into ONE system message because chat templates do not reliably
+            handle multiple system turns, and the persona goes first so the
+            protocol rules win any conflict. Empty means no persona (unchanged
+            output, e.g. a test double).
 
     Format selection:
         - openai tool format (native tools API): AGENTIC_FORMAT_NATIVE — never
@@ -2946,7 +2969,10 @@ def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
     """
     tool_format = get_tool_format(model_name)
     style = get_prompt_style(model_name)
-    blocks = [AGENTIC_ROLE_BLOCK]
+    blocks = []
+    if persona and persona.strip():
+        blocks.append(persona.strip())
+    blocks.append(AGENTIC_ROLE_BLOCK)
     if include_tool_defs and tool_defs_block:
         blocks.append(tool_defs_block)
     if tool_format == "openai":
@@ -2959,6 +2985,32 @@ def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
         blocks.append(AGENTIC_PLAN_RUN_BLOCK if plan_run else AGENTIC_PLAN_BLOCK)
     blocks.append(AGENTIC_RULES_BLOCK)
     return "\n\n".join(blocks)
+
+
+def agentic_system_prompt(ctx, tool_defs_block: str = "",
+                          include_tool_defs: bool = True) -> str:
+    """Agentic system prompt for `ctx`: persona + protocol, one message.
+
+    The persona is `_saved_system_prompt` — the prompt that was active before
+    agentic mode was entered, saved by the `/agentic` toggles — NOT
+    `ctx.system_prompt`, which holds the already-composed prompt while agentic
+    mode is on (composing from it would duplicate the protocol on every plan
+    toggle). Every place that builds an agentic system message must go through
+    here, or the ReAct step and the final stream can disagree.
+
+    Args:
+        ctx: CommandContext (or a test double with model/plan flags).
+        tool_defs_block: Inline tool definitions (native-tools models skip it).
+        include_tool_defs: False for models on the native tools API.
+
+    Returns:
+        The system prompt to send with an agentic request.
+    """
+    return get_agentic_prompt(
+        ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
+        plan_mode=bool(getattr(ctx, "plan_mode", False)),
+        plan_run=bool(getattr(ctx, "plan_run", False)),
+        persona=getattr(ctx, "_saved_system_prompt", "") or "")
 
 
 # Model-specific inference parameters for agentic/tool-calling mode.
@@ -3930,12 +3982,47 @@ def _shell_path_inside_cwd(path_str: str, cwd: Optional[str] = None) -> bool:
     except Exception:
         return False
 
-def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None) -> bool:
+def _shell_token_inside_roots(token: str, roots: list) -> bool:
+    """True when an *absolute* shell operand resolves inside one of `roots`.
+
+    Relative operands are never treated as scratch-relative: they are already
+    resolved against the CWD by `_shell_path_inside_cwd`, and letting them match
+    an extra root would turn `../important` into a match for any root.
+
+    Args:
+        token: A single shell token (may be quoted, or a glob).
+        roots: Directories outside the CWD that qualify for leniency.
+
+    Returns:
+        True when the token is an absolute path (or glob under one) inside a root.
+    """
+    p = token.strip().strip("'\"")
+    if not p or p.startswith("-") or "~" in p or "$HOME" in p or "${HOME" in p:
+        return False
+    if not os.path.isabs(p):
+        return False
+    base = p
+    if "*" in p or "?" in p:
+        base = os.path.dirname(p.split("*")[0].split("?")[0]) or "/"
+    real = os.path.realpath(base)
+    for root in roots:
+        try:
+            if os.path.commonpath([os.path.realpath(root), real]) == os.path.realpath(root):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
+                                   extra_roots: Optional[list] = None) -> bool:
     """Return True when every non-flag operand of the parsed nodes is inside CWD.
 
     Args:
         nodes: List of _ShellNode (or dict nodes) from _shell_breakdown.
         cwd: Directory to test against (defaults to os.getcwd()).
+        extra_roots: Additional absolute roots that earn the same leniency
+            (the session scratch dir: disposable, so `rm` there needs no prompt).
     """
     if cwd is None:
         cwd = os.getcwd()
@@ -3950,8 +4037,11 @@ def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None) -> bo
             # Skip flags
             if tok.startswith("-"):
                 continue
-            if not _shell_path_inside_cwd(tok, cwd):
-                return False
+            if _shell_path_inside_cwd(tok, cwd):
+                continue
+            if extra_roots and _shell_token_inside_roots(tok, extra_roots):
+                continue
+            return False
     return True
 
 # --- Home/root destructive guard (bypass-immune) ---
@@ -4142,16 +4232,20 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
     if deny_info:
         _, rp, rule = deny_info
         acl.log_event("run_command", rp, "deny", rule)
-        shown = rule["path"] if rule.get("kind") == "prefix" else "home dotfile"
+        shown = rule["path"] if rule.get("kind") in ("prefix", "temp_root") else "home dotfile"
+        redirect = ""
+        if rule.get("kind") == "temp_root":
+            redirect = (f"; for temporary files use {_scratch_root()} "
+                        "(read+write, wiped at exit)")
         return {"approved": False,
                 "reason": f"[path ACL denied] {rp} — denied by path ACL rule: "
-                          f"{rule['action']} {shown}; {ACL_DENIAL_HINT}"}
+                          f"{rule['action']} {shown}{redirect}; {ACL_DENIAL_HINT}"}
     if ask_info:
         _, rp, rule = ask_info
         granted = acl.prompt("read", rp, rule, tool="run_command", context=command)
         acl.log_event("run_command", rp, "allow" if granted else "deny", rule)
         if not granted:
-            shown = rule["path"] if rule.get("kind") == "prefix" else "home dotfile"
+            shown = rule["path"] if rule.get("kind") in ("prefix", "temp_root") else "home dotfile"
             who = "denied by user" if sys.stdin.isatty() else "denied (no TTY to ask)"
             return {"approved": False,
                     "reason": f"[path ACL denied] {rp} — {who} "
@@ -4260,8 +4354,8 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
 
     if verdict["effect"] == "allow":
         return _final_allow()
-    # effect == ask → check CWD leniency
-    if _shell_all_operands_inside_cwd(nodes):
+    # effect == ask → check CWD leniency (and the disposable scratch dir)
+    if _shell_all_operands_inside_cwd(nodes, extra_roots=[_scratch_root()]):
         return _final_allow(cwd_leniency=True)
     # Auto-confirm (yolo) respects home deny but allows ask
     if ctx is not None and getattr(ctx, "auto_confirm", False):
@@ -4329,6 +4423,9 @@ class Executor:
         self._pull_state = "pending"   # pending | done | failed
         self._workdir_state = "pending"  # pending | resolved
         self._container_workdir: Optional[str] = None
+        self._mounts_state = "pending"   # pending | resolved
+        self._container_mounts_cache: list = []
+        self._scratch_warned = False
 
     def describe(self) -> str:
         """One-line description of what commands run in (for banners/status)."""
@@ -4403,25 +4500,15 @@ class Executor:
             f"--sandbox-image / OLLAMAQUERY_CONTAINER_IMAGE / --sandbox-container <name>\n",
             'warning'))
 
-    def _resolve_container_workdir(self) -> Optional[str]:
-        """Destination that maps the current CWD inside the running container.
-
-        `exec` starts in the container's own filesystem, so the host CWD is only
-        addressable where the container mounts it. A CWD *inside* a mounted
-        volume maps too: `/mnt/data` → `/w` puts `/mnt/data/proj/sub` at
-        `/w/proj/sub`. The deepest (longest) matching source wins, so nested
-        mounts resolve to the most specific one. Returns None when no mount
-        contains the CWD, which keeps the container's default workdir (the model
-        then writes inside the container, not on the host).
+    def _container_mounts(self) -> list:
+        """Mounts of the running container (probed once; [] when inspect fails).
 
         Returns:
-            The mount destination matching the CWD (plus the relative path), or
-            None.
+            The `.Mounts` array reported by the runtime, or an empty list.
         """
-        if self._workdir_state == "resolved":
-            return self._container_workdir
-        self._workdir_state = "resolved"
-        cwd = os.path.realpath(os.getcwd())
+        if self._mounts_state == "resolved":
+            return self._container_mounts_cache
+        self._mounts_state = "resolved"
         try:
             proc = subprocess.run(
                 [self.runtime, "inspect", self.container_name, "--format", "{{json .Mounts}}"],
@@ -4430,8 +4517,25 @@ class Executor:
             mounts = json.loads(proc.stdout or "[]") if proc.returncode == 0 else []
         except (OSError, ValueError, subprocess.TimeoutExpired):
             mounts = []
-        best: Optional[tuple] = None   # (source length, container workdir)
-        for mount in mounts or []:
+        self._container_mounts_cache = mounts if isinstance(mounts, list) else []
+        return self._container_mounts_cache
+
+    def _map_host_path(self, host_path: str) -> Optional[str]:
+        """Return the container path where a host path is visible, if any.
+
+        A host path *inside* a mounted volume maps too: `/mnt/data` → `/w` puts
+        `/mnt/data/proj` at `/w/proj`. The deepest (longest) matching source
+        wins, so nested mounts resolve to the most specific one.
+
+        Args:
+            host_path: Absolute host path.
+
+        Returns:
+            The matching container path, or None when no mount covers it.
+        """
+        real = os.path.realpath(host_path)
+        best: Optional[tuple] = None   # (source length, container path)
+        for mount in self._container_mounts():
             if not isinstance(mount, dict):
                 continue
             source = mount.get("Source") or mount.get("source") or ""
@@ -4442,21 +4546,57 @@ class Executor:
                 source_real = os.path.realpath(source)
             except (OSError, ValueError):
                 continue
-            if cwd == source_real:
-                self._container_workdir = dest
-                return dest
-            # A source of "/" already ends with the separator; appending another
-            # would make the prefix "//", which no path matches (review P3).
-            prefix = source_real if source_real.endswith(os.sep) else source_real + os.sep
-            if cwd.startswith(prefix):
-                rel = os.path.relpath(cwd, source_real).replace(os.sep, "/")
+            if real == source_real:
+                candidate = dest
+            else:
+                # A source of "/" already ends with the separator; appending
+                # another would make the prefix "//", which no path matches.
+                prefix = source_real if source_real.endswith(os.sep) else source_real + os.sep
+                if not real.startswith(prefix):
+                    continue
+                rel = os.path.relpath(real, source_real).replace(os.sep, "/")
                 candidate = dest.rstrip("/") + "/" + rel
-                if best is None or len(source_real) > best[0]:
-                    best = (len(source_real), candidate)
-        if best is not None:
-            self._container_workdir = best[1]
-            return best[1]
-        return None
+            if best is None or len(source_real) > best[0]:
+                best = (len(source_real), candidate)
+        return best[1] if best is not None else None
+
+    def _resolve_container_workdir(self) -> Optional[str]:
+        """Destination that maps the current CWD inside the running container.
+
+        `exec` starts in the container's own filesystem, so the host CWD is only
+        addressable where the container mounts it. Returns None when no mount
+        contains the CWD, which keeps the container's default workdir (the model
+        then writes inside the container, not on the host).
+
+        Returns:
+            The container path matching the CWD, or None.
+        """
+        if self._workdir_state == "resolved":
+            return self._container_workdir
+        self._workdir_state = "resolved"
+        self._container_workdir = self._map_host_path(os.getcwd())
+        return self._container_workdir
+
+    def _warn_if_scratch_unmounted(self) -> None:
+        """Warn once when a running container cannot see the scratch dir.
+
+        `exec` cannot add a mount to a container that is already running, so the
+        host scratch path is only usable inside it when the user started the
+        container with a matching bind (`-v <dir>:<dir>`). The image flavour
+        mounts it automatically.
+        """
+        if self._scratch_warned:
+            return
+        self._scratch_warned = True
+        scratch = _scratch_root()
+        if self._map_host_path(scratch) == scratch:
+            return
+        parent = os.path.dirname(scratch)
+        sys.stderr.write(colorize(
+            f"[Sandbox] {scratch} is not mounted at the same path in "
+            f"{self.container_name}: files written to the scratch dir are not "
+            f"visible to container commands (restart it with -v {parent}:{parent})\n",
+            'warning'))
 
     def _container_command(self, command: str) -> str:
         """Build the runtime invocation for one sandboxed command.
@@ -4470,15 +4610,21 @@ class Executor:
         """
         if self.container_name:
             argv = [self.runtime, "exec"]
+            self._warn_if_scratch_unmounted()
             workdir = self._resolve_container_workdir()
             if workdir:
                 argv += ["-w", workdir]
             argv += [self.container_name, "sh", "-c", command]
         else:
             self._pre_pull_image()
+            # The scratch dir is mounted at the SAME absolute path so a path the
+            # model was given by write_file (host-side Python) also works inside
+            # the throwaway container. `exec` cannot add mounts; it warns instead.
+            scratch = _scratch_root()
             argv = [self.runtime, "run", "--rm",
                     "--memory", self.memory, "--cpus", self.cpus,
                     "-v", f"{os.getcwd()}:/workspace:Z",
+                    "-v", f"{scratch}:{scratch}:Z",
                     "-w", "/workspace",
                     self.image, "sh", "-c", command]
         return " ".join(shlex.quote(part) for part in argv)
@@ -4550,7 +4696,7 @@ AGENTIC_TOOL_DEFS = {
         }
     },
     "read_file": {
-        "description": "Read a text file, optionally paging through large files by 1-based line offset. Files over 100KB auto-page. A paged result reports the served line range and the `next` offset to continue from (read_file(file_path=..., offset=...)). Lines over 2000 chars are truncated. Path relative to CWD. Reading outside CWD (e.g. /proc, /sys, /etc, home dotfiles) may prompt the user for approval — if denied, use run_command instead or ask the user to allow it via /agentic acl.",
+        "description": "Read a text file, optionally paging through large files by 1-based line offset. Files over 100KB auto-page. A paged result reports the served line range and the `next` offset to continue from (read_file(file_path=..., offset=...)). Lines over 2000 chars are truncated. Path relative to CWD. Reading outside CWD (e.g. /proc, /sys, /etc, home dotfiles) may prompt the user for approval — if it is denied, call path_policy once and use an allowed path, or ask the user to grant it with `/agentic acl allow <path> read`; do not route around the refusal with a shell command or inline code.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -4562,7 +4708,7 @@ AGENTIC_TOOL_DEFS = {
         }
     },
     "write_file": {
-        "description": "Write text content to a file. Creates subdirectories if needed. Overwrites existing files.",
+        "description": "Write text content to a file. Creates subdirectories if needed. Overwrites existing files. For temporary artifacts (build output, test files) use the session scratch dir listed under `## Path access` — it is read+write with no confirmation and wiped at exit; anything worth keeping belongs in the project.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -5047,6 +5193,143 @@ _cleanup_cluster_spill_files = _cleanup_spill_files
 
 atexit.register(_cleanup_spill_files)
 
+
+# ============================================================================
+# ============= SESSION SCRATCH DIR  =========================================
+# ============================================================================
+# The model needs somewhere to put throwaway artifacts (build output, a test
+# binary, a scratch script) that is neither the project (pollution) nor a
+# confirmation prompt per file. That place is a per-process directory under the
+# shared temp area:
+#
+#   /tmp/ollamaquery/pid-<pid>/          (mode 0700, removed at exit)
+#
+# The rest of the temp area stays `deny`: /tmp is world-writable and shared with
+# every other process on the box (sockets, lock files, other users' data), so
+# "write anywhere in /tmp" is not a bounded privilege and cannot be cleaned up
+# safely. The scratch dir is bounded: one root, one owner, one leaf removed at
+# exit. Only the leaf is removed — the `/tmp/ollamaquery` parent stays (0700,
+# ours) so the next session reuses it without redoing the ownership check.
+#
+# `OLLAMAQUERY_KEEP_SCRATCH=1` keeps the leaf for post-mortem debugging.
+SCRATCH_KEEP_ENV = "OLLAMAQUERY_KEEP_SCRATCH"
+TEMP_ROOT = os.path.realpath(tempfile.gettempdir())
+SCRATCH_PARENT = os.path.join(TEMP_ROOT, "ollamaquery")
+SCRATCH_ROOT = os.path.join(SCRATCH_PARENT, f"pid-{os.getpid()}")
+_scratch_root_cache: list = []   # one-slot cache: [path]
+
+
+def _path_is_within(path: str, root: str) -> bool:
+    """True when `path` is `root` or lives under it (realpaths compared).
+
+    Args:
+        path: The path to test.
+        root: The candidate ancestor.
+
+    Returns:
+        True when the realpath of `path` is `root` or a descendant of it.
+    """
+    real_root = os.path.realpath(root)
+    try:
+        return os.path.commonpath([real_root, os.path.realpath(path)]) == real_root
+    except ValueError:
+        return False
+
+
+def _scratch_deny_applies() -> bool:
+    """Whether the "shared temp area is denied" default is safe to install.
+
+    A setup with `TMPDIR=$HOME` (or `/`) would turn the temp-area deny into a
+    home-wide (or filesystem-wide) deny, which is never what the user meant.
+
+    Returns:
+        True when the temp root contains neither $HOME nor the filesystem root.
+    """
+    home = os.path.realpath(os.path.expanduser("~"))
+    if _path_is_within(home, TEMP_ROOT) or _path_is_within("/", TEMP_ROOT):
+        return False
+    return True
+
+
+def _create_scratch_root() -> str:
+    """Create this session's scratch directory and return its path.
+
+    The parent name is predictable and the temp area is world-writable, so the
+    parent is verified before use: a directory owned by another user (or a
+    symlink) is never reused. In that case the session falls back to an
+    unpredictable `mkdtemp` root — the path is printed to the model anyway, so
+    an ugly name costs nothing.
+
+    Returns:
+        The scratch directory (already created, mode 0700).
+    """
+    parent = SCRATCH_PARENT
+    try:
+        os.makedirs(parent, mode=_PRIVATE_DIR_MODE, exist_ok=True)
+        st = os.lstat(parent)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise OSError("temp parent is not ours")
+        if stat.S_IMODE(st.st_mode) != _PRIVATE_DIR_MODE:
+            os.chmod(parent, _PRIVATE_DIR_MODE)
+    except OSError:
+        # A foreign `ollamaquery` dir in the temp area: leave it alone.
+        try:
+            return tempfile.mkdtemp(prefix=f"ollamaquery-{os.getpid()}-", dir=TEMP_ROOT)
+        except OSError:
+            # No usable temp area (read-only/full): keep the session alive and
+            # let the write fail with the OS error instead of refusing to start.
+            return SCRATCH_ROOT
+    _ensure_private_dir(SCRATCH_ROOT)
+    return SCRATCH_ROOT
+
+
+def _scratch_root() -> str:
+    """Return this session's scratch directory, creating it on first use.
+
+    Returns:
+        The realpath of the scratch directory.
+    """
+    if not _scratch_root_cache:
+        _sweep_dead_scratch_dirs()
+        _scratch_root_cache.append(_create_scratch_root())
+    return _scratch_root_cache[0]
+
+
+def _sweep_dead_scratch_dirs() -> None:
+    """Remove `pid-<n>` scratch dirs whose process no longer exists.
+
+    A session killed with SIGKILL never reaches the atexit purge, so its leaf
+    would linger. Only dirs whose owning PID is gone are removed: a live
+    session's scratch is never touched, whatever its mtime. A `mkdtemp`
+    fallback leaf cannot be matched to a PID and is left to the OS temp cleaner.
+    """
+    try:
+        entries = os.listdir(SCRATCH_PARENT)
+    except OSError:
+        return
+    for name in entries:
+        match = re.fullmatch(r"pid-(\d+)", name)
+        if not match:
+            continue
+        pid = int(match.group(1))
+        if pid == os.getpid() or _pid_alive(pid):
+            continue
+        shutil.rmtree(os.path.join(SCRATCH_PARENT, name), ignore_errors=True)
+
+
+def _cleanup_scratch_dir() -> None:
+    """Remove this session's scratch leaf (and dead sessions' leaves) at exit."""
+    keep = bool(os.environ.get(SCRATCH_KEEP_ENV))
+    if keep and _scratch_root_cache:
+        sys.stderr.write(colorize(
+            f"[Scratch] kept on request ({SCRATCH_KEEP_ENV}): {_scratch_root_cache[0]}\n", 'muted'))
+    elif _scratch_root_cache:
+        shutil.rmtree(_scratch_root_cache[0], ignore_errors=True)
+    _sweep_dead_scratch_dirs()
+
+
+atexit.register(_cleanup_scratch_dir)
+
 # Tools whose re-execution can cause harm; used by the agentic timeout escalation
 # policy to abort (rather than extend) when the last executed tool was one of these.
 AGENTIC_TIMEOUT_ABORT_TOOLS = {"run_command", "patch", "edit_file"}
@@ -5061,6 +5344,13 @@ AGENTIC_TIMEOUT_MAX_CEILING = 7200
 # IDENTICAL call is emitted this many times in a row. The streak resets whenever
 # the tool name or its arguments change.
 AGENTIC_SAME_TOOL_MAX = 10
+
+# Truncated-step guard: how many times a step that ended inside its reasoning
+# channel (with no tool call) may be nudged to continue before the loop accepts
+# its text as the final answer. The model ending a generation mid-thought is a
+# real failure mode (EOS after a long reasoning phase, or a server stop string),
+# and accepting the preamble as "the answer" silently ends an agentic query.
+AGENTIC_TRUNCATED_STEP_MAX = 2
 
 
 # ============================================================================
@@ -5274,13 +5564,17 @@ class PathAcl:
     `ask` is bypass-immune: auto_confirm never auto-approves it (same as the
     dotfile gate). Non-TTY runs deny `ask` silently and record the denial.
 
-    Default policy (steering-first): CWD + $HOME reads allowed; home dotfiles,
-    /proc, /sys, /etc are `ask` (reminder prompt); a read anywhere else is
-    `ask` (confirmed once, then a session allow rule); a write anywhere else is
-    denied. Reads are deliberately `ask` rather than `deny`: the gate is a
-    consent + audit layer, not a sandbox — `run_command`/`run_python` can
-    already read any path the OS allows, so a silent deny here only teaches the
-    model to route around the ACL through the least-audited channel.
+    Default policy (steering-first): CWD + $HOME reads allowed; the shared temp
+    area is denied except this session's scratch dir (`/tmp/ollamaquery/pid-N`,
+    read+write, wiped at exit); home dotfiles, /proc, /sys, /etc are `ask`
+    (reminder prompt); a read anywhere else is `ask` (confirmed once, then a
+    session allow rule); a write anywhere else is denied. Reads are deliberately
+    `ask` rather than `deny`: the gate is a consent + audit layer, not a
+    sandbox — `run_command`/`run_python` can already read any path the OS
+    allows, so a silent deny here only teaches the model to route around the
+    ACL through the least-audited channel. The temp area is the exception: it is
+    world-writable and shared, so it is denied outright and the model is
+    redirected to its own scratch dir instead.
     """
 
     def __init__(self) -> None:
@@ -5290,10 +5584,22 @@ class PathAcl:
         self._install_defaults()
 
     def _install_defaults(self) -> None:
-        """Install the default allow/ask/deny policy (CWD, $HOME, /proc, /sys, /etc)."""
+        """Install the default allow/ask/deny policy (CWD, $HOME, temp, /proc, /sys, /etc)."""
         for root in ("/proc", "/sys", "/etc"):
             self.add("read", "ask", root, source="default")
             self.add("write", "deny", root, source="default")
+        # The shared temp area is off-limits except our own leaf. Installed as a
+        # dedicated kind rather than a plain prefix rule because the current CWD
+        # must always win: running the CLI from a directory under /tmp
+        # (`cd /tmp/proj && python3 ollamaquery2.py`) must not lock the session
+        # out of its own project.
+        if _scratch_deny_applies():
+            for op in ("read", "write"):
+                self.rules.append({"op": op, "action": "deny", "kind": "temp_root",
+                                   "path": TEMP_ROOT, "source": "default"})
+        scratch = _scratch_root()
+        for op in ("read", "write"):
+            self.add(op, "allow", scratch, source="default")
         home = os.path.realpath(os.path.expanduser("~"))
         for op in ("read", "write"):
             self.rules.append({"op": op, "action": "ask", "kind": "home_dotfile",
@@ -5345,6 +5651,7 @@ class PathAcl:
         Returns:
             (action, rule|None) tuple.
         """
+        cwd_real = os.path.realpath(os.getcwd())
         best = None
         best_key = None
         for rule in self.rules:
@@ -5355,6 +5662,14 @@ class PathAcl:
                     if os.path.commonpath([rule["path"], realpath]) != rule["path"]:
                         continue
                 except ValueError:
+                    continue
+                key = (1 if rule["source"] == "session" else 0, len(rule["path"]))
+            elif rule.get("kind") == "temp_root":
+                if not _path_is_within(realpath, rule["path"]):
+                    continue
+                # The project always wins over the shared-temp deny: the CLI can
+                # legitimately be started from a directory under the temp area.
+                if _path_is_within(realpath, cwd_real):
                     continue
                 key = (1 if rule["source"] == "session" else 0, len(rule["path"]))
             elif rule.get("kind") == "home_dotfile":
@@ -5371,7 +5686,6 @@ class PathAcl:
         if explicit_only:
             return "allow", None
         # Implicit defaults
-        cwd_real = os.path.realpath(os.getcwd())
         try:
             if os.path.commonpath([cwd_real, realpath]) == cwd_real:
                 return "allow", None
@@ -5407,7 +5721,9 @@ class PathAcl:
         cwd = os.path.realpath(os.getcwd())
         home = os.path.realpath(os.path.expanduser("~"))
         lines = [f"{cwd} (cwd, read+write); {home} (read, when asked as ~/... "
-                 "or an absolute path)"]
+                 "or an absolute path)",
+                 f"{_scratch_root()} (session scratch, read+write — build output and "
+                 "throwaway files; wiped at exit, copy into the project to keep)"]
         granted = [r["path"] for r in self.rules
                    if r["source"] == "session" and r["action"] == "allow"
                    and r.get("kind") == "prefix"]
@@ -5443,10 +5759,12 @@ class PathAcl:
             ]
         lines = [
             f"allowed : {cwd} (cwd, read+write); {home} (read, when asked as ~/... "
-            "or an absolute path)",
+            f"or an absolute path); {_scratch_root()} (session scratch, read+write, "
+            "wiped at exit)",
             "ask     : $HOME dotfiles, /proc, /sys, /etc — one confirmation each; if the user "
             "declines, stop and say what you needed",
-            "denied  : writes outside the allowed roots; /proc/*/mem, /proc/*/environ, "
+            f"denied  : writes outside the allowed roots; the shared temp area {TEMP_ROOT} "
+            "(everywhere except the scratch dir); /proc/*/mem, /proc/*/environ, "
             "/proc/*/kcore, /proc/*/fd/*",
         ]
         session = [r for r in self.rules if r["source"] == "session"]
@@ -5602,16 +5920,18 @@ def _path_acl_decision(ctx: Optional['CommandContext'], op: str, realpath: str, 
     decision, rule = acl.evaluate(op, realpath)
     if plan_strict:
         # Strict /agentic plan is confined to CWD: any implicit allow outside
-        # CWD (the $HOME read allowance) and every `ask` rule become a hard
-        # deny — no prompts. Explicit session allow rules (rule is not None)
-        # survive, so e.g. the cluster spill dir remains readable.
+        # CWD (the $HOME read allowance), the session scratch dir and every
+        # `ask` rule become a hard deny — no prompts. Explicit session allow
+        # rules survive, for reads only, so e.g. the cluster spill dir remains
+        # pageable without reopening writes.
         cwd_real = os.path.realpath(os.getcwd())
         try:
             in_cwd = os.path.commonpath([cwd_real, realpath]) == cwd_real
         except ValueError:
             in_cwd = False
-        if decision == "allow" and rule is None and not in_cwd:
-            decision = "deny"
+        if decision == "allow" and not in_cwd:
+            if not (rule is not None and rule.get("source") == "session" and op == "read"):
+                decision = "deny"
         elif decision == "ask":
             decision = "deny"
     else:
@@ -5644,14 +5964,21 @@ def _path_acl_decision(ctx: Optional['CommandContext'], op: str, realpath: str, 
             reason = ("strict plan mode is confined to "
                       f"{os.path.realpath(os.getcwd())}")
         elif rule is not None:
-            shown = rule["path"] if rule.get("kind") == "prefix" else "home dotfile"
+            shown = rule["path"] if rule.get("kind") in ("prefix", "temp_root") else "home dotfile"
             reason = f"denied by path ACL rule: {rule['action']} {shown}"
         elif op == "read":
             # Implicit `ask` that was not granted (user declined / no TTY).
             reason = "outside the project and $HOME, not granted"
         else:
             reason = "write outside the project and $HOME (denied)"
-        return "deny", f"{head} — {reason}; {ACL_DENIAL_HINT}"
+        # A denial is a redirect, not a wall: the model's actual question is
+        # usually "then where do I put this?", and the answer is one fixed path.
+        redirect = ""
+        if not plan_strict and (op == "write"
+                                or (rule is not None and rule.get("kind") == "temp_root")):
+            redirect = (f"; for temporary files use {_scratch_root()} "
+                        "(read+write, wiped at exit)")
+        return "deny", f"{head} — {reason}{redirect}; {ACL_DENIAL_HINT}"
     return "allow", None
 
 def _tool_handle_read_file(self, args: dict) -> dict:
@@ -5844,21 +6171,22 @@ def _tool_handle_glob(self, args: dict) -> dict:
 def _grep_parse_match(line: str):
     """Parse an rg/grep 'path:line:text' output line.
 
+    Anchored from the left, because the matched text routinely contains colons
+    (`- name: ...` and `url: ...` in YAML, `// note:` in C, JSON, CSS). Parsing
+    from the right made the line number become the text for any such hit, so the
+    line was dropped as unparsable and a search over content that `read_file`
+    shows plainly answered "No files found".
+
     Args:
         line: A raw match line from rg --no-heading or grep -n.
 
     Returns:
         (path, line_no, text) tuple, or None when unparsable.
     """
-    try:
-        head, text = line.rsplit(":", 1)
-    except ValueError:
+    match = GREP_MATCH_LINE_RE.match(line)
+    if match is None:
         return None
-    try:
-        path_part, lno = head.rsplit(":", 1)
-        return path_part, int(lno), text
-    except ValueError:
-        return None
+    return match.group("path"), int(match.group("line")), match.group("text")
 
 
 def _grep_drain_stdout(pipe, sink: list, cap: int, stop: threading.Event) -> None:
@@ -6623,7 +6951,11 @@ def _tool_handle_patch(self, args: dict) -> dict:
                 return {"success": False, "output": "", "error": f"Path traversal denied within diff headers: {sec['path']}"}
         target = ""
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".diff", delete=False) as f:
+        # The temp diff lives in the session scratch dir: /tmp itself is ACL-denied
+        # (the model's one writable temp root is the scratch dir), and `patch` runs
+        # through the shell gate, which scans every operand.
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".diff", delete=False,
+                                         dir=_scratch_root()) as f:
             f.write(diff_text)
             diff_path = f.name
         command = f"patch -i {shlex.quote(diff_path)} {target}" if target else f"patch -i {shlex.quote(diff_path)}"
@@ -10106,14 +10438,42 @@ class ToolRegistry:
             # Fail closed: an MCP tool we cannot classify is treated as destructive.
             return manager.resolve(tool_name) is not None
 
+    def _scratch_targeted(self, tool_name: str, args: dict) -> bool:
+        """True when a destructive file tool writes only inside the scratch dir.
+
+        The scratch dir is disposable and wiped at exit, so a confirmation there
+        protects nothing: it would just make the one freely-writable place as
+        slow as the project. Paths are realpath'd, so a symlink inside the
+        scratch that points outside is *not* exempt.
+
+        Args:
+            tool_name: Name of the tool about to run.
+            args: The tool's (alias-normalized) arguments.
+
+        Returns:
+            True when the tool's only target path is inside the scratch dir.
+        """
+        if tool_name not in ("write_file", "edit_file"):
+            return False
+        raw = args.get("file_path") or args.get("file") or args.get("path")
+        if not raw:
+            return False
+        try:
+            return _path_is_within(os.path.realpath(os.path.expanduser(str(raw))),
+                                   _scratch_root())
+        except (OSError, ValueError):
+            return False
+
     def _confirm(self, tool_name: str, args: dict) -> bool:
         """Ask the user before running a destructive tool.
 
         Plan mode forces a confirmation for every destructive tool (run_command
         is the only destructive tool reachable, and only in the `/agentic plan
         run` tier), bypassing auto-confirm — exactly like the Path ACL's
-        bypass-immune `ask` rules. Otherwise destructive tools are confirmed
-        unless auto-confirm is on.
+        bypass-immune `ask` rules. A write inside the session scratch dir is
+        exempt: that is the one place the model may use without asking (see
+        PathAcl), so re-asking at the tool layer would defeat it. Otherwise
+        destructive tools are confirmed unless auto-confirm is on.
 
         Args:
             tool_name: Name of the tool to run.
@@ -10126,6 +10486,8 @@ class ToolRegistry:
             return True
         if self._ctx and getattr(self._ctx, 'plan_mode', False):
             return self._prompt_confirm(tool_name, args)
+        if self._scratch_targeted(tool_name, args):
+            return True
         manager = getattr(self._ctx, "mcp_manager", None) if self._ctx else None
         forced = False
         if manager is not None:
@@ -12067,11 +12429,13 @@ class ModelQuery:
 AGENTIC_SUBCOMMANDS = [
     'on', 'off', 'full', 'auto', 'plan', 'sandbox', 'verbose', 'thinking',
     'trace', 'log', 'lazytool', 'iterations', 'timeout', 'heartbeattokens',
-    'compactthreshold', 'acl', 'status',
+    'compactthreshold', 'acl', 'scratch', 'status',
 ]
 AGENTIC_PLAN_ARGS = ['on', 'off', 'run']
 AGENTIC_ACL_ACTIONS = ['list', 'status', 'log', 'allow', 'ask', 'deny', 'remove', 'reset']
-AGENTIC_SECOND_LEVEL = {'plan': AGENTIC_PLAN_ARGS, 'acl': AGENTIC_ACL_ACTIONS}
+AGENTIC_SCRATCH_ACTIONS = ['path', 'list', 'clear']
+AGENTIC_SECOND_LEVEL = {'plan': AGENTIC_PLAN_ARGS, 'acl': AGENTIC_ACL_ACTIONS,
+                        'scratch': AGENTIC_SCRATCH_ACTIONS}
 
 # /compact subcommands for tab completion (mirrors run_handle_compact usage)
 COMPACT_SUBCOMMANDS = ['now', 'force', 'llm', 'threshold', 'list', 'status']
@@ -14012,6 +14376,12 @@ class StepFeedback:
         self.thinking_tokens = 0
         self.thinking_capped = False
         self.content_streamed = False
+        # True when the LAST text chunk carried reasoning rather than content.
+        # A generation that ends on a reasoning chunk did not finish its turn:
+        # the model was still thinking when the stream stopped (EOS after a long
+        # reasoning phase, or a server-side stop). Tracked in `_accumulate`, so
+        # it does not depend on whether thinking is displayed.
+        self.ended_in_thinking = False
 
         # Terminal state.
         self.thinking_open = False
@@ -14091,6 +14461,7 @@ class StepFeedback:
         if thought:
             self.thought += thought
             self.last_activity = time.time()
+            self.ended_in_thinking = True
             # F5: track an estimate of total thinking tokens so a single step
             # can't silently burn the whole budget on reasoning undetected.
             # Detection + flag only — we keep accumulating (F4 tail-caps the
@@ -14104,6 +14475,9 @@ class StepFeedback:
         if content:
             self.content += content
             self.last_activity = time.time()
+            # Content after reasoning means the turn reached its answer phase, so
+            # the stream no longer ends mid-thought.
+            self.ended_in_thinking = False
 
     def _render(self, thought: str, content: str) -> None:
         """Render live feedback for a chunk (thinking stream or heartbeat dot).
@@ -14752,9 +15126,8 @@ class AgenticFinalizer:
             tool_format = get_tool_format(host.ctx.model)
             include_tool_defs = tool_format != "openai"
             tool_defs_block = host.tool_registry.get_system_prompt_block() if include_tool_defs else ""
-            reentry_messages = [{'role': 'system', 'content': get_agentic_prompt(
-                host.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
-                plan_mode=host.ctx.plan_mode, plan_run=host.ctx.plan_run)}]
+            reentry_messages = [{'role': 'system', 'content': agentic_system_prompt(
+                host.ctx, tool_defs_block, include_tool_defs=include_tool_defs)}]
             if len(host.messages) > 1:
                 reentry_messages.extend(host.messages[1:])
             sync_kwargs = dict(get_inference_params(host.ctx.model))
@@ -14873,6 +15246,16 @@ class ReActState:
         self.step_timeout = ctx.agentic_step_timeout
         self.response_text = ""
         self.api_error = ""
+        # True when the step that produced `response_text` already executed its
+        # tool calls. At the iteration limit the budget branch in `finish_query`
+        # promotes `response_text` to the final answer, and a tool-call JSON
+        # would then be re-executed by the finalizer — a silent duplicate run of
+        # a possibly destructive tool.
+        self.tool_ran_this_step = False
+        # How many truncated steps have been nudged to continue (bounded by
+        # AGENTIC_TRUNCATED_STEP_MAX so a model that keeps dying mid-thought
+        # cannot loop forever).
+        self.truncated_nudges = 0
 
 
 class AgenticRunner:
@@ -14999,9 +15382,8 @@ class AgenticRunner:
         """
         include_tool_defs = get_tool_format(self.ctx.model) != "openai"
         tool_defs_block = self.tool_registry.get_system_prompt_block() if include_tool_defs else ""
-        content = get_agentic_prompt(
-            self.ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
-            plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)
+        content = agentic_system_prompt(
+            self.ctx, tool_defs_block, include_tool_defs=include_tool_defs)
         # Path policy up front, positive half only: the allowed roots (plus this
         # session's grants) are what the model actually needs to plan. The
         # ask/denied detail and the grant command live behind the `path_policy`
@@ -15128,21 +15510,33 @@ class AgenticRunner:
         except OSError:
             return None
         target = f" (intended target: {file_path})" if file_path else ""
+        dest = file_path or "<target>"
         print(colorize(
             f"\n[Agentic] Step {iteration} timed out mid-write_file — "
             f"{'complete' if closed else 'partial'} content ({len(content)} chars) "
             f"spilled to {spill_file}.", 'warning'), file=sys.stderr)
+        # The timeout nudge appended just before this one says "please continue
+        # your previous response", which is exactly the wrong instruction here:
+        # the model follows it, re-generates the same oversized write, and hits
+        # the same timeout. The recovery note has to supersede it explicitly —
+        # that is why the model only "sometimes" used the spill file.
+        override = ('RECOVERY — this overrides the previous "please continue your '
+                    'previous response" instruction. ')
         if closed:
-            return (f"[Agentic] The timed-out write_file{target} had fully streamed its "
-                    f"content — only the message was cut off. The complete content "
-                    f"({len(content)} chars) was saved to {spill_file}. Do NOT regenerate "
-                    f'it: place it with run_command("cp {spill_file} <target>"), or '
-                    f"read_file it to verify, then continue.")
-        return (f"[Agentic] The timed-out write_file{target} was cut off mid-content. The "
-                f"partial content decoded so far ({len(content)} chars) was saved to "
-                f"{spill_file} — it is TRUNCATED. Do NOT copy it as-is: read_file it, "
-                f"resume writing the remaining content, and re-issue write_file with the "
-                f"full content.")
+            return (override
+                    + f"The timed-out write_file{target} had fully streamed its content — "
+                    f"only the message was cut off. The complete content "
+                    f"({len(content)} chars) is saved at {spill_file}. Do NOT regenerate "
+                    f'it: place it with run_command("cp {spill_file} \'{dest}\'"), or '
+                    f"read_file it to verify first, then continue.")
+        return (override
+                + f"The write_file{target} was cut off mid-content, so generating it again "
+                f"from scratch burns the same budget. The decoded prefix "
+                f"({len(content)} chars) is saved at {spill_file} — it is TRUNCATED, not a "
+                f'valid file. Next: run_command("cp {spill_file} \'{dest}\'") to keep that '
+                f"prefix, read_file {spill_file} to see where it stops (it pages 2000 lines "
+                f"at a time — use the `next` offset in the header), then generate ONLY the "
+                f"remainder and append it, instead of re-emitting the whole file.")
 
     def timeout_continue(self, feedback: 'StepFeedback', step_cancel: dict,
                          step_start: float, iteration: int, step_timeout: int,
@@ -15239,7 +15633,11 @@ class AgenticRunner:
                 return
 
             while state.iteration < state.max_iterations:
-                state.iteration += 1
+                # The counter is incremented by `_run_step` (it IS the iteration,
+                # and the step header prints that number). Incrementing here too
+                # — as the pre-split inline loop did — silently halved the budget:
+                # `agentic_max_iterations = 6` ran 3 steps and the first header
+                # read "Step 2/6".
                 if self._run_step(host, state) == "break":
                     break
 
@@ -15317,6 +15715,7 @@ class AgenticRunner:
             step.
         """
         state.iteration += 1
+        state.tool_ran_this_step = False
         state.messages = self.step_header(host, state)
 
         images_to_send = ([] if host.ctx.supports_vision is False
@@ -15423,6 +15822,30 @@ class AgenticRunner:
                                tool_call=first_call)
 
         if not tool_calls:
+            # A step that ended on a reasoning chunk never finished its turn: the
+            # model was still thinking when the stream stopped, so its text is a
+            # preamble ("Let me write the file now…"), not an answer. Accepting it
+            # here silently ends the query — with thinking display on, finalize
+            # skips the re-generation (the text already reached the terminal) and
+            # the preamble is recorded as the answer. Nudge once or twice and let
+            # the model finish what it was about to do.
+            if (state.response_text and feedback.ended_in_thinking
+                    and state.truncated_nudges < AGENTIC_TRUNCATED_STEP_MAX):
+                state.truncated_nudges += 1
+                state.messages.append({'role': 'assistant',
+                                       'content': state.response_text})
+                state.messages.append({
+                    'role': 'user',
+                    'content': "You stopped in the middle of your reasoning and never "
+                               "finished. Continue from exactly where you stopped: call "
+                               "the tool you were about to call, or give the complete "
+                               "final answer. Do not start over.",
+                    '_system_nudge': True})
+                print(colorize(
+                    "\n[Agentic] Step ended mid-reasoning with no tool call — nudging to continue "
+                    f"({state.truncated_nudges}/{AGENTIC_TRUNCATED_STEP_MAX}).",
+                    'warning'), file=sys.stderr)
+                return "continue"
             state.final_answer = state.response_text
             # The step's content may already be on the terminal
             # (thinking mode streams it live) — finalize must then
@@ -15449,6 +15872,12 @@ class AgenticRunner:
         host._append_tool_messages(
             state.messages, state.response_text, api_tool_calls, tool_calls,
             observations, raw_observations, state.send_tools_api)
+        # The step's text was the tool call, and it has been consumed. Clearing it
+        # keeps the iteration-limit branch in `finish_query` from promoting that
+        # JSON to the final answer, which would re-execute the tool (a duplicate
+        # `run_command`/`apply_patch` is not idempotent).
+        state.tool_ran_this_step = True
+        state.response_text = ""
         return "continue"
 
 
@@ -15530,9 +15959,8 @@ class AgenticRunner:
         if state.send_tools_api and check_tools_error(response):
             state.send_tools_api = False
             tool_defs_block = self.tool_registry.get_system_prompt_block()
-            state.messages[0] = {'role': 'system', 'content': get_agentic_prompt(
-                host.ctx.model, tool_defs_block, include_tool_defs=True,
-                plan_mode=host.ctx.plan_mode, plan_run=host.ctx.plan_run)}
+            state.messages[0] = {'role': 'system', 'content': agentic_system_prompt(
+                host.ctx, tool_defs_block, include_tool_defs=True)}
             print(colorize("\n[WARNING] Model does not support native tools API. Falling back to inline tool definitions.", 'warning'), file=sys.stderr)
             return "tools"
         return "ok"
@@ -17080,14 +17508,40 @@ class ChatLoop:
                 print(colorize("Context getting full", 'warning'), file=sys.stderr)
 
     def run_build_prompt(self, host_clean: str) -> str:
-        """Build the dynamic prompt prefix."""
+        """Build the dynamic prompt prefix: mode tag + backend@host/model.
+
+        The tag is rebuilt every iteration, so `/agentic` transitions show up
+        immediately. Without it an interactive session looks identical whether a
+        write tool is reachable or not — and after a `[chat]`/`[agentic plan]`
+        switch, or when several terminals are open, the prompt was the only place
+        that information was missing.
+        """
+        prompt_prefix = f"[{self._prompt_mode_tag()}] "
         if self.ctx.model:
-            prompt_prefix = f"{self.ctx.backend}@{host_clean}/{self.ctx.model}"
+            prompt_prefix += f"{self.ctx.backend}@{host_clean}/{self.ctx.model}"
         else:
-            prompt_prefix = f"{self.ctx.backend}@{host_clean}/(no model selected)"
+            prompt_prefix += f"{self.ctx.backend}@{host_clean}/(no model selected)"
         if self.ctx.current_images:
             prompt_prefix += "[img]"
         return prompt_prefix
+
+    def _prompt_mode_tag(self) -> str:
+        """Short mode label for the input prompt (chat / plan / plan:run / agentic).
+
+        `:box` is appended when tool subprocesses run in a container: that is a
+        different boundary from the tool surface, and it changes what
+        `run_command` does, so it belongs in the same glance.
+        """
+        if self.ctx.plan_mode:
+            tag = "plan:run" if self.ctx.plan_run else "plan"
+        elif self.ctx.agentic_mode:
+            tag = "agentic"
+        else:
+            tag = "chat"
+        executor = getattr(self, "executor", None)
+        if executor is not None and getattr(executor, "mode", "host") == "container":
+            tag += ":box"
+        return tag
 
     def run_handle_exit(self, full_input: str) -> Optional[bool]:
         """Handle exit/quit commands. Returns True to break loop."""
@@ -17594,10 +18048,80 @@ class ChatLoop:
             return self._agentic_toggle_named(subcmd)
         if subcmd == "acl":
             return self._handle_agentic_acl(parts)
+        if subcmd == "scratch":
+            return self._handle_agentic_scratch(parts)
         if subcmd == "plan":
             return self._agentic_toggle_plan(parts)
 
-        print(colorize("[Usage: /agentic [on|off|full|auto|plan [on|off|run]|sandbox|verbose|thinking|trace|log|lazytool|acl|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|status]]", 'warning'), file=sys.stderr)
+        print(colorize("[Usage: /agentic [on|off|full|auto|plan [on|off|run]|sandbox|verbose|thinking|trace|log|lazytool|acl|scratch [path|list|clear]|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|status]]", 'warning'), file=sys.stderr)
+        return False
+
+    def _handle_agentic_scratch(self, parts: list) -> bool:
+        """Handle /agentic scratch [path|list|clear] — the model's writable temp dir.
+
+        Args:
+            parts: Split /agentic args (parts[2] is the action or omitted).
+
+        Returns:
+            False to keep the chat loop running.
+        """
+        action = parts[2] if len(parts) > 2 else "path"
+        root = _scratch_root()
+        if action in ("path", "status"):
+            total, count = 0, 0
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in filenames:
+                    try:
+                        total += os.path.getsize(os.path.join(dirpath, name))
+                        count += 1
+                    except OSError:
+                        pass
+            print(colorize(f"\n[Scratch] {root}", 'info'), file=sys.stderr)
+            print(colorize(
+                f"  {count} file(s), {total} bytes — read+write with no confirmation; "
+                f"removed at session exit (keep with {SCRATCH_KEEP_ENV}=1)", 'muted'),
+                file=sys.stderr)
+            print(colorize("  /agentic scratch list|clear — inspect or empty it", 'muted'),
+                  file=sys.stderr)
+            executor = getattr(self.ctx, "executor", None)
+            if executor is not None and getattr(executor, "mode", "host") == "container":
+                visible = executor._map_host_path(root)
+                where = ("the same path" if visible == root else
+                         f"{visible} (mounted elsewhere)" if visible else "NOT mounted")
+                print(colorize(f"  sandbox: {executor.describe_target()} — {where}",
+                               'muted'), file=sys.stderr)
+            print(file=sys.stderr)
+            return False
+        if action == "list":
+            entries = []
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in filenames:
+                    full = os.path.join(dirpath, name)
+                    try:
+                        entries.append((os.path.relpath(full, root), os.path.getsize(full)))
+                    except OSError:
+                        pass
+            if not entries:
+                print(colorize("[Scratch] empty", 'muted'), file=sys.stderr)
+            for rel, size in sorted(entries):
+                print(f"  {size:>10}  {rel}", file=sys.stderr)
+            return False
+        if action == "clear":
+            removed = 0
+            for name in os.listdir(root):
+                full = os.path.join(root, name)
+                try:
+                    if os.path.isdir(full) and not os.path.islink(full):
+                        shutil.rmtree(full, ignore_errors=True)
+                    else:
+                        os.unlink(full)
+                    removed += 1
+                except OSError:
+                    pass
+            print(colorize(f"[Scratch] cleared {removed} entr(y/ies) from {root}", 'info'),
+                  file=sys.stderr)
+            return False
+        print(colorize("[Usage: /agentic scratch [path|list|clear]]", 'warning'), file=sys.stderr)
         return False
 
     # Named toggles (always toggle between on/off)
@@ -17626,8 +18150,7 @@ class ChatLoop:
         if self.ctx.agentic_mode:
             if not getattr(self.ctx, '_saved_system_prompt', None):
                 self.ctx._saved_system_prompt = self.ctx.system_prompt
-            self.ctx.system_prompt = get_agentic_prompt(
-                self.ctx.model, plan_mode=self.ctx.plan_mode, plan_run=self.ctx.plan_run)
+            self.ctx.system_prompt = agentic_system_prompt(self.ctx)
         else:
             # Leaving agentic mode also clears plan mode; otherwise a later
             # `/agentic on` would silently re-apply read-only plan restrictions.
@@ -17651,8 +18174,7 @@ class ChatLoop:
             print(colorize("[Agentic plan mode: OFF — read-only restrictions lifted]", 'warning'), file=sys.stderr)
         if not getattr(self.ctx, '_saved_system_prompt', None):
             self.ctx._saved_system_prompt = self.ctx.system_prompt
-        self.ctx.system_prompt = get_agentic_prompt(
-            self.ctx.model, plan_mode=False, plan_run=False)
+        self.ctx.system_prompt = agentic_system_prompt(self.ctx)
         self.ctx.agentic_mode = True
         self.ctx.agentic_verbose = True
         self.ctx.agentic_show_thinking = True
@@ -17722,8 +18244,7 @@ class ChatLoop:
                 return False
             # Switching tier while plan mode is already active.
             self.ctx.plan_run = want_run
-            self.ctx.system_prompt = get_agentic_prompt(
-                self.ctx.model, plan_mode=True, plan_run=want_run)
+            self.ctx.system_prompt = agentic_system_prompt(self.ctx)
             self._print_plan_mode_status()
             self._refresh_context_bar()
             return False
@@ -17741,8 +18262,7 @@ class ChatLoop:
         self.ctx._plan_prev_prompt = self.ctx.system_prompt
         if not getattr(self.ctx, '_saved_system_prompt', None):
             self.ctx._saved_system_prompt = self.ctx._plan_prev_prompt
-        self.ctx.system_prompt = get_agentic_prompt(
-            self.ctx.model, plan_mode=True, plan_run=want_run)
+        self.ctx.system_prompt = agentic_system_prompt(self.ctx)
         self._print_plan_mode_status()
         self._refresh_context_bar()
         return False
@@ -17892,6 +18412,15 @@ class ChatLoop:
             rp = os.path.realpath(os.path.expanduser(path))
             acl.add(op, action, path, source="session")
             print(colorize(f"[Path ACL] {op} {action} {rp}", 'success'), file=sys.stderr)
+            scratch = _scratch_root()
+            if (action == "allow" and op in ("write", "any")
+                    and _path_is_within(scratch, rp)
+                    and not _path_is_within(rp, scratch)):
+                print(colorize(
+                    f"[Path ACL] note: {rp} contains the session scratch dir "
+                    f"({scratch}), which is already read+write by default — this "
+                    "grant widens the model's writable surface to the whole path.",
+                    'warning'), file=sys.stderr)
             return False
         if action == "remove":
             if len(parts) < 4:
@@ -17911,17 +18440,27 @@ class ChatLoop:
             acl: The PathAcl instance to display.
         """
         print(colorize("\n[Path ACL - Use /agentic acl <allow|ask|deny|remove|reset|log>]", 'info'), file=sys.stderr)
-        print("  Defaults: CWD always allowed; reads inside ~ allowed.", file=sys.stderr)
-        print("  Everything else outside CWD/~ is denied unless a rule matches.", file=sys.stderr)
+        print("  Defaults: CWD always allowed; reads inside ~ allowed; session scratch dir read+write.", file=sys.stderr)
+        print(f"  {TEMP_ROOT} is denied except the scratch dir. Other outside reads ask; writes deny.", file=sys.stderr)
         print("  'ask' rules prompt per access and are never auto-approved.", file=sys.stderr)
         print(file=sys.stderr)
         print(f"  {'OP':<6} {'ACTION':<7} {'PATH':<44} SOURCE", file=sys.stderr)
         print("  " + "-" * 74, file=sys.stderr)
         for r in acl.rules:
-            shown = r["path"] if r.get("kind") == "prefix" else "~/.* (home dotfile)"
+            shown = r["path"] if r.get("kind") in ("prefix", "temp_root") else "~/.* (home dotfile)"
             print(f"  {r['op']:<6} {r['action']:<7} {shown:<44} {r['source']}", file=sys.stderr)
         print(file=sys.stderr)
-        print("  Recent access decisions: /agentic acl log", file=sys.stderr)
+        print("  Change it for this session (op: read|write|any, default any):", file=sys.stderr)
+        for line in (
+            "    /agentic acl allow <path> [op]    e.g. /agentic acl allow /tmp write",
+            "    /agentic acl ask   <path> [op]    prompt again for that path",
+            "    /agentic acl deny  <path> [op]    forbid it this session",
+            "    /agentic acl remove <path>        drop the session rule",
+            "    /agentic acl reset                restore the defaults above",
+            "    /agentic acl log                  recent allow/deny decisions",
+            "    /agentic scratch                  this session's writable temp dir",
+        ):
+            print(colorize(line, 'muted'), file=sys.stderr)
         print(file=sys.stderr)
 
     def _print_acl_log(self, acl: 'PathAcl') -> None:
@@ -17943,7 +18482,7 @@ class ChatLoop:
         c = self.ctx
         print(colorize("\n[Agentic Settings - Use /agentic <option> [value]]", 'info'), file=sys.stderr)
         print("  Subcommands: on, off, full, auto, plan [on|off|run], sandbox, verbose, thinking, trace, log, lazytool,", file=sys.stderr)
-        print("               iterations <N>, timeout <N>, heartbeattokens <N>, compactthreshold <v>, acl, status", file=sys.stderr)
+        print("               iterations <N>, timeout <N>, heartbeattokens <N>, compactthreshold <v>, acl, scratch [path|list|clear], status", file=sys.stderr)
         print(file=sys.stderr)
 
         plan_value = "off" if not c.plan_mode else ("run" if getattr(c, "plan_run", False) else "on")

@@ -432,7 +432,7 @@ class TestPathTraversal(unittest.TestCase):
         self.assertIn("path_policy", result.get("error", ""))
 
     def test_read_file_rejects_absolute_outside(self):
-        result = self.reg.execute("read_file", {"file": "/tmp/foo"})
+        result = self.reg.execute("read_file", {"file": "/var/lib/aq-probe.txt"})
         self.assertFalse(result["success"])
         self.assertIn("outside the project and $HOME", result.get("error", ""))
         self.assertIn("path_policy", result.get("error", ""))

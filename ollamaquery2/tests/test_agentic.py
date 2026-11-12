@@ -1079,8 +1079,8 @@ class TestGrepReliability(unittest.TestCase):
     TestToolRegistry's 17 grep cases cover the happy paths, argument handling,
     the ACL and the caps; this class owns the fixtures that made the three
     backends disagree (binary, unreadable, CRLF, a 4.5 MB file, a 20k-char line,
-    symlinks) plus the two blocking properties: nothing is skipped silently, and
-    a pathological scan is bounded.
+    symlinks, match text with its own colons) plus the two blocking properties:
+    nothing is skipped silently, and a pathological scan is bounded.
 
     The external branch asserts the pure-Python fallback did NOT run, so a
     "backend parity" claim cannot be satisfied by both sides accidentally
@@ -1366,6 +1366,46 @@ class TestGrepReliability(unittest.TestCase):
             self.assertIn("nested" + os.sep + "inner.md:", recursive["output"])
             self.assertIn("text.py:", recursive["output"])
 
+    # -- row 16: match text that itself contains a colon ------------------
+    def test_matched_text_containing_a_colon_is_reported(self):
+        """A colon in the matched line must not discard the hit.
+
+        The parse used to run from the right, so for every YAML/JSON/C line
+        carrying a colon (`- name: ...`, `url: ...`, `// note:`) the line number
+        was read as the text, `int()` failed, and the hit was dropped. The
+        search then answered "No files found" for content `read_file` shows
+        plainly — a false negative the model reports as "pattern absent".
+        """
+        self._write("role.yml",
+                    "---\n"
+                    "- name: Create robot for service provisioner\n"
+                    "  url: https://quay/{{ token }}\n"
+                    "  image: csi-external-provisioner\n")
+        for backend in ("external", "python"):
+            result, used = self._run(backend, r"provisioner")
+            self.assertTrue(result["success"], msg=f"{backend}: {result.get('error')}")
+            self.assertFalse(used["fallback"], msg=f"{backend} ran the wrong backend")
+            self.assertIn("Found 2 matches", result["output"])
+            self.assertIn("role.yml:", result["output"])
+            self.assertNotIn("No files found", result["output"])
+            self.assertIn("Line 2: - name: Create robot for service provisioner",
+                          result["output"])
+            self.assertIn("Line 4:   image: csi-external-provisioner", result["output"])
+
+    def test_parse_match_keeps_colons_in_path_and_text(self):
+        """`path:LINE:text` is anchored from the left; both sides keep colons."""
+        self.assertEqual(q._grep_parse_match("a/b.yml:12:- name: x"),
+                         ("a/b.yml", 12, "- name: x"))
+        # A colon inside the path is not mistaken for the line separator.
+        self.assertEqual(q._grep_parse_match("dir:1/x.txt:3:key: value"),
+                         ("dir:1/x.txt", 3, "key: value"))
+        self.assertEqual(q._grep_parse_match("file.c:9:  // note: why"),
+                         ("file.c", 9, "  // note: why"))
+        self.assertEqual(q._grep_parse_match("a.py:3:print('x'): done"),
+                         ("a.py", 3, "print('x'): done"))
+        self.assertIsNone(q._grep_parse_match("no line number here: nope"))
+        self.assertIsNone(q._grep_parse_match("garbage"))
+
 
 class TestRunPythonPath(unittest.TestCase):
     """run_python tool must handle file_path without host absolute paths."""
@@ -1617,18 +1657,45 @@ class TestContainerSandboxConfig(unittest.TestCase):
         exec_argv = [a for a in seen if a[1:2] == ["exec"]][0]
         self.assertNotIn("-w", exec_argv)
 
-    def test_run_with_an_image_mounts_the_cwd_at_workspace(self):
+    def test_run_with_an_image_mounts_the_cwd_and_the_scratch_dir(self):
         seen = []
         with patch("ollamaquery2.subprocess.run", side_effect=self._fake_run(seen)):
             ex = self._executor(mode="container", container_image="img:3")
             ex.run("id")
         argv = seen[-1]
-        self.assertEqual(argv[1:4], ["run", "--rm", "--memory"])
-        self.assertEqual(argv[5:7], ["--cpus", q.DEFAULT_CONTAINER_CPUS])
-        self.assertEqual(argv[7], "-v")
-        self.assertTrue(argv[8].endswith(":/workspace:Z"))
-        self.assertEqual(argv[9:12], ["-w", "/workspace", "img:3"])
-        self.assertEqual(argv[12:], ["sh", "-c", "id"])
+        self.assertEqual(argv[1:3], ["run", "--rm"])
+        mounts = [argv[i + 1] for i, part in enumerate(argv) if part == "-v"]
+        self.assertTrue(mounts[0].endswith(":/workspace:Z"))
+        scratch = q._scratch_root()
+        # Same absolute path on both sides: a path write_file handed to the model
+        # must also work inside the throwaway container.
+        self.assertIn(f"{scratch}:{scratch}:Z", mounts)
+        self.assertEqual(argv[argv.index("-w") + 1], "/workspace")
+        self.assertEqual(argv[-4:], ["img:3", "sh", "-c", "id"])
+
+    def test_exec_mode_warns_once_when_the_scratch_dir_is_not_mounted(self):
+        """`exec` cannot add mounts, so an invisible scratch dir must be reported."""
+        mounts = json.dumps([{"Source": os.getcwd(), "Destination": "/workspace"}])
+        seen, err = [], io.StringIO()
+        with patch("ollamaquery2.subprocess.run",
+                   side_effect=self._fake_run(seen, inspect_stdout=mounts)), \
+             contextlib.redirect_stderr(err):
+            ex = self._executor(mode="container", container_name="dev-box")
+            ex.run("pwd")
+            ex.run("pwd")
+        self.assertEqual(err.getvalue().count("[Sandbox]"), 1)
+        self.assertIn(q._scratch_root(), err.getvalue())
+        self.assertIn("-v", err.getvalue())
+
+    def test_exec_mode_is_quiet_when_the_temp_area_is_mounted(self):
+        mounts = json.dumps([{"Source": q.TEMP_ROOT, "Destination": q.TEMP_ROOT}])
+        seen, err = [], io.StringIO()
+        with patch("ollamaquery2.subprocess.run",
+                   side_effect=self._fake_run(seen, inspect_stdout=mounts)), \
+             contextlib.redirect_stderr(err):
+            ex = self._executor(mode="container", container_name="dev-box")
+            ex.run("pwd")
+        self.assertNotIn("[Sandbox]", err.getvalue())
 
     def test_throwaway_container_has_a_default_resource_ceiling(self):
         """1 cpu / 1g by default: a stray model process must not cost the host."""
@@ -2515,6 +2582,135 @@ class TestReActLoopUnit(unittest.TestCase):
 
         self.assertEqual(resp.get("error", {}).get("message"), "cancelled")
         self.assertNotIn("[ERROR]", stderr.getvalue())
+
+    # -- iteration budget + truncated steps (2026-10-29 regression) ----------
+    def test_iteration_limit_runs_exactly_max_steps(self):
+        """`agentic_max_iterations` counts STEPS, not two per step.
+
+        `run()` incremented the counter and `_run_step()` incremented it again
+        (the increment stayed in the extracted body), so every pass cost 2: the
+        real budget was `ceil(max/2)`, a configured 6 ran 3 steps, and the first
+        step header read "Step 2/6".
+        """
+        self.ctx.agentic_max_iterations = 3
+        calls = []
+
+        def mock_sync(*args, **kwargs):
+            calls.append(1)
+            return self._make_sync_response(
+                '{"tool": "write_file", "arguments": {"file": "x.txt", "content": "y"}}')
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="done")
+        self.loop.run_agentic_query("Keep using tools")
+
+        self.assertEqual(len(calls), 3)
+
+    def test_first_step_header_is_step_one(self):
+        """The header must print the step that is running, not the next one."""
+        self.ctx.agentic_max_iterations = 2
+
+        def mock_sync(*args, **kwargs):
+            return self._make_sync_response("Direct answer, no tool.")
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="Direct answer, no tool.")
+        stderr = io.StringIO()
+        with patch('sys.stderr', stderr):
+            self.loop.run_agentic_query("Say hello")
+
+        self.assertIn("Step 1/2", stderr.getvalue())
+
+    def test_iteration_limit_does_not_reexecute_the_tool(self):
+        """At the iteration limit the last tool call must not run a second time.
+
+        `finish_query` promoted `response_text` (the tool-call JSON) to the final
+        answer, and the finalizer parsed and executed it again — a duplicate
+        `run_command`/`apply_patch` is not idempotent.
+        """
+        self.ctx.agentic_max_iterations = 1
+        executed = []
+        real_execute = self.loop.tool_registry.execute
+
+        def spy(name, args):
+            executed.append(name)
+            return real_execute(name, args)
+
+        self.loop.tool_registry.execute = spy
+
+        def mock_sync(*args, **kwargs):
+            return self._make_sync_response(
+                '{"tool": "write_file", "arguments": {"file": "x.txt", "content": "y"}}')
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="done")
+        self.loop.run_agentic_query("Write it")
+
+        self.assertEqual(executed.count("write_file"), 1)
+
+    def test_step_ending_mid_reasoning_is_nudged_not_accepted(self):
+        """A step that ends on a reasoning chunk is a preamble, not the answer.
+
+        Observed live: content ("Let me write the file now…") then the model
+        returned to its reasoning channel and the generation ended. The loop
+        recorded the 41-token preamble as the final answer and the query stopped.
+        """
+        replies = [("Let me write the document.", "still planning"),  # ends in thought
+                   ("The document is written.", "")]
+        idx = [0]
+        calls = []
+
+        def mock_sync(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk")
+            content, thought = replies[min(idx[0], len(replies) - 1)]
+            idx[0] += 1
+            calls.append(1)
+            if on_chunk:
+                if content:
+                    on_chunk("", content, False)
+                if thought:
+                    on_chunk(thought, "", False)
+            return self._make_sync_response(content)
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="The document is written.")
+        self.loop.run_agentic_query("Write the document")
+
+        self.assertEqual(len(calls), 2, "the truncated step must be retried, not accepted")
+        self.assertNotIn("_system_nudge",
+                         [k for m in self.loop.messages for k in m],
+                         "the nudge is loop-internal and must not be persisted")
+
+    def test_truncated_step_nudge_is_bounded(self):
+        """A model that always dies mid-thought is nudged twice, then accepted."""
+        calls = []
+
+        def mock_sync(*args, **kwargs):
+            on_chunk = kwargs.get("on_chunk")
+            calls.append(1)
+            if on_chunk:
+                on_chunk("", "Preamble.", False)
+                on_chunk("still reasoning", "", False)
+            return self._make_sync_response("Preamble.")
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="Preamble.")
+        self.loop.run_agentic_query("Do the thing")
+
+        self.assertEqual(len(calls), 1 + q.AGENTIC_TRUNCATED_STEP_MAX)
+
+    def test_step_feedback_tracks_ending_in_thinking(self):
+        """`ended_in_thinking` follows the LAST text chunk, whatever is displayed."""
+        feedback = q.StepFeedback(self.ctx, show_thinking=False)
+        feedback.feed("reasoning", "", False)
+        self.assertTrue(feedback.ended_in_thinking)
+        feedback.feed("", "visible text", False)
+        self.assertFalse(feedback.ended_in_thinking)
+        feedback.feed("more reasoning", "", False)
+        self.assertTrue(feedback.ended_in_thinking)
+        # A usage-only chunk (no text) must not change the verdict.
+        feedback.feed("", "", True)
+        self.assertTrue(feedback.ended_in_thinking)
 
 
 class TestReActLoopDoesNotLitterTheCheckout(unittest.TestCase):
@@ -3952,6 +4148,19 @@ class TestComposableSystemPrompt(unittest.TestCase):
         prompt = q.get_agentic_prompt("test-model", tool_defs)
         self.assertIn("test_tool", prompt)
 
+    def test_persona_leads_the_blocks(self):
+        """The chat persona is the voice; the agentic blocks are the mechanics."""
+        prompt = q.get_agentic_prompt("test-model", persona="PERSONA TEXT")
+        self.assertTrue(prompt.startswith("PERSONA TEXT"))
+        self.assertLess(prompt.index("PERSONA TEXT"), prompt.index("capable AI agent"))
+        self.assertIn("## General rules", prompt)
+
+    def test_persona_is_optional_and_blank_is_ignored(self):
+        plain = q.get_agentic_prompt("test-model")
+        self.assertTrue(plain.startswith("You are a capable AI agent"))
+        self.assertEqual(q.get_agentic_prompt("test-model", persona="   "), plain)
+        self.assertEqual(q.get_agentic_prompt("test-model", persona=""), plain)
+
     def test_get_agentic_prompt_strict_format(self):
         prompt = q.get_agentic_prompt("test-model")
         self.assertIn("Output ONLY the JSON tool call", prompt)
@@ -4181,6 +4390,81 @@ class TestAgenticPlanCommand(unittest.TestCase):
         loop._agentic_toggle_plan(['/agentic', 'plan', 'off'])
         self.assertTrue(loop.ctx.agentic_mode)
         self.assertEqual(loop.ctx.system_prompt, agentic_prompt)
+
+
+class TestPersonaInAgenticPrompt(unittest.TestCase):
+    """The chat persona survives `/agentic ...` (composition, not replacement).
+
+    `/agentic on` used to swap `ctx.system_prompt` for the protocol blocks, and
+    the three prompt builders called `get_agentic_prompt()` directly, so a
+    `-P teacher` session silently lost its persona the moment agentic mode was
+    enabled — including in the ReAct step and the final stream.
+    """
+
+    PERSONA = "You are a patient teacher. Explain with analogies and examples."
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.auto_confirm = True
+        self.ctx.base_url = "http://localhost:9999"
+        self.ctx.backend = "opencodezen"   # offline: no tokenize / whole-request counter
+        self.ctx.model = "test-model"      # inline delivery, no native tools array
+        self.ctx.system_prompt = self.PERSONA
+        self.ctx._saved_system_prompt = None
+        self.ctx._plan_prev_prompt = None
+        self.ctx.agentic_mode = False
+        self.ctx.plan_mode = False
+        self.ctx.plan_run = False
+        self.loop = q.ChatLoop(self.ctx)
+
+    def tearDown(self):
+        self.ctx.agentic_mode = False
+        self.ctx.plan_mode = False
+        self.ctx.plan_run = False
+        self.ctx._saved_system_prompt = None
+        self.ctx._plan_prev_prompt = None
+        self.ctx.system_prompt = q.DEFAULT_SYSTEM_PROMPT
+
+    def test_persona_leads_and_the_protocol_follows(self):
+        self.loop._agentic_toggle_on_off(True)
+        prompt = self.ctx.system_prompt
+        self.assertTrue(prompt.startswith(self.PERSONA))
+        self.assertIn("capable AI agent", prompt)
+        self.assertIn("## General rules", prompt)
+
+    def test_wire_prompt_carries_the_persona(self):
+        """The step/final-stream builders must agree with the toggled prompt."""
+        self.loop._agentic_toggle_on_off(True)
+        self.loop.messages = [{'role': 'system', 'content': self.ctx.system_prompt}]
+        messages, _logger, _tools, _send = self.loop._init_agentic_query("ask")
+        wire = messages[0]['content']
+        self.assertTrue(wire.startswith(self.PERSONA))
+        self.assertEqual(wire, self.loop._agentic_prompt_and_tools()[0])
+        self.assertIn("## Available tools", wire)
+
+    def test_plan_and_full_keep_the_persona_without_duplicating_it(self):
+        self.loop._agentic_toggle_plan(['/agentic', 'plan'])
+        self.assertTrue(self.ctx.system_prompt.startswith(self.PERSONA))
+        self.assertEqual(self.ctx.system_prompt.count(self.PERSONA), 1)
+        self.loop._agentic_toggle_plan(['/agentic', 'plan', 'run'])
+        self.assertEqual(self.ctx.system_prompt.count(self.PERSONA), 1)
+        self.loop._agentic_toggle_plan(['/agentic', 'plan', 'off'])
+        self.assertTrue(self.ctx.system_prompt.startswith(self.PERSONA))
+        self.assertEqual(self.ctx.system_prompt.count(self.PERSONA), 1)
+        self.loop._agentic_set_full()
+        self.assertTrue(self.ctx.system_prompt.startswith(self.PERSONA))
+        self.assertEqual(self.ctx.system_prompt.count(self.PERSONA), 1)
+
+    def test_off_restores_the_persona_alone(self):
+        self.loop._agentic_toggle_on_off(True)
+        self.loop._agentic_toggle_on_off(False)
+        self.assertEqual(self.ctx.system_prompt, self.PERSONA)
+
+    def test_without_a_saved_persona_the_prompt_is_unchanged(self):
+        self.ctx._saved_system_prompt = None
+        self.ctx.system_prompt = ""
+        self.loop._agentic_toggle_on_off(True)
+        self.assertTrue(self.ctx.system_prompt.startswith("You are a capable AI agent"))
 
 
 class TestAppendToolMessages(unittest.TestCase):

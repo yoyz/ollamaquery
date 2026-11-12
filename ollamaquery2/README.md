@@ -119,7 +119,21 @@ spawnshell are disabled when unavailable.
 | `git_inspect`              | Read-only git inspection: `status`, `diff`, `diff_staged`, `diff_head`, `log` (any ref, path-scoped, renames followed), `show`, `blame -L` (fixed argv, no shell) |
 | `path_policy`              | Read-only: the session path map (allowed / needs confirmation / forbidden), or the verdict for one path — no filesystem access, no prompt |
 
-Subcommands: `/agentic auto`, `plan [on|off|run]`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `iterations <N>`, `timeout <N>`.
+Subcommands: `/agentic auto`, `plan [on|off|run]`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `iterations <N>`, `timeout <N>`.
+
+The model is steered to use the **dedicated file tools** (`read_file`, `write_file`,
+`edit_file`, `grep`, `glob`, `list_directory`) instead of shell equivalents (`cat`,
+`head`, `sed -i`, `echo >`, `find`): they are path-ACL checked, their output is not cut
+off by the generic observation cap (`read_file` pages large files and returns a `next`
+offset), and they always act on the host project — including in sandbox mode, where a
+shell `cat` would read the container's copy. `run_command` stays for what it is good at:
+compilers, builds, tests, binaries, system inspection.
+
+**Your profile stays.** `-P teacher` (or a custom system prompt) is **composed** with
+the agentic protocol rather than replaced: the persona leads (voice, language, depth)
+and the protocol blocks follow (tools, ReAct), in one system message — the persona is
+user configuration, the protocol is mechanics. `/agentic off` restores the persona
+alone, and `/promptshow system` shows the composed prompt that is actually sent.
 
 `/agentic plan` enables read-only planner mode. The default (strict) tier restricts
 the tool surface to `read_file`, `glob`, `grep`, `list_directory`, `fetch_url`,
@@ -140,10 +154,24 @@ File tools (`read_file`, `write_file`, `edit_file`, `list_directory`) and
 | Path                              | read   | write   |
 | --------------------------------- | ------ | ------- |
 | Current working directory         | allow  | allow   |
+| Session scratch dir (`/tmp/ollamaquery/<pid>`) | allow  | allow   |
 | `$HOME` (explicit `~` / absolute) | allow  | deny    |
 | `$HOME` dotfiles (`~/.*`)         | ask    | ask     |
 | `/proc`, `/sys`, `/etc`           | ask    | deny    |
+| `/tmp` (everything but the scratch dir) | deny | deny  |
 | anything else outside CWD/`$HOME` | ask    | deny    |
+
+- **Scratch dir.** Each session gets `/tmp/ollamaquery/pid-<pid>/` (mode
+  `0700`) as the one writable place outside the project, so the model has a
+  definite answer to "where do I put this build output / test binary?" instead
+  of probing the filesystem until something is refused. It is removed at exit
+  (only the leaf: the parent stays), `OLLAMAQUERY_KEEP_SCRATCH=1` keeps it, and
+  `write_file`/`edit_file` there need no destructive-tool confirmation. The rest
+  of `/tmp` is denied — it is world-writable and shared with every other process,
+  so it cannot be bounded or cleaned up — and a denial names the scratch dir as
+  the redirect. `/agentic scratch` prints the path, `list` shows its contents,
+  `clear` empties it. The container sandbox mounts it at the same absolute path
+  (a running container that cannot be re-mounted gets a one-time warning).
 
 - `ask` prompts per access and is never auto-approved (bypass-immune to
   `/agentic auto`); non-TTY runs deny and log it.
@@ -161,7 +189,10 @@ File tools (`read_file`, `write_file`, `edit_file`, `list_directory`) and
   use an allowed path — never reroute through `run_command`/`run_python`.
 - Reads outside the project are `ask`, not `deny`, on purpose: the gate is a
   consent + audit layer, not a sandbox. The shell can read the same file anyway,
-  so a silent deny only pushed the model onto the least-audited channel.
+  so a silent deny only pushed the model onto the least-audited channel. The
+  shared temp area is the deliberate exception: `/tmp` is world-writable, shared
+  with every process, and impossible to clean up, so it is denied outright and
+  the model is redirected to its own scratch dir.
 - Sensitive virtual files (`/proc/*/mem`, `environ`, `kcore`, `/proc/*/fd/*`) are
   hard-blocked regardless of rules.
 - `run_command` is now path-aware: `cat /etc/passwd`, `head /sys/...` etc.
@@ -181,6 +212,7 @@ Inspect and influence the policy with `/agentic acl`:
 /agentic acl ask /sys read      # restore prompting for /sys
 /agentic acl remove /etc        # drop session rules for a path
 /agentic acl reset              # restore defaults
+/agentic scratch                # this session's writable temp dir (list|clear)
 ```
 
 Defaults apply per session; `reset` restores them. Longest path prefix wins,

@@ -4,17 +4,22 @@
 Covers:
 - PathAcl defaults: CWD allowed, $HOME reads allowed (explicit only), home
   dotfiles / /proc /sys /etc are `ask`, a read anywhere else is `ask`
-  (confirmed once), a write anywhere else is denied.
+  (confirmed once), a write anywhere else is denied, and the shared temp area
+  is denied except this session's scratch dir (`/tmp/ollamaquery/pid-N`).
 - Session overrides via add()/remove(), longest-prefix precedence.
 - _path_acl_decision: ask -> non-TTY deny, hard-block of sensitive /proc files,
   and the "explicit home request only" rule (../ escapes stay denied).
 - Shell command operand scan (run_command path awareness): cat /etc, cat /proc
   now require approval; CWD paths and rule-less paths are unaffected.
+- The session scratch dir: creation (0700), cleanup leaf-only, dead-PID sweep,
+  shell leniency, plan-mode confinement, and the denial redirect.
 - The /agentic acl command dispatch (list / allow / deny / remove / reset).
 - fetch_url scheme guard: non-http(s) URLs (file://, ftp://, data:) are
   rejected so fetch cannot read local files and bypass the ACL.
 """
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -69,14 +74,14 @@ class TestPathAclDefaults(unittest.TestCase):
     def test_other_outside_reads_ask(self):
         # Outside CWD/$HOME a read is confirmed once (never silently denied):
         # a deny there would only push the model to `cat`, which the same ACL
-        # cannot gate. Writes stay denied.
-        self.assertEqual(self._ev("read", "/tmp/foo")[0], "ask")
+        # cannot gate. Writes stay denied. The shared temp area is the one
+        # exception: it is denied outright (see TestScratchDir).
         self.assertEqual(self._ev("read", "/var/log/syslog")[0], "ask")
-        self.assertIsNone(self._ev("read", "/tmp/foo")[1])
+        self.assertIsNone(self._ev("read", "/var/log/syslog")[1])
 
     def test_other_outside_writes_denied(self):
-        self.assertEqual(self._ev("write", "/tmp/foo")[0], "deny")
         self.assertEqual(self._ev("write", "/var/log/syslog")[0], "deny")
+        self.assertEqual(self._ev("write", "/opt/aq-out.txt")[0], "deny")
 
 
 class TestPathAclOverrides(unittest.TestCase):
@@ -107,6 +112,179 @@ class TestPathAclOverrides(unittest.TestCase):
         self.acl.add("read", "deny", "/proc", source="session")
         self.acl.reset()
         self.assertEqual(self.acl.evaluate("read", "/proc/cpuinfo")[0], "ask")
+
+
+class TestScratchDir(unittest.TestCase):
+    """The session scratch dir is the one writable place outside CWD/$HOME."""
+
+    def setUp(self):
+        self.acl = m.PathAcl()
+        self.scratch = m._scratch_root()
+
+    def _ev(self, op, p):
+        return self.acl.evaluate(op, os.path.realpath(os.path.expanduser(p)))
+
+    def test_scratch_is_created_private(self):
+        import stat
+        self.assertTrue(os.path.isdir(self.scratch))
+        self.assertEqual(stat.S_IMODE(os.stat(self.scratch).st_mode), 0o700)
+        self.assertEqual(os.path.dirname(self.scratch), m.SCRATCH_PARENT)
+
+    def test_scratch_read_and_write_allowed_without_a_session_grant(self):
+        decision, rule = self._ev("write", self.scratch + "/build/out.o")
+        self.assertEqual(decision, "allow")
+        self.assertEqual(rule["source"], "default")
+        self.assertEqual(self._ev("read", self.scratch + "/build/out.o")[0], "allow")
+
+    def test_rest_of_the_temp_area_is_denied(self):
+        for p in ("/tmp/x", m.SCRATCH_PARENT, m.SCRATCH_PARENT + "/pid-1/x"):
+            self.assertEqual(self._ev("read", p)[0], "deny", p)
+            self.assertEqual(self._ev("write", p)[0], "deny", p)
+        parent_rule = self._ev("read", "/tmp/x")[1]
+        self.assertEqual(parent_rule["kind"], "temp_root")
+
+    def test_scratch_allow_beats_the_temp_deny_regardless_of_order(self):
+        # The defaults install the deny first; longest-prefix must still win.
+        self.assertLess(len(self._ev("read", "/tmp/x")[1]["path"]),
+                        len(self._ev("write", self.scratch + "/a")[1]["path"]))
+        # A re-added deny first must not change the answer either.
+        self.acl.rules.reverse()
+        self.assertEqual(self._ev("write", self.scratch + "/a")[0], "allow")
+
+    def test_cwd_under_the_temp_area_stays_usable(self):
+        """`cd /tmp/proj && python3 ollamaquery2.py` must not lock the session out."""
+        with tempfile.TemporaryDirectory(dir="/tmp") as td:
+            cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                acl = m.PathAcl()
+                self.assertEqual(acl.evaluate("write", os.path.join(td, "a.txt"))[0], "allow")
+                self.assertEqual(acl.evaluate("read", os.path.join(td, "a.txt"))[0], "allow")
+                # Everything else in /tmp is still denied.
+                self.assertEqual(acl.evaluate("read", "/tmp/elsewhere")[0], "deny")
+            finally:
+                os.chdir(cwd)
+
+    def test_reset_restores_the_scratch_dir(self):
+        self.acl.add("write", "deny", self.scratch, source="session")
+        self.assertEqual(self._ev("write", self.scratch + "/a")[0], "deny")
+        self.acl.reset()
+        self.assertEqual(self._ev("write", self.scratch + "/a")[0], "allow")
+
+    def test_session_deny_on_the_scratch_dir_wins(self):
+        self.acl.add("write", "deny", self.scratch, source="session")
+        self.assertEqual(self._ev("write", self.scratch + "/a")[0], "deny")
+
+    def test_session_deny_on_a_scratch_subdirectory_is_scoped(self):
+        self.acl.add("write", "deny", self.scratch + "/secret", source="session")
+        self.assertEqual(self._ev("write", self.scratch + "/secret/a")[0], "deny")
+        self.assertEqual(self._ev("write", self.scratch + "/other/a")[0], "allow")
+
+    def test_plan_strict_confines_the_scratch_dir(self):
+        ctx = FakeCtx()
+        ctx.plan_mode = True
+        ctx.plan_run = False
+        decision, msg = m._path_acl_decision(ctx, "read", self.scratch + "/a",
+                                             tool="read_file")
+        self.assertEqual(decision, "deny")
+        self.assertIn("strict plan mode is confined to", msg)
+        # An explicit session read grant still works (spill paging).
+        with tempfile.TemporaryDirectory() as outside:
+            ctx.path_acl.add("read", "allow", outside, source="session")
+            decision, msg = m._path_acl_decision(ctx, "read", outside + "/p.txt",
+                                                 tool="read_file")
+        self.assertEqual(decision, "allow")
+
+    def test_prompt_and_map_name_the_scratch_dir(self):
+        allowed = " ".join(self.acl.allowed_lines())
+        self.assertIn(self.scratch, allowed)
+        self.assertIn("wiped at exit", allowed)
+        full = " ".join(self.acl.describe())
+        self.assertIn(self.scratch, full)
+        self.assertIn("shared temp area", full)
+
+    def test_tmp_denial_redirects_to_the_scratch_dir(self):
+        ctx = FakeCtx()
+        decision, msg = m._path_acl_decision(ctx, "write", "/tmp/x", tool="write_file")
+        self.assertEqual(decision, "deny")
+        self.assertIn("deny /tmp", msg)
+        self.assertIn(f"for temporary files use {self.scratch}", msg)
+        self.assertIn("path_policy", msg)
+
+    def test_shell_leniency_covers_the_scratch_dir_only(self):
+        ctx = FakeCtx()
+        with patch.object(m.PathAcl, "prompt", side_effect=AssertionError("scratch must not prompt")):
+            res = m.check_shell_approval(f"rm -rf {self.scratch}/build", ctx=ctx)
+        self.assertTrue(res["approved"], res.get("message"))
+        with patch("sys.stdin.isatty", return_value=False):
+            res = m.check_shell_approval("rm -rf /tmp/build", ctx=ctx)
+        self.assertFalse(res["approved"])
+
+    def test_relative_operand_does_not_borrow_the_scratch_leniency(self):
+        nodes = m._shell_breakdown("rm -rf ../outside")
+        self.assertFalse(m._shell_all_operands_inside_cwd(
+            nodes, extra_roots=[self.scratch]))
+
+    def test_write_file_in_the_scratch_dir_needs_no_confirmation(self):
+        reg = m.ToolRegistry(ctx=FakeCtx())
+        target = os.path.join(self.scratch, "work", "a.txt")
+        with patch.object(m.ToolRegistry, "_prompt_confirm",
+                          side_effect=AssertionError("scratch must not prompt")):
+            result = reg.execute("write_file", {"file_path": target, "content": "x"})
+        self.assertTrue(result["success"], result.get("error"))
+        self.assertTrue(os.path.exists(target))
+
+    def test_write_file_outside_the_scratch_dir_still_confirms(self):
+        reg = m.ToolRegistry(ctx=FakeCtx())
+        with patch.object(m.ToolRegistry, "_prompt_confirm", return_value=False) as mocked:
+            result = reg.execute("write_file", {"file_path": "outside.txt", "content": "x"})
+        self.assertFalse(result["success"])
+        self.assertIn("Cancelled by user", result["error"])
+        mocked.assert_called_once()
+
+    def test_a_symlink_inside_the_scratch_dir_is_not_exempt(self):
+        link = os.path.join(self.scratch, "escape-link")
+        try:
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.symlink(os.path.join(CWD, "escape.txt"), link)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        reg = m.ToolRegistry(ctx=FakeCtx())
+        try:
+            with patch.object(m.ToolRegistry, "_prompt_confirm", return_value=False) as mocked:
+                reg.execute("write_file", {"file_path": link, "content": "x"})
+            mocked.assert_called_once()
+        finally:
+            os.unlink(link)
+
+    def test_cleanup_removes_the_leaf_and_keeps_the_parent(self):
+        leaf = tempfile.mkdtemp(prefix="pid-", dir=m.SCRATCH_PARENT)
+        with open(os.path.join(leaf, "artifact.bin"), "w") as f:
+            f.write("x")
+        saved = list(m._scratch_root_cache)
+        m._scratch_root_cache[:] = [leaf]
+        try:
+            m._cleanup_scratch_dir()
+        finally:
+            m._scratch_root_cache[:] = saved
+        self.assertFalse(os.path.exists(leaf))
+        self.assertTrue(os.path.isdir(m.SCRATCH_PARENT))
+
+    def test_sweep_keeps_live_sessions_and_removes_dead_ones(self):
+        dead = os.path.join(m.SCRATCH_PARENT, "pid-999999")
+        alive = os.path.join(m.SCRATCH_PARENT, f"pid-{os.getpid()}")
+        os.makedirs(dead, exist_ok=True)
+        os.makedirs(alive, exist_ok=True)
+        try:
+            with patch.object(m, "_pid_alive", side_effect=lambda pid: pid != 999999):
+                m._sweep_dead_scratch_dirs()
+            self.assertFalse(os.path.exists(dead))
+            self.assertTrue(os.path.isdir(alive))
+        finally:
+            import shutil
+            shutil.rmtree(dead, ignore_errors=True)
+            shutil.rmtree(alive, ignore_errors=True)
 
 
 class TestRawHomeExplicit(unittest.TestCase):
@@ -163,9 +341,9 @@ class TestPathAclDecision(unittest.TestCase):
         # Non-TTY: the implicit ask cannot be answered, so it denies — but the
         # message must name the remedy and forbid the tool-switching workaround,
         # otherwise the model tries `cat` then `python -c`.
-        decision, msg = m._path_acl_decision(self.ctx, "read", "/tmp/strata-kbuild.log",
+        decision, msg = m._path_acl_decision(self.ctx, "read", "/var/lib/aq-probe.log",
                                              tool="read_file",
-                                             raw_path="/tmp/strata-kbuild.log")
+                                             raw_path="/var/lib/aq-probe.log")
         self.assertEqual(decision, "deny")
         self.assertIn("path_policy", msg)
         self.assertIn("run_command", msg)
@@ -175,19 +353,21 @@ class TestPathAclDecision(unittest.TestCase):
         # add a session allow rule for that path so the next read is silent.
         with patch("sys.stdin.isatty", return_value=True), \
                 patch("builtins.input", return_value="s"):
-            decision, msg = m._path_acl_decision(self.ctx, "read", "/tmp/granted.log",
+            decision, msg = m._path_acl_decision(self.ctx, "read", "/var/lib/granted.log",
                                                  tool="read_file",
-                                                 raw_path="/tmp/granted.log")
+                                                 raw_path="/var/lib/granted.log")
         self.assertEqual(decision, "allow")
         self.assertIsNone(msg)
-        self.assertEqual(self.ctx.path_acl.evaluate("read", "/tmp/granted.log")[0], "allow")
+        self.assertEqual(self.ctx.path_acl.evaluate("read", "/var/lib/granted.log")[0], "allow")
 
     def test_outside_write_denied_without_prompt(self):
         with patch.object(m.PathAcl, "prompt", side_effect=AssertionError("write must not prompt")):
-            decision, msg = m._path_acl_decision(self.ctx, "write", "/tmp/out.txt",
-                                                 tool="write_file", raw_path="/tmp/out.txt")
+            decision, msg = m._path_acl_decision(self.ctx, "write", "/opt/out.txt",
+                                                 tool="write_file", raw_path="/opt/out.txt")
         self.assertEqual(decision, "deny")
         self.assertIn("write outside", msg)
+        # The denial redirects to the scratch dir instead of leaving a dead end.
+        self.assertIn(m._scratch_root(), msg)
 
 
 class TestShellOperandRealpath(unittest.TestCase):
@@ -301,9 +481,16 @@ class TestShellCodeBlobScan(unittest.TestCase):
         self.assertIsNone(self._scan("git commit -m 'fix /etc handling'"))
 
     def test_code_path_without_rule_not_flagged(self):
-        # /tmp has no explicit rule: the code-blob scan must not invent one
-        # (read_file asks there; the shell does not, by design).
-        self.assertIsNone(self._scan("python3 -c \"print(open('/tmp/x').read())\""))
+        # A path with no explicit rule is left to the shell gate / file tools:
+        # the code-blob scan must not invent a rule for it.
+        self.assertIsNone(self._scan("python3 -c \"print(open('/var/log/aq/x').read())\""))
+
+    def test_tmp_deny_is_visible_to_the_code_blob_scan(self):
+        """`python3 -c "open('/tmp/x','w')"` must be denied by the temp-area rule."""
+        res = self._scan("python3 -c \"print(open('/tmp/x').read())\"")
+        self.assertIsNotNone(res)
+        self.assertIn("deny /tmp", res["reason"])
+        self.assertIn(m._scratch_root(), res["reason"])
 
     def test_url_not_treated_as_path(self):
         self.assertIsNone(self._scan("curl -o out.html https://example.com/a/b"))
@@ -321,7 +508,7 @@ class TestAclDenialPointsAtTool(unittest.TestCase):
     def setUp(self):
         self.ctx = FakeCtx()
 
-    def _deny(self, op="read", path="/tmp/strata-kbuild.log", op_name="read_file"):
+    def _deny(self, op="read", path="/var/lib/aq-probe.log", op_name="read_file"):
         decision, msg = m._path_acl_decision(self.ctx, op, path, tool=op_name, raw_path=path)
         self.assertEqual(decision, "deny")
         return msg
@@ -436,6 +623,17 @@ class TestAgenticPromptPathPolicy(unittest.TestCase):
         self.ctx.plan_mode = False
         self.ctx.plan_run = False
         self.loop = m.ChatLoop(self.ctx)
+        # CommandContext is a process-wide singleton: restore the ACL rules and
+        # the plan flags after each test, or a session grant added here (e.g.
+        # `read allow /tmp`) silently changes every later module's expectations.
+        rules = list(self.ctx.path_acl.rules)
+
+        def _restore():
+            self.ctx.path_acl.rules = list(rules)
+            self.ctx.plan_mode = False
+            self.ctx.plan_run = False
+            self.ctx.agentic_mode = False
+        self.addCleanup(_restore)
 
     def test_agentic_prompt_lists_allowed_paths_only(self):
         self.ctx.path_acl.add("read", "allow", "/tmp", source="session")
@@ -469,6 +667,27 @@ class TestRulesBlockPathPolicyRule(unittest.TestCase):
                 prompt = m.get_agentic_prompt(model, plan_mode=plan)
                 self.assertIn("Call path_policy once", prompt, model)
                 self.assertIn("do NOT retry it with run_command/run_python", prompt, model)
+
+    def test_dedicated_tools_are_preferred_over_shell_equivalents(self):
+        """Tool choice is steered, not forbidden: shell = run, tools = file I/O."""
+        for model in ('qwen3.5:9b', 'nemotron-cascade', 'some-unknown:latest'):
+            for plan in (False, True):
+                prompt = m.get_agentic_prompt(model, plan_mode=plan)
+                self.assertIn("instead of shell equivalents", prompt, model)
+                self.assertIn("Use run_command (when a shell is available) to RUN things",
+                              prompt, model)
+
+    def test_read_file_description_does_not_invite_the_bypass(self):
+        """A denial must not point at run_command — that is the ACL bypass."""
+        desc = m.AGENTIC_TOOL_DEFS["read_file"]["description"]
+        self.assertNotIn("use run_command instead", desc)
+        self.assertIn("call path_policy once", desc)
+        self.assertIn("do not route around the refusal", desc)
+
+    def test_write_file_description_names_the_scratch_dir_for_temporary_files(self):
+        desc = m.AGENTIC_TOOL_DEFS["write_file"]["description"]
+        self.assertIn("session scratch dir", desc)
+        self.assertIn("wiped at exit", desc)
 
 
 class TestShellApprovalPrompt(unittest.TestCase):
@@ -585,6 +804,70 @@ class TestAgenticAclCommand(unittest.TestCase):
         loop = _loop()
         self.assertFalse(loop._handle_agentic_acl(['/agentic', 'acl']))
         self.assertFalse(loop._handle_agentic_acl(['/agentic', 'acl', 'log']))
+
+    def test_list_shows_how_to_change_the_rules(self):
+        """Bare `/agentic acl` is also the help screen: the commands must be visible."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            _loop()._handle_agentic_acl(['/agentic', 'acl'])
+        out = err.getvalue()
+        self.assertIn("/agentic acl allow <path> [op]", out)
+        self.assertIn("e.g. /agentic acl allow /tmp write", out)
+        self.assertIn("/agentic acl remove <path>", out)
+        self.assertIn("/agentic acl reset", out)
+        self.assertIn("/agentic scratch", out)
+
+    def test_allowing_a_path_that_contains_the_scratch_dir_warns(self):
+        """`allow /tmp write` defeats the scratch redirect — say so, out loud."""
+        loop = _loop()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop._handle_agentic_acl(['/agentic', 'acl', 'allow', '/tmp', 'write'])
+        self.assertIn("widens the model's writable surface", err.getvalue())
+        self.assertEqual(loop.ctx.path_acl.evaluate("write", "/tmp/x")[0], "allow")
+
+    def test_allowing_the_scratch_dir_itself_does_not_warn(self):
+        loop = _loop()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop._handle_agentic_acl(['/agentic', 'acl', 'allow',
+                                      m._scratch_root(), 'write'])
+        self.assertNotIn("widens the model's writable surface", err.getvalue())
+
+
+class TestAgenticScratchCommand(unittest.TestCase):
+    """`/agentic scratch` makes the one writable temp path visible to the user."""
+
+    def test_bare_prints_the_path_and_the_cleanup_rule(self):
+        loop = _loop()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(loop.run_handle_agentic('/agentic scratch'))
+        self.assertIn(m._scratch_root(), err.getvalue())
+        self.assertIn("removed at session exit", err.getvalue())
+
+    def test_list_then_clear(self):
+        loop = _loop()
+        artifact = os.path.join(m._scratch_root(), "artifact.txt")
+        with open(artifact, "w") as f:
+            f.write("x")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop._handle_agentic_scratch(['/agentic', 'scratch', 'list'])
+        self.assertIn("artifact.txt", err.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()):
+            loop._handle_agentic_scratch(['/agentic', 'scratch', 'clear'])
+        self.assertFalse(os.path.exists(artifact))
+
+    def test_unknown_action_prints_usage(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            _loop()._handle_agentic_scratch(['/agentic', 'scratch', 'nonsense'])
+        self.assertIn("Usage: /agentic scratch", err.getvalue())
+
+    def test_completion_offers_the_actions(self):
+        self.assertEqual(m.AGENTIC_SECOND_LEVEL['scratch'], ['path', 'list', 'clear'])
+        self.assertIn('scratch', m.AGENTIC_SUBCOMMANDS)
 
 
 class TestAclFileTools(unittest.TestCase):

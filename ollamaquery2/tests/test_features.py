@@ -1657,6 +1657,27 @@ class TestBuildPrompt(unittest.TestCase):
         prompt = self.loop.run_build_prompt("localhost")
         self.assertIn("no model selected", prompt)
 
+    def test_mode_tag_is_chat_by_default(self):
+        """The prompt says which tool surface is active (chat / plan / agentic)."""
+        self.assertTrue(self.loop.run_build_prompt("localhost").startswith("[chat] "))
+
+    def test_mode_tag_is_agentic(self):
+        self.ctx.agentic_mode = True
+        self.assertTrue(self.loop.run_build_prompt("localhost").startswith("[agentic] "))
+
+    def test_mode_tag_distinguishes_plan_tiers(self):
+        self.ctx.agentic_mode = True
+        self.ctx.plan_mode = True
+        self.assertTrue(self.loop.run_build_prompt("localhost").startswith("[plan] "))
+        self.ctx.plan_run = True
+        self.assertTrue(self.loop.run_build_prompt("localhost").startswith("[plan:run] "))
+
+    def test_mode_tag_marks_container_sandbox(self):
+        """`:box` is a different boundary from the tool surface — same glance."""
+        self.ctx.agentic_mode = True
+        self.loop.executor.mode = "container"
+        self.assertTrue(self.loop.run_build_prompt("localhost").startswith("[agentic:box] "))
+
 
 # ============================================================================
 # 11. Utility Functions
