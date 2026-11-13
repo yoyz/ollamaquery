@@ -2491,9 +2491,8 @@ class TestReActLoopUnit(unittest.TestCase):
         self.assertFalse(self.loop.query_handler.query_stream.called)
 
     def test_empty_response_nudge_not_persisted(self):
-        """The injected 'Please provide a tool call or your final answer.' nudge
-        is loop-internal steering and must NOT be merged into the persistent
-        conversation history."""
+        """The empty-step 'continue where you stopped' nudge is loop-internal
+        steering and must NOT be merged into the persistent conversation history."""
         calls = [
             self._make_sync_response(""),                      # empty → nudge injected
             self._make_sync_response("Done."),                 # real answer
@@ -2511,7 +2510,7 @@ class TestReActLoopUnit(unittest.TestCase):
         self.loop.run_agentic_query("Say done")
 
         self.assertFalse(
-            any(m.get("content") == "Please provide a tool call or your final answer."
+            any(m.get("content") == q.AgenticRunner.continuation_nudge("empty")
                 for m in self.loop.messages),
             "System nudge must not persist in conversation history")
         self.assertEqual(self.loop.messages[-1]["role"], "assistant")
@@ -2711,6 +2710,189 @@ class TestReActLoopUnit(unittest.TestCase):
         # A usage-only chunk (no text) must not change the verdict.
         feedback.feed("", "", True)
         self.assertTrue(feedback.ended_in_thinking)
+
+    # -- stream completeness (2026-11-13) ------------------------------------
+    #
+    # Live symptom: the loop stopped mid-work after a step whose prose announced
+    # the next action ("Je lance la transformation…") and sometimes nudged the
+    # model to "resume" mid-cycle. Both come from a step whose turn never
+    # finished being treated as an answer; these pin the classification and the
+    # bounded continuation nudges.
+
+    def test_truncation_reason_classification(self):
+        """Only a stream that ended without a terminal marker is 'cut'."""
+        cls = q.AgenticRunner.truncation_reason
+        self.assertIsNone(cls(None))
+        self.assertIsNone(cls({}))
+        self.assertIsNone(cls({"parsed_lines": 4, "bad_lines": 0, "saw_final": True,
+                               "finish_reason": "stop"}))
+        self.assertEqual(cls({"parsed_lines": 4, "saw_final": False,
+                              "finish_reason": ""}), "cut")
+        self.assertEqual(cls({"parsed_lines": 4, "saw_final": True,
+                              "finish_reason": "length"}), "length")
+        self.assertEqual(cls({"parsed_lines": 4, "saw_final": True, "bad_lines": 2,
+                              "finish_reason": "stop"}), "badstream")
+
+    def test_cut_stream_prose_is_nudged_not_finalized(self):
+        """A step cut before its terminal marker is a preamble, not the answer."""
+        cut = dict(self._make_sync_response("I'll write the file now."),
+                   _stream={"parsed_lines": 5, "bad_lines": 0, "saw_final": False,
+                            "finish_reason": ""})
+        replies = [
+            cut,
+            dict(self._make_sync_response("The file is written."),
+                 _stream={"parsed_lines": 5, "bad_lines": 0, "saw_final": True,
+                          "finish_reason": "stop"}),
+        ]
+        idx = [0]
+        seen = []
+
+        def mock_sync(messages, model, **kwargs):
+            seen.append([dict(m) for m in messages])
+            i = idx[0]
+            idx[0] += 1
+            return replies[min(i, len(replies) - 1)]
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="The file is written.")
+        self.loop.run_agentic_query("Write the file")
+
+        self.assertEqual(len(seen), 2, "a cut step must be retried, not accepted")
+        self.assertIn(q.AgenticRunner.continuation_nudge("cut"),
+                      [m.get("content") for m in seen[1]])
+        self.assertNotIn(q.AgenticRunner.continuation_nudge("cut"),
+                         [m.get("content") for m in self.loop.messages])
+
+    def test_length_capped_step_is_nudged(self):
+        """`finish_reason: length` means the output cap cut the turn: continue it."""
+        capped = dict(self._make_sync_response("Step one…"),
+                      _stream={"parsed_lines": 3, "bad_lines": 0, "saw_final": True,
+                               "finish_reason": "length"})
+        seen = []
+        idx = [0]
+        replies = [capped, self._make_sync_response("All done.")]
+
+        def mock_sync(messages, model, **kwargs):
+            seen.append([dict(m) for m in messages])
+            i = idx[0]
+            idx[0] += 1
+            return replies[min(i, len(replies) - 1)]
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="All done.")
+        self.loop.run_agentic_query("Do it")
+
+        self.assertEqual(len(seen), 2)
+        self.assertIn(q.AgenticRunner.continuation_nudge("length"),
+                      [m.get("content") for m in seen[1]])
+
+    def test_empty_step_asks_to_continue_not_to_start(self):
+        """An empty step nudges 'continue where you stopped' (bounded)."""
+        seen = []
+        idx = [0]
+
+        def mock_sync(messages, model, **kwargs):
+            seen.append([dict(m) for m in messages])
+            idx[0] += 1
+            return self._make_sync_response("") if idx[0] == 1 else \
+                self._make_sync_response("Done.")
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="Done.")
+        self.loop.run_agentic_query("Say done")
+
+        self.assertEqual(len(seen), 2)
+        texts = [m.get("content") for m in seen[1]]
+        self.assertIn(q.AgenticRunner.continuation_nudge("empty"), texts)
+        self.assertNotIn("Please provide a tool call or your final answer.", texts)
+
+    def test_empty_steps_are_bounded(self):
+        """A model that always returns nothing is nudged twice, then finalized."""
+        calls = []
+
+        def mock_sync(*args, **kwargs):
+            calls.append(1)
+            return self._make_sync_response("")
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="")
+        self.loop.run_agentic_query("Say something")
+
+        self.assertEqual(len(calls), 1 + q.AGENTIC_TRUNCATED_STEP_MAX)
+
+    def test_corrupt_native_tool_call_is_not_executed_with_empty_args(self):
+        """Truncated native arguments must not run the tool with `{}`."""
+        bad = {"choices": [{"message": {
+            "role": "assistant", "content": "",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "write_file",
+                                         "arguments": '{"file": "x.txt", "content": "y'}}],
+        }}]}
+        valid = {"choices": [{"message": {
+            "role": "assistant", "content": "",
+            "tool_calls": [{"id": "c2", "type": "function",
+                            "function": {"name": "write_file",
+                                         "arguments": '{"file": "x.txt", "content": "ok"}'}}],
+        }}]}
+        seen, idx = [], [0]
+        replies = [bad, valid, self._make_sync_response("Written.")]
+
+        def mock_sync(messages, model, **kwargs):
+            seen.append([dict(m) for m in messages])
+            i = idx[0]
+            idx[0] += 1
+            return replies[min(i, len(replies) - 1)]
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="Written.")
+        with patch.object(self.loop.tool_registry, "execute",
+                          wraps=self.loop.tool_registry.execute) as spy:
+            self.loop.run_agentic_query("Write x.txt")
+
+        # Step 1 (corrupt) must not execute; step 2 (valid) must.
+        self.assertEqual(spy.call_count, 1, "a corrupt native call must not run")
+        self.assertEqual(spy.call_args[0][0], "write_file")
+        self.assertTrue(spy.call_args[0][1].get("file_path") or spy.call_args[0][1].get("file"))
+        # And the model was asked to re-emit it rather than to finalize.
+        self.assertIn(q.AgenticRunner.continuation_nudge("unparsed"),
+                      [m.get("content") for m in seen[1]])
+
+    def test_parse_calls_drops_unparseable_native_arguments(self):
+        """`parse_calls` keeps "" (zero-arg tool) but drops corrupt JSON."""
+        execution = q.ToolExecution(self.ctx, self.loop.tool_registry, self.loop.parser)
+        blank = [{"function": {"name": "path_policy", "arguments": ""}}]
+        corrupt = [{"function": {"name": "write_file", "arguments": '{oops'}}]
+        nameless = [{"function": {"name": "", "arguments": "{}"}}]
+        self.assertEqual(execution.parse_calls("", blank),
+                         [{"tool": "path_policy", "arguments": {}}])
+        self.assertEqual(execution.parse_calls("", corrupt), [])
+        self.assertEqual(execution.parse_calls("", nameless), [])
+
+    def test_truncated_inline_tool_call_is_nudged(self):
+        """An unbalanced inline `{"tool": …` (inline-format model) is not an answer."""
+        truncated = ('{"tool": "write_file", "arguments": {"file": "x.txt", '
+                     '"content": "a long body that never closes')
+        seen, idx = [], [0]
+        replies = [self._make_sync_response(truncated),
+                   self._make_sync_response(
+                       '{"tool": "write_file", "arguments": {"file": "x.txt", "content": "ok"}}'),
+                   self._make_sync_response("Written.")]
+
+        def mock_sync(messages, model, **kwargs):
+            seen.append([dict(m) for m in messages])
+            i = idx[0]
+            idx[0] += 1
+            return replies[min(i, len(replies) - 1)]
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="Written.")
+        self.loop.run_agentic_query("Write x.txt")
+
+        self.assertEqual(len(seen), 3, "the truncated call must be re-asked, then executed")
+        self.assertIn(q.AgenticRunner.continuation_nudge("unparsed"),
+                      [m.get("content") for m in seen[1]])
+        with open("x.txt", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "ok")
 
 
 class TestReActLoopDoesNotLitterTheCheckout(unittest.TestCase):

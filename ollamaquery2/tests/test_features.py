@@ -29,6 +29,7 @@ import textwrap
 import tempfile
 import unittest
 import subprocess
+import contextlib
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from urllib.request import Request
@@ -938,6 +939,104 @@ class TestMultilineInput(unittest.TestCase):
 # ============================================================================
 # 6.  Command Handling
 # ============================================================================
+
+class TestUnknownCommand(unittest.TestCase):
+    """An unrecognised `/command` is answered by the harness, never sent to the model.
+
+    Typing `/aaaaa` used to become a prompt: tokens spent, and the model answers
+    a typo as if it were a question. Commands own the `/word` namespace, so the
+    dispatcher now reports the typo locally (with a suggestion) and tells the
+    user how to send a literal slash line (`//word`).
+    """
+
+    def setUp(self):
+        self.ctx = _fresh_ctx()
+        self.loop = _chat_loop(self.ctx)
+
+    def _dispatch(self, line):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            result = self.loop._dispatch_command(line)
+        return result, err.getvalue()
+
+    def test_unknown_command_is_consumed(self):
+        result, err = self._dispatch('/aaaaa')
+        self.assertIs(result, False, "an unknown command must not reach the query path")
+        self.assertIn("Unknown command '/aaaaa'", err)
+        self.assertIn("Nothing was sent to the model", err)
+        self.assertIn("//aaaaa", err)
+
+    def test_close_match_is_suggested(self):
+        _, err = self._dispatch('/sesssions')
+        self.assertIn('/sessions', err)
+
+    def test_no_absurd_suggestion_for_a_short_word(self):
+        """`/tmp` scores 0.75 against `/mcp` in difflib; the first-letter rule drops it."""
+        _, err = self._dispatch('/tmp')
+        self.assertIn("Unknown command '/tmp'", err)
+        self.assertNotIn('Did you mean', err)
+
+    def test_suggestion_is_a_slash_command_and_case_insensitive(self):
+        _, err = self._dispatch('/SAVE')
+        self.assertIn('Did you mean /save?', err)
+        self.assertNotIn('Did you mean save?', err)
+
+    def test_dropped_first_letter_still_suggests(self):
+        _, err = self._dispatch('/istmodel')
+        self.assertIn('/listmodel', err)
+
+    def test_known_command_with_bad_arguments_shows_usage(self):
+        _, err = self._dispatch('/stats everything')
+        self.assertIn("'/stats' was not understood with those arguments", err)
+        self.assertIn('/stats', err)
+
+    def test_paths_and_prose_still_reach_the_model(self):
+        for line in ('/tmp/foo', '/var/log/syslog', 'explain /tmp/foo'):
+            result, _ = self._dispatch(line)
+            self.assertIsNone(result, f"{line!r} must fall through to the model")
+
+    def test_model_is_never_called(self):
+        self.loop.query_handler.query_stream = MagicMock()
+        self.loop.query_handler.query_sync_stream = MagicMock()
+        self._dispatch('/notacommand')
+        self.assertFalse(self.loop.query_handler.query_stream.called)
+        self.assertFalse(self.loop.query_handler.query_sync_stream.called)
+
+    def test_escape_removes_one_slash_for_command_shaped_lines(self):
+        self.assertEqual(q.unescape_command_line('//aaaaa'), '/aaaaa')
+        self.assertEqual(q.unescape_command_line('//save me'), '/save me')
+        # Not command-shaped: left alone.
+        self.assertEqual(q.unescape_command_line('//server/share'), '//server/share')
+        self.assertEqual(q.unescape_command_line('///x'), '///x')
+        self.assertEqual(q.unescape_command_line('/aaaaa'), '/aaaaa')
+
+    def test_help_documents_the_escape(self):
+        self.assertIn('//', q.format_help_text(compact=False))
+
+    def _run_lines(self, lines):
+        """Drive ChatLoop.run() with scripted input; returns the query-path lines."""
+        loop = _chat_loop(self.ctx)
+        seen = []
+        loop.run_init_session = MagicMock()
+        loop.run_update_ollama_context = MagicMock()
+        loop.run_display_context_bar = MagicMock()
+        loop.run_build_prompt = MagicMock(return_value='> ')
+        loop.run_process_query = seen.append
+        script = iter(list(lines) + ['exit'])
+        with patch.object(q, 'gather_user_input', lambda prompt: next(script)), \
+             contextlib.redirect_stderr(io.StringIO()):
+            loop.run()
+        return seen
+
+    def test_unknown_command_never_reaches_the_query_path(self):
+        self.assertEqual(self._run_lines(['/aaaaa']), [],
+                         "an unknown command must be swallowed by the harness")
+
+    def test_escaped_line_reaches_the_query_path_unescaped(self):
+        self.assertEqual(self._run_lines(['//aaaaa']), ['/aaaaa'])
+        # And the escape does not turn into a command execution.
+        self.assertEqual(self._run_lines(['//save me']), ['/save me'])
+
 
 class TestCommandHandlers(unittest.TestCase):
     """Verify each /command handler dispatches correctly."""
@@ -2560,6 +2659,93 @@ class TestSyncStream(unittest.TestCase):
         self.assertEqual(seen[1], ("", "answer", False))
         self.assertEqual(seen[2][0], "")  # final chunk: no thought/content
         self.assertTrue(seen[2][2])       # is_final True
+
+    # -- stream completeness report (2026-11-13) -----------------------------
+    #
+    # The ReAct loop must be able to tell "the model finished its turn" from
+    # "the stream died". Previously a dropped connection, a cap hit, or malformed
+    # frames all looked like a normal `stop` (the synthesized response hardcoded
+    # `finish_reason: "stop"`), so a half-written announcement was recorded as
+    # the final answer.
+
+    def test_complete_stream_is_reported(self):
+        qh = self._make_query("llamacpp")
+        lines = [
+            json.dumps({"choices": [{"delta": {"content": "answer"}}]}),
+            json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        ]
+        m1, m2 = self._mock_transport(qh, lines)
+        with m1, m2:
+            resp = qh.query_sync_stream([{"role": "user", "content": "hi"}], SMALL_MODEL)
+
+        info = resp["_stream"]
+        self.assertTrue(info["complete"])
+        self.assertTrue(info["saw_final"])
+        self.assertEqual(info["finish_reason"], "stop")
+        self.assertEqual(info["parsed_lines"], 2)
+        self.assertEqual(info["bad_lines"], 0)
+
+    def test_cut_stream_is_reported_incomplete(self):
+        """No terminal chunk (connection dropped) is NOT a normal completion."""
+        qh = self._make_query("llamacpp")
+        lines = [json.dumps({"choices": [{"delta": {"content": "I'll write it"}}]})]
+        m1, m2 = self._mock_transport(qh, lines)
+        with m1, m2:
+            resp = qh.query_sync_stream([{"role": "user", "content": "hi"}], SMALL_MODEL)
+
+        info = resp["_stream"]
+        self.assertFalse(info["complete"])
+        self.assertFalse(info["saw_final"])
+        self.assertEqual(info["finish_reason"], "")
+
+    def test_capped_stream_reports_length(self):
+        qh = self._make_query("llamacpp")
+        lines = [
+            json.dumps({"choices": [{"delta": {"content": "truncated…"}}]}),
+            json.dumps({"choices": [{"delta": {}, "finish_reason": "length"}]}),
+        ]
+        m1, m2 = self._mock_transport(qh, lines)
+        with m1, m2:
+            resp = qh.query_sync_stream([{"role": "user", "content": "hi"}], SMALL_MODEL)
+
+        self.assertEqual(resp["_stream"]["finish_reason"], "length")
+
+    def test_ollama_done_reason_is_reported(self):
+        qh = self._make_query("ollama")
+        lines = [json.dumps({"message": {"role": "assistant", "content": "x"},
+                             "done": True, "done_reason": "length"})]
+        m1, m2 = self._mock_transport(qh, lines)
+        with m1, m2:
+            resp = qh.query_sync_stream([{"role": "user", "content": "hi"}], SMALL_MODEL)
+
+        self.assertEqual(resp["_stream"]["finish_reason"], "length")
+        self.assertTrue(resp["_stream"]["complete"])
+
+    def test_malformed_lines_are_counted_not_silent(self):
+        """A frame that is not JSON loses tokens: it must be visible in the report."""
+        qh = self._make_query("llamacpp")
+        lines = [
+            '{"choices": [{"delta": {"content": "ok"}}]}',
+            '{"choices": [{"delta": {"content": "trunc',   # dropped frame
+            json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        ]
+        m1, m2 = self._mock_transport(qh, lines)
+        with m1, m2:
+            resp = qh.query_sync_stream([{"role": "user", "content": "hi"}], SMALL_MODEL)
+
+        self.assertEqual(resp["_stream"]["bad_lines"], 1)
+        self.assertEqual(resp["_stream"]["parsed_lines"], 2)
+
+    def test_aggregate_accepts_a_stream_info_sink(self):
+        """The by-ref sink works for a direct (door) call too."""
+        qh = self._make_query("llamacpp")
+        lines = [json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})]
+        info = {}
+        m1, m2 = self._mock_transport(qh, lines)
+        with m1, m2:
+            qh._aggregate_sync_stream(q.Request("http://x"), "llamacpp", 1, None,
+                                      stream_info_out=info)
+        self.assertTrue(info["complete"])
 
 
 class TestStreamParserSeam(unittest.TestCase):

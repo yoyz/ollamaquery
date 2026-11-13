@@ -97,6 +97,31 @@ spawnshell are disabled when unavailable.
 | `/contextsizeset <N>`        | Override context window                                                                                                      |          |                                                    |        |                                        |
 | `/quit` `/exit`              | End session (`Ctrl+C` twice / `Ctrl+D` also works)                                                                           |          |                                                    |        |                                        |
 
+Unknown `/commands` are **answered by the harness, never sent to the model**: a
+typo like `/aaaaa` prints an error with the closest command names and a pointer
+to `/help`, without spending a token. Paths (`/tmp/foo`) and prose are still sent
+as queries; to send a line that *starts* with `/` to the model, type `//` first
+(`//aaaaa` → the model receives `/aaaaa`).
+
+### Sessions
+
+Conversations are auto-saved on exit; `/save` names them so a later `/resume`
+does not need a timestamp:
+
+| Command             | Description                                                                 |
+| ------------------- | --------------------------------------------------------------------------- |
+| `/save`             | Save now — updates the session this conversation is already bound to        |
+| `/save <name>`      | Save under `<name>`; saving again under the same name updates that session  |
+| `/sessions [count]` | List saved sessions (label, model, messages, summary; `*` = active session) |
+| `/resume <session>` | Load by id (exact or prefix) or by name (`/resume acl` is enough)           |
+| `/rename <name>`    | Rename the session this conversation saved, keeping its id                  |
+
+A name is normalized to a slug (`Réunion ACL` → `reunion-acl`), stored both as a
+label and in the id (`20261113_152947_reunion-acl`, so transcripts are readable
+in `~/.ollamaquery.d/sessions/`), and matched with accents, case and spacing
+folded. Tab completion on `/resume ` offers every saved slug and id. The newest
+50 sessions are kept (dir `0700`, files `0600`).
+
 ### Agentic Mode
 
 `/agentic on` enables a ReAct loop with tool access:
@@ -145,6 +170,14 @@ is the deeper tier: it re-adds `run_command`, which always asks for confirmation
 query, never modify.
 
 Safety features: destructive tool confirmation, path ACL (see below), shell approval gate, step timeout (default 300s), stuck detection, same-tool-loop abort (after 10 consecutive identical calls), optional container sandbox (podman/docker).
+
+Each step's stream is also checked for **completeness**: a turn cut mid-generation
+(dropped connection, `finish_reason: length` output cap, malformed frames) or a
+native tool call whose arguments don't parse is *continued* with a bounded nudge
+("continue where you stopped, do not start over") instead of the partial text
+being taken as the final answer — and a step that genuinely ended without a tool
+call says so explicitly. A corrupt native tool call is never executed with empty
+arguments.
 
 ### Access Control (Path ACL)
 

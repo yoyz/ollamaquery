@@ -62,7 +62,8 @@ query, unless `TEST_MODEL` names one explicitly.
 | Retry, URL fetch, token counting        | `test_features.py`, `test_modifications.py`                                |
 | Shell gate, path ACL, fetch schemes     | `test_acl.py`                                                              |
 | State-file privacy (`0700`/`0600`)      | `test_state_files.py`                                                      |
-| Session save/resume, `/drop`            | `test_features.py`, `test_modifications.py` (thinner than the rest)        |
+| Session save/resume/rename, names       | `test_sessions.py`, `test_state_files.py`, `test_features.py`              |
+| `/drop`                                 | `test_features.py`, `test_modifications.py`                                |
 | Compaction (mechanical + LLM)           | `test_compaction.py`, `test_compact_command.py`                            |
 | Agentic ReAct, tool parsing, timeouts   | `test_agentic.py`, `test_agentic_timeout.py`                               |
 | Tool-result summarization               | `test_tool_summarize.py`                                                   |
@@ -70,9 +71,8 @@ query, unless `TEST_MODEL` names one explicitly.
 | Backend dialects                        | `test_features.py`, `test_strata.py`, `test_lmstudio.py`, `test_vision.py` |
 | Release checks                          | `test_release.py`                                                          |
 
-Known thin spots: session save/resume and `/drop` have direct coverage but few
-cases; the shell tokenizer is mostly exercised through `check_shell_approval`
-rather than directly.
+Known thin spots: `/drop` has direct coverage but few cases; the shell tokenizer
+is mostly exercised through `check_shell_approval` rather than directly.
 
 ## Release checklist
 

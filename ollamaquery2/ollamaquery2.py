@@ -67,7 +67,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 
 # ============================================================================
@@ -570,22 +570,29 @@ COMMANDS = {
     'sessions': {
         'aliases': ['/sessions'],
         'category': 'Core',
-        'description': 'List saved sessions',
+        'description': 'List saved sessions (name or id, model, messages, summary)',
         'usage': '/sessions [count]',
         'handler': None
     },
     'resume': {
         'aliases': ['/resume'],
         'category': 'Core',
-        'description': 'Resume a previous session',
-        'usage': '/resume <session_id>',
+        'description': 'Resume a saved session by id or name',
+        'usage': '/resume <session_id|name>',
         'handler': None
     },
     'save': {
         'aliases': ['/save'],
         'category': 'Core',
-        'description': 'Save current session to disk',
-        'usage': '/save',
+        'description': 'Save the current session, optionally under a name',
+        'usage': '/save [name]    (same name = update that session)',
+        'handler': None
+    },
+    'rename': {
+        'aliases': ['/rename'],
+        'category': 'Core',
+        'description': 'Rename the saved session of this conversation',
+        'usage': '/rename <name>',
         'handler': None
     },
 }
@@ -600,6 +607,56 @@ def get_command_aliases() -> List[str]:
     for cmd in COMMANDS.values():
         aliases.extend(cmd['aliases'])
     return aliases
+
+
+# A first word shaped like this is a command, never a query. It is deliberately
+# narrow (one slash + a name, no dots, no second slash) so `/tmp/foo`,
+# `//host/share` and prose keep going to the model.
+COMMAND_WORD_RE = re.compile(r"^/[A-Za-z][A-Za-z0-9_-]*$")
+COMMAND_ESCAPE_PREFIX = "//"
+
+
+def command_word(text: str) -> Optional[str]:
+    """Return the command-shaped first word of `text`, or None.
+
+    Used to keep an unrecognised `/command` inside the harness: every command
+    lives in that namespace, so sending a typo to the model costs tokens and
+    gets it answered as if it were a prompt. Paths (`/tmp/foo`) and the `//`
+    escape are excluded, so this can only fire on input that was meant as a
+    command.
+
+    Args:
+        text: A raw input line.
+
+    Returns:
+        The first word when it looks like a command name, else None.
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith('/') or stripped.startswith(COMMAND_ESCAPE_PREFIX):
+        return None
+    words = stripped.split()
+    word = words[0] if words else stripped
+    return word if COMMAND_WORD_RE.match(word) else None
+
+
+def unescape_command_line(text: str) -> str:
+    """Undo the `//command` escape so a literal slash line reaches the model.
+
+    Only applied when the remainder is command-shaped, so a URL-ish
+    `//server/share` is left untouched.
+
+    Args:
+        text: A raw input line.
+
+    Returns:
+        The line with one leading slash removed when it used the escape, else
+        the line unchanged.
+    """
+    if not text.startswith(COMMAND_ESCAPE_PREFIX):
+        return text
+    remainder = text[1:]
+    word = remainder.split()[0] if remainder.split() else remainder
+    return remainder if COMMAND_WORD_RE.match(word) else text
 
 
 def get_commands_by_category(category: Optional[str] = None) -> Dict:
@@ -651,6 +708,11 @@ def format_help_text(compact: bool = False) -> str:
                 lines.append(f"  {colorize(f'{aliases:<28}', 'success')} {desc}")
                 if info.get('usage') and info['usage'] != info['aliases'][0]:
                     lines.append(f"    {colorize('Usage: ' + info['usage'], 'muted')}")
+
+    if not compact:
+        lines.append(colorize(
+            "\nUnknown /commands are answered locally (nothing is sent to the "
+            "model); prefix a line with '//' to send it literally.", 'muted'))
 
     return '\n'.join(lines)
 
@@ -2662,10 +2724,40 @@ def _open_private(path: str, mode: str = "w", **kwargs: object) -> IO:
 SESSION_DIR = os.path.expanduser("~/.ollamaquery.d/sessions")
 SESSION_INDEX = os.path.join(SESSION_DIR, "index.json")
 MAX_SESSIONS = 50
+SESSION_NAME_MAX_CHARS = 60
+SESSION_SLUG_MAX_CHARS = 40
+
+
+def _session_slug(name: str) -> str:
+    """Normalize a session name into a selectable, filename-safe slug.
+
+    Accents are folded ("Réunion ACL" -> "reunion-acl") and every run of
+    characters outside a-z/0-9 collapses to one dash; the result is trimmed and
+    capped at SESSION_SLUG_MAX_CHARS. An empty return means the name has no
+    usable character, so the caller must reject it instead of saving a session
+    nobody can select by name.
+
+    Args:
+        name: The user-supplied session name.
+
+    Returns:
+        The slug, or "" when nothing usable remains.
+    """
+    folded = unicodedata.normalize("NFKD", name or "")
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    slug = re.sub(r"[^a-z0-9]+", "-", folded.strip().lower()).strip("-")
+    return slug[:SESSION_SLUG_MAX_CHARS].strip("-")
 
 
 class SessionManager:
-    """Manages session persistence: save, list, resume."""
+    """Manages session persistence: save, list, resume.
+
+    A session has two handles: a stable `id` (the transcript's filename stem,
+    e.g. `20261113_152947_acl-refactor`) and an optional human `name` given by
+    `/save <name>`. `/resume` accepts either (exact id, id prefix, name, name
+    prefix, or a name substring). A name is a **slot**: saving again under the
+    same name updates that record instead of piling up transcripts.
+    """
 
     def __init__(self) -> None:
         """Ensure the session directory exists and load the session index."""
@@ -2697,10 +2789,83 @@ class SessionManager:
         with _open_private(SESSION_INDEX, 'w') as f:
             json.dump(self._index, f, indent=2)
 
-    def save_session(self, messages: list, ctx: 'CommandContext') -> str:
-        """Save current session to disk. Returns session ID."""
-        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = os.path.join(SESSION_DIR, f"{session_id}.json")
+    def _entry_by_id(self, session_id: Optional[str]) -> Optional[dict]:
+        """Return the index entry for an exact id (None when absent)."""
+        if not session_id:
+            return None
+        for entry in self._index:
+            if isinstance(entry, dict) and entry.get('id') == session_id:
+                return entry
+        return None
+
+    def _entry_by_slug(self, slug: str) -> Optional[dict]:
+        """Return the most recent index entry using `slug` (None when free)."""
+        if not slug:
+            return None
+        for entry in self._index:
+            if isinstance(entry, dict) and entry.get('slug') == slug:
+                return entry
+        return None
+
+    def name_owner(self, name: str) -> Optional[dict]:
+        """Return the entry already holding `name`, or None when it is free.
+
+        Args:
+            name: The user-supplied name (accents/case/spacing are normalized).
+
+        Returns:
+            The conflicting index entry, or None.
+        """
+        return self._entry_by_slug(_session_slug(name))
+
+    def _unique_id(self, base: str) -> str:
+        """Return `base`, or `base-2`, `base-3`… so no transcript is overwritten."""
+        candidate, suffix = base, 1
+        while os.path.exists(os.path.join(SESSION_DIR, f"{candidate}.json")):
+            suffix += 1
+            candidate = f"{base}-{suffix}"
+        return candidate
+
+    def save_session(self, messages: list, ctx: 'CommandContext',
+                     name: Optional[str] = None,
+                     session_id: Optional[str] = None) -> str:
+        """Save the conversation, optionally under a name. Returns the session id.
+
+        Args:
+            messages: History to persist.
+            ctx: The shared context (model, backend, base_url, token count).
+            name: Optional human label ("acl-refactor"). Re-using a name updates
+                that session in place, so a name behaves as one slot rather than
+                accumulating a transcript per save.
+            session_id: Optional exact id to update in place — what `/save`
+                without a name does for an already-saved or resumed session,
+                and what `/rename` uses to keep the file it already has.
+
+        Returns:
+            The session id (the transcript's filename stem).
+
+        Raises:
+            ValueError: `name` has no letter or digit left after slugging.
+        """
+        label = (name or "").strip()[:SESSION_NAME_MAX_CHARS].strip()
+        slug = _session_slug(label)
+        if label and not slug:
+            raise ValueError(f"session name {label!r} has no letters or digits")
+
+        entry = self._entry_by_id(session_id)
+        if entry is None and slug:
+            entry = self._entry_by_slug(slug)
+        if entry is None:
+            created = datetime.now().isoformat()
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_id = self._unique_id(f"{stamp}_{slug}" if slug else stamp)
+        else:
+            session_id = entry.get('id', '')
+            created = entry.get('created') or datetime.now().isoformat()
+            if not label:
+                # Re-saving an existing record without a new label keeps its name.
+                label = entry.get('name', '')
+                slug = entry.get('slug', '')
 
         summary = ""
         for msg in messages:
@@ -2710,10 +2875,13 @@ class SessionManager:
                     summary = content[:100].replace('\n', ' ')
                     break
 
+        now = datetime.now().isoformat()
         session_data = {
             "id": session_id,
-            "created": datetime.now().isoformat(),
-            "updated": datetime.now().isoformat(),
+            "name": label,
+            "slug": slug,
+            "created": created,
+            "updated": now,
             "model": ctx.model,
             "backend": ctx.backend,
             "base_url": ctx.base_url,
@@ -2723,13 +2891,18 @@ class SessionManager:
             "messages": messages
         }
 
-        with _open_private(filepath, 'w', encoding='utf-8') as f:
+        with _open_private(os.path.join(SESSION_DIR, f"{session_id}.json"),
+                           'w', encoding='utf-8') as f:
             json.dump(session_data, f, ensure_ascii=False)
 
-        self._index = [e for e in self._index if e['id'] != session_id]
+        self._index = [e for e in self._index
+                       if not (isinstance(e, dict) and e.get('id') == session_id)]
         self._index.insert(0, {
             "id": session_id,
-            "created": session_data["created"],
+            "name": label,
+            "slug": slug,
+            "created": created,
+            "updated": now,
             "model": ctx.model,
             "message_count": len(messages),
             "summary": summary
@@ -2737,7 +2910,7 @@ class SessionManager:
 
         if len(self._index) > MAX_SESSIONS:
             for old in self._index[MAX_SESSIONS:]:
-                old_path = os.path.join(SESSION_DIR, f"{old['id']}.json")
+                old_path = os.path.join(SESSION_DIR, f"{old.get('id', '')}.json")
                 if os.path.exists(old_path):
                     try:
                         os.unlink(old_path)
@@ -2752,20 +2925,61 @@ class SessionManager:
         """Return recent session metadata."""
         return self._index[:limit]
 
-    def load_session(self, session_id: str) -> Optional[dict]:
-        """Load a session by ID (exact or prefix match)."""
-        matches = [e for e in self._index if e['id'].startswith(session_id)]
-        if not matches:
+    def resolve(self, handle: str) -> Optional[dict]:
+        """Resolve a user handle to an index entry.
+
+        Precedence (first match wins; the index is newest-first, so within one
+        step the most recent session wins): exact id, id prefix, exact name,
+        name prefix, then a name substring. Names are compared through their
+        slug, so accents, case and spacing never matter (`/resume reunion`,
+        `/resume Réunion`, `/resume réunion-acl` are the same request). That
+        makes `/resume 20261113` (dated prefix) work too, while a pasted full id
+        can never be shadowed by a name.
+
+        Args:
+            handle: An id, an id prefix, a name, or a name fragment.
+
+        Returns:
+            The matching index entry, or None.
+        """
+        text = (handle or "").strip()
+        if not text:
             return None
-        target = matches[0]
-        filepath = os.path.join(SESSION_DIR, f"{target['id']}.json")
+        slug_handle = _session_slug(text)
+        tests = [
+            lambda e: e.get('id') == text,
+            lambda e: (e.get('id') or '').startswith(text),
+        ]
+        if slug_handle:
+            tests += [
+                lambda e: e.get('slug') == slug_handle,
+                lambda e: (e.get('slug') or '').startswith(slug_handle),
+                lambda e: slug_handle in (e.get('slug') or ''),
+            ]
+        for test in tests:
+            for entry in self._index:
+                if isinstance(entry, dict) and test(entry):
+                    return entry
+        return None
+
+    def load_session(self, handle: str) -> Optional[dict]:
+        """Load a session by id (exact or prefix) or by name (see `resolve`)."""
+        entry = self.resolve(handle)
+        if entry is None:
+            return None
+        filepath = os.path.join(SESSION_DIR, f"{entry.get('id', '')}.json")
         if not os.path.exists(filepath):
             return None
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
         except Exception:
             return None
+        if isinstance(data, dict):
+            data.setdefault('id', entry.get('id'))
+            data.setdefault('name', entry.get('name', ''))
+            data.setdefault('slug', entry.get('slug', ''))
+        return data
 
 
 # ============================================================================
@@ -11654,9 +11868,42 @@ class StreamParser:
             }
         return resp
 
+    @staticmethod
+    def _finish_reason(chunk: dict, backend: str) -> str:
+        """Return the backend's stop reason carried by a final chunk.
+
+        Args:
+            chunk: A parsed JSON chunk that reported `is_final`.
+            backend: Backend name (Ollama uses `done_reason`, the rest
+                OpenAI-style `choices[0].finish_reason`).
+
+        Returns:
+            The reason ("stop", "length", …), or "" when the backend sent none.
+        """
+        if backend == "ollama":
+            return chunk.get("done_reason") or ""
+        choices = chunk.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            return choices[0].get("finish_reason") or ""
+        return ""
+
+    @staticmethod
+    def _publish_stream_info(stream_info: dict, sink: Optional[dict]) -> None:
+        """Mark whether the stream ended on a terminal marker and copy it to `sink`.
+
+        Args:
+            stream_info: The facts collected while reading the stream.
+            sink: Optional by-ref dict the caller passed in.
+        """
+        stream_info["complete"] = bool(stream_info.get("saw_final"))
+        if sink is not None:
+            sink.clear()
+            sink.update(stream_info)
+
     def _aggregate_sync_stream(self, req: Request, backend: str, socket_timeout: float,
                                on_chunk: object, cancel: Optional[dict] = None,
-                               tool_calls_out: Optional[list] = None) -> tuple:
+                               tool_calls_out: Optional[list] = None,
+                               stream_info_out: Optional[dict] = None) -> tuple:
         """Read a streaming response and aggregate content/thinking/tools/usage.
 
         Args:
@@ -11668,6 +11915,13 @@ class StreamParser:
             tool_calls_out: Optional by-ref list kept in sync with the
                 accumulated tool calls (partial or complete) as they stream, so
                 a caller can salvage a finished tool call after a timeout.
+            stream_info_out: Optional by-ref dict filled with what happened to
+                the stream itself: `parsed_lines`, `bad_lines`, `saw_final`,
+                `finish_reason`, `complete` (False = no terminal marker ever
+                arrived, so the turn was cut) and `error` when it raised. A
+                caller that gets `complete=False` must not treat the partial
+                text as a finished turn (that is how an announcement
+                ("I'll write the file now") became a final answer).
 
         Returns:
             (full_content, full_thinking, tool_calls, tool_call_index, usage),
@@ -11678,6 +11932,8 @@ class StreamParser:
         tool_calls = []          # ordered, deduped accumulated tool calls
         tool_call_index = {}     # index -> partial tool call dict
         usage = {}
+        stream_info = {"parsed_lines": 0, "bad_lines": 0, "saw_final": False,
+                       "finish_reason": "", "complete": False}
         try:
             with _request_with_retry(req, timeout=socket_timeout) as response:
                 if cancel is not None and hasattr(response, 'close'):
@@ -11690,8 +11946,17 @@ class StreamParser:
                     try:
                         chunk = json.loads(raw_line)
                     except json.JSONDecodeError:
+                        # A dropped frame loses its tokens (a tool call can lose
+                        # half its arguments). Counted, never silent: the step is
+                        # reported as incomplete so the loop can retry instead of
+                        # finalizing a half-written answer.
+                        stream_info["bad_lines"] += 1
                         continue
+                    stream_info["parsed_lines"] += 1
                     thought, content, is_final, u, tcs = self._parse_chunk(chunk, backend)
+                    if is_final:
+                        stream_info["saw_final"] = True
+                        stream_info["finish_reason"] = self._finish_reason(chunk, backend)
                     if thought:
                         full_thinking += thought
                     if content:
@@ -11715,7 +11980,10 @@ class StreamParser:
                 # return quietly instead of spamming an error line.
                 return None
             sys.stderr.write(colorize(f"[ERROR] {backend} sync stream failed: {e}\n", 'error'))
+            stream_info["error"] = str(e)
+            self._publish_stream_info(stream_info, stream_info_out)
             return {"error": {"message": str(e), "type": type(e).__name__}}
+        self._publish_stream_info(stream_info, stream_info_out)
         return full_content, full_thinking, tool_calls, tool_call_index, usage
 
 # ============================================================================
@@ -11961,10 +12229,12 @@ class ModelQuery:
 
     def _aggregate_sync_stream(self, req: Request, backend: str, socket_timeout: float,
                                on_chunk: object, cancel: Optional[dict] = None,
-                               tool_calls_out: Optional[list] = None) -> tuple:
+                               tool_calls_out: Optional[list] = None,
+                               stream_info_out: Optional[dict] = None) -> tuple:
         """Aggregate a streaming response (door onto `StreamParser`)."""
         return self._stream_parser()._aggregate_sync_stream(
-            req, backend, socket_timeout, on_chunk, cancel, tool_calls_out=tool_calls_out)
+            req, backend, socket_timeout, on_chunk, cancel,
+            tool_calls_out=tool_calls_out, stream_info_out=stream_info_out)
 
     def calculate_stats(self, total_time: float, content: str, usage: Optional[dict] = None,
                         messages: Optional[list] = None, thought: str = "",
@@ -12151,8 +12421,10 @@ class ModelQuery:
         req = Request(api_url, data=data, headers=headers)
         self._debug_request(api_url, payload)
 
+        stream_info: dict = {}
         result = self._aggregate_sync_stream(req, backend, socket_timeout, on_chunk, cancel,
-                                             tool_calls_out=tool_calls_out)
+                                             tool_calls_out=tool_calls_out,
+                                             stream_info_out=stream_info)
         if isinstance(result, dict):  # error dict
             return result
         if result is None:  # cancelled
@@ -12173,7 +12445,13 @@ class ModelQuery:
         if usage_out is not None and isinstance(usage_out, list):
             usage_out.append(usage)
 
-        return self._synthesize_sync_response(full_content, full_thinking, tool_calls, usage)
+        resp = self._synthesize_sync_response(full_content, full_thinking, tool_calls, usage)
+        if stream_info:
+            # `complete=False` means the stream ended without a terminal marker
+            # (`done`/`finish_reason`): the turn was cut, so the ReAct loop must
+            # not read the partial text as a finished answer.
+            resp["_stream"] = dict(stream_info)
+        return resp
 
 
     def _update_context_tokens(self, backend: str, aggregated_usage: dict, messages: list,
@@ -12550,6 +12828,10 @@ class ChatCompleter:
         elif buffer.startswith('/promptshow ') or buffer.startswith('/showprompt '):
             matches = self._complete_subcommands(buffer, text, PROMPTSHOW_SUBCOMMANDS)
 
+        # 3d. /resume completion (saved session names and ids)
+        elif buffer.startswith('/resume '):
+            matches = self._complete_session_handles(text)
+
         # 4. File Path Autocompletion (/cwd, /ls, /image and inline @)
         # buffer is the full line, text could be in the middle of the line
         elif buffer.startswith('/cwd ') or buffer.startswith('/ls ') or buffer.startswith('/image ') or text.startswith('@'):
@@ -12646,6 +12928,49 @@ class ChatCompleter:
             return [c for c in second if c.startswith(text)]
 
         return []
+
+    def _session_handles(self) -> list:
+        """Return cached `/resume` handles, refreshed at most every 5 seconds.
+
+        Readline calls `complete()` once per candidate, and building a
+        SessionManager also re-checks the mode of every transcript, so a fresh
+        index read per keystroke would be pure syscall churn. A short TTL keeps
+        a session saved a moment ago completable without that.
+
+        Returns:
+            Selectable handles: each name's slug, then its id, deduplicated.
+        """
+        cached = getattr(self, '_session_handles_cache', None)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < 5:
+            return cached[1]
+        try:
+            entries = SessionManager().list_sessions(limit=MAX_SESSIONS)
+        except OSError:
+            entries = []
+        handles = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            handles.append(entry.get('slug') or entry.get('id', ''))
+            handles.append(entry.get('id', ''))
+        self._session_handles_cache = (now, list(dict.fromkeys(h for h in handles if h)))
+        return self._session_handles_cache[1]
+
+    def _complete_session_handles(self, text: str) -> list:
+        """Complete saved-session slugs and ids for `/resume`.
+
+        Names are offered as their slug ("Réunion ACL" -> "reunion-acl") because
+        readline splits candidates on spaces; the id is the always-available
+        fallback for an unnamed session.
+
+        Args:
+            text: The token being completed.
+
+        Returns:
+            Matching handles, newest session first.
+        """
+        return [h for h in self._session_handles() if h.startswith(text)]
 
     def _complete_agentic(self, buffer: str, text: str) -> list:
         """Complete /agentic subcommands and their second-level arguments.
@@ -14710,12 +15035,25 @@ class ToolExecution:
                 name = func.get('name', '')
                 args_raw = func.get('arguments', {})
                 if isinstance(args_raw, str):
-                    try:
-                        args = json.loads(args_raw)
-                    except json.JSONDecodeError:
+                    text = args_raw.strip()
+                    if not text:
+                        # Zero-argument tools legitimately arrive as "".
                         args = {}
+                    else:
+                        try:
+                            args = json.loads(text)
+                        except json.JSONDecodeError:
+                            # A truncated/corrupt argument stream must never run
+                            # the tool with empty args (that is how a half-written
+                            # `write_file` or `run_command` would execute on the
+                            # wrong target). Drop the call: the loop then sees
+                            # "native calls, none parseable" and asks the model to
+                            # re-emit it instead of finalizing the prose.
+                            continue
                 else:
                     args = args_raw
+                if not name:
+                    continue
                 tool_calls.append({"tool": name, "arguments": args})
         elif response_text:
             tool_calls = self.parser.parse_tool_calls(response_text)
@@ -15256,6 +15594,9 @@ class ReActState:
         # AGENTIC_TRUNCATED_STEP_MAX so a model that keeps dying mid-thought
         # cannot loop forever).
         self.truncated_nudges = 0
+        # Same budget for steps that produced neither text nor a tool call (the
+        # model was cut before it could say anything).
+        self.empty_nudges = 0
 
 
 class AgenticRunner:
@@ -15789,12 +16130,29 @@ class AgenticRunner:
 
         state.response_text, api_tool_calls = self.step_content(response)
 
+        # What happened to the stream itself (absent on a mocked response, which
+        # keeps unit tests and non-streaming callers on the old behaviour).
+        stream_info = response.get("_stream") if isinstance(response, dict) else None
+        cut_reason = self.truncation_reason(stream_info)
+        if isinstance(stream_info, dict) and stream_info.get("bad_lines"):
+            print(colorize(
+                f"\n[Agentic] {stream_info['bad_lines']} stream line(s) were not valid "
+                "JSON — part of the response was lost.", 'warning'), file=sys.stderr)
+
         if not state.response_text and not api_tool_calls:
-            state.messages.append({
-                'role': 'user',
-                'content': 'Please provide a tool call or your final answer.',
-                '_system_nudge': True})
-            return "continue"
+            # Nothing usable came back. Say "continue where you stopped" instead
+            # of "provide a tool call or your final answer": the latter reads as
+            # a fresh instruction and makes the model restart the cycle.
+            state.empty_nudges += 1
+            if state.empty_nudges <= AGENTIC_TRUNCATED_STEP_MAX:
+                self.push_continuation_nudge(state, cut_reason or "empty")
+                print(colorize(
+                    f"\n[Agentic] Empty step ({cut_reason or 'no output'}) — nudging to "
+                    f"continue ({state.empty_nudges}/{AGENTIC_TRUNCATED_STEP_MAX}).",
+                    'warning'), file=sys.stderr)
+                return "continue"
+            # Out of patience: fall through to the answer path below (empty), so
+            # the finalize phase re-generates the answer instead of spinning.
 
         # Per-step stats in the chat-mode format: time, prefill/think/
         # answer rates, and the growing context size — so the user can
@@ -15817,9 +16175,15 @@ class AgenticRunner:
 
         if state.logger:
             first_call = tool_calls[0] if tool_calls else None
-            state.logger.write(type="turn", iteration=state.iteration,
-                               model_response=state.response_text,
-                               tool_call=first_call)
+            entry = dict(type="turn", iteration=state.iteration,
+                         model_response=state.response_text,
+                         tool_call=first_call)
+            if isinstance(stream_info, dict) and stream_info:
+                # Why the turn ended the way it did — the first thing to look at
+                # when a query "stopped by itself".
+                entry["stream"] = {k: stream_info.get(k) for k in
+                                   ("complete", "finish_reason", "bad_lines")}
+            state.logger.write(**entry)
 
         if not tool_calls:
             # A step that ended on a reasoning chunk never finished its turn: the
@@ -15827,26 +16191,39 @@ class AgenticRunner:
             # preamble ("Let me write the file now…"), not an answer. Accepting it
             # here silently ends the query — with thinking display on, finalize
             # skips the re-generation (the text already reached the terminal) and
-            # the preamble is recorded as the answer. Nudge once or twice and let
-            # the model finish what it was about to do.
-            if (state.response_text and feedback.ended_in_thinking
+            # the preamble is recorded as the answer. The same holds for a cut
+            # stream (no terminal marker), a capped generation, frames lost in
+            # transit, and a native tool call that failed to parse. Nudge (bounded)
+            # and let the model finish what it was about to do.
+            reason = ""
+            if api_tool_calls:
+                reason = "unparsed"
+            elif looks_like_truncated_tool_call(state.response_text):
+                # Inline-format model cut inside its JSON: parse_tool_calls sees
+                # nothing, and the orphaned `{"tool": …` opening would otherwise
+                # be finalized as prose.
+                reason = "unparsed"
+            elif feedback.ended_in_thinking:
+                reason = "thinking"
+            elif cut_reason:
+                reason = cut_reason
+            if (reason and (state.response_text or reason == "unparsed")
                     and state.truncated_nudges < AGENTIC_TRUNCATED_STEP_MAX):
                 state.truncated_nudges += 1
-                state.messages.append({'role': 'assistant',
-                                       'content': state.response_text})
-                state.messages.append({
-                    'role': 'user',
-                    'content': "You stopped in the middle of your reasoning and never "
-                               "finished. Continue from exactly where you stopped: call "
-                               "the tool you were about to call, or give the complete "
-                               "final answer. Do not start over.",
-                    '_system_nudge': True})
+                self.push_continuation_nudge(state, reason, state.response_text)
                 print(colorize(
-                    "\n[Agentic] Step ended mid-reasoning with no tool call — nudging to continue "
-                    f"({state.truncated_nudges}/{AGENTIC_TRUNCATED_STEP_MAX}).",
+                    f"\n[Agentic] Step ended before its turn finished ({reason}) — nudging "
+                    f"to continue ({state.truncated_nudges}/{AGENTIC_TRUNCATED_STEP_MAX}).",
                     'warning'), file=sys.stderr)
                 return "continue"
             state.final_answer = state.response_text
+            if state.response_text:
+                # Say why the loop stopped: without this a model that simply
+                # decided to stop looks like a harness cut, and the user retypes
+                # "ok vas y" to find out.
+                print(colorize(
+                    "\n[Agentic] No tool call in this step — the model's text is the "
+                    "final answer.", 'muted'), file=sys.stderr)
             # The step's content may already be on the terminal
             # (thinking mode streams it live) — finalize must then
             # skip the final re-generation.
@@ -15880,6 +16257,93 @@ class AgenticRunner:
         state.response_text = ""
         return "continue"
 
+
+    # --- Step continuation (unfinished turns) ------------------------------
+    #
+    # A step can end without finishing its turn in four ways that used to be
+    # indistinguishable from a real final answer: the stream stopped mid-reasoning,
+    # the server cut the generation (`finish_reason: length`), the stream ended
+    # without any terminal marker (dropped connection), or malformed frames ate
+    # part of the payload. Each nudge says "continue where you stopped, do not
+    # start over" — the wording matters: a model told only "provide a tool call"
+    # re-derives and re-does the work it had already drafted.
+    CONTINUATION_NUDGES = {
+        "thinking": (
+            "You stopped in the middle of your reasoning and never finished. "
+            "Continue from exactly where you stopped: call the tool you were about "
+            "to call, or give the complete final answer. Do not start over."),
+        "cut": (
+            "Your previous response was cut off mid-generation (the stream ended "
+            "before the turn finished). Continue from exactly where you stopped: "
+            "call the tool you were about to call, or give the complete final "
+            "answer. Do not start over."),
+        "badstream": (
+            "Part of your previous response was lost in transit (malformed stream "
+            "frames), so it may be incomplete. Continue from exactly where you "
+            "stopped: re-emit the tool call you were about to make with complete "
+            "arguments, or give the final answer. Do not start over."),
+        "length": (
+            "Your previous response hit the output-token cap before the turn "
+            "finished. Continue from exactly where you stopped: emit the tool call "
+            "you were about to make (or a shorter final answer). Do not start over."),
+        "unparsed": (
+            "The tool call in your previous response could not be parsed (malformed "
+            "or truncated JSON). Do not explain it again — re-emit the same tool "
+            "call with complete, valid JSON arguments."),
+        "empty": (
+            "Your previous step produced no visible text and no tool call. Continue "
+            "from exactly where you stopped: call the tool you were about to call, "
+            "or give the complete final answer. Do not start over."),
+    }
+
+    @classmethod
+    def continuation_nudge(cls, reason: str) -> str:
+        """Return the 'continue where you stopped' nudge for `reason`."""
+        return cls.CONTINUATION_NUDGES.get(reason, cls.CONTINUATION_NUDGES["cut"])
+
+    @staticmethod
+    def truncation_reason(stream_info: Optional[dict]) -> Optional[str]:
+        """Classify a step whose stream did not end cleanly.
+
+        `_aggregate_sync_stream` reports what happened to the stream itself; a
+        response without that report (mocked, older caller) is never classified,
+        and neither is a clean one, so a normal turn is untouched.
+
+        Args:
+            stream_info: The `_stream` dict `query_sync_stream` attaches.
+
+        Returns:
+            "badstream" (malformed frames lost data), "length" (the output cap
+            was hit), "cut" (no terminal marker arrived), or None.
+        """
+        if not isinstance(stream_info, dict) or not stream_info.get("parsed_lines"):
+            return None
+        if stream_info.get("bad_lines"):
+            return "badstream"
+        reason = (stream_info.get("finish_reason") or "").lower()
+        if reason in ("length", "max_tokens", "num_predict"):
+            return "length"
+        if not stream_info.get("saw_final"):
+            return "cut"
+        return None
+
+    def push_continuation_nudge(self, state: 'ReActState', reason: str,
+                                echo_text: str = "") -> None:
+        """Echo the partial turn back and ask the model to continue it.
+
+        The echo is what makes "continue" work: the model sees the text it
+        already produced, so it finishes that sentence instead of restarting.
+
+        Args:
+            state: The query state (messages are appended).
+            reason: A key of `CONTINUATION_NUDGES`.
+            echo_text: The step's partial text, when there is one.
+        """
+        if echo_text:
+            state.messages.append({'role': 'assistant', 'content': echo_text})
+        state.messages.append({'role': 'user',
+                               'content': self.continuation_nudge(reason),
+                               '_system_nudge': True})
 
     def step_header(self, host: object, state: 'ReActState') -> list:
         """Print the ReAct step header and refresh compaction/nudge state.
@@ -16521,15 +16985,18 @@ class ConversationStore:
 
     Call map:
       messages: replace/append/drop/clear
-      session:  save_session/list_sessions/load_session/autosave_on_exit
+      session:  save_session/rename_session/list_sessions/load_session/autosave_on_exit
+                (+ `active_id`/`active_name`: the session `/save` updates)
       compact:  maybe_auto_compact_chat/…_agentic → compact_run → compact_truncate_largest
     """
 
     def __init__(self, ctx_provider: object, wire_provider: object) -> None:
-        """Store the providers; `messages` starts empty."""
+        """Store the providers; `messages` starts empty and no session is bound."""
         self._ctx_provider = ctx_provider
         self._wire_provider = wire_provider
         self.messages: list[Message] = []
+        self.active_id: Optional[str] = None
+        self.active_name: Optional[str] = None
 
     @property
     def ctx(self) -> object:
@@ -16573,9 +17040,30 @@ class ConversationStore:
 
     # --- session persistence ----------------------------------------------
 
-    def save_session(self) -> str:
-        """Save the current history via SessionManager; returns the session id."""
-        return SessionManager().save_session(self.messages, self.ctx)
+    def save_session(self, name: Optional[str] = None) -> str:
+        """Save the current history via SessionManager; returns the session id.
+
+        A name is a slot: two `/save <same name>` calls update one transcript.
+        Without a name, an already-saved or resumed session is updated in place
+        (no fresh timestamp per `/save`); only a never-saved conversation gets
+        a new timestamped id.
+        """
+        label = (name or "").strip()
+        session_id = SessionManager().save_session(
+            self.messages, self.ctx,
+            name=label or self.active_name,
+            session_id=None if label else self.active_id)
+        self.active_id = session_id
+        self.active_name = label or self.active_name
+        return session_id
+
+    def rename_session(self, name: str) -> str:
+        """Rename the active saved session, keeping its id and its file."""
+        session_id = SessionManager().save_session(
+            self.messages, self.ctx, name=name, session_id=self.active_id)
+        self.active_id = session_id
+        self.active_name = name.strip()
+        return session_id
 
     def list_sessions(self, limit: int = 10) -> list:
         """Return the most recent saved sessions."""
@@ -16584,6 +17072,8 @@ class ConversationStore:
     def load_session(self, session_id: str) -> Optional[dict]:
         """Load a session into the store; returns the session data or None.
 
+        The handle may be an id (exact or prefix) or a name, and becomes the
+        active session so a later `/save` updates it instead of duplicating it.
         The model is not switched here (the handler reports it); only the
         message history is adopted.
         """
@@ -16591,13 +17081,17 @@ class ConversationStore:
         if data is None:
             return None
         self.replace(data.get('messages', []))
+        self.active_id = data.get('id')
+        self.active_name = data.get('name') or None
         return data
 
     def autosave_on_exit(self) -> Optional[str]:
         """Auto-save a meaningful conversation on exit; None when there is none.
 
-        A persistence failure must never block the exit path, so it is
-        swallowed here (the caller only prints the saved id).
+        It goes through `save_session`, so a named (or resumed) session is kept
+        current instead of spawning a second transcript at every exit. A
+        persistence failure must never block the exit path, so it is swallowed
+        here (the caller only prints the saved id).
         """
         if len(self.messages) <= 2:
             return None
@@ -16668,9 +17162,10 @@ class ConversationStore:
         any messages the streaming finalize appended — so the conversation stays
         chronologically ordered (user query → tool work → final answer).
 
-        `_system_nudge` messages (loop-internal steering, e.g. the empty-response
-        "Please provide a tool call..." fallback) are excluded from persistent
-        history so repeated empty responses don't pile into context forever.
+        `_system_nudge` messages (loop-internal steering: the empty-step and
+        truncated-step "continue where you stopped" nudges, the timeout nudge)
+        are excluded from persistent history so repeated stalls don't pile into
+        context forever.
 
         Also called from the `except KeyboardInterrupt` path so a ^C that aborts a
         step still preserves every completed tool turn instead of erasing the
@@ -17059,6 +17554,14 @@ class ChatLoop:
                     print(colorize("\n[ERROR] No model selected. Use /listmodel to see available models, then /switchmodel <name> to select one.", 'error'), file=sys.stderr)
                     continue
 
+                # `//command` — the user wants the literal `/command` sent to the
+                # model, not executed. Checked before dispatch so the unescaped
+                # text can never run as a command.
+                escaped_line = unescape_command_line(full_input)
+                if escaped_line != full_input:
+                    self.run_process_query(escaped_line)
+                    continue
+
                 dispatched = self._dispatch_command(full_input)
                 if dispatched is True:
                     break
@@ -17127,11 +17630,73 @@ class ChatLoop:
             self.run_handle_sessions,
             self.run_handle_resume,
             self.run_handle_save,
+            self.run_handle_rename,
         )
         for handler in handlers:
             if handler(full_input) is False:
                 return False
+
+        # A `/name` the harness does not know is a command typo, not a prompt:
+        # answer it locally (with a suggestion) instead of paying tokens to have
+        # the model answer "/aaaaa" as if it were a question. The word test is
+        # narrow, so paths and prose still fall through to the query path.
+        unknown = command_word(full_input)
+        if unknown:
+            self.run_handle_unknown_command(unknown, full_input)
+            return False
         return None
+
+    def run_handle_unknown_command(self, word: str, full_input: str) -> None:
+        """Report an unknown (or misused) command without calling the model.
+
+        Args:
+            word: The command-shaped first word of the line.
+            full_input: The full line (only used for the "unexpected arguments"
+                case, where the word itself is a real command).
+        """
+        meta = next((c for c in COMMANDS.values()
+                     if word in c.get('aliases', [])), None)
+        if meta is not None:
+            print(colorize(f"[Command] '{word}' was not understood with those "
+                           "arguments.", 'error'), file=sys.stderr)
+            if meta.get('usage'):
+                print(colorize(f"[Command] Usage: {meta['usage']}", 'muted'),
+                      file=sys.stderr)
+        else:
+            print(colorize(f"[Command] Unknown command '{word}'.", 'error'),
+                  file=sys.stderr)
+            for suggestion in self._command_suggestions(word):
+                print(colorize(f"[Command] Did you mean {suggestion}?", 'muted'),
+                      file=sys.stderr)
+        print(colorize(
+            "[Command] Nothing was sent to the model. /help lists the commands; "
+            f"to send a line that starts with '{word[0]}' to the model, type "
+            f"'{COMMAND_ESCAPE_PREFIX}{word.lstrip('/')}' first.",
+            'muted'), file=sys.stderr)
+
+    def _command_suggestions(self, word: str) -> list:
+        """Return the command names close enough to `word` to suggest.
+
+        `difflib` alone is too eager on short words (`/tmp` scores 0.75 against
+        `/mcp` because of the shared `mp` block), so a candidate must also share
+        the first letter after the slash unless it is a near-perfect match (a
+        dropped first letter, `/istmodel` → `/listmodel`). Candidates are
+        always real `/`-prefixed commands, compared case-insensitively.
+
+        Args:
+            word: The unknown command word.
+
+        Returns:
+            Up to three command names, best first.
+        """
+        lowered = word.lower()
+        scored = sorted(
+            ((difflib.SequenceMatcher(None, lowered, c.lower()).ratio(), c)
+             for c in self.commands if c.startswith('/')),
+            key=lambda pair: pair[0], reverse=True)
+        return [c for ratio, c in scored
+                if ratio >= 0.7
+                and (ratio >= 0.85 or c[1:2].lower() == lowered[1:2])][:3]
 
     def list_models(self, filter_arg: Optional[str] = None) -> None:
         """List available models from the backend, with optional name filter."""
@@ -17549,7 +18114,10 @@ class ChatLoop:
             # Auto-save session on exit if there's meaningful conversation
             session_id = self._conversation().autosave_on_exit()
             if session_id:
-                print(colorize(f"[Auto-save] Session saved as {session_id}", 'muted'), file=sys.stderr)
+                label = self._conversation().active_name
+                suffix = f" (name: {label})" if label else ""
+                print(colorize(f"[Auto-save] Session saved as {session_id}{suffix}",
+                               'muted'), file=sys.stderr)
             print(colorize("\n[Goodbye!]", 'info'), file=sys.stderr)
             return True
         return None
@@ -19112,7 +19680,7 @@ class ChatLoop:
         self._wire_view().print_full_message(index)
 
     def run_handle_sessions(self, full_input: str) -> Optional[bool]:
-        """Handle /sessions command to list saved sessions."""
+        """Handle /sessions command to list saved sessions (name or id first)."""
         if full_input.startswith('/sessions'):
             parts = full_input.split()
             limit = 10
@@ -19125,47 +19693,104 @@ class ChatLoop:
             if not sessions:
                 print(colorize("[Sessions] No saved sessions found.", 'warning'), file=sys.stderr)
                 return False
+            active_id = self._conversation().active_id
             print(colorize(f"\n--- Saved Sessions (last {len(sessions)}) ---", 'info'), file=sys.stderr)
+            # The label column is the name when there is one, else the id; the
+            # active session is flagged with '*' so /save's target is obvious.
+            width = max([4] + [len(s.get('name') or s.get('id', ''))
+                               for s in sessions if isinstance(s, dict)])
+            width = min(width, 32)
             for s in sessions:
+                label = (s.get('name') or s.get('id', ''))[:width]
                 model = s.get('model', 'unknown')
                 msgs = s.get('message_count', 0)
                 summary = s.get('summary', '')[:60]
                 created = s.get('created', '')[:16]
-                print(colorize(f"  {s['id']}  {model:20s}  {msgs:3d} msgs  {created}  {summary}", 'info'), file=sys.stderr)
-            print(colorize("--- End Sessions ---\n", 'info'), file=sys.stderr)
+                marker = '*' if s.get('id') == active_id else ' '
+                print(colorize(
+                    f" {marker}{label:<{width}}  {model:20s}  {msgs:3d} msgs  "
+                    f"{created}  {summary}", 'info'), file=sys.stderr)
+            print(colorize("--- End Sessions ---", 'info'), file=sys.stderr)
+            print(colorize("Resume with /resume <name|id> (a name prefix is enough).\n",
+                           'muted'), file=sys.stderr)
             return False
         return None
 
     def run_handle_resume(self, full_input: str) -> Optional[bool]:
-        """Handle /resume command to resume a previous session."""
+        """Handle /resume command to resume a session by id or name."""
         if full_input.startswith('/resume'):
-            parts = full_input.split()
-            if len(parts) < 2:
-                print(colorize("[Resume] Usage: /resume <session_id>", 'warning'), file=sys.stderr)
+            handle = full_input[len('/resume'):].strip()
+            if not handle:
+                print(colorize("[Resume] Usage: /resume <session_id|name>  "
+                               "(see /sessions)", 'warning'), file=sys.stderr)
                 return False
-            session_id = parts[1]
-            session_data = self._conversation().load_session(session_id)
+            session_data = self._conversation().load_session(handle)
             if not session_data:
-                print(colorize(f"[Resume] Session '{session_id}' not found.", 'error'), file=sys.stderr)
+                print(colorize(f"[Resume] Session '{handle}' not found. "
+                               "/sessions lists saved ids and names.", 'error'),
+                      file=sys.stderr)
                 return False
             msg_count = len(self.messages)
             self._refresh_context_bar()
             model = session_data.get('model', '')
+            name = session_data.get('name') or ""
+            label = f" '{name}'" if name else ""
             print(colorize(
-                f"[Resume] Loaded session {session_data['id']} ({msg_count} messages, "
-                f"model: {model}, tokens: {self.ctx.current_context_tokens})",
+                f"[Resume] Loaded session {session_data.get('id', '?')}{label} "
+                f"({msg_count} messages, model: {model}, "
+                f"tokens: {self.ctx.current_context_tokens})",
                 'success'), file=sys.stderr)
             return False
         return None
 
     def run_handle_save(self, full_input: str) -> Optional[bool]:
-        """Handle /save command to save current session."""
+        """Handle /save [name] — save the session, optionally naming it."""
         if full_input.startswith('/save'):
             if len(self.messages) <= 1:
                 print(colorize("[Save] Nothing to save (empty session).", 'warning'), file=sys.stderr)
                 return False
-            session_id = self._conversation().save_session()
-            print(colorize(f"[Save] Session saved as {session_id}", 'success'), file=sys.stderr)
+            name = full_input[len('/save'):].strip()[:SESSION_NAME_MAX_CHARS].strip()
+            if name and not _session_slug(name):
+                print(colorize(f"[Save] Invalid name '{name}': use letters or digits.",
+                               'error'), file=sys.stderr)
+                return False
+            store = self._conversation()
+            previous = store.active_id
+            session_id = store.save_session(name or None)
+            label = store.active_name
+            suffix = f" (name: {label})" if label else ""
+            verb = "updated" if session_id == previous else "saved as"
+            print(colorize(f"[Save] Session {verb} {session_id}{suffix}",
+                           'success'), file=sys.stderr)
+            return False
+        return None
+
+    def run_handle_rename(self, full_input: str) -> Optional[bool]:
+        """Handle /rename <name> — label the session this conversation saved."""
+        if full_input.startswith('/rename'):
+            name = full_input[len('/rename'):].strip()[:SESSION_NAME_MAX_CHARS].strip()
+            if not name:
+                print(colorize("[Rename] Usage: /rename <name>  (renames the saved "
+                               "session; /save <name> names a new one)", 'warning'),
+                      file=sys.stderr)
+                return False
+            if not _session_slug(name):
+                print(colorize(f"[Rename] Invalid name '{name}': use letters or digits.",
+                               'error'), file=sys.stderr)
+                return False
+            store = self._conversation()
+            if not store.active_id:
+                print(colorize("[Rename] No saved session in this conversation yet — "
+                               "use /save <name> first.", 'warning'), file=sys.stderr)
+                return False
+            owner = SessionManager().name_owner(name)
+            if owner is not None and owner.get('id') != store.active_id:
+                print(colorize(f"[Rename] '{name}' is already used by session "
+                               f"{owner.get('id')}.", 'error'), file=sys.stderr)
+                return False
+            session_id = store.rename_session(name)
+            print(colorize(f"[Rename] Session {session_id} is now named '{name}'.",
+                           'success'), file=sys.stderr)
             return False
         return None
 
