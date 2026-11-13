@@ -4227,6 +4227,28 @@ class TestGitInspect(unittest.TestCase):
                 self.assertEqual(f.read(), big)
             # The spill dir is ACL-allowed so read_file can page it in plan mode.
             rd = self.reg.execute("read_file", {"file_path": spill_file})
+            self.assertTrue(rd["success"], msg=rd.get("error"))
+
+    def test_spill_failure_returns_the_output_unchanged(self):
+        """A failed spill must lose nothing (regression: `return text` NameError).
+
+        `_spill_git_result` promises "On any failure the output is returned
+        unchanged", but the fallback named an undefined `text`: a full disk (or
+        a quota/permission error) turned a usable diff into `name 'text' is not
+        defined`, which `ToolRegistry.execute` reported to the model as a
+        failed tool. Found by `ruff --select F821`.
+        """
+        big = "@@ -1 +1 @@\n" + ("+CHANGED-LINE\n" * 5000)
+        capture = {"returncode": 0, "stdout": big, "stderr": "",
+                   "truncated": False, "timed_out": False}
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(q, "CLUSTER_SPILL_DIR", os.path.join(tmp, "spill")), \
+                 patch.object(q, "_git_capture", return_value=capture), \
+                 patch.object(q, "_open_private",
+                              side_effect=OSError(28, "No space left on device")):
+                result = self._run(action="diff_head")
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertIn("CHANGED-LINE", result["output"])
 
     @unittest.skipUnless(HAS_GIT, "git not installed")
     def test_status_and_log_on_real_repo(self):

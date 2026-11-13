@@ -141,6 +141,26 @@ Key faithful details:
     the exception: they are consumed up to the delimiter and emitted as one
     opaque word, with only their `$(...)`/backticks scanned (bash executes
     those), so a `<<'EOF'` script keeps its single-node shape.
+*   **Follow-ups of the same family, closed 2026-11-13 (G1–G4).** An adversarial
+    pass after `0.4.3` reproduced four residuals against real bash:
+    `$HOME`/`${HOME}` were never resolved (`$` bailed out of
+    `_shell_operand_realpath`, and the embedded-path regex cannot match the `/`
+    after `E`), so `echo hacked > $HOME/.bashrc` and `cat $HOME/.bashrc` reached
+    no rule; `\`+newline is a *continuation* that bash deletes entirely, but the
+    scanner kept both characters, so `> \<NL>~/.bashrc` and `> ~/\<NL>.bashrc`
+    resolved under the CWD; `>&` was excluded from the write set although bash
+    accepts `>&file` (it writes the file); and redirect targets were graded with
+    `evaluate("read", …)`, so `>> /etc/hosts` was an approvable `ask` instead of
+    the `deny` the design promises. Now: the two HOME spellings expand to the home
+    directory (whole token and code blob), `\`+newline is dropped before tokenizing
+    (outside single quotes), `>&` joins the write set with the fd forms
+    (`2>&1`, `>&-`) filtered out, and **targets are graded as writes** while
+    operands stay reads. Pinned by
+    `tests/test_acl.py::TestShellHomeRefExpansion`,
+    `TestShellLineContinuationInWords`, `TestShellFdRedirectTargets` and
+    `TestShellRedirectWriteSemantics` (23 tests).
+    Conservative over-blocking is deliberate and pinned: a *quoted* `~`/`$HOME`
+    (which bash does not expand) still asks.
 *   Group nodes `( … )`, `$(…)`, `<(…)` contribute no own pattern, only nested
     nodes (`opencode_implementation_detail_shell_permission_parser.md:401`).
 

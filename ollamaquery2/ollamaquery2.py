@@ -3939,10 +3939,25 @@ def _shell_scan_word(s: str, i: int) -> tuple:
                 if s[k] == '"':
                     break
                 k += 1
-            parts.append(s[j:k + 1])
+            # Bash removes `\`+newline inside double quotes as well (line
+            # continuation happens before parameter expansion). Keeping the two
+            # characters made `"~/\\<NL>.bashrc"` resolve to a CWD-relative path
+            # rather than the home dotfile it names (G2).
+            seg = s[j:k + 1]
+            parts.append(seg.replace("\\\r\n", "").replace("\\\n", ""))
             j = k + 1
             continue
         if c == "\\":
+            # `\` + newline is a line continuation, not an escaped newline: bash
+            # deletes both characters before tokenizing, so `echo x > \\<NL>~/.bashrc`
+            # writes `~/.bashrc`. Keeping them hid the `~` from expanduser and the
+            # target resolved inside the CWD (G2).
+            if s[j + 1:j + 3] == "\r\n":
+                j += 3
+                continue
+            if s[j + 1:j + 2] == "\n":
+                j += 2
+                continue
             parts.append(s[j:j + 2])
             j += 2
             continue
@@ -3982,10 +3997,12 @@ def _shell_scan_word(s: str, i: int) -> tuple:
 _SHELL_REDIR_OPS = ("&>>", "<<-", "<<<", ">>", ">&", "<&", "<>", ">|", "<<", "&>", ">", "<")
 
 # Redirect operators whose target is a file the command writes. `<`, `<<`,
-# `<<<`, `>&` and `<&` are excluded: their target is a read path, a heredoc
-# delimiter, a here-string or an fd number, never a file being created — and
-# `_shell_arity_tokens` drops each of them from the operand list anyway.
-_SHELL_WRITE_REDIR_OPS = frozenset({">", ">>", ">|", "&>", "&>>", "<>"})
+# `<<<` and `<&` are excluded: their target is a read path, a heredoc delimiter,
+# a here-string or an fd number. `>&` IS included: bash accepts `>&file` as
+# "write stdout and stderr to file" (verified), and excluding it made
+# `echo hacked >&~/.bashrc` an `allow` whose destination nobody inspected (G3).
+# The fd forms (`2>&1`, `>&-`) are filtered in `_shell_redirect_targets`.
+_SHELL_WRITE_REDIR_OPS = frozenset({">", ">>", ">|", "&>", "&>>", "<>", ">&"})
 
 # Redirect targets that mean "discard" or "the terminal" rather than a file
 # outside the project, so the very common `cmd 2>/dev/null` and
@@ -4246,6 +4263,11 @@ def _shell_tokenize(s: str) -> list:
             i += len(op)
             continue
         text, j, nested = _shell_scan_word(s, i)
+        if not text:
+            # A `\` + newline continuation at a word boundary leaves nothing to
+            # emit; an empty WORD would add a phantom operand to every check.
+            i = j
+            continue
         tokens.append(_ShellToken(_SHELL_WORD, text, i, j, nested))
         if pending_delim is not None:
             # The word after `<<` / `<<-` names the heredoc terminator. Several
@@ -4295,8 +4317,13 @@ def _shell_redirect_targets(tokens: list) -> list:
     for i, t in enumerate(tokens):
         if t.kind != _SHELL_REDIR or t.text not in _SHELL_WRITE_REDIR_OPS:
             continue
-        if i + 1 < len(tokens) and tokens[i + 1].kind == _SHELL_WORD:
-            out.append(tokens[i + 1].text)
+        if not (i + 1 < len(tokens) and tokens[i + 1].kind == _SHELL_WORD):
+            continue
+        target = tokens[i + 1].text
+        if t.text == ">&" and (target.isdigit() or target.strip() == "-"):
+            # `2>&1` / `>&-` duplicate or close an fd: no file is opened.
+            continue
+        out.append(target)
     return out
 
 def _shell_arity_tokens(tokens: list) -> list:
@@ -4533,8 +4560,9 @@ def _shell_redirect_target_is_discardable(tok: str) -> bool:
 
     `2>/dev/null` is the most common redirection there is; prompting for it (or
     failing the CWD-leniency check because of it) would only train the model to
-    drop the redirection. fd duplication (`2>&1`) never reaches here: `>&` and
-    `<&` are not write redirections, so their target is not collected.
+    drop the redirection. fd duplication (`2>&1`, `>&-`) never reaches here
+    either: `_shell_redirect_targets` skips digit/`-` targets of `>&` before the
+    target is collected.
 
     Args:
         tok: A redirection target word.
@@ -4632,6 +4660,37 @@ def _shell_is_home_destructive(nodes: list) -> bool:
     return False
 
 
+# `$HOME` / `${HOME}`, but not `$HOMEDIR`: a bound that keeps a longer variable
+# name from being rewritten into a home path.
+_SHELL_HOME_REF_RE = re.compile(r"\$\{HOME\}|\$HOME(?![A-Za-z0-9_])")
+
+
+def _shell_expand_home_refs(text: str) -> str:
+    """Rewrite `$HOME`/`${HOME}` as the home directory, like a literal `~`.
+
+    The Path ACL talks about the *home directory*, not about how a shell spelled
+    it: `echo x > $HOME/.bashrc` and `echo x > ~/.bashrc` are the same write. The
+    operand scanner used to bail out on any `$` (env refs are not simple paths)
+    and the embedded-path regex could not match the `/` right after `E`, so the
+    first spelling reached no rule at all while the second one asked (G1).
+
+    The replacement is the *resolved* home, not `~`: inside a word
+    (`> /tmp$HOME/x`) a literal `~` would produce `/tmp~/x`, a path that does
+    not exist, while bash writes `/tmp<home>/x`. Only HOME is expanded:
+    `$XDG_CONFIG_HOME`, `$PWD` and `$VAR` stay opaque — a variable holding a
+    path can always evade a static scan, and the ACL is steering, not a sandbox
+    (see the "Path ACL is a consent + audit layer" note).
+
+    Args:
+        text: A shell word or a code blob.
+
+    Returns:
+        The text with the two HOME spellings replaced by the home directory.
+    """
+    home = os.path.expanduser("~")
+    return _SHELL_HOME_REF_RE.sub(lambda _m: home, text)
+
+
 def _shell_operand_realpath(tok: str) -> Optional[str]:
     """Best-effort resolve of a shell token to an absolute realpath.
 
@@ -4644,6 +4703,7 @@ def _shell_operand_realpath(tok: str) -> Optional[str]:
     """
     t = tok.strip().strip("'\"")
     t = t.lstrip("<>")  # strip redirection markers (>>/etc/foo)
+    t = _shell_expand_home_refs(t)  # $HOME/.x == ~/.x (G1)
     if not t or t.startswith("-"):
         return None
     if "*" in t or "?" in t:
@@ -4720,7 +4780,11 @@ def _shell_token_path_candidates(tok: str, program: str = "") -> list:
     prog = os.path.basename(program or "").lower()
     if prog not in _SHELL_CODE_PROGRAMS and not any(c in tok for c in _SHELL_CODE_CHARS):
         return out
-    for frag in _EMBEDDED_ABS_PATH_RE.findall(tok):
+    # Expand the home spellings before looking for embedded paths, so
+    # `sh -c 'cat $HOME/.bashrc'` yields `~/.bashrc` just like `~` would (G1):
+    # the regex cannot match a `/` that follows the `E` of `$HOME`, and with
+    # `${HOME}` it matched the wrong path (`/.bashrc`).
+    for frag in _EMBEDDED_ABS_PATH_RE.findall(_shell_expand_home_refs(tok)):
         try:
             real = os.path.realpath(os.path.expanduser(frag))
         except Exception:
@@ -4767,24 +4831,29 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
         # Redirection targets are destinations, not arguments, but they are the
         # file the command writes: `echo x >> /etc/hosts` and
         # `echo hacked > ~/.bashrc` must reach the same rules as `touch` would.
-        scanned = list(toks[1:]) + [t for t in node.redirect_targets
-                                    if not _shell_redirect_target_is_discardable(t)]
-        for tok in scanned:
+        # They are also the one token whose direction is unambiguous, so they are
+        # graded as `write`: `>> /etc/hosts` is a hard deny, where the read half
+        # of the policy only asks (and `auto_confirm` answers yes) — the C2 fix
+        # promised "writes outside the project stay deny" (G4).
+        scanned = ([(t, "read") for t in toks[1:]] +
+                   [(t, "write") for t in node.redirect_targets
+                    if not _shell_redirect_target_is_discardable(t)])
+        for tok, op in scanned:
             for rp in _shell_token_path_candidates(tok, toks[0]):
                 if _is_blocked_system_file(rp):
                     acl.log_event("run_command", rp, "deny", None)
                     return {"approved": False,
                             "reason": f"[path ACL denied] {rp} — System file blocked "
                                       f"(sensitive virtual file); {ACL_DENIAL_HINT}"}
-                decision, rule = acl.evaluate("read", rp, explicit_only=True)
+                decision, rule = acl.evaluate(op, rp, explicit_only=True)
                 if rule is None:
                     continue
                 if decision == "deny" and deny_info is None:
-                    deny_info = (tok, rp, rule)
+                    deny_info = (tok, rp, rule, op)
                 elif decision == "ask" and ask_info is None:
-                    ask_info = (tok, rp, rule)
+                    ask_info = (tok, rp, rule, op)
     if deny_info:
-        _, rp, rule = deny_info
+        _, rp, rule, _op = deny_info
         acl.log_event("run_command", rp, "deny", rule)
         shown = rule["path"] if rule.get("kind") in ("prefix", "temp_root") else "home dotfile"
         redirect = ""
@@ -4795,8 +4864,8 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
                 "reason": f"[path ACL denied] {rp} — denied by path ACL rule: "
                           f"{rule['action']} {shown}{redirect}; {ACL_DENIAL_HINT}"}
     if ask_info:
-        _, rp, rule = ask_info
-        granted = acl.prompt("read", rp, rule, tool="run_command", context=command)
+        _, rp, rule, op = ask_info
+        granted = acl.prompt(op, rp, rule, tool="run_command", context=command)
         acl.log_event("run_command", rp, "allow" if granted else "deny", rule)
         if not granted:
             shown = rule["path"] if rule.get("kind") in ("prefix", "temp_root") else "home dotfile"
@@ -8813,7 +8882,7 @@ def _spill_git_result(ctx: object, output_text: str, action: str) -> str:
             f"or `limit` if you only need one file."
         )
     except Exception:
-        return text
+        return output_text
 
 
 def _tool_handle_git_inspect(self, args: dict) -> dict:
@@ -12326,6 +12395,54 @@ class StreamParser:
         self._publish_stream_info(stream_info, stream_info_out)
         return full_content, full_thinking, tool_calls, tool_call_index, usage
 
+
+def stream_is_incomplete(info: Optional[dict]) -> bool:
+    """Return whether a stream ended without finishing its turn.
+
+    The single definition of "this text is a prefix, not an answer", shared by
+    the two paths that persist a `query_stream` result (chat and the agentic
+    finalize stream). A terminal marker wins over an error that arrived after
+    it: a connection dropped once `done`/`finish_reason` was seen did not cost
+    any tokens, so the answer is complete.
+
+    Args:
+        info: The by-ref dict published by `query_stream` (or
+            `_aggregate_sync_stream`). `None`/empty means the caller got no
+            facts — typically a stubbed handler in a test — and is treated as
+            complete, so callers that never pass a sink keep their old behavior.
+
+    Returns:
+        True only when the stream demonstrably failed to finish.
+    """
+    if not info:
+        return False
+    if info.get("complete"):
+        return False
+    if info.get("error"):
+        return True
+    return int(info.get("parsed_lines") or 0) > 0
+
+
+def stream_incomplete_reason(info: dict) -> str:
+    """Describe why a stream did not finish, for the user-facing warning.
+
+    Args:
+        info: The by-ref dict published by `query_stream`.
+
+    Returns:
+        A short human-readable cause ("transport error: …", output cap, bad
+        frames, missing terminal marker).
+    """
+    if info.get("error"):
+        return f"transport error: {info['error']}"
+    if info.get("finish_reason") == "length":
+        return "the output cap was reached (/maxtokens)"
+    bad_lines = int(info.get("bad_lines") or 0)
+    if bad_lines:
+        return f"{bad_lines} malformed frame(s) broke the stream"
+    return "the stream ended without its terminal marker"
+
+
 # ============================================================================
 # ============= MODEL QUERY CLASS ============================================
 # ============================================================================
@@ -12566,6 +12683,16 @@ class ModelQuery:
         """Shape a sync response for the backend (door onto `StreamParser`)."""
         return self._stream_parser()._synthesize_sync_response(
             content, thinking, tool_calls, usage)
+
+    @staticmethod
+    def _finish_reason(chunk: dict, backend: str) -> str:
+        """Return a final chunk's stop reason (door onto `StreamParser`)."""
+        return StreamParser._finish_reason(chunk, backend)
+
+    @staticmethod
+    def _publish_stream_info(stream_info: dict, sink: Optional[dict]) -> None:
+        """Copy the stream's facts to the caller's sink (door onto `StreamParser`)."""
+        StreamParser._publish_stream_info(stream_info, sink)
 
     def _aggregate_sync_stream(self, req: Request, backend: str, socket_timeout: float,
                                on_chunk: object, cancel: Optional[dict] = None,
@@ -12925,7 +13052,8 @@ class ModelQuery:
         self,
         messages: list[Message], model: str, stream_enabled: bool = True, debug: bool = False,
         show_thinking: bool = True, context_size: Optional[int] = None, images: Optional[list] = None,
-        tool_calls_out: Optional[list] = None, **kwargs: dict
+        tool_calls_out: Optional[list] = None, stream_info_out: Optional[dict] = None,
+        **kwargs: dict
     ) -> str:
         """Stream response from any backend. Dispatches to backend-specific chunk parsing.
 
@@ -12939,10 +13067,18 @@ class ModelQuery:
             images: Optional list of base64 images.
             tool_calls_out: Optional list to populate with accumulated tool_calls from streaming.
                 For OpenAI-compatible streaming, incremental tool_calls are merged by index.
+            stream_info_out: Optional by-ref dict filled with what happened to the
+                stream: `parsed_lines`, `bad_lines`, `saw_final`, `finish_reason`,
+                `complete` (False = the turn was cut) and `error` when it raised.
+                The return value stays a plain string, so a caller that must not
+                persist a truncated answer (`run_process_query`, the agentic
+                finalize stream) passes this dict and checks it with
+                `stream_is_incomplete()`.
             **kwargs: Extra payload args.
 
         Returns:
-            The accumulated full response content.
+            The accumulated full response content — which is a *prefix* when
+            `stream_info_out` reports `complete=False` or an `error`.
         """
         full_content = ""
         full_thought = ""
@@ -12969,6 +13105,9 @@ class ModelQuery:
         aggregated_usage = {}
         stream_tool_calls = []  # Accumulated tool calls from streaming (merged by index)
         stream_tool_call_index = {}  # Maps index -> partial tool call dict
+        stream_info = {"parsed_lines": 0, "bad_lines": 0, "saw_final": False,
+                       "finish_reason": "", "complete": False}
+        published = False
 
         try:
             with _request_with_retry(req) as response:
@@ -12976,6 +13115,11 @@ class ModelQuery:
                     try:
                         chunk = json.loads(raw_line)
                         thought, content, is_final, usage, tool_calls = self._parse_chunk(chunk, backend)
+
+                        stream_info["parsed_lines"] += 1
+                        if is_final:
+                            stream_info["saw_final"] = True
+                            stream_info["finish_reason"] = self._finish_reason(chunk, backend)
 
                         # Client-side phase timing: first token ends prefill,
                         # first content ends thinking, stream end ends the answer.
@@ -13003,7 +13147,16 @@ class ModelQuery:
                             chunk, thought, content, is_final, debug, show_thinking, display_state)
 
                     except json.JSONDecodeError:
+                        # Counted, never silent: a dropped frame is how a
+                        # half-written answer used to look finished.
+                        stream_info["bad_lines"] += 1
                         continue
+
+            # The stream is over: publish its own facts before stats or token
+            # accounting can fail, so a post-stream error is not reported as a
+            # cut answer.
+            self._publish_stream_info(stream_info, stream_info_out)
+            published = True
 
             # Finalize accumulated tool_calls
             if stream_tool_call_index:
@@ -13035,6 +13188,12 @@ class ModelQuery:
 
         except Exception as e:
             sys.stderr.write(colorize(f"{self._stream_error_detail(e, backend, model)}\n", 'error'))
+            stream_info["error"] = str(e)
+            if not published:
+                # Nothing is claimed about a stream whose facts were never
+                # published: `complete` stays False and the error is visible to
+                # the caller, which can then refuse to persist the prefix.
+                self._publish_stream_info(stream_info, stream_info_out)
             self.last_stream_thought = full_thought
             return full_content
 
@@ -15602,6 +15761,7 @@ class AgenticFinalizer:
                 if state.send_tools_api:
                     stream_kwargs["tools"] = state.openai_tools
 
+                stream_info: dict = {}
                 response = self.query_handler.query_stream(
                     final_messages, host.ctx.model,
                     stream_enabled=host.ctx.stream_enabled,
@@ -15610,11 +15770,24 @@ class AgenticFinalizer:
                     context_size=host.ctx.context_size,
                     images=([] if host.ctx.supports_vision is False else host.ctx.current_images),
                     tool_calls_out=stream_tool_calls_out,
+                    stream_info_out=stream_info,
                     no_thinking=host.ctx.force_no_thinking,
                     reasoning_effort=host.ctx.reasoning_effort,
                     preserve_thinking=host.ctx.preserve_thinking,
                     **stream_kwargs
                 )
+                if stream_is_incomplete(stream_info):
+                    # D1: the re-generation was cut. Discard the prefix and any
+                    # tool call it half-carried (arguments that never finished
+                    # must not run), then fall back to the step's answer — the
+                    # branch below prints it and nothing partial is persisted.
+                    print(colorize(
+                        f"\n[Agentic] Final answer stream incomplete — "
+                        f"{stream_incomplete_reason(stream_info)}.\n"
+                        f"          The partial re-generation was discarded; "
+                        f"keeping the step's answer.", 'warning'), file=sys.stderr)
+                    response = ""
+                    stream_tool_calls_out.clear()
                 if response or stream_tool_calls_out:
                     stream_tool_calls = self.collect_stream_tool_calls(
                         host, stream_tool_calls_out, response)
@@ -20181,6 +20354,7 @@ class ChatLoop:
                 print(colorize("\n[ERROR] No model selected. Use /switchmodel <name> to select a model first.", 'error'), file=sys.stderr)
                 return
 
+            stream_info: dict = {}
             response = self.query_handler.query_stream(
                 payload_messages,
                 self.ctx.model,
@@ -20192,10 +20366,20 @@ class ChatLoop:
                 no_thinking=self.ctx.force_no_thinking,
                 reasoning_effort=self.ctx.reasoning_effort,
                 preserve_thinking=self.ctx.preserve_thinking,
-                apply_output_cap=True
+                apply_output_cap=True,
+                stream_info_out=stream_info
             )
 
-            if response:
+            if stream_is_incomplete(stream_info):
+                # D1: what was streamed is a prefix, not an answer. Keep it on
+                # screen (the user watched it arrive) but out of the stored
+                # conversation, so the next turn cannot build on a half reply.
+                print(colorize(
+                    f"\n[Stream] Answer incomplete — {stream_incomplete_reason(stream_info)}.\n"
+                    f"         The partial text was NOT saved to the conversation; "
+                    f"ask again to retry.", 'warning'), file=sys.stderr)
+                print()
+            elif response:
                 assistant_msg = {'role': 'assistant', 'content': response}
                 if (self.ctx.preserve_thinking
                         and self.ctx.backend in ("llamacpp", "strata", "lmstudio")):

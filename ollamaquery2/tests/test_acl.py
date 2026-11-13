@@ -650,6 +650,191 @@ class TestShellRedirectTargets(unittest.TestCase):
         self.assertEqual(node.redirect_targets, [])
 
 
+class TestShellHomeRefExpansion(unittest.TestCase):
+    """`$HOME`/`${HOME}` must grade exactly like a literal `~` (G1).
+
+    `_shell_operand_realpath` bailed out on any `$` (env refs are not simple
+    paths) and the embedded-path regex could not match the `/` after `E` — so
+    `echo hacked > $HOME/.bashrc` and `cat $HOME/.bashrc` reached no rule at all
+    while the `~` spelling asked. Verified against bash: both spellings write and
+    read the same file (`HOME=<tmp> bash -c 'echo x > $HOME/.bashrc'`).
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx)
+
+    def test_redirect_target_is_expanded(self):
+        for cmd in ("echo hacked > $HOME/.bashrc",
+                    "echo hacked > ${HOME}/.bashrc"):
+            with self.subTest(cmd=cmd):
+                res = self._scan(cmd)
+                self.assertIsNotNone(res, cmd)
+                self.assertFalse(res["approved"])
+                self.assertIn(".bashrc", res["reason"])
+
+    def test_operand_is_expanded(self):
+        for cmd in ("cat $HOME/.bashrc", "head ${HOME}/.ssh/id_rsa"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self._scan(cmd), cmd)
+
+    def test_braced_form_resolves_the_right_path(self):
+        # `${HOME}` used to slip through the regex and resolve `/.bashrc`.
+        self.assertEqual(m._shell_operand_realpath("${HOME}/.bashrc"),
+                         os.path.realpath(os.path.expanduser("~/.bashrc")))
+
+    def test_code_blob_is_expanded(self):
+        self.assertIsNotNone(self._scan("sh -c 'cat $HOME/.bashrc'"))
+
+    def test_home_non_dotfile_is_unchanged(self):
+        # A write under $HOME is allowed today for `~`; expanding must not change
+        # the grade of the same path spelled the other way.
+        self.assertIsNone(self._scan("echo x > $HOME/notes.txt"))
+        self.assertIsNone(self._scan("echo x > ~/notes.txt"))
+
+    def test_longer_variable_name_is_not_rewritten(self):
+        self.assertEqual(m._shell_expand_home_refs("$HOMEDIR/x"), "$HOMEDIR/x")
+        self.assertIsNone(self._scan("echo x > $HOMEDIR/notes.txt"))
+
+    def test_quoted_home_still_asks_conservatively(self):
+        # bash expands neither `~` nor `$HOME` inside quotes, so these create a
+        # literal name under the CWD. The scanner strips quotes and over-prompts;
+        # that is the safe direction and matches the pre-existing `~` behaviour,
+        # so it is pinned rather than "fixed" silently.
+        for cmd in ('echo x > "~/.bashrc"', "echo x > '$HOME/.bashrc'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self._scan(cmd))
+
+
+class TestShellLineContinuationInWords(unittest.TestCase):
+    """`\\`+newline is deleted before tokenizing, even inside a word (G2).
+
+    `_shell_scan_word` kept the two characters, so the target became
+    `\\⏎~/.bashrc`: no leading `~`, `expanduser` a no-op, realpath under the CWD,
+    CWD leniency, allow — while bash writes `~/.bashrc`.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx)
+
+    def test_leading_continuation_in_the_target(self):
+        res = self._scan("echo hacked > \\\n~/.bashrc")
+        self.assertIsNotNone(res)
+        self.assertIn(".bashrc", res["reason"])
+
+    def test_continuation_inside_the_word(self):
+        self.assertIsNotNone(self._scan("echo hacked > ~/\\\n.bashrc"))
+
+    def test_continuation_inside_double_quotes(self):
+        self.assertIsNotNone(self._scan('echo hacked > "~/\\\n.bashrc"'))
+
+    def test_continuation_does_not_split_the_command(self):
+        # `echo hi \<NL>rm -rf ~` is one command for bash; the guard must still
+        # see the `rm` (fail-closed).
+        nodes = m._shell_breakdown("echo hi \\\nrm -rf ~")
+        self.assertEqual(len(nodes), 1)
+        self.assertIn("rm -rf ~", nodes[0].pattern)
+
+    def test_continuation_joins_a_word_like_bash(self):
+        self.assertEqual(m._shell_breakdown("echo a\\\nb")[0].tokens,
+                         ["echo", "ab"])
+
+    def test_no_phantom_empty_operand(self):
+        self.assertEqual(m._shell_breakdown("echo a \\\n b")[0].tokens,
+                         ["echo", "a", "b"])
+
+
+class TestShellFdRedirectTargets(unittest.TestCase):
+    """`>&file` is a file write; `2>&1`/`>&-` are fd operations (G3).
+
+    `>&` was excluded from the write-redirection set on the assumption that its
+    target is always an fd number. Bash accepts `>&file` (verified: it writes the
+    file), so `echo hacked >&~/.bashrc` was an `allow` whose destination no rule
+    inspected.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx)
+
+    def test_file_target_is_collected(self):
+        node = m._shell_breakdown("echo hacked >&~/.bashrc")[0]
+        self.assertEqual(node.redirect_targets, ["~/.bashrc"])
+
+    def test_file_target_is_gated(self):
+        self.assertIsNotNone(self._scan("echo hacked >&~/.bashrc"))
+        self.assertIsNotNone(self._scan("echo hacked >&/etc/hosts"))
+
+    def test_fd_forms_stay_silent(self):
+        for cmd in ("echo x >&1", "echo x >&-", "echo x 2>&1"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self._scan(cmd))
+                self.assertEqual(m._shell_breakdown(cmd)[0].redirect_targets, [])
+        # A real target *after* an fd duplication is still collected (and still
+        # silent, because /dev/null is a discard device).
+        self.assertIsNone(self._scan("echo x 2>&1 >/dev/null"))
+        self.assertEqual(
+            m._shell_breakdown("echo x 2>&1 >/dev/null")[0].redirect_targets,
+            ["/dev/null"])
+
+    def test_digit_target_is_not_a_file(self):
+        self.assertEqual(m._shell_breakdown("echo x >&1")[0].redirect_targets, [])
+
+
+class TestShellRedirectWriteSemantics(unittest.TestCase):
+    """A redirect target is a write, so the write half of the policy grades it (G4).
+
+    `>> /etc/hosts` used to be scanned with `evaluate("read", …)`: the `/etc` rule
+    asks, and `auto_confirm` answers yes. The C2 fix's own promise is "writes
+    outside the project stay deny", so the target is graded as a write; an
+    operand stays read (the command may read or write it).
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx)
+
+    def test_etc_target_is_a_hard_deny(self):
+        for cmd in ("echo x >> /etc/hosts", "echo x > /etc/config",
+                    "echo x >&/etc/hosts"):
+            with self.subTest(cmd=cmd):
+                res = self._scan(cmd)
+                self.assertIsNotNone(res, cmd)
+                self.assertFalse(res["approved"])
+                self.assertIn("denied by path ACL rule", res["reason"], cmd)
+
+    def test_proc_and_sys_targets_are_hard_denies(self):
+        for cmd in ("echo x > /proc/self/comm", "echo x > /sys/kernel/x"):
+            with self.subTest(cmd=cmd):
+                res = self._scan(cmd)
+                self.assertIn("denied by path ACL rule", res["reason"])
+
+    def test_auto_confirm_cannot_approve_it(self):
+        self.ctx.auto_confirm = True
+        res = m.check_shell_approval("echo x >> /etc/hosts", ctx=self.ctx)
+        self.assertFalse(res["approved"])
+
+    def test_home_dotfile_still_asks(self):
+        res = self._scan("echo x > ~/.bashrc")
+        self.assertFalse(res["approved"])
+        self.assertIn("no TTY to ask", res["reason"])
+
+    def test_cwd_target_is_allowed(self):
+        self.assertIsNone(self._scan("echo x > out.txt"))
+
+    def test_tmp_target_keeps_the_scratch_hint(self):
+        res = self._scan("echo x > /tmp/out.txt")
+        self.assertIn("temporary files", res["reason"])
+
 
 class TestAclDenialPointsAtTool(unittest.TestCase):
     """A denial is one line: the reason + a pointer to the `path_policy` tool.

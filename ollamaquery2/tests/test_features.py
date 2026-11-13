@@ -2821,6 +2821,221 @@ class TestStreamParserSeam(unittest.TestCase):
         self.assertTrue(hasattr(parser, '_normalize_llamacpp_usage'))
 
 
+class TestIncompleteStreamContract(unittest.TestCase):
+    """D1: a cut stream must never be stored as a finished answer.
+
+    `query_stream` still returns a plain string (every call site keeps working),
+    but it publishes the stream's own facts into a by-ref sink. The two paths
+    that persist an answer — chat (`run_process_query`) and the agentic
+    finalize stream — consult it: a prefix is displayed but never saved, so the
+    next turn cannot build on half a reply.
+    """
+
+    def setUp(self):
+        self.ctx = _fresh_ctx(backend='llamacpp', base_url='http://127.0.0.1:1')
+        self.qh = q.ModelQuery(context=self.ctx)
+
+    # -- producer side -----------------------------------------------------
+
+    def _stream(self, lines, sink, raises=None):
+        """Drive `query_stream` over a stubbed transport, stdout captured."""
+        def fake_iter(response, backend):
+            for line in lines:
+                yield line
+            if raises is not None:
+                raise raises
+
+        self.qh._iter_stream_lines = fake_iter
+
+        class FakeResponse:
+            def __enter__(self_inner):
+                return None
+
+            def __exit__(self_inner, *exc):
+                return False
+
+        stats = {'eval_count': 0, 'prompt_eval_count': 0, 'content_length': 0,
+                 'eval_duration': 0, 'tokens_per_second': 0, 'total_time': 0,
+                 'gen_sec': 0.1}
+        out = io.StringIO()
+        with patch.object(self.qh, '_build_stream_request',
+                          return_value=("http://localhost/fake", {}, {})), \
+             patch.object(q, '_request_with_retry', return_value=FakeResponse()), \
+             patch.object(self.qh, '_update_context_tokens'), \
+             patch.object(self.qh, 'calculate_stats', return_value=stats), \
+             patch.object(self.qh, 'print_stats_display'), \
+             contextlib.redirect_stdout(out):
+            text = self.qh.query_stream(
+                [{"role": "user", "content": "hi"}], SMALL_MODEL,
+                stream_info_out=sink)
+        return text, out.getvalue()
+
+    def test_complete_stream_publishes_complete_facts(self):
+        sink = {}
+        text, _out = self._stream([
+            json.dumps({"choices": [{"delta": {"content": "Hel"}}]}),
+            json.dumps({"choices": [{"delta": {"content": "lo"}}]}),
+            json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        ], sink)
+
+        self.assertEqual(text, "Hello")
+        self.assertEqual(sink["parsed_lines"], 3)
+        self.assertEqual(sink["bad_lines"], 0)
+        self.assertTrue(sink["saw_final"])
+        self.assertEqual(sink["finish_reason"], "stop")
+        self.assertTrue(sink["complete"])
+        self.assertNotIn("error", sink)
+        self.assertFalse(q.stream_is_incomplete(sink))
+
+    def test_transport_error_publishes_a_prefix(self):
+        """A mid-stream reset returns the partial text BUT reports it as cut."""
+        sink = {}
+        text, _out = self._stream(
+            [json.dumps({"choices": [{"delta": {"content": "The answer is"}}]})],
+            sink, raises=URLError("connection reset by peer"))
+
+        self.assertEqual(text, "The answer is")
+        self.assertFalse(sink["complete"])
+        self.assertIn("connection reset", sink["error"])
+        self.assertTrue(q.stream_is_incomplete(sink))
+        self.assertIn("transport error", q.stream_incomplete_reason(sink))
+
+    def test_malformed_frame_is_counted_not_silent(self):
+        sink = {}
+        text, _out = self._stream([
+            '{"choices": [{"delta": {"content": "ok"}}]}',
+            '{"choices": [{"delta": {"content": "trunc',   # dropped frame
+        ], sink)
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(sink["bad_lines"], 1)
+        self.assertEqual(sink["parsed_lines"], 1)
+        self.assertFalse(sink["complete"])
+        self.assertTrue(q.stream_is_incomplete(sink))
+        self.assertIn("malformed frame", q.stream_incomplete_reason(sink))
+
+    def test_terminal_marker_wins_over_a_late_error(self):
+        """A connection lost after `finish_reason` did not cost any token."""
+        sink = {}
+        self._stream([
+            json.dumps({"choices": [{"delta": {"content": "done"}}]}),
+            json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        ], sink, raises=OSError("socket closed"))
+
+        self.assertTrue(sink["complete"])
+        self.assertIn("error", sink)
+        self.assertFalse(q.stream_is_incomplete(sink))
+
+    def test_no_facts_means_not_incomplete(self):
+        """An empty sink (stubbed handler) keeps the pre-D1 behaviour."""
+        self.assertFalse(q.stream_is_incomplete({}))
+        self.assertFalse(q.stream_is_incomplete(None))
+        self.assertFalse(q.stream_is_incomplete({"parsed_lines": 0, "complete": False}))
+
+    # -- consumer side -----------------------------------------------------
+
+    def _chat_loop(self):
+        loop = q.ChatLoop(self.ctx)
+        loop.messages = [{'role': 'system', 'content': 'sys', '_tokens': 1}]
+        return loop
+
+    def _plumbing(self, loop):
+        """No-op the persist-path plumbing so the test stays offline."""
+        return [
+            patch.object(loop, '_refresh_context_bar'),
+            patch.object(loop, '_near_full_nudge_message', return_value=None),
+            patch.object(loop, '_force_compact_if_no_output_room',
+                         side_effect=lambda messages: messages),
+            patch.object(q.ConversationStore, 'maybe_auto_compact_chat'),
+            patch.object(q.CommandContext, 'stamp_tokens'),
+        ]
+
+    def _cut_query(self, text):
+        """A `query_stream` stub that reports a cut stream and returns `text`."""
+        def fake_query(messages, model, **kwargs):
+            kwargs['stream_info_out'].update({
+                "parsed_lines": 6, "bad_lines": 0, "saw_final": False,
+                "finish_reason": "", "complete": False})
+            return text
+        return fake_query
+
+    def test_chat_does_not_persist_a_cut_answer(self):
+        loop = self._chat_loop()
+        err = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for patcher in self._plumbing(loop):
+                stack.enter_context(patcher)
+            stack.enter_context(patch.object(loop.query_handler, 'query_stream',
+                                             side_effect=self._cut_query("half an answer")))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            loop.run_process_query("question")
+
+        self.assertEqual([m['role'] for m in loop.messages], ['system', 'user'],
+                         "a cut answer must not be stored as the assistant turn")
+        self.assertIn("incomplete", err.getvalue())
+        self.assertIn("NOT saved", err.getvalue())
+
+    def test_chat_persists_a_complete_stream(self):
+        """Negative control: a finished stream is still stored."""
+        loop = self._chat_loop()
+
+        def complete_query(messages, model, **kwargs):
+            kwargs['stream_info_out'].update({
+                "parsed_lines": 4, "bad_lines": 0, "saw_final": True,
+                "finish_reason": "stop", "complete": True})
+            return "full answer"
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._plumbing(loop):
+                stack.enter_context(patcher)
+            stack.enter_context(patch.object(loop.query_handler, 'query_stream',
+                                             side_effect=complete_query))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            loop.run_process_query("question")
+
+        self.assertEqual(loop.messages[-1]['role'], 'assistant')
+        self.assertEqual(loop.messages[-1]['content'], "full answer")
+
+    def test_finalize_discards_a_cut_re_generation_and_its_tool_call(self):
+        """A cut final stream must not persist its prefix nor run a half tool call."""
+        loop = self._chat_loop()
+        messages = [{'role': 'system', 'content': 'test'}]
+
+        def cut_query(messages_arg, model, **kwargs):
+            kwargs['stream_info_out'].update({
+                "parsed_lines": 3, "bad_lines": 0, "saw_final": False,
+                "finish_reason": "", "complete": False})
+            out = kwargs.get('tool_calls_out')
+            if out is not None:
+                out.append({"id": "c1", "type": "function",
+                            "function": {"name": "run_command",
+                                         "arguments": '{"command": "rm -rf /"'}})
+            return "partial re-generation"
+
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for patcher in self._plumbing(loop):
+                stack.enter_context(patcher)
+            stack.enter_context(patch.object(loop.query_handler, 'query_stream',
+                                             side_effect=cut_query))
+            execute = stack.enter_context(patch.object(loop.tool_registry, 'execute'))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            loop._finalize_agentic_query(
+                messages, final_answer="Step answer", final_content="test content",
+                send_tools_api=False, openai_tools=[], logger=None,
+                iteration=1, response_text="")
+
+        self.assertNotIn("partial re-generation",
+                         [m.get('content') for m in loop.messages],
+                         "the cut re-generation was persisted")
+        self.assertIn("Step answer", out.getvalue(),
+                      "the step's complete answer should be shown instead")
+        self.assertIn("incomplete", err.getvalue())
+        execute.assert_not_called()
+
+
 # ============================================================================
 # Run
 # ============================================================================
