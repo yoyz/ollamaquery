@@ -5,6 +5,10 @@ __pycache__/
 # Local-only agent brief: intentionally not tracked (it drifts with the code)
 AGENTS.md
 
+# Local-only backlogs: same rationale (functional/security + refactor handoff)
+TODO.md
+TODO_refactor.md
+
 # Local MCP config examples: tests generate their own in temp dirs
 mcp.json.example
 

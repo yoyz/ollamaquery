@@ -67,7 +67,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 
 # ============================================================================
@@ -831,12 +831,64 @@ def _thinking_close_tag() -> str:
 # ============= RETRY UTILITY ================================================
 # ============================================================================
 
+_DEFINITIVE_DNS_ERRNOS = frozenset(
+    n for n in (getattr(socket, "EAI_NONAME", None), getattr(socket, "EAI_NODATA", None))
+    if n is not None
+)
+
+
+def _is_definitive_network_failure(exc: BaseException) -> bool:
+    """True when `exc` is a failure a retry cannot fix.
+
+    Two cases, both answered in milliseconds and both permanent for the URL
+    that was asked for:
+
+      * `ConnectionRefusedError` (ECONNREFUSED) — the TCP handshake came back
+        with RST, so nothing is listening on that port;
+      * `socket.gaierror` with `EAI_NONAME`/`EAI_NODATA` — the name does not
+        resolve, so it will not start resolving a second later.
+
+    Retrying those costs one `delay` per attempt and delays every error path.
+    With a dead default endpoint (`127.0.0.1:11434`) that was ~2 s per failed
+    token-count call — the offline test suite spent ~80 % of its wall time
+    there. Timeouts, resets, `EAI_AGAIN` and 5xx stay retryable: those are
+    transient by nature.
+
+    The exception is looked at through `URLError.reason` (how urllib wraps it)
+    and through explicit causes/chains.
+
+    Args:
+        exc: The exception raised by `urlopen`.
+
+    Returns:
+        True when the failure is definitive.
+    """
+    seen = set()
+    stack = [exc]
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ConnectionRefusedError):
+            return True
+        if (isinstance(current, socket.gaierror)
+                and getattr(current, "errno", None) in _DEFINITIVE_DNS_ERRNOS):
+            return True
+        for attr in ("reason", "__cause__", "__context__"):
+            inner = getattr(current, attr, None)
+            if isinstance(inner, BaseException):
+                stack.append(inner)
+    return False
+
+
 def _request_with_retry(req: Request, max_retries: int = 3, delay: float = 1,
                         timeout: float = 120, **kwargs: dict) -> object:
     """Open URL with retry on transient network errors.
 
     Retries on URLError, HTTPError (5xx only), ConnectionError, TimeoutError,
-    and OSError. Does NOT retry HTTP 4xx client errors.
+    and OSError. Does NOT retry HTTP 4xx client errors, a connection refusal or
+    an unresolvable host (`_is_definitive_network_failure`).
 
     Args:
         req: URL string or Request object to pass to urlopen
@@ -859,6 +911,8 @@ def _request_with_retry(req: Request, max_retries: int = 3, delay: float = 1,
         except (URLError, HTTPError, ConnectionResetError, ConnectionError, TimeoutError, OSError) as e:
             if isinstance(e, HTTPError) and e.code < 500:
                 raise  # Don't retry 4xx client errors
+            if _is_definitive_network_failure(e):
+                raise  # Nothing listens on that port / the name does not resolve
             if attempt < max_retries:
                 sys.stderr.write(
                     colorize(f"\n[RETRY] Request failed ({e}), "
@@ -3927,18 +3981,226 @@ def _shell_scan_word(s: str, i: int) -> tuple:
 
 _SHELL_REDIR_OPS = ("&>>", "<<-", "<<<", ">>", ">&", "<&", "<>", ">|", "<<", "&>", ">", "<")
 
+# Redirect operators whose target is a file the command writes. `<`, `<<`,
+# `<<<`, `>&` and `<&` are excluded: their target is a read path, a heredoc
+# delimiter, a here-string or an fd number, never a file being created — and
+# `_shell_arity_tokens` drops each of them from the operand list anyway.
+_SHELL_WRITE_REDIR_OPS = frozenset({">", ">>", ">|", "&>", "&>>", "<>"})
+
+# Redirect targets that mean "discard" or "the terminal" rather than a file
+# outside the project, so the very common `cmd 2>/dev/null` and
+# `cmd > /dev/tty` stay prompt-free.
+_SHELL_DISCARD_TARGETS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr",
+                                    "/dev/tty", "/dev/console"})
+
+
+def _shell_heredoc_delimiter(word: str) -> Optional[tuple]:
+    """Return the delimiter bash compares heredoc body lines against.
+
+    Applies quote removal only (single quotes, double quotes, backslashes).
+    A word carrying an expansion (`$VAR`, `$'...'`, backticks) returns None:
+    bash does not expand the delimiter, and a delimiter this parser cannot
+    reproduce must not be treated as a heredoc at all (see `_shell_tokenize`).
+
+    Args:
+        word: The raw word token following a `<<` / `<<-` operator.
+
+    Returns:
+        `(delimiter, quoted)`, where `quoted` is True when the word used any
+        quoting (so bash performs no expansion in the body), or None when the
+        delimiter cannot be resolved.
+    """
+    out = []
+    quoted = False
+    i = 0
+    n = len(word)
+    while i < n:
+        c = word[i]
+        if c == "\\":
+            if i + 1 >= n:
+                return None
+            out.append(word[i + 1])
+            quoted = True
+            i += 2
+            continue
+        if c == "'":
+            j = word.find("'", i + 1)
+            if j == -1:
+                return None
+            out.append(word[i + 1:j])
+            quoted = True
+            i = j + 1
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if word[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if word[j] == '"':
+                    break
+                j += 1
+            if j >= n:
+                return None
+            inner = word[i + 1:j]
+            if "$" in inner or "`" in inner:
+                return None
+            out.append(inner)
+            quoted = True
+            i = j + 1
+            continue
+        if c in "$`":
+            return None
+        out.append(c)
+        i += 1
+    return "".join(out), quoted
+
+
+def _shell_heredoc_line_matches(line: str, delimiter: str, strip_tabs: bool) -> bool:
+    """Return True when `line` terminates the heredoc for `delimiter`.
+
+    Args:
+        line: One body line, without its trailing newline.
+        delimiter: The dequoted delimiter from `_shell_heredoc_delimiter`.
+        strip_tabs: True for `<<-`, which strips leading tabs from body lines.
+
+    Returns:
+        True when the line is the delimiter (a CR from CRLF input is ignored).
+    """
+    if line.endswith("\r"):
+        line = line[:-1]
+    if strip_tabs:
+        line = line.lstrip("\t")
+    return line == delimiter
+
+
+def _shell_read_heredocs(s: str, start: int, heredocs: list) -> tuple:
+    """Consume the bodies of the pending heredocs, starting at `start`.
+
+    Args:
+        s: The full command string.
+        start: Index of the first body character (just after the line break).
+        heredocs: `[(delimiter, strip_tabs, quoted)]`, in bash's read order.
+
+    Returns:
+        `(bodies, end, terminated)`: one `(text, start, end)` per pending
+        heredoc, the index just past the last terminator (or len(s) when one is
+        missing), and whether every body was terminated.
+    """
+    bodies = []
+    pos = start
+    n = len(s)
+    for delimiter, strip_tabs, _quoted in heredocs:
+        body_start = pos
+        lines = []
+        ended = False
+        while pos <= n:
+            line_end = s.find("\n", pos)
+            line = s[pos:] if line_end == -1 else s[pos:line_end]
+            if _shell_heredoc_line_matches(line, delimiter, strip_tabs):
+                ended = True
+                pos = n if line_end == -1 else line_end + 1
+                break
+            lines.append(line)
+            if line_end == -1:
+                pos = n
+                break
+            pos = line_end + 1
+        bodies.append(("\n".join(lines), body_start, pos))
+        if not ended:
+            return bodies, n, False
+    return bodies, pos, True
+
+
+def _shell_heredoc_substitutions(body: str) -> list:
+    """Return the command substitutions bash executes inside a heredoc body.
+
+    Only an unquoted delimiter expands a body, so callers pass bodies of quoted
+    heredocs through untouched. Extract-and-nest (rather than "the body is
+    data") keeps `cat <<EOF\\n$(rm -rf ~)\\nEOF` visible to the gate.
+
+    Args:
+        body: The raw heredoc body text.
+
+    Returns:
+        The inner text of every `$(...)` and backtick substitution.
+    """
+    nested = []
+    i = 0
+    n = len(body)
+    while i < n:
+        c = body[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "`":
+            k = body.find("`", i + 1)
+            if k == -1:
+                break
+            nested.append(body[i + 1:k])
+            i = k + 1
+            continue
+        if body[i:i + 2] == "$(":
+            k = _shell_find_closing(body, i + 2, "(", ")")
+            nested.append(body[i + 2:k])
+            i = k + 1
+            continue
+        i += 1
+    return nested
+
+
 def _shell_tokenize(s: str) -> list:
-    """Tokenize a shell command string into _ShellToken objects."""
+    """Tokenize a shell command string into _ShellToken objects.
+
+    A newline is a command separator, mirroring `shell=True` — not whitespace.
+    Treating it as whitespace merged `echo hi\\nrm -rf ~` into a single `echo`
+    node, so the second command inherited the first one's `allow` rule and the
+    home guard only ever saw `head == "echo"`.
+
+    Heredoc bodies are the one exception: bash feeds every line up to the
+    delimiter to the redirection, so those newlines stay data. A body is
+    emitted as one opaque word (it is file content, not arguments) whose nested
+    `$(...)` are still scanned, because bash does execute those. An
+    unresolvable delimiter is not treated as a heredoc, so its body is gated as
+    if it were commands: that can over-prompt, but it can never hide one.
+    """
     tokens = []
     i = 0
     n = len(s)
+    heredocs: list = []              # [(delimiter, strip_tabs, quoted)] awaiting a body
+    pending_delim: Optional[bool] = None  # strip_tabs flag of the last `<<`
     while i < n:
         c = s[i]
-        if c in " \t\r\n":
+        if c == "\r" and s[i + 1:i + 2] != "\n":
+            i += 1
+            continue
+        if c in "\r\n":
+            newline_len = 2 if c == "\r" else 1
+            if heredocs:
+                bodies, end_i, terminated = _shell_read_heredocs(s, i + newline_len, heredocs)
+                for body, body_start, body_end in bodies:
+                    quoted = heredocs.pop(0)[2] if heredocs else False
+                    if not body:
+                        continue
+                    nested = [] if quoted else _shell_heredoc_substitutions(body)
+                    tokens.append(_ShellToken(_SHELL_WORD, body, body_start, body_end, nested))
+                heredocs.clear()
+                if terminated:
+                    tokens.append(_ShellToken(_SHELL_CTRL, s[i:i + newline_len],
+                                              i, i + newline_len))
+                i = end_i
+                continue
+            pending_delim = None
+            tokens.append(_ShellToken(_SHELL_CTRL, s[i:i + newline_len],
+                                      i, i + newline_len))
+            i += newline_len
+            continue
+        if c in " \t":
             i += 1
             continue
         two = s[i:i + 2]
         if two == "||" or two == "&&" or two == "|&" or two == ";;":
+            pending_delim = None
             tokens.append(_ShellToken(_SHELL_CTRL, two, i, i + 2))
             i += 2
             continue
@@ -3958,14 +4220,18 @@ def _shell_tokenize(s: str) -> list:
             if op is None:
                 op = "&"
             kind = _SHELL_CTRL if op == "&&" or op == "&" else _SHELL_REDIR
+            if kind == _SHELL_CTRL:
+                pending_delim = None
             tokens.append(_ShellToken(kind, op, i, i + len(op)))
             i += len(op)
             continue
         if c == "|":
+            pending_delim = None
             tokens.append(_ShellToken(_SHELL_CTRL, "|", i, i + 1))
             i += 1
             continue
         if c == ";":
+            pending_delim = None
             tokens.append(_ShellToken(_SHELL_CTRL, ";", i, i + 1))
             i += 1
             continue
@@ -3976,28 +4242,62 @@ def _shell_tokenize(s: str) -> list:
                     op = cand
                     break
             tokens.append(_ShellToken(_SHELL_REDIR, op, i, i + len(op)))
+            pending_delim = (op == "<<-") if op in ("<<", "<<-") else None
             i += len(op)
             continue
         text, j, nested = _shell_scan_word(s, i)
         tokens.append(_ShellToken(_SHELL_WORD, text, i, j, nested))
+        if pending_delim is not None:
+            # The word after `<<` / `<<-` names the heredoc terminator. Several
+            # heredoc operators may share one command line (`cat <<A <<B`); bash
+            # reads the bodies in that order at the newline.
+            delimiter = _shell_heredoc_delimiter(text)
+            if delimiter is not None:
+                heredocs.append((delimiter[0], pending_delim, delimiter[1]))
+            pending_delim = None
         i = j
     return tokens
 
 class _ShellNode:
     """A parsed shell command node with source, glob pattern, and arity tokens."""
 
-    __slots__ = ("source", "pattern", "tokens")
-    def __init__(self, source: str, pattern: str, tokens: list) -> None:
+    __slots__ = ("source", "pattern", "tokens", "redirect_targets")
+    def __init__(self, source: str, pattern: str, tokens: list,
+                 redirect_targets: Optional[list] = None) -> None:
         """Initialize a shell node.
 
         Args:
             source: Original command source text.
             pattern: Glob pattern used for rule matching.
             tokens: Arity-reduced token list.
+            redirect_targets: File targets of this node's write redirections
+                (`>`, `>>`, `>|`, `&>`, `&>>`, `<>`). They are deliberately kept
+                out of `tokens` (they are not command arguments) but still
+                checked as operands, otherwise `echo x >> /etc/hosts` is an
+                `allow` node whose destination nobody inspects.
         """
         self.source = source
         self.pattern = pattern
         self.tokens = tokens
+        self.redirect_targets = redirect_targets or []
+
+
+def _shell_redirect_targets(tokens: list) -> list:
+    """Return the file targets of a segment's write redirections.
+
+    Args:
+        tokens: The segment's raw _ShellToken list (before arity reduction).
+
+    Returns:
+        List of raw target words (may be empty, may repeat).
+    """
+    out = []
+    for i, t in enumerate(tokens):
+        if t.kind != _SHELL_REDIR or t.text not in _SHELL_WRITE_REDIR_OPS:
+            continue
+        if i + 1 < len(tokens) and tokens[i + 1].kind == _SHELL_WORD:
+            out.append(tokens[i + 1].text)
+    return out
 
 def _shell_arity_tokens(tokens: list) -> list:
     """Drop redirection operators and their targets from a token list.
@@ -4058,7 +4358,7 @@ def _shell_breakdown(command: str) -> list:
             continue
         source = command[seg[0].start:seg[-1].end].strip()
         tokens_ = _shell_arity_tokens(seg)
-        nodes.append(_ShellNode(source, source, tokens_))
+        nodes.append(_ShellNode(source, source, tokens_, _shell_redirect_targets(seg)))
         for t in seg:
             if t.kind == _SHELL_WORD:
                 for inner in t.nested:
@@ -4158,7 +4458,7 @@ def shell_check_command(command: str, config: object, approved: Optional[list] =
             break
         if rule["action"] == "ask":
             effect = "ask"
-    return {"command": command, "nodes": [{"source": n.source, "pattern": n.pattern, "tokens": n.tokens} for n in nodes], "patterns": patterns, "always": always, "effect": effect, "details": details}
+    return {"command": command, "nodes": [{"source": n.source, "pattern": n.pattern, "tokens": n.tokens, "redirect_targets": n.redirect_targets} for n in nodes], "patterns": patterns, "always": always, "effect": effect, "details": details}
 
 # --- CWD leniency helpers ---
 def _shell_path_inside_cwd(path_str: str, cwd: Optional[str] = None) -> bool:
@@ -4228,9 +4528,30 @@ def _shell_token_inside_roots(token: str, roots: list) -> bool:
     return False
 
 
+def _shell_redirect_target_is_discardable(tok: str) -> bool:
+    """True for redirect targets that do not name a project-external file.
+
+    `2>/dev/null` is the most common redirection there is; prompting for it (or
+    failing the CWD-leniency check because of it) would only train the model to
+    drop the redirection. fd duplication (`2>&1`) never reaches here: `>&` and
+    `<&` are not write redirections, so their target is not collected.
+
+    Args:
+        tok: A redirection target word.
+
+    Returns:
+        True when the target is a discard/terminal device.
+    """
+    return tok.strip().strip("'\"").lstrip("<>") in _SHELL_DISCARD_TARGETS
+
+
 def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
                                    extra_roots: Optional[list] = None) -> bool:
     """Return True when every non-flag operand of the parsed nodes is inside CWD.
+
+    Write-redirection targets count as operands: they are the destination the
+    command will modify, so `python3 gen.py > /etc/config` must not borrow the
+    leniency earned by `gen.py` being in the project.
 
     Args:
         nodes: List of _ShellNode (or dict nodes) from _shell_breakdown.
@@ -4250,6 +4571,16 @@ def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
         for tok in toks[1:]:
             # Skip flags
             if tok.startswith("-"):
+                continue
+            if _shell_path_inside_cwd(tok, cwd):
+                continue
+            if extra_roots and _shell_token_inside_roots(tok, extra_roots):
+                continue
+            return False
+        targets = (n.get("redirect_targets") if isinstance(n, dict)
+                   else getattr(n, "redirect_targets", None))
+        for tok in targets or []:
+            if _shell_redirect_target_is_discardable(tok):
                 continue
             if _shell_path_inside_cwd(tok, cwd):
                 continue
@@ -4412,6 +4743,10 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
     them — otherwise `python3 -c "open('/etc/passwd')"` silently bypassed a
     rule that `cat /etc/passwd` respects. Non-code arguments that merely
     mention a path (`git commit -m "fix /etc handling"`) are not scanned.
+    Write-redirection targets are scanned too: `echo x >> /etc/hosts` and
+    `echo hacked > ~/.bashrc` were `allow` nodes whose destination no rule ever
+    looked at (the target is not a command argument, so arity reduction dropped
+    it). `/dev/null` and the other discard devices stay silent.
 
     Args:
         command: The raw command string.
@@ -4429,7 +4764,12 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
         toks = node.tokens
         if not toks:
             continue
-        for tok in toks[1:]:
+        # Redirection targets are destinations, not arguments, but they are the
+        # file the command writes: `echo x >> /etc/hosts` and
+        # `echo hacked > ~/.bashrc` must reach the same rules as `touch` would.
+        scanned = list(toks[1:]) + [t for t in node.redirect_targets
+                                    if not _shell_redirect_target_is_discardable(t)]
+        for tok in scanned:
             for rp in _shell_token_path_candidates(tok, toks[0]):
                 if _is_blocked_system_file(rp):
                     acl.log_event("run_command", rp, "deny", None)

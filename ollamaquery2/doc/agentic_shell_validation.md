@@ -129,7 +129,18 @@ Key faithful details:
 *   `CWD exemption:2008` — `cd` etc. emit no pattern.
 *   `_shell_arity_tokens:2135` drops redirections and their targets + `2>` fd
     prefix, so `echo hi > out` keeps pattern `echo hi > out` but tokens
-    `["echo","hi"]`.
+    `["echo","hi"]`. Since 2026-11-13 the dropped **write** targets are carried
+    on the node (`redirect_targets`) and gated as operands: `echo x >> /etc/hosts`
+    and `echo hacked > ~/.bashrc` used to be `allow` because no downstream check
+    saw the destination (C2). `/dev/null` and the terminal devices are exempt,
+    and the CWD leniency checks the target too.
+*   Newlines split commands: `_shell_tokenize` emits a `_SHELL_CTRL` for `\n`
+    (`\r\n` as one separator), because `shell=True` treats them as separators
+    while the old parser skipped them as whitespace — that let
+    `echo hi\nrm -rf ~` inherit the `echo *` allow rule (C1). Heredoc bodies are
+    the exception: they are consumed up to the delimiter and emitted as one
+    opaque word, with only their `$(...)`/backticks scanned (bash executes
+    those), so a `<<'EOF'` script keeps its single-node shape.
 *   Group nodes `( … )`, `$(…)`, `<(…)` contribute no own pattern, only nested
     nodes (`opencode_implementation_detail_shell_permission_parser.md:401`).
 
@@ -357,7 +368,10 @@ Hermes v2 models.
     `~/.ollamaquery.d/shell_permissions.json` (like `backends.json:6450` MRU).
 *   Optional config file `permission.bash` overlay for user rules.
 *   Extend hard guard to additional destructive patterns if needed (opt-in).
-*   Restore heredoc body scanning if agents start using `<<EOF` heavily.
+*   Heredoc body scanning: **done** 2026-11-13, in the other direction — the body
+    is treated as data (one opaque word, bash does not execute it) and only its
+    `$(...)`/backticks are scanned. Anything more aggressive over-prompts on
+    heredoc-written C/shell content.
 
 ---
 

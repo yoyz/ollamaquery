@@ -496,6 +496,161 @@ class TestShellCodeBlobScan(unittest.TestCase):
         self.assertIsNone(self._scan("curl -o out.html https://example.com/a/b"))
 
 
+class TestShellNewlineSeparator(unittest.TestCase):
+    """A newline splits commands exactly like `;` (C1).
+
+    `_shell_tokenize` treated `\\n` as ordinary whitespace while `shell=True`
+    treats it as a command separator, so `echo hi\\nrm -rf ~` was one node whose
+    head was `echo`: the `echo *` allow rule matched the whole line and the
+    home guard never saw the `rm`.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _patterns(self, command):
+        verdict = m.shell_check_command(command, m.DEFAULT_SHELL_PERMISSION)
+        return [node["pattern"] for node in verdict["nodes"]]
+
+    def test_second_line_is_a_node_of_its_own(self):
+        self.assertEqual(self._patterns("echo hi\nrm -rf /tmp/x"),
+                         ["echo hi", "rm -rf /tmp/x"])
+
+    def test_destructive_second_line_hits_the_home_guard(self):
+        res = m.check_shell_approval("echo hi\nrm -rf ~", ctx=self.ctx)
+        self.assertFalse(res["approved"])
+        self.assertIn("BLOCKED (rejected)", res["message"])
+
+    def test_destructive_second_line_hits_the_home_guard_behind_an_allow_head(self):
+        # The exact reproduced case: `echo *` is allow, so nothing but the
+        # newline split can put `rm` in front of the home guard.
+        res = m.check_shell_approval("echo hi\nrm -rf $HOME", ctx=self.ctx)
+        self.assertFalse(res["approved"])
+
+    def test_crlf_is_a_single_separator(self):
+        self.assertEqual(self._patterns("echo hi\r\nrm -rf /tmp/x"),
+                         ["echo hi", "rm -rf /tmp/x"])
+
+    def test_multiple_lines_are_all_gated(self):
+        self.assertEqual(self._patterns("ls\npwd\necho done"),
+                         ["ls", "pwd", "echo done"])
+
+    def test_backslash_continuation_is_not_a_separator(self):
+        # `\` + newline is line continuation for bash; it must not split.
+        patterns = self._patterns("echo hi \\\nrm -rf /tmp/x")
+        self.assertEqual(len(patterns), 1)
+        self.assertIn("rm -rf /tmp/x", patterns[0])
+
+    def test_heredoc_body_is_not_parsed_as_commands(self):
+        cmd = ("cat > out.c <<'EOF'\n#include <stdio.h>\n"
+               "int main(void){return 0;}\nEOF")
+        self.assertEqual(len(self._patterns(cmd)), 1)
+
+    def test_heredoc_body_cannot_swallow_the_next_command(self):
+        # A `<<` inside the body must not queue a bogus heredoc that eats the
+        # rest of the line: that was a real bypass during development.
+        cmd = "cat > out.txt <<EOF\ncout << x\nEOF\nrm -rf ~"
+        self.assertEqual(len(self._patterns(cmd)), 2)
+        res = m.check_shell_approval(cmd, ctx=self.ctx)
+        self.assertFalse(res["approved"])
+
+    def test_unquoted_heredoc_substitution_is_still_gated(self):
+        # bash expands (and therefore executes) `$(...)` in an unquoted body.
+        res = m.check_shell_approval("cat > out.txt <<EOF\n$(rm -rf ~)\nEOF",
+                                     ctx=self.ctx)
+        self.assertFalse(res["approved"])
+
+    def test_quoted_heredoc_body_is_data(self):
+        res = m.check_shell_approval("cat > out.txt <<'EOF'\n$(rm -rf ~)\nEOF",
+                                     ctx=self.ctx)
+        self.assertTrue(res["approved"], res.get("message"))
+
+    def test_unresolvable_delimiter_fails_closed(self):
+        # `$'EOF'` cannot be reproduced by this parser, so the heredoc is
+        # ignored and the body is gated as commands (over-prompting beats
+        # hiding the trailing `rm`).
+        res = m.check_shell_approval("cat <<$'EOF'\nbody\nrm -rf ~", ctx=self.ctx)
+        self.assertFalse(res["approved"])
+
+    def test_two_heredocs_on_one_line(self):
+        cmd = "cat <<-A <<B\n\tbody a\nA\nbody b\nB\nrm -rf ~"
+        self.assertEqual(len(self._patterns(cmd)), 2)
+        self.assertFalse(m.check_shell_approval(cmd, ctx=self.ctx)["approved"])
+
+
+class TestShellRedirectTargets(unittest.TestCase):
+    """Write-redirection targets are operands (C2).
+
+    `_shell_arity_tokens` drops the operator *and its target*, so no downstream
+    check ever saw them: `echo hacked > ~/.bashrc` and `echo x >> /etc/hosts`
+    were `allow` (the whole line matched `echo *`) while `touch ~/.bashrc` was
+    `ask`.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx)
+
+    def test_target_is_not_an_argument(self):
+        node = m._shell_breakdown("echo hi > out.txt")[0]
+        self.assertEqual(node.tokens, ["echo", "hi"])
+        self.assertEqual(node.redirect_targets, ["out.txt"])
+
+    def test_redirect_to_dotfile_asks(self):
+        res = self._scan("echo hacked > ~/.bashrc")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+        self.assertIn(".bashrc", res["reason"])
+        self.assertIn("ask", res["reason"])
+
+    def test_redirect_to_etc_is_not_allowed(self):
+        res = self._scan("echo x >> /etc/hosts")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+        self.assertIn("/etc/hosts", res["reason"])
+
+    def test_redirect_inside_cwd_stays_allowed(self):
+        self.assertIsNone(self._scan("echo x > out.txt"))
+
+    def test_leniency_does_not_cover_an_outside_target(self):
+        # The argument is in the project, the destination is not: the old
+        # CWD-leniency check only looked at arguments and auto-allowed this.
+        self.assertFalse(m._shell_all_operands_inside_cwd(
+            m._shell_breakdown("python3 gen.py > /etc/config")))
+
+    def test_leniency_still_covers_inside_and_discard_targets(self):
+        self.assertTrue(m._shell_all_operands_inside_cwd(
+            m._shell_breakdown("rm -rf build > out.txt")))
+        self.assertTrue(m._shell_all_operands_inside_cwd(
+            m._shell_breakdown("rm -rf build 2>/dev/null")))
+
+    def test_dev_null_and_terminal_devices_are_ignored(self):
+        for cmd in ("make -j4 2>/dev/null", "make -j4 >/dev/null 2>&1",
+                    "echo hi > /dev/tty", "echo hi >&2"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self._scan(cmd))
+
+    def test_gate_prompts_for_a_redirect_to_a_dotfile(self):
+        with patch("sys.stdin.isatty", return_value=True), \
+                patch("builtins.input", return_value="n") as asked:
+            res = m.check_shell_approval("echo hacked > ~/.bashrc", ctx=self.ctx)
+        self.assertFalse(res["approved"])
+        self.assertTrue(asked.called)
+
+    def test_gate_denies_redirect_to_etc_without_a_tty(self):
+        with patch("sys.stdin.isatty", return_value=False):
+            res = m.check_shell_approval("echo x >> /etc/hosts", ctx=self.ctx)
+        self.assertFalse(res["approved"])
+        self.assertIn("path ACL", res["message"])
+
+    def test_read_redirect_target_is_not_a_write_target(self):
+        node = m._shell_breakdown("wc -l < input.txt")[0]
+        self.assertEqual(node.redirect_targets, [])
+
+
+
 class TestAclDenialPointsAtTool(unittest.TestCase):
     """A denial is one line: the reason + a pointer to the `path_policy` tool.
 

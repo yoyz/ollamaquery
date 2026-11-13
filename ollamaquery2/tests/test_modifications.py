@@ -232,6 +232,66 @@ class TestRetryUtility(unittest.TestCase):
             self.assertEqual(json.loads(resp.read()), {"ok": True})
             self.assertEqual(mock.call_count, 2)
 
+    def test_no_retry_on_connection_refused(self):
+        """ECONNREFUSED is definitive: one attempt, no delay.
+
+        The offline suite used to spend ~80 % of its wall time sleeping between
+        doomed retries of a dead `127.0.0.1:11434` (178 refused handshakes ≈
+        118 s of `time.sleep`): a refusal comes back in milliseconds, so a retry
+        can only delay the error.
+        """
+        with patch.object(m, 'urlopen') as mock:
+            mock.side_effect = URLError(
+                ConnectionRefusedError(111, 'Connection refused'))
+            started = time.monotonic()
+            with self.assertRaises(URLError):
+                m._request_with_retry(Request('http://localhost/x'),
+                                      max_retries=3, delay=0.5)
+            self.assertEqual(mock.call_count, 1)
+            self.assertLess(time.monotonic() - started, 0.4)
+
+    def test_no_retry_on_unresolvable_host(self):
+        """EAI_NONAME is definitive too: the name will not resolve next second."""
+        with patch.object(m, 'urlopen') as mock:
+            mock.side_effect = URLError(socket.gaierror(-2, 'Name or service not known'))
+            started = time.monotonic()
+            with self.assertRaises(URLError):
+                m._request_with_retry(Request('http://x/api/tokenize'),
+                                      max_retries=3, delay=0.5)
+            self.assertEqual(mock.call_count, 1)
+            self.assertLess(time.monotonic() - started, 0.4)
+
+    def test_retry_still_happens_on_transient_dns(self):
+        """EAI_AGAIN is a temporary resolver failure, so it keeps its retry."""
+        with patch.object(m, 'urlopen') as mock:
+            mock.side_effect = [URLError(socket.gaierror(-3, 'Try again')),
+                                io.BytesIO(b'{}')]
+            resp = m._request_with_retry(Request('http://x/api/tags'),
+                                         max_retries=2, delay=0.01)
+            self.assertEqual(resp.read(), b'{}')
+            self.assertEqual(mock.call_count, 2)
+
+    def test_retry_still_happens_on_a_timeout(self):
+        """A timeout is transient, so it keeps its retry."""
+        with patch.object(m, 'urlopen') as mock:
+            mock.side_effect = [URLError(TimeoutError('timed out')),
+                                io.BytesIO(b'{"ok": true}')]
+            resp = m._request_with_retry(Request('http://localhost/x'),
+                                         max_retries=2, delay=0.01)
+            self.assertEqual(json.loads(resp.read()), {"ok": True})
+            self.assertEqual(mock.call_count, 2)
+
+    def test_definitive_helper_looks_through_the_wrapper(self):
+        """The failure is recognised through URLError and through causes."""
+        direct = ConnectionRefusedError(111, 'Connection refused')
+        self.assertTrue(m._is_definitive_network_failure(direct))
+        self.assertTrue(m._is_definitive_network_failure(URLError(direct)))
+        wrapped = RuntimeError('outer')
+        wrapped.__cause__ = direct
+        self.assertTrue(m._is_definitive_network_failure(wrapped))
+        self.assertFalse(m._is_definitive_network_failure(URLError('conn refused')))
+        self.assertFalse(m._is_definitive_network_failure(URLError(TimeoutError('t'))))
+
     def test_exhausted_retries_raises(self):
         """After exhausting retries, the exception is raised."""
         with patch.object(m, 'urlopen') as mock:
