@@ -50,4 +50,5 @@ jobs:
             tests.test_compact_command \
             tests.test_agentic_timeout \
             tests.test_tool_summarize \
-            tests.test_state_files
+            tests.test_state_files \
+            tests.test_maas
