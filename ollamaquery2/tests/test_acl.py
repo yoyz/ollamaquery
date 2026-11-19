@@ -1250,5 +1250,102 @@ class TestAclFileTools(unittest.TestCase):
         self.assertIn("denied", result.get("error", ""))
 
 
+class TestShellDashCDecomposition(unittest.TestCase):
+    """The home guard reaches inside `-c` payloads (M2).
+
+    Pre-fix, `bash -c "rm -rf ~"` was a plain `ask` that `auto_confirm`
+    approved while a direct `rm -rf ~` is a hard deny: the guard only read the
+    first-level tokens, and the quoted payload was one opaque word.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _res(self, command, ctx=None):
+        return m.check_shell_approval(command, ctx=ctx or self.ctx)
+
+    def _assert_nested_deny(self, command):
+        res = self._res(command)
+        self.assertFalse(res["approved"], command)
+        self.assertEqual(res["effect"], "deny", command)
+        self.assertIn("BLOCKED (rejected)", res.get("message", ""), command)
+        self.assertIn("nested `-c`", res.get("message", ""), command)
+
+    def test_direct_rm_still_denied(self):
+        res = self._res("rm -rf ~")
+        self.assertEqual(res["effect"], "deny")
+        self.assertNotIn("nested", res.get("message", ""))
+
+    def test_bash_double_quoted(self):
+        self._assert_nested_deny('bash -c "rm -rf ~"')
+
+    def test_sh_single_quoted(self):
+        self._assert_nested_deny("sh -c 'rm -rf ~'")
+
+    def test_bundled_flags(self):
+        self._assert_nested_deny("bash -lc 'rm -rf ~'")
+
+    def test_home_variable_spelling(self):
+        self._assert_nested_deny("bash -xc 'rm -rf $HOME'")
+
+    def test_root_target(self):
+        self._assert_nested_deny('dash -c "rm -rf /"')
+
+    def test_wrapper_sudo_with_option_value(self):
+        self._assert_nested_deny("sudo -u root bash -c 'rm -rf ~'")
+
+    def test_wrapper_env_assignment(self):
+        self._assert_nested_deny("env FOO=1 bash -c 'rm -rf ~'")
+
+    def test_wrapper_busybox(self):
+        self._assert_nested_deny("busybox sh -c 'rm -rf ~'")
+
+    def test_python_os_system(self):
+        self._assert_nested_deny("python3 -c \"import os; os.system('rm -rf ~')\"")
+
+    def test_python_subprocess_shell(self):
+        self._assert_nested_deny(
+            "python3 -c \"subprocess.run('rm -rf ~', shell=True)\"")
+
+    def test_python_list_form_is_not_a_shell(self):
+        # No shell, no `~` expansion: this deletes a file literally named "~".
+        res = self._res("python3 -c \"subprocess.run(['rm', '-rf', '~'])\"")
+        self.assertNotEqual(res["effect"], "deny")
+
+    def test_resolved_home_path(self):
+        """The payload is normalized like the top-level one (`/home/<user>` → `~`)."""
+        home = os.path.expanduser("~")
+        self._assert_nested_deny(f"bash -c 'rm -rf {home}'")
+
+    def test_harmless_payloads_are_not_blocked(self):
+        for command in ("bash -c 'echo hi'",
+                        "python3 -c \"print('hello')\"",
+                        "bash -c 'rm -rf /tmp/x'",
+                        "bash -c 'rm -rf /home/somebody'",
+                        "echo 'bash -c \"rm -rf ~\"'"):
+            res = self._res(command)
+            self.assertNotIn("nested `-c`", res.get("message") or "", command)
+
+    def test_nested_three_levels(self):
+        self._assert_nested_deny("bash -c \"bash -c \\\"bash -c 'rm -rf ~'\\\"\"")
+
+    def test_nested_four_levels_uses_the_text_fallback(self):
+        command = ("bash -c \"bash -c \\\"bash -c \\\\\\\"bash -c "
+                   "'rm -rf ~'\\\\\\\"\\\"\"")
+        self._assert_nested_deny(command)
+
+    def test_auto_confirm_cannot_approve_it(self):
+        ctx = FakeCtx()
+        ctx.auto_confirm = True
+        res = self._res('bash -c "rm -rf ~"', ctx=ctx)
+        self.assertEqual(res["effect"], "deny")
+        self.assertIn("nested `-c`", res.get("message", ""))
+
+    def test_recursion_is_bounded(self):
+        command = "bash -c " * 12 + "'rm -rf ~'"
+        res = self._res(command)
+        self.assertEqual(res["effect"], "deny")
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

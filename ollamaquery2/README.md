@@ -1,6 +1,6 @@
 # ollamaquery2
 
-A feature-rich CLI for LLMs via local Ollama, Llama.cpp, LM Studio and Strata servers, plus cloud OpenAI-compatible APIs (Gemini, OpenCode Zen/Go, Mistral, DeepSeek). Single Python file, no pip install needed.
+A feature-rich CLI for LLMs via local Ollama, Llama.cpp, LM Studio and Strata servers, plus cloud OpenAI-compatible APIs (Gemini, OpenCode Zen/Go, Mistral, DeepSeek) and MaaS gateways in front of vLLM. Single Python file, no pip install needed.
 
 ## Backends
 
@@ -15,6 +15,7 @@ A feature-rich CLI for LLMs via local Ollama, Llama.cpp, LM Studio and Strata se
 | OpenCode Go    | `https://opencode.ai/zen/go`                                | `OPENCODEGO_API_KEY`                    |
 | Mistral        | `https://api.mistral.ai`                                    | `MISTRAL_API_KEY`                       |
 | DeepSeek       | `https://api.deepseek.com`                                  | `DEEPSEEK_API_KEY`                      |
+| MaaS           | (none — the `https` origin is deployment-specific)          | `MAAS_API_KEY` / `MAAS_API_KEY_FILE`    |
 
 Auto-detects available **local** backends. Cloud backends are selected with
 `-b` and read their API key from the environment (`GEMINI_HOST`,
@@ -23,6 +24,12 @@ Auto-detects available **local** backends. Cloud backends are selected with
 Strata shares Llama.cpp's default port (8080) and OpenAI dialect but streams
 reasoning via `delta.reasoning_content` and exposes Anthropic
 `/v1/messages/count_tokens`; it is recognized by its unique `/health` marker.
+
+MaaS is an OpenShift AI / KServe gateway in front of vLLM that routes only
+`/v1/models` and `/v1/chat/completions`: the origin is supplied with `-H` or
+`MAAS_HOST` (a trailing `/v1` is accepted and stripped), model ids are `publishers/<publisher>/models/<name>` (short names
+are resolved against the listing), and the context window is not discoverable —
+set it with `--context-size` or `/contextsizeset`. See `doc/backend_maas.md`.
 
 ## Quick Start
 
@@ -36,7 +43,8 @@ python3 ollamaquery2.py -c
 ```text
 -c                  Interactive chat mode
 -m <model>          Model name
--b <backend>        Backend: ollama, llamacpp, strata, lmstudio, gemini, opencodezen, opencodego, mistral, deepseek
+-b <backend>        Backend: ollama, llamacpp, strata, lmstudio, gemini, opencodezen, opencodego, mistral, deepseek, maas
+--context-size <n>  Context window override (needed for MaaS, which exposes none)
 -H <url>            Backend URL override
 -I "query"          Single-shot query
 -i <file>           Input file for batch
@@ -501,6 +509,10 @@ from composable blocks (role, tool definitions, format, examples, rules).
 | `OPENCODEGO_API_KEY`     | (unset)                  | OpenCode Go cloud backend key      |
 | `MISTRAL_API_KEY`        | (unset)                  | Mistral cloud backend key          |
 | `DEEPSEEK_API_KEY`       | (unset)                  | DeepSeek cloud backend key         |
+| `MAAS_HOST`              | (unset)                  | MaaS `https` origin (or pass `-H`) |
+| `MAAS_API_KEY`           | (unset)                  | MaaS key (prefer a file)           |
+| `MAAS_API_KEY_FILE`      | (unset)                  | Path to a 0600 file holding the key|
+| `MAAS_MODEL_TTL`         | `300`                    | Seconds the model listing is cached|
 | `OLLAMAQUERY_MCP_CONFIG` | (unset)                  | MCP config path (see `doc/mcp.md`) |
 
 ## Similar Projects

@@ -284,19 +284,23 @@ DEFAULT_OPENCODEZEN_HOST = 'https://opencode.ai/zen'
 DEFAULT_OPENCODEGO_HOST  = 'https://opencode.ai/zen/go'
 DEFAULT_MISTRAL_HOST     = 'https://api.mistral.ai'
 DEFAULT_DEEPSEEK_HOST    = 'https://api.deepseek.com'
+# MaaS (OpenShift AI / KServe in front of vLLM): the origin is deployment
+# specific, so there is no default — `-H` or MAAS_HOST must supply it.
+DEFAULT_MAAS_HOST        = ''
 DEFAULT_OLLAMA_PORT    =  11434
 DEFAULT_LLAMACPP_PORT  =  8080
 DEFAULT_LMSTUDIO_PORT  =  1234
 DEFAULT_STRATA_PORT    =  8080
 
 # Cloud backends share the OpenAI-compatible /v1/models shape but need an API key.
-CLOUD_BACKENDS = {"gemini", "opencodezen", "opencodego", "mistral", "deepseek"}
+CLOUD_BACKENDS = {"gemini", "opencodezen", "opencodego", "mistral", "deepseek", "maas"}
 CLOUD_API_KEY_ENV = {
     "gemini": "GEMINI_API_KEY",
     "opencodezen": "OPENCODEZEN_API_KEY",
     "opencodego": "OPENCODEGO_API_KEY",
     "mistral": "MISTRAL_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
+    "maas": "MAAS_API_KEY",
 }
 CLOUD_HOST_ENV = {
     "gemini": "GEMINI_HOST",
@@ -304,6 +308,7 @@ CLOUD_HOST_ENV = {
     "opencodego": "OPENCODEGO_HOST",
     "mistral": "MISTRAL_HOST",
     "deepseek": "DEEPSEEK_HOST",
+    "maas": "MAAS_HOST",
 }
 CLOUD_DEFAULT_HOST = {
     "gemini": DEFAULT_GEMINI_HOST,
@@ -311,6 +316,7 @@ CLOUD_DEFAULT_HOST = {
     "opencodego": DEFAULT_OPENCODEGO_HOST,
     "mistral": DEFAULT_MISTRAL_HOST,
     "deepseek": DEFAULT_DEEPSEEK_HOST,
+    "maas": DEFAULT_MAAS_HOST,
 }
 
 
@@ -962,6 +968,418 @@ def _truncated_marker(limit: int) -> str:
 
 
 # ============================================================================
+# ============= MAAS GATEWAY (OpenShift AI / KServe in front of vLLM) ========
+# ============================================================================
+# The target is a MaaS gateway that routes only `/v1/models` and
+# `/v1/chat/completions`. Measured behaviour (doc/maas-handoff/):
+#   - model ids are `publishers/<publisher>/models/<name>`; a short name is a
+#     SILENT 404, so the client resolves it against the listing, never guesses;
+#   - chat failures arrive as bare 404/500 with no body — only `200` is trusted;
+#   - `/v1/models` is rate-limited and answers 403 / 429 / 500 / `200` with an
+#     EMPTY inventory in bursts, and emits no `Retry-After`, so backoff is local;
+#   - `401` is definitive (key rejected), and reasoning is always on, so
+#     `max_tokens` must never be tiny or `content` comes back null.
+#
+# Everything here is exercisable offline: `transport`, `sleep` and `clock` are
+# injected, and the model cache is a plain dict (module-level by default, so a
+# probe, a listing and a model resolution in one process cost one round-trip).
+
+MAAS_MAX_ATTEMPTS = 6
+MAAS_BACKOFF_BASE = 0.5
+MAAS_BACKOFF_CEILING = 8.0
+MAAS_MODEL_TTL = 300.0
+MAAS_MIN_OUTPUT_TOKENS = 1024
+MAAS_TRANSPORT_ERROR = 0          # no HTTP code: DNS, timeout, reset
+MAAS_FATAL_CODES = frozenset({401})
+MAAS_RETRYABLE_CODES = frozenset({403, 429, 500, 502, 503, 504})
+MAAS_API_KEY_FILE_ENV = "MAAS_API_KEY_FILE"
+MAAS_MODEL_CACHE = {}             # base_url -> (monotonic_ts, [models])
+
+
+class MaaSError(Exception):
+    """A MaaS operation failed; the message is safe to show to the user."""
+
+
+class MaaSAuthError(MaaSError):
+    """The API key was rejected (401) — definitive, never retried."""
+
+
+class MaaSUnavailable(MaaSError):
+    """A retryable failure survived every attempt."""
+
+
+def maas_classify_status(code: int) -> str:
+    """Map an HTTP status (or transport error) to a retry decision.
+
+    Args:
+        code: HTTP status, or MAAS_TRANSPORT_ERROR when no response arrived.
+
+    Returns:
+        One of "ok", "fatal", "retry", "unexpected". `404` is deliberately
+        "unexpected" (an incomplete model id), not "offline".
+    """
+    if code == 200:
+        return "ok"
+    if code in MAAS_FATAL_CODES:
+        return "fatal"
+    if code == MAAS_TRANSPORT_ERROR or code in MAAS_RETRYABLE_CODES:
+        return "retry"
+    return "unexpected"
+
+
+def maas_backoff_seconds(attempt: int, base: float = MAAS_BACKOFF_BASE,
+                         ceiling: float = MAAS_BACKOFF_CEILING,
+                         jitter: Optional[object] = None) -> float:
+    """Exponential backoff with a capped sleep and optional jitter.
+
+    Args:
+        attempt: 1-based attempt number that just failed.
+        base: First delay; doubles per attempt.
+        ceiling: Maximum exponential delay (jitter is added on top).
+        jitter: Zero-argument callable returning 0..1; defaults to no jitter
+            so the function stays deterministic unless the caller opts in.
+
+    Returns:
+        Seconds to sleep.
+    """
+    delay = min(base * (2 ** max(0, attempt - 1)), ceiling)
+    if jitter is not None:
+        delay += float(jitter()) * base
+    return delay
+
+
+def maas_server_detail(body: str) -> str:
+    """Extract `exceptionCode`/`refId`/`error` from a gateway error body.
+
+    Args:
+        body: Raw response text (often empty; the gateway's chat errors have
+            no body at all).
+
+    Returns:
+        A short `exceptionCode=AUTH_FAILURE, refId=001` string, or "" when
+        the body carries nothing usable.
+    """
+    try:
+        payload = json.loads(body or "{}")
+    except ValueError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    parts = []
+    for key in ("exceptionCode", "refId"):
+        value = payload.get(key)
+        if value:
+            parts.append(f"{key}={value}")
+    error = payload.get("error")
+    if isinstance(error, str) and error and not parts:
+        parts.append(error[:120])
+    return ", ".join(parts)
+
+
+def maas_origin(host: str) -> str:
+    """Normalize a MaaS origin: add `https://`, drop a trailing `/v1`.
+
+    The route is always TLS, and the only routed paths live below `/v1`, so
+    users naturally paste either the origin or the OpenAI base URL. Both are
+    accepted: `maas.example.internal`, `https://host`, `https://host/`,
+    `https://host/v1` and `https://host/v1/` all become `https://host`.
+
+    Args:
+        host: User-supplied origin (from -H, MAAS_HOST or a saved config).
+
+    Returns:
+        The normalized origin, or "" when the input is empty.
+    """
+    value = (host or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if not value.startswith(("http://", "https://")):
+        value = f"https://{value}"
+    if value.endswith("/v1"):
+        value = value[:-3].rstrip("/")
+    return value
+
+
+def maas_api_key(explicit: Optional[str] = None) -> str:
+    """Resolve the MaaS key from --api-key, MAAS_API_KEY or MAAS_API_KEY_FILE.
+
+    The key is never written anywhere; a key file is read line by line and
+    the first line is stripped (a trailing newline is the usual mistake).
+
+    Args:
+        explicit: Value passed as --api-key (may be None).
+
+    Returns:
+        The key, or "" when none is configured.
+    """
+    if explicit:
+        return explicit.strip()
+    key = os.environ.get("MAAS_API_KEY", "").strip()
+    if key:
+        return key
+    path = os.environ.get(MAAS_API_KEY_FILE_ENV, "").strip()
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.readline().strip()
+        except OSError as exc:
+            sys.stderr.write(colorize(
+                f"[MaaS] Cannot read {MAAS_API_KEY_FILE_ENV}={path}: {exc}\n", 'warning'))
+    return ""
+
+
+def maas_parse_models(text: str) -> list:
+    """Parse a `/v1/models` body into `{"name", "owned_by", "ready"}` dicts.
+
+    Args:
+        text: Raw JSON body.
+
+    Returns:
+        The model list (possibly empty).
+
+    Raises:
+        MaaSError: The body is not the expected JSON object.
+    """
+    try:
+        payload = json.loads(text or "{}")
+    except ValueError as exc:
+        raise MaaSError(f"GET /v1/models returned non-JSON: {exc}") from None
+    if not isinstance(payload, dict):
+        raise MaaSError("GET /v1/models returned a non-object JSON body")
+    models = []
+    for row in payload.get("data") or []:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        models.append({
+            "name": row["id"],
+            "owned_by": row.get("kind", "maas"),
+            "ready": bool(row.get("ready")),
+        })
+    return models
+
+
+def maas_resolve_model_id(ids: list, wanted: str) -> str:
+    """Resolve a short model name to its full `publishers/.../models/...` id.
+
+    Precedence, each step requiring a UNIQUE hit: exact id, `/<wanted>`
+    suffix, then substring. A name containing "/" is already an id and is
+    returned without any network use.
+
+    Args:
+        ids: Known model ids.
+        wanted: Short or full model name from the user.
+
+    Returns:
+        The matching full id.
+
+    Raises:
+        MaaSError: Empty name, ambiguous match, or no match. The message lists
+            candidates, so it is an explicit local error, not a silent 404.
+    """
+    name = (wanted or "").strip()
+    if not name:
+        raise MaaSError("MaaS model name is empty")
+    if "/" in name:
+        return name
+    predicates = (
+        lambda i: i == name,
+        lambda i: i.endswith("/" + name),
+        lambda i: name in i,
+    )
+    for predicate in predicates:
+        hits = [i for i in ids if predicate(i)]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise MaaSError(f"MaaS model {name!r} is ambiguous: " + ", ".join(hits[:6]))
+    known = ", ".join(ids[:6]) if ids else "(none)"
+    raise MaaSError(f"MaaS model {name!r} is not exposed by this endpoint (known: {known})")
+
+
+class MaaSGateway:
+    """Retrying, caching client for the two routes a MaaS gateway exposes.
+
+    Args:
+        base_url: The `https` origin only (no `/v1`, no model).
+        api_key: Bearer token (empty is allowed for `transport` tests).
+        timeout: Per-request socket timeout in seconds.
+        max_attempts: Total attempts per request (>= 1).
+        backoff_base / backoff_ceiling: See `maas_backoff_seconds`.
+        cache_ttl: Seconds the model listing stays fresh (0 disables).
+        sleep / clock / jitter / cache / transport: Injection seams for tests.
+    """
+
+    def __init__(self, base_url: str, api_key: str = "",
+                 timeout: float = 30.0,
+                 max_attempts: int = MAAS_MAX_ATTEMPTS,
+                 backoff_base: float = MAAS_BACKOFF_BASE,
+                 backoff_ceiling: float = MAAS_BACKOFF_CEILING,
+                 cache_ttl: float = MAAS_MODEL_TTL,
+                 sleep: Optional[object] = None,
+                 clock: Optional[object] = None,
+                 jitter: Optional[object] = None,
+                 cache: Optional[dict] = None,
+                 transport: Optional[object] = None) -> None:
+        self.base_url = maas_origin(base_url)
+        self.api_key = api_key or ""
+        self.timeout = timeout
+        self.max_attempts = max(1, int(max_attempts))
+        self.backoff_base = backoff_base
+        self.backoff_ceiling = backoff_ceiling
+        self.cache_ttl = cache_ttl
+        self._sleep = sleep or time.sleep
+        self._clock = clock or time.monotonic
+        self._jitter = jitter
+        self._cache = MAAS_MODEL_CACHE if cache is None else cache
+        self._transport = transport or self._http_transport
+        self.sleeps = []          # observable for tests and /agentic trace
+
+    def _http_transport(self, method: str, path: str,
+                        body: Optional[dict] = None) -> tuple:
+        """Perform one HTTP request; a transport failure becomes code 0.
+
+        Args:
+            method: "GET" or "POST".
+            path: Route below the origin (`/v1/models`).
+            body: JSON body for POST.
+
+        Returns:
+            (code, text, headers); code 0 means no HTTP response at all.
+        """
+        url = f"{self.base_url}{path}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        if self.api_key:
+            headers['Authorization'] = f'Bearer {self.api_key}'
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode('utf-8')
+            headers['Content-Type'] = 'application/json'
+        request = Request(url, data=data, headers=headers, method=method)
+        try:
+            with urlopen(request, timeout=self.timeout) as response:  # maas-transport
+                text = response.read().decode('utf-8', 'replace')
+                return response.getcode() or 200, text, dict(response.headers)
+        except HTTPError as exc:
+            try:
+                text = exc.read().decode('utf-8', 'replace')
+            except OSError:
+                text = ""
+            return exc.code, text, dict(exc.headers or {})
+        except (URLError, OSError) as exc:
+            return MAAS_TRANSPORT_ERROR, str(exc), {}
+
+    def _retryable_failure(self, verdict: str, code: int, detail: str) -> str:
+        """Return the human description of a failure worth retrying."""
+        if verdict == "ok":
+            return "200 with an empty inventory (looks like a disguised 403)"
+        described = f"HTTP {code}" if code else "no HTTP response"
+        return f"{described}{f' [{detail}]' if detail else ''}"
+
+    def list_models(self, force: bool = False, require_models: bool = False) -> list:
+        """Return the model inventory, cached and retried.
+
+        Args:
+            force: Bypass a fresh cache entry (`/mcp`-style refresh).
+            require_models: Treat a last-attempt empty `200` as a failure
+                (used by the startup probe, where an empty list means "not
+                ready" rather than "genuinely empty").
+
+        Returns:
+            A list of `{"name", "owned_by", "ready"}` dicts.
+
+        Raises:
+            MaaSAuthError: 401 — the key was rejected.
+            MaaSError: Any unexpected status or a non-JSON body.
+            MaaSUnavailable: Every attempt failed and no stale cache exists.
+        """
+        cached = self._cache.get(self.base_url)
+        if not force and cached and (self._clock() - cached[0]) < self.cache_ttl:
+            return [dict(model) for model in cached[1]]
+
+        last_failure = ""
+        for attempt in range(1, self.max_attempts + 1):
+            code, text, _headers = self._transport("GET", "/v1/models", None)
+            verdict = maas_classify_status(code)
+            detail = maas_server_detail(text)
+            if verdict == "fatal":
+                raise MaaSAuthError(
+                    "401 Unauthorized — the MaaS API key was rejected or expired; "
+                    "not retrying."
+                    + (f" [{detail}]" if detail else ""))
+            if verdict == "unexpected":
+                raise MaaSError(
+                    f"GET /v1/models returned HTTP {code}"
+                    + (f" [{detail}]" if detail else "")
+                    + " — a 404 means a wrong origin/path (only /v1/models "
+                      "and /v1/chat/completions are routed), not an offline "
+                      "server.")
+            if verdict == "ok":
+                models = maas_parse_models(text)
+                if models:
+                    self._cache[self.base_url] = (self._clock(), models)
+                    return [dict(model) for model in models]
+                if attempt >= self.max_attempts and not require_models:
+                    # The inventory may genuinely be empty; accept it so a
+                    # listing never loops forever on a healthy empty endpoint.
+                    self._cache[self.base_url] = (self._clock(), [])
+                    return []
+            last_failure = self._retryable_failure(verdict, code, detail)
+            if attempt < self.max_attempts:
+                delay = maas_backoff_seconds(
+                    attempt, self.backoff_base, self.backoff_ceiling, self._jitter)
+                self.sleeps.append(delay)
+                self._sleep(delay)
+
+        if cached:
+            age = int(self._clock() - cached[0])
+            sys.stderr.write(colorize(
+                f"[MaaS] Listing unavailable ({last_failure}); using the cached "
+                f"inventory ({age}s old).\n", 'warning'))
+            return [dict(model) for model in cached[1]]
+        raise MaaSUnavailable(
+            f"GET /v1/models gave up after {self.max_attempts} attempts "
+            f"(last: {last_failure}).")
+
+    def resolve_model(self, wanted: str, force: bool = False) -> str:
+        """Resolve a user-supplied model name to the full id.
+
+        Args:
+            wanted: Short name (`glm-53-flash`) or a full id.
+            force: Refresh the listing even if the cache is fresh.
+
+        Returns:
+            The full id to send in the chat payload.
+
+        Raises:
+            MaaSError: Empty, ambiguous or unknown name.
+        """
+        if "/" in (wanted or ""):
+            return wanted.strip()
+        models = self.list_models(force=force)
+        return maas_resolve_model_id([model["name"] for model in models], wanted)
+
+
+def maas_gateway(base_url: str, api_key: Optional[str] = None,
+                 **kwargs: object) -> MaaSGateway:
+    """Build a gateway with the default key resolution and cache.
+
+    Args:
+        base_url: The `https` origin.
+        api_key: Explicit key (falls back to MAAS_API_KEY / MAAS_API_KEY_FILE).
+        **kwargs: Overrides forwarded to `MaaSGateway` (tests use them).
+
+    Returns:
+        A configured gateway.
+    """
+    if "cache_ttl" not in kwargs:
+        try:
+            kwargs["cache_ttl"] = float(os.environ.get("MAAS_MODEL_TTL", MAAS_MODEL_TTL))
+        except ValueError:
+            kwargs["cache_ttl"] = MAAS_MODEL_TTL
+    return MaaSGateway(base_url, maas_api_key(api_key), **kwargs)
+
+
+# ============================================================================
 # ============= CONTEXT WINDOW TRACKING ======================================
 # ============================================================================
 
@@ -1040,6 +1458,12 @@ def refresh_context_window_size(ctx: 'CommandContext') -> bool:
     Returns:
         True if a positive context size was stored, False otherwise.
     """
+    override = int(getattr(ctx, 'context_size_override', 0) or 0)
+    if override > 0:
+        # An explicit --context-size always wins: MaaS exposes no window, and
+        # a user override must survive /switchmodel resetting the window.
+        ctx.context_window_size = override
+        return True
     if ctx.backend == "ollama":
         size = get_ollama_context_size(ctx.base_url, ctx.model)
     elif ctx.backend == "lmstudio":
@@ -1052,6 +1476,18 @@ def refresh_context_window_size(ctx: 'CommandContext') -> bool:
         size = 131072  # Mistral models: 32K-128K context
     elif ctx.backend == "deepseek":
         size = 131072  # DeepSeek: 128K context (deepseek-v4)
+    elif ctx.backend == "maas":
+        # Only /v1/models and /v1/chat/completions are routed: the window is
+        # not discoverable. `--context-size` / `/contextsizeset` is the
+        # explicit override; no fabricated default.
+        global _MAAS_WINDOW_HINTED
+        if not _MAAS_WINDOW_HINTED:
+            _MAAS_WINDOW_HINTED = True
+            sys.stderr.write(colorize(
+                "[MaaS] Context window is not exposed by this gateway; set it "
+                "with --context-size <tokens> or /contextsizeset <tokens>.\n",
+                'info'))
+        size = 0
     else:
         size = get_llamacpp_context_size(ctx.base_url)
 
@@ -1191,6 +1627,53 @@ def fetch_models_llamacpp(base_url: str, api_key: Optional[str] = None) -> list:
             return [{'name': n[7:] if n.startswith('models/') else n} for n in raw_names]
     except Exception:
         return []
+
+
+def fetch_models_maas(base_url: str, api_key: Optional[str] = None) -> list:
+    """Fetch the MaaS inventory with the gateway retry/cache policy.
+
+    Unlike `fetch_models_llamacpp`, this distinguishes "the endpoint answered
+    with an empty inventory" (retried, then accepted) from "the endpoint is
+    rate-limiting us" (retried, then reported), which is the whole point of
+    the MaaS core. A 401 is reported immediately.
+
+    Args:
+        base_url: The `https` origin (no /v1, no model).
+        api_key: Explicit key; falls back to MAAS_API_KEY / MAAS_API_KEY_FILE.
+
+    Returns:
+        `[{"name": full_id, "owned_by": kind, "ready": bool}]`, or [] when the
+        endpoint is unreachable (the reason is printed).
+    """
+    if not base_url:
+        return []
+    try:
+        return maas_gateway(base_url, api_key).list_models()
+    except MaaSError as exc:
+        sys.stderr.write(colorize(f"[MaaS] {exc}\n", 'warning'))
+        return []
+
+
+def fetch_models_for_backend(backend: str, base_url: str,
+                             api_key: Optional[str] = None) -> list:
+    """Fetch the inventory with the backend's own failure policy.
+
+    MaaS gets the retrying/caching gateway (its `/v1/models` is rate-limited);
+    the other OpenAI-compatible backends keep the single-attempt helper.
+
+    Args:
+        backend: Backend name.
+        base_url: Backend base URL.
+        api_key: Key for cloud backends.
+
+    Returns:
+        `[{"name": ...}]` dicts (possibly empty).
+    """
+    if backend == "maas":
+        return fetch_models_maas(base_url, api_key)
+    if backend in CLOUD_BACKENDS:
+        return fetch_models_llamacpp(base_url, api_key=api_key)
+    return fetch_models_llamacpp(base_url)
 
 def get_llamacpp_context_size(base_url: str) -> int:
     """Get context size from Llama.cpp /slots endpoint."""
@@ -1477,6 +1960,8 @@ _STRATA_MSG_OVERHEAD = None
 # Warn once per session when the output cap is applied with an unknown window
 # (LM Studio, or not yet fetched) — otherwise every request would spam stderr.
 _MAX_OUTPUT_WINDOW_WARNED = False
+# MaaS exposes no window at all: say it once, then rely on --context-size.
+_MAAS_WINDOW_HINTED = False
 
 
 def estimate_token_count(text: str) -> int:
@@ -1621,6 +2106,7 @@ class CommandContext:
 
         # Context window tracking
         self.context_window_size: int = 0  # Will be fetched from server
+        self.context_size_override: int = 0  # --context-size (wins over detection)
         self.current_context_tokens: int = 0  # Updated after each query
         self.compaction_threshold: float = COMPACTION_THRESHOLD  # Auto-compact trigger (0.0-1.0)
 
@@ -3230,8 +3716,10 @@ TOOL_FORMAT_REGISTRY = [
     ("granite-code", "openai"),
     ("rnj", "openai"),
     ("ministral", "inline"),
+    ("glm-53", "openai"),
     ("glm-4", "inline"),
     ("glm4", "inline"),
+    ("gemma4", "openai"),
     ("llama", "openai"),
     ("gpt-oss", "openai"),
     ("nemotron", "inline"),
@@ -4717,6 +5205,200 @@ def _shell_is_home_destructive(nodes: list) -> bool:
     return False
 
 
+# Interpreters whose `-c` argument is itself shell/python code. The home guard
+# used to look only at the outer command, so `bash -c "rm -rf ~"` was a plain
+# `ask` that auto_confirm approved while `rm -rf ~` is a hard deny (M2).
+_SHELL_INTERPRETERS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "posh", "yash"})
+# Words that execute the rest of the line; their own options are skipped so
+# `sudo -u root bash -c …` and `env FOO=1 bash -c …` are seen.
+_SHELL_WRAPPERS = frozenset({"sudo", "doas", "env", "nohup", "command", "exec", "time", "nice", "stdbuf"})
+_SHELL_WRAPPER_VALUE_FLAGS = frozenset({"-u", "-g", "-p", "-C", "-U", "-r", "-t", "-n", "-o", "-e", "-i"})
+_PYTHON_HEAD_RE = re.compile(r"^python(?:[0-9]+(?:\.[0-9]+)*)?$")
+# Bounded recursion: beyond this depth a conservative text check decides.
+_SHELL_NESTED_MAX_DEPTH = 6
+# `os.system("…")`, `os.popen("…")`, `subprocess.run("…", …)` — the shell
+# spelling inside a `python -c` payload. `subprocess.run(["rm", …])` (list form)
+# does not use a shell and does not expand `~`, so it is not a home-delete.
+_PY_SHELL_CALL_RE = re.compile(
+    r"(?:os\.system|os\.popen|commands\.getoutput|"
+    r"subprocess\.(?:run|call|check_call|check_output|Popen))"
+    r"\s*\(\s*[rbfuRBFU]{0,2}(['\"])(.*?)\1",
+    re.S,
+)
+
+
+def _shell_unquote(payload: str) -> str:
+    """Strip one matching pair of surrounding quotes from a `-c` payload.
+
+    The tokenizer keeps the quotes on the word (arity matching uses the raw
+    text), while the interpreter removes them before running the payload.
+    Without this, re-tokenizing `bash -c "rm -rf ~"` sees the whole quoted
+    string as one token and the home guard never sees an `rm`.
+
+    Args:
+        payload: The token following `-c`.
+
+    Returns:
+        The payload with one matched `'…'` or `"…"` pair removed.
+    """
+    text = payload.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        quote = text[0]
+        inner = text[1:-1]
+        if quote == '"':
+            # Inside double quotes bash treats `\"` as a literal quote; the
+            # tokenizer keeps the backslash, so a nested `bash -c \"…\"` would
+            # otherwise split into `\"bash` / `…\"` and stop the recursion.
+            inner = inner.replace('\\"', '"')
+        return inner
+    return text
+
+
+def _shell_c_payloads(tokens: list) -> list:
+    """Return the argument following a `-c` (or bundled `-xc`) flag.
+
+    Args:
+        tokens: Word tokens of one command node (after arity reduction).
+
+    Returns:
+        The payload strings, in order (normally zero or one), unquoted.
+    """
+    payloads = []
+    for index, token in enumerate(tokens):
+        if token == "-c" or (token.startswith("-") and not token.startswith("--")
+                             and len(token) > 1 and "c" in token[1:]):
+            if index + 1 < len(tokens) and not tokens[index + 1].startswith("-"):
+                payloads.append(_shell_unquote(tokens[index + 1]))
+    return payloads
+
+
+def _shell_embedded_commands(tokens: list) -> list:
+    """Extract nested command strings from one shell command node.
+
+    Handles a leading wrapper (`sudo`, `env`, `nohup`, …), shell interpreters
+    (`sh -c`, `bash -lc`, `busybox sh -c`) and `python -c` payloads that call
+    `os.system`/`os.popen`/`subprocess.*` with a string.
+
+    Args:
+        tokens: Word tokens of the command node.
+
+    Returns:
+        Nested command strings to gate recursively (never the caller's own).
+    """
+    if not tokens:
+        return []
+    index = 0
+    total = len(tokens)
+    while index < total:
+        head = tokens[index].strip("'\"").rsplit("/", 1)[-1].lower()
+        if head not in _SHELL_WRAPPERS:
+            break
+        index += 1
+        if head == "env":
+            # `env VAR=value VAR2=value cmd …` (options are rare here)
+            while index < total and ("=" in tokens[index] or tokens[index].startswith("-")):
+                index += 1
+            continue
+        while index < total and tokens[index].startswith("-"):
+            flag = tokens[index].split("=", 1)[0]
+            index += 1
+            if flag in _SHELL_WRAPPER_VALUE_FLAGS and index < total:
+                index += 1
+    if index >= total:
+        return []
+    head = tokens[index].strip("'\"").rsplit("/", 1)[-1].lower()
+    body = tokens[index + 1:]
+    if head == "busybox":
+        if not body:
+            return []
+        head = body[0].strip("'\"").rsplit("/", 1)[-1].lower()
+        body = body[1:]
+    if head in _SHELL_INTERPRETERS:
+        return _shell_c_payloads(body)
+    if _PYTHON_HEAD_RE.match(head):
+        commands = []
+        for code in _shell_c_payloads(body):
+            commands.extend(match.group(2) for match in _PY_SHELL_CALL_RE.finditer(code))
+        return commands
+    return []
+
+
+def _shell_text_home_destructive(text: str) -> bool:
+    """Conservative text check used once the recursion depth is exhausted.
+
+    Args:
+        text: A nested command string.
+
+    Returns:
+        True when `rm` targets `~`/`$HOME` or the bare filesystem root.
+    """
+    for candidate in (text, _shell_normalize_for_home(text)):
+        if re.search(r"\brm\b[^\n;|&]*(?:~|\$HOME|\$\{HOME)", candidate):
+            return True
+        if re.search(r"\brm\b[^\n;|&]*\s/(?:\*|\s|$|;|\|&)", candidate):
+            return True
+    return False
+
+
+# An escaped interpreter launch (`bash -c "…"`) whose payload the tokenizer
+# could not re-split because of mismatched backslash runs. Used only as the
+# last-resort path, so `echo 'rm -rf ~'` (no interpreter) is not over-blocked.
+_SHELL_INTERPRETER_TEXT_RE = re.compile(
+    r"(?:^|[;&|]\s*|\s)(?:(?:sudo|doas|nohup|command|exec|time)\s+)?"
+    r"(?:busybox\s+)?(?:sh|bash|dash|zsh|ksh|mksh|ash)\s+[^;|&]*-[A-Za-z]*c[A-Za-z]*\s",
+    re.IGNORECASE,
+)
+
+
+def _shell_text_nested_destructive(text: str) -> bool:
+    """Last-resort check for an interpreter payload that resisted tokenizing.
+
+    Args:
+        text: A `-c` payload.
+
+    Returns:
+        True when the text launches a shell interpreter with `-c` and the
+        payload text deletes the home directory or the root filesystem.
+    """
+    return bool(_SHELL_INTERPRETER_TEXT_RE.search(text)) and _shell_text_home_destructive(text)
+
+
+def _shell_nested_home_hit(nodes: list, depth: int = 1) -> Optional[str]:
+    """Find a home/root-destructive command nested in a `-c` payload.
+
+    Args:
+        nodes: Parsed command nodes (`_ShellNode` or dict form).
+        depth: Current recursion depth (bounded by _SHELL_NESTED_MAX_DEPTH).
+
+    Returns:
+        The offending nested command string, or None.
+    """
+    for node in nodes:
+        tokens = node.get("tokens") if isinstance(node, dict) else node.tokens
+        for payload in _shell_embedded_commands(tokens or []):
+            if not payload.strip():
+                continue
+            if _shell_text_nested_destructive(payload):
+                return payload
+            if depth >= _SHELL_NESTED_MAX_DEPTH:
+                if _shell_text_home_destructive(payload):
+                    return payload
+                continue
+            inner = shell_check_command(payload, DEFAULT_SHELL_PERMISSION, _SHELL_SESSION_APPROVED)
+            if _shell_is_home_destructive(inner["nodes"]):
+                return payload
+            # Same normalization pass as the top-level guard: the resolved home
+            # (`rm -rf /home/<user>`) must fold to `~` inside the payload too.
+            inner_norm = shell_check_command(_shell_normalize_for_home(payload),
+                                             DEFAULT_SHELL_PERMISSION, _SHELL_SESSION_APPROVED)
+            if _shell_is_home_destructive(inner_norm["nodes"]):
+                return payload
+            deeper = _shell_nested_home_hit(inner["nodes"], depth + 1)
+            if deeper:
+                return deeper
+    return None
+
+
 # `$HOME` / `${HOME}`, but not `$HOMEDIR`: a bound that keeps a longer variable
 # name from being rewritten into a home path.
 _SHELL_HOME_REF_RE = re.compile(r"\$\{HOME\}|\$HOME(?![A-Za-z0-9_])")
@@ -4949,6 +5631,15 @@ def _shell_hard_block(command: str, verdict: dict) -> Optional[Dict]:
     # Home/root guard: either original or normalized hits destructive rm (bypass-immune, contains 'rejected' for test compat)
     if _shell_is_home_destructive(verdict["nodes"]) or _shell_is_home_destructive(norm_verdict["nodes"]):
         return {"approved": False, "effect": "deny", "message": "BLOCKED (rejected): recursive delete of home directory (~/ or $HOME) or root filesystem is never allowed", "verdict": verdict}
+    # M2: the same rule must reach a `-c` payload, otherwise `bash -c "rm -rf ~"`
+    # is an ask that auto_confirm answers yes (the promise is "bypass-immune").
+    nested = _shell_nested_home_hit(verdict["nodes"]) or _shell_nested_home_hit(norm_verdict["nodes"])
+    if nested:
+        shown = nested if len(nested) <= 200 else nested[:200] + "…"
+        return {"approved": False, "effect": "deny",
+                "message": "BLOCKED (rejected): a nested `-c` command deletes the home directory "
+                           f"(~/ or $HOME) or the root filesystem, which is never allowed: {shown}",
+                "verdict": verdict}
     # Also catch opencode deny (explicit rules) — include 'rejected' for compat with safety_blocklist test
     if verdict["effect"] == "deny":
         return {"approved": False, "effect": "deny", "message": "BLOCKED (rejected): denied by permission rules (%s)" % ", ".join(d["pattern"] for d in verdict["details"] if d["action"]=="deny"), "verdict": verdict}
@@ -7907,7 +8598,6 @@ def _parse_unified_hunks(body: str) -> tuple:
         (hunks, detected_path, is_delete).
         Each hunk: {"start": int, "old_count": int, "old_lines": [str], "new_lines": [str]}
     """
-    import re
     hunks = []
     lines = body.splitlines(keepends=True)
     i = 0
@@ -11583,6 +12273,9 @@ class RequestBuilder:
         """
         if backend in ("llamacpp", "strata"):
             params = ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]
+        elif backend == "maas":
+            # vLLM (behind the gateway) accepts the wide OpenAI-ish profile.
+            params = ["temperature", "top_p", "top_k", "min_p", "presence_penalty"]
         elif backend == "lmstudio":
             params = ["temperature", "top_p", "presence_penalty", "repeat_penalty"]
         elif backend in ("gemini", "opencodezen", "opencodego"):
@@ -11680,7 +12373,7 @@ class RequestBuilder:
         if kwargs.get('is_warmup'):
             if backend == "ollama":
                 payload["options"] = {"num_predict": 1}
-            elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            elif backend in ("llamacpp", "strata", "lmstudio") or backend in CLOUD_BACKENDS:
                 payload["max_tokens"] = 1
             return
         # Ollama context window via num_ctx. OpenAI-compatible servers treat the
@@ -11697,7 +12390,12 @@ class RequestBuilder:
             if backend == "ollama":
                 payload.setdefault("options", {})
                 payload["options"]["num_predict"] = max_output
-            elif backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            elif backend in ("llamacpp", "strata", "lmstudio") or backend in CLOUD_BACKENDS:
+                if backend == "maas":
+                    # Reasoning is always on there and counts against
+                    # `max_tokens`: a small cap returns `content: null` with
+                    # finish_reason=length and no error at all.
+                    max_output = max(int(max_output), MAAS_MIN_OUTPUT_TOKENS)
                 payload["max_tokens"] = max_output
 
     def _apply_output_cap(self, messages: list[Message], kwargs: dict) -> tuple:
@@ -11735,6 +12433,13 @@ class RequestBuilder:
             sys.stderr.write(colorize(
                 f"[maxtokens] No output room ({prompt_tokens}/{window}); "
                 f"using floor {MAX_OUTPUT_MIN_FLOOR}.", 'warning') + "\n")
+        if self.ctx.backend == "maas" and 0 < effective < MAAS_MIN_OUTPUT_TOKENS:
+            # Reasoning is always on and shares `max_tokens`: under ~1K the
+            # gateway returns `content: null` with finish_reason=length and no
+            # error. Prefer a slightly over-budget request to a silent empty
+            # answer; the floor is applied here so `resolve_output_budget`
+            # callers (e.g. /maxtokens status) see the same number.
+            effective = MAAS_MIN_OUTPUT_TOKENS
         kwargs = dict(kwargs)
         kwargs['max_output_tokens'] = effective
         return messages, kwargs
@@ -12203,7 +12908,7 @@ class StreamParser:
                         "load_duration": chunk.get("load_duration", 0),
                     }
             return thought, content, is_final, usage, tool_calls
-        elif backend in ("llamacpp", "strata", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+        elif backend in ("llamacpp", "strata") or backend in CLOUD_BACKENDS:
             choices = chunk.get("choices", [])
             is_final = bool(choices and choices[0].get("finish_reason") is not None)
             delta = choices[0].get("delta", {}) if choices else {}
@@ -12235,7 +12940,7 @@ class StreamParser:
             decoded = line.decode('utf-8').strip()
             if not decoded:
                 continue
-            if backend in ("llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+            if backend in ("llamacpp", "strata", "lmstudio") or backend in CLOUD_BACKENDS:
                 if decoded.startswith('data: '):
                     decoded = decoded[6:].strip()
             if decoded == '[DONE]':
@@ -12679,7 +13384,7 @@ class ModelQuery:
             Dict of HTTP headers for the request.
         """
         headers = {'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'}
-        if self.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek") and self.ctx.api_key:
+        if self.backend in CLOUD_BACKENDS and self.ctx.api_key:
             headers['Authorization'] = f'Bearer {self.ctx.api_key}'
         return headers
 
@@ -12898,8 +13603,8 @@ class ModelQuery:
         except Exception as e:
             msg = f"[ERROR] Sync query failed: {e}"
             if isinstance(e, HTTPError) and e.code == 403:
-                if self.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-                    env_hint = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+                if self.backend in CLOUD_BACKENDS:
+                    env_hint = CLOUD_API_KEY_ENV
                     msg += f"\n[HINT] {self.backend} authentication failed. Check your --api-key or {env_hint.get(self.backend, 'API_KEY')} env var."
                 elif ":cloud" in model:
                     msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
@@ -13057,8 +13762,8 @@ class ModelQuery:
         """
         msg = f"\n[ERROR] {backend} streaming failed: {e}"
         if isinstance(e, HTTPError) and e.code == 403:
-            if backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-                env_hint = {"gemini": "GEMINI_API_KEY", "opencodezen": "OPENCODEZEN_API_KEY", "opencodego": "OPENCODEGO_API_KEY", "mistral": "MISTRAL_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+            if backend in CLOUD_BACKENDS:
+                env_hint = CLOUD_API_KEY_ENV
                 msg += f"\n[HINT] {backend} authentication failed. Check your --api-key or {env_hint.get(backend, 'API_KEY')} env var."
             elif ":cloud" in model:
                 msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
@@ -13339,8 +14044,9 @@ class ChatCompleter:
         """Fetch available models from the backend."""
         if self.backend in ("llamacpp", "strata"):
             self.models = [m['name'] for m in fetch_models_llamacpp(self.base_url)]
-        elif self.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-            self.models = [m['name'] for m in fetch_models_llamacpp(self.base_url, api_key=self.api_key)]
+        elif self.backend in CLOUD_BACKENDS:
+            self.models = [m['name'] for m in fetch_models_for_backend(
+                self.backend, self.base_url, self.api_key)]
         else:
             self.models = [m['name'] for m in fetch_models_ollama(self.base_url)]
 
@@ -18112,8 +18818,9 @@ class ChatLoop:
         """Fetch available models from the backend."""
         if self.ctx.backend in ("llamacpp", "strata", "lmstudio"):
             self.ctx.models = [m['name'] for m in fetch_models_llamacpp(self.ctx.base_url)]
-        elif self.ctx.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-            self.ctx.models = [m['name'] for m in fetch_models_llamacpp(self.ctx.base_url, api_key=self.ctx.api_key)]
+        elif self.ctx.backend in CLOUD_BACKENDS:
+            self.ctx.models = [m['name'] for m in fetch_models_for_backend(
+                self.ctx.backend, self.ctx.base_url, self.ctx.api_key)]
         else:
             self.ctx.models = [m['name'] for m in fetch_models_ollama(self.ctx.base_url)]
 
@@ -18293,8 +19000,9 @@ class ChatLoop:
         if self.ctx.backend == "ollama":
             list_models_ollama(self.ctx.base_url, filter_arg, file=sys.stdout)
             return
-        elif self.ctx.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
-            models = fetch_models_llamacpp(self.ctx.base_url, api_key=self.ctx.api_key)
+        elif self.ctx.backend in CLOUD_BACKENDS:
+            models = fetch_models_for_backend(
+                self.ctx.backend, self.ctx.base_url, self.ctx.api_key)
         else:
             models = fetch_models_llamacpp(self.ctx.base_url)
         if not models:
@@ -18430,7 +19138,6 @@ class ChatLoop:
             List of non-empty command block strings.
         """
         text = strip_ansi(text)
-        import re
         parts = re.split(r'(?m)^.*[\$#] ', text)
         return [p.strip() for p in parts if p.strip()]
 
@@ -19123,7 +19830,20 @@ class ChatLoop:
                 new_model = parts[1].strip()
                 if self.ctx.backend == "ollama":
                     model_exists = is_available_ollama_model(self.ctx.base_url, new_model)
-                elif self.ctx.backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+                elif self.ctx.backend == "maas":
+                    # Short names are silent 404s; resolve against the listing.
+                    try:
+                        resolved = maas_gateway(self.ctx.base_url,
+                                                self.ctx.api_key).resolve_model(new_model)
+                    except MaaSError as exc:
+                        print(colorize(f"[MaaS] {exc}", 'error'), file=sys.stderr)
+                        return False
+                    if resolved != new_model:
+                        print(colorize(f"[MaaS] '{new_model}' resolved to '{resolved}'",
+                                       'info'), file=sys.stderr)
+                    new_model = resolved
+                    model_exists = True
+                elif self.ctx.backend in CLOUD_BACKENDS:
                     model_exists = is_available_llamacpp_model(self.ctx.base_url, new_model, api_key=self.ctx.api_key)
                 else:
                     model_exists = is_available_llamacpp_model(self.ctx.base_url, new_model)
@@ -19153,7 +19873,7 @@ class ChatLoop:
                     else:
                         refresh_context_window_size(self.ctx)
 
-                    if self.ctx.backend not in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+                    if self.ctx.backend not in CLOUD_BACKENDS:
                         # Warmup ping to trigger model loading (not needed for cloud APIs)
                         if self.messages:
                             ping_messages = list(self.messages)
@@ -20479,15 +21199,20 @@ class ChatLoop:
 
 
 def list_models_llamacpp(base_url: str, filter_arg: Optional[str] = None,
-                         api_key: Optional[str] = None) -> None:
-    """List Llama.cpp / Gemini models.
+                         api_key: Optional[str] = None,
+                         backend: Optional[str] = None) -> None:
+    """List Llama.cpp / Gemini / MaaS models.
 
     Args:
         base_url: Server URL.
         filter_arg: Optional name filter string.
         api_key: Optional API key for cloud backends.
+        backend: Backend name; MaaS gets its retrying inventory.
     """
-    models = fetch_models_llamacpp(base_url, api_key=api_key)
+    if backend:
+        models = fetch_models_for_backend(backend, base_url, api_key)
+    else:
+        models = fetch_models_llamacpp(base_url, api_key=api_key)
 
     if not models:
         print("\n[No models found via llamacpp API]", file=sys.stderr)
@@ -20838,6 +21563,41 @@ def check_gemini(url: str, api_key: Optional[str] = None, timeout: float = 2) ->
         return False
 
 
+def check_maas(url: str, api_key: Optional[str] = None, timeout: float = 5) -> bool:
+    """Probe a MaaS gateway with its own retry policy.
+
+    `check_gemini` is not enough here: it does not retry 403/429/500 and treats
+    an empty `200` as success. This probe retries the burst codes, hard-fails
+    on 401, and requires a non-empty inventory so an empty (disguised 403) is
+    not reported as a healthy endpoint.
+
+    Args:
+        url: The `https` origin (no /v1).
+        api_key: Explicit key; falls back to MAAS_API_KEY / MAAS_API_KEY_FILE.
+        timeout: Per-request socket timeout.
+
+    Returns:
+        True when the listing came back with at least one model.
+    """
+    if not url:
+        sys.stderr.write(colorize(
+            "[ERROR] maas requires the https origin: pass -H https://<host> "
+            "or set MAAS_HOST.\n", 'error'))
+        return False
+    key = maas_api_key(api_key)
+    if not key:
+        sys.stderr.write(colorize(
+            "[ERROR] maas requires an API key: set MAAS_API_KEY or "
+            "MAAS_API_KEY_FILE (MAAS_API_KEY_FILE points to a 0600 file).\n", 'error'))
+        return False
+    try:
+        gateway = maas_gateway(url, key, timeout=timeout, max_attempts=MAAS_MAX_ATTEMPTS)
+        return bool(gateway.list_models(require_models=True))
+    except MaaSError as exc:
+        sys.stderr.write(colorize(f"[MaaS] {exc}\n", 'warning'))
+        return False
+
+
 def auto_detect_backend() -> tuple:
     """Auto-detect backend based on default ports using HEAD request.
 
@@ -20980,6 +21740,8 @@ def _probe_backend(backend: str, host: str, api_key: Optional[str] = None) -> bo
         return check_backend_with_get(host, 'ollama')
     if backend == "lmstudio":
         return check_lmstudio(host)
+    if backend == "maas":
+        return check_maas(host, api_key)
     if backend in CLOUD_BACKENDS:
         key = api_key or os.environ.get(CLOUD_API_KEY_ENV.get(backend, ''), '')
         return check_gemini(host, key)
@@ -21017,6 +21779,10 @@ def _resolve_host_override(args: argparse.Namespace) -> tuple:
     """
     base_url = _ensure_url_scheme(args.host)
     selected_backend = args.backend
+    if selected_backend == "maas":
+        # Origin only: a pasted `.../v1` (or a bare host) is normalized, and the
+        # route is always TLS.
+        base_url = maas_origin(args.host)
     if not selected_backend:
         # Infer backend from known ports
         port_match = re.search(r':(\d+)(/|$)', base_url)
@@ -21085,6 +21851,8 @@ def _resolve_fallback(args: argparse.Namespace) -> tuple:
     if fallback_backend in CLOUD_BACKENDS:
         env_var = CLOUD_HOST_ENV[fallback_backend]
         fallback_host = os.environ.get(env_var, CLOUD_DEFAULT_HOST[fallback_backend])
+        if fallback_backend == "maas":
+            fallback_host = maas_origin(fallback_host)
     elif fallback_backend == "llamacpp":
         fallback_host = os.environ.get('LLAMACPP_HOST', DEFAULT_LLAMACPP_HOST)
     elif fallback_backend == "strata":
@@ -21116,7 +21884,10 @@ def resolve_connection(args: argparse.Namespace) -> tuple:
 
     # Cloud services with fixed URLs — skip local probes
     if args.backend in CLOUD_BACKENDS:
-        return args.backend, os.environ.get(CLOUD_HOST_ENV[args.backend], CLOUD_DEFAULT_HOST[args.backend])
+        host = os.environ.get(CLOUD_HOST_ENV[args.backend], CLOUD_DEFAULT_HOST[args.backend])
+        if args.backend == "maas":
+            host = maas_origin(host)
+        return args.backend, host
 
     saved_backends = load_saved_backends()
 
@@ -21150,8 +21921,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument_group('Backend')
-    parser.add_argument("-b", "--backend", choices=["ollama", "llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek"], default=None, help="API backend to use (auto-detected if omitted).")
+    parser.add_argument("-b", "--backend", choices=["ollama", "llamacpp", "strata", "lmstudio", "gemini", "opencodezen", "opencodego", "mistral", "deepseek", "maas"], default=None, help="API backend to use (auto-detected if omitted).")
     parser.add_argument('-H', '--host', help='Custom API URL')
+    parser.add_argument('--context-size', type=int, metavar='TOKENS', default=None,
+                        help='Context window override in tokens (MaaS cannot expose it; '
+                             'otherwise the window is detected from the server)')
     parser.add_argument('-k', '--api-key', help='API key for cloud backends (Gemini, etc.)')
     parser.add_argument('--version', action='store_true', help='Show version and exit')
 
@@ -21284,12 +22058,26 @@ def _verify_server(backend: str, base_url: str, args: argparse.Namespace) -> tup
         if the initial guess was wrong. Exits with code 1 if unreachable.
     """
     server_reachable = False
+    if backend == "maas" and not base_url:
+        sys.stderr.write(colorize(
+            "[ERROR] maas requires the https origin: pass -H https://<host> "
+            "or set MAAS_HOST.\n", 'error'))
+        sys.exit(1)
     if backend in CLOUD_BACKENDS:
-        api_key = args.api_key or os.environ.get(CLOUD_API_KEY_ENV.get(backend, ''), '')
-        if not api_key:
-            sys.stderr.write(colorize(f"[ERROR] {backend} requires an API key. Set --api-key, {CLOUD_API_KEY_ENV.get(backend, '')} env var, or save to config.\n", 'error'))
-            sys.exit(1)
-        server_reachable = check_gemini(base_url, api_key)
+        if backend == "maas":
+            api_key = maas_api_key(getattr(args, 'api_key', None))
+            if not api_key:
+                sys.stderr.write(colorize(
+                    "[ERROR] maas requires an API key. Set MAAS_API_KEY, "
+                    "MAAS_API_KEY_FILE (a 0600 file), or --api-key.\n", 'error'))
+                sys.exit(1)
+            server_reachable = check_maas(base_url, api_key)
+        else:
+            api_key = args.api_key or os.environ.get(CLOUD_API_KEY_ENV.get(backend, ''), '')
+            if not api_key:
+                sys.stderr.write(colorize(f"[ERROR] {backend} requires an API key. Set --api-key, {CLOUD_API_KEY_ENV.get(backend, '')} env var, or save to config.\n", 'error'))
+                sys.exit(1)
+            server_reachable = check_gemini(base_url, api_key)
     else:
         server_reachable = _probe_backend(backend, base_url, args.api_key)
 
@@ -21305,7 +22093,9 @@ def _verify_server(backend: str, base_url: str, args: argparse.Namespace) -> tup
     if not server_reachable:
         hint = ""
         has_port = re.search(r':\d{2,5}(/|$)', base_url)
-        if backend in ("gemini", "opencodezen", "opencodego", "mistral", "deepseek"):
+        if backend == "maas":
+            hint = " (see the [MaaS] message above: wrong origin, rejected key, or rate limit)"
+        elif backend in CLOUD_BACKENDS:
             hint = " (check your API key and internet connection)"
         elif backend == "llamacpp" and not has_port:
             hint = f" (try {base_url}:{DEFAULT_LLAMACPP_PORT})"
@@ -21333,6 +22123,18 @@ def _select_model(backend: str, base_url: str, args: argparse.Namespace) -> str:
         Model name or empty string if none available.
     """
     if args.model:
+        if backend == "maas" and "/" not in args.model:
+            # A short name is a SILENT 404 on the gateway; resolve it against
+            # the listing instead of guessing a publisher.
+            try:
+                resolved = maas_gateway(base_url, maas_api_key(args.api_key)).resolve_model(args.model)
+            except MaaSError as exc:
+                sys.stderr.write(colorize(f"[MaaS] {exc}\n", 'error'))
+                sys.exit(1)
+            if resolved != args.model:
+                sys.stderr.write(colorize(
+                    f"[MaaS] '{args.model}' resolved to '{resolved}'\n", 'info'))
+            return resolved
         return args.model
 
     if backend == "ollama":
@@ -21348,15 +22150,22 @@ def _select_model(backend: str, base_url: str, args: argparse.Namespace) -> str:
         sys.stderr.write(colorize("[WARNING] No models available on Ollama server.\n", 'warning'))
         return ""
 
-    LABELS = {"lmstudio": "LM Studio", "strata": "Strata", "gemini": "Gemini", "opencodezen": "OpenCode Zen", "opencodego": "OpenCode Go", "mistral": "Mistral", "deepseek": "DeepSeek"}
+    LABELS = {"lmstudio": "LM Studio", "strata": "Strata", "gemini": "Gemini", "opencodezen": "OpenCode Zen", "opencodego": "OpenCode Go", "mistral": "Mistral", "deepseek": "DeepSeek", "maas": "MaaS"}
 
-    api_key = args.api_key or os.environ.get(CLOUD_API_KEY_ENV.get(backend, ''), '')
-    available = fetch_models_llamacpp(base_url, api_key=api_key if backend in CLOUD_BACKENDS else None)
+    api_key = _cloud_api_key(backend, args.api_key)
+    available = fetch_models_for_backend(
+        backend, base_url, api_key if backend in CLOUD_BACKENDS else None)
     if available:
         model = available[0]['name']
         label = LABELS.get(backend, "Llama.cpp")
         sys.stderr.write(colorize(f"[INFO] Auto-selected hosted model: '{model}'\n", 'success'))
         return model
+
+    if backend == "maas":
+        sys.stderr.write(colorize(
+            "[MaaS] No model is exposed by this endpoint. Use -l to list the "
+            "ids, then -m with a full publishers/.../models/... id.\n", 'error'))
+        return ""
 
     if backend in ("llamacpp", "strata", "lmstudio"):
         label = LABELS.get(backend, "Llama.cpp")
@@ -21383,6 +22192,8 @@ def _cloud_api_key(backend: str, api_key: Optional[str] = None) -> str:
     Returns:
         str: The resolved key, or "" if neither is available.
     """
+    if backend == "maas":
+        return maas_api_key(api_key)
     return api_key or os.environ.get(CLOUD_API_KEY_ENV.get(backend, ''), '')
 
 
@@ -21423,6 +22234,10 @@ def _make_query_handler(backend: str, base_url: str, args: argparse.Namespace) -
     qh.ctx.backend = backend
     qh.ctx.shell_timeout = args.shell_timeout
     qh.ctx.api_key = _cloud_api_key(backend, args.api_key)
+    if getattr(args, 'context_size', None):
+        # Explicit override (MaaS exposes no window; useful elsewhere too).
+        qh.ctx.context_size_override = int(args.context_size)
+        qh.ctx.context_window_size = int(args.context_size)
     return qh
 
 
@@ -21436,7 +22251,8 @@ def _run_listing(backend: str, base_url: str, args: argparse.Namespace) -> None:
     """
     if backend in CLOUD_BACKENDS:
         list_models_llamacpp(base_url, filter_arg=args.model,
-                             api_key=_cloud_api_key(backend, args.api_key))
+                             api_key=_cloud_api_key(backend, args.api_key),
+                             backend=backend)
     elif backend in ("llamacpp", "strata", "lmstudio"):
         list_models_llamacpp(base_url, filter_arg=args.model)
     elif args.list_all:
@@ -21537,6 +22353,9 @@ def _run_chat(backend: str, base_url: str, target_model: str, args: argparse.Nam
     ctx.system_prompt = args.prompt
     ctx.shell_timeout = args.shell_timeout
     ctx.api_key = _cloud_api_key(backend, args.api_key)
+    if getattr(args, 'context_size', None):
+        ctx.context_size_override = int(args.context_size)
+        ctx.context_window_size = int(args.context_size)
     _attach_mcp_manager(ctx, args)
     _apply_sandbox_args(ctx, args)
 

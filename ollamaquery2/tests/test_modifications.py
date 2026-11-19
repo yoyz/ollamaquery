@@ -1114,6 +1114,11 @@ class TestUrlopenReplaced(unittest.TestCase):
                 # Skip startup probe lines (fast, non-retrying URL checks at launch)
                 if '# startup-probe' in line:
                     continue
+                # Skip the MaaS transport: it performs exactly ONE attempt and
+                # owns its own 403/429/500 retry loop in MaaSGateway (the
+                # generic helper retries 5xx only, with a fixed 1 s delay).
+                if '# maas-transport' in line:
+                    continue
                 bare_urlopen_lines.append((i, line.strip()))
         self.assertEqual(bare_urlopen_lines, [],
                          f"Bare urlopen calls remain:\n" +

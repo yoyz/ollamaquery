@@ -161,6 +161,21 @@ Key faithful details:
     `TestShellRedirectWriteSemantics` (23 tests).
     Conservative over-blocking is deliberate and pinned: a *quoted* `~`/`$HOME`
     (which bash does not expand) still asks.
+*   **`-c` payloads are gated too (M2, closed 2026-11-19).** The guard used to
+    read only the first-level tokens, so `bash -c "rm -rf ~"` was a plain `ask`
+    that `auto_confirm` approved while a direct `rm -rf ~` is denied — a hole
+    in the "bypass-immune" promise. `_shell_embedded_commands` extracts the
+    payload after a `-c`/bundled `-xc` flag for the shell interpreters
+    (`sh|bash|dash|zsh|ksh|mksh|ash`, also `busybox sh`) through the wrappers
+    (`sudo -u <user>`, `env VAR=x`, `nohup`, `command`, `exec`, `time`, `nice`),
+    and for `python -c` the string arguments of `os.system`/`os.popen`/
+    `subprocess.*` (`shell=True` or not — the list form does not expand `~`, so
+    it is not a home delete). The payload is unquoted once (a double-quoted
+    payload also unescapes `\"`), re-tokenized, normalized like the top level
+    (`/home/<user>` → `~`), and the recursion is bounded at 6 levels; at the
+    limit a conservative text check decides. Recursion terminates on repeated
+    `bash -c "bash -c …"`; a 200 KB payload costs ~170 ms.
+    `tests/test_acl.py::TestShellDashCDecomposition` (18).
 *   Group nodes `( … )`, `$(…)`, `<(…)` contribute no own pattern, only nested
     nodes (`opencode_implementation_detail_shell_permission_parser.md:401`).
 
@@ -191,6 +206,14 @@ Guard `ollamaquery2.py:2366` `_shell_is_home_destructive`:
 
 Only `~/` + `/` are hard-blocked; `rm -rf /tmp/junk` stays `ask` (soft,
 promptable) — the tier split `hermes_implementation_detail_shell_permission_parser.md:174`.
+
+The guard also descends into `-c` payloads (M2): `_shell_nested_home_hit` runs
+the same `rm` + `~`/`$HOME`/root test on each nested command, and a hit returns
+the same bypass-immune `BLOCKED (rejected)` verdict naming the nested command.
+`bash -c "rm -rf ~"`, `sh -c '…'`, `bash -lc`, `sudo -u root bash -c …`,
+`env VAR=x bash -c …`, `busybox sh -c …` and
+`python3 -c "os.system('rm -rf ~')"` are all denied; `auto_confirm` cannot
+approve any of them.
 
 ### 2.4 CWD Leniency
 

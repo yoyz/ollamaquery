@@ -1,6 +1,6 @@
 # Code Structure — ollamaquery2.py
 
-Snapshot: **2026-11-19**, `__version__ = "0.4.4"`, **21 776 lines**.
+Snapshot: **2026-11-19**, `__version__ = "0.4.4"`, **22 595 lines**.
 Regenerated from the section markers (`# ============= …`) and an AST pass, not
 patched by hand — see §8. Numbers drift; regenerate rather than trust a diff.
 
@@ -13,7 +13,10 @@ patched by hand — see §8. Numbers drift; regenerate rather than trust a diff.
 > The `0.4.4` pass (2026-11-19) adds 86 lines over the `0.4.3` snapshot
 > (`_anthropic_messages` on `CommandContext`, token stamping in
 > `ToolExecution`, the `/agentic status` column width), so every range after
-> those points shifts again; the header count is current.
+> those points shifts again. The MaaS pass (same day, unreleased) adds ~590
+> lines in a new section right after the retry utility (the gateway core) plus
+> the per-backend wiring in the request/listing paths; every range below the
+> utility section is shifted once more. The header count is current.
 
 > Historical note: the previous revision of this file described a ~4 300-line
 > version and placed `ChatLoop` at lines 2109–2737. That document was stale by
@@ -29,7 +32,8 @@ the same file**, each with a thin "door" on its old owner so call sites and
 tests never change.
 
 Supported backends: Ollama, llama.cpp, Strata, LM Studio, Gemini, OpenCode Zen,
-OpenCode Go, Mistral, DeepSeek, plus MCP servers as tool providers (stdio).
+OpenCode Go, Mistral, DeepSeek, MaaS (OpenShift AI / KServe in front of vLLM),
+plus MCP servers as tool providers (stdio).
 
 Modes: chat (`-c`), batch (`--input-dir`), single query (`-I`), listing (`-l`),
 model info (`--show`).
