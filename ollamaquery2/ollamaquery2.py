@@ -67,7 +67,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 
 
 # ============================================================================
@@ -1883,6 +1883,58 @@ class CommandContext:
         return out
 
     @staticmethod
+    def _anthropic_messages(wire: list[dict]) -> list[dict]:
+        """Convert OpenAI-shaped assistant `tool_calls` to Anthropic `tool_use` blocks.
+
+        Strata's `count_tokens` is an Anthropic endpoint: an assistant turn
+        carrying `tool_calls` is counted as if the calls were absent (measured
+        live: 22 KB of `write_file` arguments → 0 tokens), so every agentic
+        session was reported smaller than it is by the whole weight of its tool
+        arguments. The same turn in `tool_use` shape counts correctly.
+
+        Parsed arguments become `input` verbatim; JSON that does not parse (a
+        truncated call) is kept under `input.arguments` instead of being dropped,
+        so a broken call is still charged its true size.
+
+        Only assistant tool-call turns are reshaped. `tool` results, `system`
+        messages (counted inside `messages`) and plain text are already counted,
+        and leaving them alone avoids inventing Anthropic's strict
+        user/assistant alternation, which the counter does not require.
+
+        Args:
+            wire: Messages in the shape produced by `_wire_messages()` (OpenAI
+                dialect, which llama.cpp's /apply-template also needs).
+
+        Returns:
+            A new list where each assistant tool-call turn carries content
+            blocks; every other message is passed through by reference.
+        """
+        out = []
+        for msg in wire:
+            if msg.get('role') != 'assistant' or not msg.get('tool_calls'):
+                out.append(msg)
+                continue
+            blocks = []
+            content = msg.get('content')
+            if isinstance(content, str) and content:
+                blocks.append({'type': 'text', 'text': content})
+            for call in msg['tool_calls']:
+                function = call.get('function') or {}
+                arguments = function.get('arguments')
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments) if arguments.strip() else {}
+                    except ValueError:
+                        arguments = {'arguments': arguments}
+                if not isinstance(arguments, dict):
+                    arguments = {'value': arguments}
+                blocks.append({'type': 'tool_use', 'id': call.get('id', ''),
+                               'name': function.get('name', ''),
+                               'input': arguments})
+            out.append({'role': 'assistant', 'content': blocks})
+        return out
+
+    @staticmethod
     def _anthropic_tools(tools: list) -> list:
         """Convert OpenAI-shaped tools to the Anthropic count_tokens shape.
 
@@ -1939,6 +1991,11 @@ class CommandContext:
         unsupported = {'total': None, 'tools': None, 'source': 'none'}
 
         if self.backend == 'strata':
+            # Anthropic-shaped endpoint: it ignores OpenAI `tool_calls` outright,
+            # so an assistant turn's arguments used to count as zero. `wire` keeps
+            # the OpenAI shape for llama.cpp's /apply-template; the conversion is
+            # dialect-specific and therefore lives here.
+            wire = self._anthropic_messages(wire)
             url = f"{self.base_url}/v1/messages/count_tokens"
             body: dict = {'model': self.model or 'model', 'messages': wire}
             anthropic_tools = self._anthropic_tools(tools) if tools else None
@@ -15592,14 +15649,30 @@ class ToolExecution:
         return complete
 
     # === Conversation turns ===
-    @staticmethod
-    def append_messages(messages: list[Message], response_text: str, api_tool_calls: list,
+    def _stamp(self, msg: Message) -> None:
+        """Cache the exact token count of a message just appended.
+
+        A message without `_tokens` makes `calculate_context_tokens()` fall back
+        to `estimate_token_count()`, whose regex count × 2.0 (code-ish text)
+        reports a measured 1.7-2.1× the real size — which is why the stored sum
+        used to read ~2.8× the outbound request in an agentic session. Stamping
+        at append keeps the stored sum on the backend's own scale, once, instead
+        of re-tokenizing it later.
+
+        Args:
+            msg: The message appended to the conversation.
+        """
+        if self.ctx is not None:
+            self.ctx.stamp_tokens(msg)
+
+    def append_messages(self, messages: list[Message], response_text: str, api_tool_calls: list,
                         tool_calls: list, observations: list, raw_observations: list,
                         send_tools_api: bool) -> None:
         """Append the assistant turn and tool-result messages after executing tools.
 
         Native-tools backends get `tool`-role messages keyed by `tool_call_id`;
-        inline-mode backends get a plain `Tool result:` user note.
+        inline-mode backends get a plain `Tool result:` user note. Every appended
+        message is stamped with its exact token count (see `_stamp`).
         """
         combined = "\n---\n".join(observations) if observations else "[No tool output]"
         assistant_content = response_text
@@ -15615,14 +15688,18 @@ class ToolExecution:
         if api_tool_calls:
             assistant_msg['tool_calls'] = api_tool_calls
         messages.append(assistant_msg)
+        self._stamp(assistant_msg)
         if send_tools_api and api_tool_calls and observations:
             for idx, tc in enumerate(api_tool_calls):
                 obs = raw_observations[idx] if idx < len(raw_observations) else "ERROR: Cancelled or skipped due to preceding tool sequence abort."
                 tool_msg = {'role': 'tool', 'tool_call_id': tc.get('id', ''), 'content': obs}
                 tool_msg['name'] = tc.get('function', {}).get('name', '')
                 messages.append(tool_msg)
+                self._stamp(tool_msg)
         else:
-            messages.append({'role': 'user', 'content': f"Tool result:\n{combined}"})
+            note = {'role': 'user', 'content': f"Tool result:\n{combined}"}
+            messages.append(note)
+            self._stamp(note)
 
     # === Observation sizing ===
     @staticmethod
@@ -19582,9 +19659,13 @@ class ChatLoop:
             ("heartbeattokens", "Tokens per heartbeat dot", str(c.agentic_heartbeat_tokens)),
             ("compactthreshold", "Agentic auto-compact trigger", f"{c.agentic_compact_threshold:.0%}"),
         ]
+        # Column width derives from the longest name ("heartbeattokens",
+        # "compactthreshold"), else the value brackets stop lining up when a
+        # longer setting is added.
+        name_width = max(len(name) for name, _, _ in settings)
         for name, desc, value in settings:
             marker = ">" if (value not in ("off", "false", "host", "0") and "off" not in value) else " "
-            print(f"  {marker} {name:<12} [{value:<8}] {desc}", file=sys.stderr)
+            print(f"  {marker} {name:<{name_width}} [{value:<8}] {desc}", file=sys.stderr)
         print()
 
     def run_handle_listtool(self, full_input: str) -> Optional[bool]:

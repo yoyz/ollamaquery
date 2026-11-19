@@ -2237,6 +2237,109 @@ class TestInputHelpers(unittest.TestCase):
 # ============================================================================
 
 
+class TestStrataToolCallCounting(unittest.TestCase):
+    """Strata's count_tokens ignores OpenAI `tool_calls`, so the wire is reshaped.
+
+    Measured live against a Strata server: an assistant turn carrying 22 KB of
+    `write_file` arguments counted as 0 tokens, while the same call in Anthropic
+    `tool_use` shape counted 7546. An agentic session was therefore reported
+    smaller than it is by the whole weight of its tool arguments — and the miss
+    grows with the number of calls, since arguments stay in the history.
+    """
+
+    ARGS = '{"path": "src/app.py", "content": "x = 1\\n"}'
+
+    def setUp(self):
+        self.ctx = m.CommandContext()
+        self.ctx.backend = 'strata'
+        self.ctx.base_url = 'http://127.0.0.1:1'
+
+    def _assistant_turn(self, arguments=None):
+        return {'role': 'assistant', 'content': 'Writing now.',
+                'tool_calls': [{'id': 'c1', 'type': 'function',
+                                'function': {'name': 'write_file',
+                                             'arguments': self.ARGS if arguments is None
+                                             else arguments}}]}
+
+    def test_tool_calls_become_tool_use_blocks(self):
+        wire = m.CommandContext._wire_messages([
+            {'role': 'user', 'content': 'write it'},
+            self._assistant_turn(),
+            {'role': 'tool', 'tool_call_id': 'c1', 'content': 'ok'},
+        ])
+        converted = m.CommandContext._anthropic_messages(wire)
+        blocks = converted[1]['content']
+        self.assertEqual(blocks[0], {'type': 'text', 'text': 'Writing now.'})
+        self.assertEqual(blocks[1]['type'], 'tool_use')
+        self.assertEqual(blocks[1]['id'], 'c1')
+        self.assertEqual(blocks[1]['name'], 'write_file')
+        # The arguments are what the counter used to miss: parsed, not a string.
+        self.assertEqual(blocks[1]['input'], {'path': 'src/app.py', 'content': 'x = 1\n'})
+
+    def test_non_tool_messages_are_passed_through(self):
+        wire = m.CommandContext._wire_messages([
+            {'role': 'user', 'content': 'hi'},
+            {'role': 'tool', 'tool_call_id': 'c1', 'content': 'ok'},
+        ])
+        converted = m.CommandContext._anthropic_messages(wire)
+        self.assertIs(converted[0], wire[0])
+        self.assertIs(converted[1], wire[1])
+
+    def test_unparsable_arguments_are_kept_not_dropped(self):
+        """A truncated call must still be charged: dropping it re-opens the hole."""
+        turn = self._assistant_turn('{"path": "src/a.py", "content": "def f(')
+        turn['content'] = ''
+        blocks = m.CommandContext._anthropic_messages([turn])[0]['content']
+        self.assertEqual(blocks[0]['type'], 'tool_use')
+        self.assertIn('def f(', blocks[0]['input']['arguments'])
+
+    def test_textless_tool_turn_has_no_empty_text_block(self):
+        turn = self._assistant_turn()
+        turn['content'] = ''
+        blocks = m.CommandContext._anthropic_messages([turn])[0]['content']
+        self.assertEqual([b['type'] for b in blocks], ['tool_use'])
+
+    def test_wire_messages_keeps_the_openai_shape(self):
+        """llama.cpp's /apply-template needs `tool_calls`; the conversion is per-backend."""
+        wire = m.CommandContext._wire_messages([self._assistant_turn()])
+        self.assertEqual(wire[0]['tool_calls'][0]['id'], 'c1')
+
+    def test_count_wire_tokens_sends_tool_use_to_the_counter(self):
+        seen = {}
+
+        def fake_post(url, body):
+            seen['body'] = body
+            return 1000
+
+        with patch.object(m, 'post_count_tokens', side_effect=fake_post):
+            total = self.ctx.count_wire_tokens(
+                'sys',
+                [{'role': 'user', 'content': 'write it'}, self._assistant_turn()],
+                tools=None)['total']
+
+        self.assertEqual(total, 1000)
+        sent = seen['body']['messages']
+        self.assertEqual(sent[0], {'role': 'system', 'content': 'sys'})
+        self.assertEqual(sent[2]['content'][1]['type'], 'tool_use')
+        self.assertEqual(sent[2]['content'][1]['input']['path'], 'src/app.py')
+
+    def test_llamacpp_still_gets_the_openai_shape(self):
+        """The reshape must not leak into the backend that renders `tool_calls`."""
+        self.ctx.backend = 'llamacpp'
+        seen = {}
+
+        def fake_retry(request, max_retries=1, timeout=10):
+            seen['body'] = json.loads(request.data.decode('utf-8'))
+            raise RuntimeError('stop before any render')
+
+        with patch.object(m, '_request_with_retry', side_effect=fake_retry):
+            self.ctx.count_wire_tokens(
+                'sys', [{'role': 'user', 'content': 'x'}, self._assistant_turn()])
+
+        assistant = seen['body']['messages'][2]
+        self.assertEqual(assistant['tool_calls'][0]['function']['name'], 'write_file')
+
+
 class TestWireTokenCount(unittest.TestCase):
     """`/tokencount` must report the request the server actually receives.
 

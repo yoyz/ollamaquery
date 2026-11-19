@@ -1,6 +1,6 @@
 # Code Structure — ollamaquery2.py
 
-Snapshot: **2026-11-13**, `__version__ = "0.4.3"`, **21 690 lines**.
+Snapshot: **2026-11-19**, `__version__ = "0.4.4"`, **21 776 lines**.
 Regenerated from the section markers (`# ============= …`) and an AST pass, not
 patched by hand — see §8. Numbers drift; regenerate rather than trust a diff.
 
@@ -10,6 +10,10 @@ patched by hand — see §8. Numbers drift; regenerate rather than trust a diff.
 > (and the section-marker pass) to refresh them. The D1 pass (2026-11-13) added
 > ~50 lines before `ModelQuery` (`stream_is_incomplete` +
 > `stream_incomplete_reason`), so ranges after the stream section shift again.
+> The `0.4.4` pass (2026-11-19) adds 86 lines over the `0.4.3` snapshot
+> (`_anthropic_messages` on `CommandContext`, token stamping in
+> `ToolExecution`, the `/agentic status` column width), so every range after
+> those points shifts again; the header count is current.
 
 > Historical note: the previous revision of this file described a ~4 300-line
 > version and placed `ChatLoop` at lines 2109–2737. That document was stale by

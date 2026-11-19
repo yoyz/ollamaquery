@@ -3323,7 +3323,9 @@ class TestToolExecutionExtraction(unittest.TestCase):
         calls = executor.parse_calls('{"tool": "read_file", "arguments": {"file_path": "x"}}', [])
         self.assertEqual(calls[0]["tool"], "read_file")
         messages = []
-        executor.append_messages(messages, "text", [], calls, ["[read_file] ok"], ["ok"], False)
+        # Appending now stamps token counts; keep the test offline.
+        with patch.object(q.CommandContext, "tokenize", return_value=5):
+            executor.append_messages(messages, "text", [], calls, ["[read_file] ok"], ["ok"], False)
         self.assertEqual(messages[0]["role"], "assistant")
         self.assertTrue(messages[1]["content"].startswith("Tool result:"))
 
@@ -3340,6 +3342,65 @@ class TestToolExecutionExtraction(unittest.TestCase):
         first = loop._tool_exec()
         self.assertIsInstance(first, q.ToolExecution)
         self.assertIs(first, loop._tool_exec())
+
+
+class TestAppendMessagesStampsTokens(unittest.TestCase):
+    """Turns appended by the loop must carry `_tokens`.
+
+    Without it, `calculate_context_tokens()` falls back to
+    `estimate_token_count()`, whose regex count × 2.0 reports a measured
+    1.7-2.1× the real size: the stored sum then disagreed with the outbound
+    number the status bar shows (measured live: 382 150 stored vs 148 784 sent).
+    """
+
+    API_CALLS = [{"id": "c1", "type": "function",
+                  "function": {"name": "write_file",
+                               "arguments": '{"path": "a.py", "content": "x = 1"}'}}]
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.lazy_tool = False
+        self.executor = q.ToolExecution(self.ctx, None, q.ToolCallParser(self.ctx))
+
+    def _append(self, messages, send_tools_api):
+        with patch.object(q.CommandContext, "tokenize",
+                          side_effect=lambda text: max(1, len(text) // 4)):
+            self.executor.append_messages(
+                messages, "calling it", self.API_CALLS if send_tools_api else [],
+                [{"tool": "write_file", "arguments": {"path": "a.py"}}],
+                ["[write_file] ok"], ["ok"], send_tools_api)
+
+    def test_native_path_stamps_both_messages(self):
+        messages = []
+        self._append(messages, True)
+        self.assertEqual([m["role"] for m in messages], ["assistant", "tool"])
+        for msg in messages:
+            self.assertIn("_tokens", msg)
+        # The call's arguments are part of the assistant turn's cost, not just
+        # its text ("calling it" alone would be 2 tokens under this tokenizer).
+        self.assertGreater(messages[0]["_tokens"], len("calling it") // 4)
+
+    def test_inline_path_stamps_the_user_note(self):
+        messages = []
+        self._append(messages, False)
+        self.assertEqual([m["role"] for m in messages], ["assistant", "user"])
+        self.assertIn("_tokens", messages[1])
+
+    def test_stored_sum_no_longer_falls_back_to_the_heuristic(self):
+        messages = []
+        self._append(messages, True)
+        with patch.object(q, "estimate_token_count") as estimate:
+            stored = self.ctx.calculate_context_tokens(messages)
+        estimate.assert_not_called()
+        self.assertEqual(stored, sum(m["_tokens"] for m in messages))
+
+    def test_no_context_is_tolerated(self):
+        """Bare fixtures build ToolExecution(None, ...); stamping must no-op."""
+        executor = q.ToolExecution(None, None, q.ToolCallParser(None))
+        messages = []
+        executor.append_messages(messages, "text", [], [], ["obs"], ["obs"], False)
+        self.assertEqual([m["role"] for m in messages], ["assistant", "user"])
+        self.assertNotIn("_tokens", messages[0])
 
 
 class TestSpillIsolation(unittest.TestCase):
@@ -4409,6 +4470,39 @@ class TestComposableSystemPrompt(unittest.TestCase):
         self.assertIn("Read-only planning mode", prompt)
 
 
+class TestAgenticStatusDisplay(unittest.TestCase):
+    """`/agentic` status table: every setting listed, value brackets aligned."""
+
+    SETTINGS = (
+        "agentic", "plan", "auto", "sandbox", "verbose", "thinking", "trace",
+        "log", "lazytool", "iterations", "timeout", "heartbeattokens",
+        "compactthreshold",
+    )
+
+    def _render(self) -> str:
+        loop = object.__new__(q.ChatLoop)
+        loop.ctx = q.CommandContext()
+        loop.executor = q.Executor(mode="host")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop._print_agentic_status()
+        return err.getvalue()
+
+    def test_every_setting_is_listed(self):
+        out = self._render()
+        for name in self.SETTINGS:
+            self.assertIn(name, out)
+
+    def test_value_brackets_align(self):
+        """A name longer than the column used to push its `[value]` out of line."""
+        out = self._render()
+        rows = [ln for ln in out.splitlines()
+                if re.match(r"^ {2}[> ] \S+ +\[[^\]]*\] ", ln)]
+        self.assertEqual(len(rows), len(self.SETTINGS), out)
+        columns = {ln.index("[") for ln in rows}
+        self.assertEqual(len(columns), 1, "value brackets not aligned:\n" + "\n".join(rows))
+
+
 class TestAgenticPlanCommand(unittest.TestCase):
     """Test the /agentic plan command handler (read-only planning mode)."""
 
@@ -4679,6 +4773,15 @@ class TestAppendToolMessages(unittest.TestCase):
     templates render hybrid JSON+XML (the bug the native format block prevents).
     Inline backends still need the call echoed as text.
     """
+
+    def setUp(self):
+        # Appending now stamps token counts via the backend tokenizer; these
+        # tests are about message shape, so keep them offline.
+        self._tokenizer = patch.object(q.CommandContext, 'tokenize', return_value=5)
+        self._tokenizer.start()
+
+    def tearDown(self):
+        self._tokenizer.stop()
 
     def _loop(self):
         q.CommandContext._instance = None
