@@ -1,6 +1,6 @@
 # Code Structure — ollamaquery2.py
 
-Snapshot: **2026-11-19**, `__version__ = "0.4.4"`, **22 595 lines**.
+Snapshot: **2026-11-19**, `__version__ = "0.4.5"`, **22 695 lines**.
 Regenerated from the section markers (`# ============= …`) and an AST pass, not
 patched by hand — see §8. Numbers drift; regenerate rather than trust a diff.
 
@@ -16,7 +16,10 @@ patched by hand — see §8. Numbers drift; regenerate rather than trust a diff.
 > those points shifts again. The MaaS pass (same day, unreleased) adds ~590
 > lines in a new section right after the retry utility (the gateway core) plus
 > the per-backend wiring in the request/listing paths; every range below the
-> utility section is shifted once more. The header count is current.
+> utility section is shifted once more. The `0.4.5` pass (2026-11-19) is net
+> **+11 lines** over `0.4.4` (a sampling entry withdrawn, the reasoning-only
+> nudge, two parser fixes and the SSE keep-alive filter added), so the ranges
+> below are unchanged. The header count is current.
 
 > Historical note: the previous revision of this file described a ~4 300-line
 > version and placed `ChatLoop` at lines 2109–2737. That document was stale by
@@ -75,7 +78,7 @@ The file is partitioned by three-line banner comments. Ranges below are
 | 13041–13951 | Input handling                    | `gather_user_input`, inline commands (`!`, `/curl`, `@file`), `_ExitRequested`, readline/history                                                                                                                                          |
 | 13955–14351 | Tool-call parsing                 | Balanced-JSON primitives + `ToolCallParser` (strict vs lazy policy, 4-pass extraction)                                                                                                                                                    |
 | 14355–14661 | Agentic timeout policy            | `TimeoutEvent` (frozen), `AgenticTimeoutPolicy` (states C / A / B, nudge, ceiling doubling)                                                                                                                                               |
-| 14665–14874 | Agentic step feedback             | `StepFeedback`: live thinking, heartbeat dots, idle watchdog, accumulated content for timeout analysis                                                                                                                                    |
+| 14665–14874 | Agentic step feedback             | `StepFeedback`: live thinking, token-driven dots, idle wait mark (`Zz`), accumulated content for timeout analysis                                                                                                                                    |
 | 14878–15163 | Agentic tool execution            | `ToolExecution`: run, cap observation, same-tool guard, message append (native vs inline)                                                                                                                                                 |
 | 15167–15538 | Agentic finalizer                 | `AgenticFinalizer`: stream the final answer **or** run the tool call it carried and re-enter (bounded)                                                                                                                                    |
 | 15542–16463 | Agentic runner                    | `ReActState` + `AgenticRunner`: `run` (skeleton), `_start_query`, `_run_step`, `call_step`, presentation, partial-write recovery, bounded continuation nudges (`cut`/`length`/`badstream`/`unparsed`)                                     |

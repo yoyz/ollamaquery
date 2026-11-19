@@ -1273,6 +1273,21 @@ class TestInferenceParamsRegistry(unittest.TestCase):
         self.assertLess(keys.index('qwen3.8'), keys.index('qwen3'),
                         "qwen3.8 must be matched before generic qwen3")
 
+    def test_glm5_flash_falls_back_to_defaults(self):
+        """GLM-5.x (MaaS `glm-53-flash`) has no entry: the inherited glm-4.7
+        profile stalled `/agentic` on that gateway, while the defaults work for
+        the other MaaS families. Re-add only with a measured live run."""
+        for alias in ('publishers/acme/models/glm-53-flash',
+                      'glm-53-flash',
+                      'glm-5.3-flash'):
+            self.assertEqual(m.get_inference_params(alias),
+                             m.DEFAULT_INFERENCE_PARAMS, alias)
+
+    def test_glm47_keeps_its_entry(self):
+        keys = list(m.MODEL_INFERENCE_PARAMS_REGISTRY)
+        self.assertIn('glm-4.7', keys)
+        self.assertNotIn('glm-5', keys)
+
     def test_registry_order_qwen36_before_qwen3(self):
         keys = list(m.MODEL_INFERENCE_PARAMS_REGISTRY)
         self.assertLess(keys.index('qwen3.6'), keys.index('qwen3'),

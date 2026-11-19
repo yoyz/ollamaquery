@@ -2821,6 +2821,41 @@ class TestStreamParserSeam(unittest.TestCase):
         self.assertTrue(hasattr(parser, '_normalize_llamacpp_usage'))
 
 
+class TestSseLineFiltering(unittest.TestCase):
+    """SSE lines without a payload must never be parsed as JSON.
+
+    Strata emits `: keep-alive` comment frames while the model thinks. Counting
+    them as malformed frames made every Strata step report "part of the response
+    was lost" and classified the turn `badstream` even when nothing was lost.
+    """
+
+    def setUp(self):
+        self.ctx = _fresh_ctx()
+        self.qh = q.ModelQuery(context=self.ctx)
+        self.qh.ctx.backend = "strata"
+
+    def _lines(self, raw, backend="strata"):
+        return list(self.qh._iter_stream_lines(raw, backend))
+
+    def test_comment_frames_are_skipped(self):
+        raw = [b': keep-alive', b'', b'data: {"a": 1}', b': keep-alive', b'[DONE]']
+        self.assertEqual(self._lines(raw), ['{"a": 1}'])
+
+    def test_named_sse_fields_are_skipped(self):
+        raw = [b'event: message', b'id: 3', b'retry: 1000',
+               b'data: {"a": 2}']
+        self.assertEqual(self._lines(raw), ['{"a": 2}'])
+
+    def test_data_prefix_without_space_is_stripped(self):
+        self.assertEqual(self._lines([b'data:{"a": 3}', b'[DONE]']), ['{"a": 3}'])
+
+    def test_ollama_ndjson_is_untouched(self):
+        """The filter is SSE-only: Ollama's NDJSON has no comment/field lines."""
+        raw = [b'{"message": {"content": "x"}}', b': keep-alive']
+        self.assertEqual(self._lines(raw, "ollama"),
+                         ['{"message": {"content": "x"}}', ': keep-alive'])
+
+
 class TestIncompleteStreamContract(unittest.TestCase):
     """D1: a cut stream must never be stored as a finished answer.
 

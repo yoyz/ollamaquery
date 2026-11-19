@@ -1,7 +1,7 @@
 # MaaS backend — OpenShift AI / KServe in front of vLLM
 
-Status: **implemented** (`0.4.4`, `-b maas`), verified offline; the gateway was
-measured live during the investigation (2026-11-19). The measurements and the
+Status: **implemented** (`0.4.5`, `-b maas`), verified offline and exercised
+live against the gateway (`glm-53-flash`, `gemma4`; 2026-11-19). The measurements and the
 reference wrapper that preceded this backend are archived outside git history;
 this file is the durable reference, written from what the code actually does.
 
@@ -96,9 +96,29 @@ cache holds ids only — never the key.
 - **Native tool calling** is used. `glm-53-flash` and `gemma4` were falling
   through `TOOL_FORMAT_REGISTRY` to `inline` even though the endpoint serves
   native calls; both are now `openai`. The other `glm-4`/`glm4` entries stay
-  `inline` (they target different checkpoints).
+  `inline` (they target different checkpoints). A streaming step that carries
+  the `tools` array is what the agentic loop sends, and `gemma4` completes
+  full agentic runs over it on this gateway.
 - **Inference parameters**: vLLM accepts the wide profile (`temperature`,
-  `top_p`, `top_k`, `min_p`, `presence_penalty`).
+  `top_p`, `top_k`, `min_p`, `presence_penalty`). GLM-5.x has **no** registry
+  entry: the glm-4.7-Flash profile that was inherited for it (temp 0.7 /
+  top_p 1.0 / top_k 20 / min_p 0.01) stalled `/agentic` on this gateway — one
+  delta, then silence for as long as the client waits — while chat (which
+  sends no inference params) and `gemma4` (which falls back to the defaults)
+  both work on the same session. `glm-53-flash` therefore runs on the
+  defaults, and the live re-run after the removal does `glob` then `read_file`
+  at 0.7-0.8 s per step on that gateway. Re-add a profile only after a measured
+  live run.
+
+**When a thinking model stalls** (a turn ends with reasoning only, no text and
+no tool call): the reasoning shares `max_tokens` and cannot be disabled, so a
+hard task can consume the whole output budget. The loop now says so — a clean
+turn with reasoning but no content gets a dedicated nudge (“the analysis is
+private and was not delivered; do not repeat it, emit the tool call or the
+answer”), and the JSONL `turn` entry carries `reasoning_chars` so the log shows
+the cause. Practical settings for long agentic work: `/maxtokens 16384` or more,
+`--context-size <real window>` (otherwise the cap is applied unclamped), and a
+longer `/agentic timeout` if the model thinks for minutes.
 
 ## 6. Context window
 

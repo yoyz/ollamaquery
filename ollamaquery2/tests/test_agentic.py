@@ -2806,6 +2806,35 @@ class TestReActLoopUnit(unittest.TestCase):
         self.assertIn(q.AgenticRunner.continuation_nudge("empty"), texts)
         self.assertNotIn("Please provide a tool call or your final answer.", texts)
 
+    def test_reasoning_only_step_names_the_cause(self):
+        """A clean turn with reasoning but no content/call gets its own nudge.
+
+        A thinking backend (MaaS/GLM-5.x) can end a turn with everything in the
+        private reasoning channel. The old "empty" nudge did not say why, so the
+        model re-derived the same analysis instead of emitting the call.
+        """
+        seen = []
+        idx = [0]
+
+        def mock_sync(messages, model, **kwargs):
+            seen.append([dict(m) for m in messages])
+            idx[0] += 1
+            if idx[0] == 1:
+                on_chunk = kwargs.get("on_chunk")
+                if on_chunk:
+                    on_chunk("private analysis that never became content", "", False)
+                return self._make_sync_response("")
+            return self._make_sync_response("Done.")
+
+        self.loop.query_handler.query_sync_stream = mock_sync
+        self.loop.query_handler.query_stream = MagicMock(return_value="Done.")
+        self.loop.run_agentic_query("Say done")
+
+        self.assertEqual(len(seen), 2)
+        texts = [m.get("content") for m in seen[1]]
+        self.assertIn(q.AgenticRunner.continuation_nudge("reasoning"), texts)
+        self.assertNotIn(q.AgenticRunner.continuation_nudge("empty"), texts)
+
     def test_empty_steps_are_bounded(self):
         """A model that always returns nothing is nudged twice, then finalized."""
         calls = []
@@ -3075,6 +3104,83 @@ class TestNormalizeToolJson(unittest.TestCase):
         """Plain text or non-tool JSON returns None."""
         self.assertIsNone(self.loop._normalize_tool_json("plain text"))
         self.assertIsNone(self.loop._normalize_tool_json('{"not": "a tool"}'))
+
+    def test_internal_shape_with_string_arguments(self):
+        """`{"tool": …}` with a JSON-string `arguments` is parsed (M7).
+
+        OpenAI-trained models send string arguments in this shape too; leaving
+        them as a string made the executor call `.items()` on a str and abort
+        the whole ReAct session.
+        """
+        result = self.loop._normalize_tool_json(
+            '{"tool": "run_command", "arguments": "{\\"command\\": \\"ls\\"}"}')
+        self.assertEqual(result["tool"], "run_command")
+        self.assertEqual(result["arguments"], {"command": "ls"})
+
+    def test_internal_shape_unparsable_arguments_are_kept_raw(self):
+        result = self.loop._normalize_tool_json(
+            '{"tool": "run_command", "arguments": "{not json"}')
+        self.assertEqual(result["arguments"], {"raw": "{not json"})
+
+    def test_internal_shape_preserves_extra_keys(self):
+        result = self.loop._normalize_tool_json(
+            '{"tool": "x", "arguments": {"a": 1}, "id": "call_1"}')
+        self.assertEqual(result["id"], "call_1")
+        self.assertEqual(result["arguments"], {"a": 1})
+
+
+class TestToolCallJsonAcceptability(unittest.TestCase):
+    """The XML-hybrid filter must not reject legitimate `<`/`>` arguments (M8)."""
+
+    def test_accepts_shell_redirection(self):
+        self.assertTrue(q.tool_call_json_acceptable(
+            {"tool": "run_command",
+             "arguments": {"command": "sort < in.txt > out.txt"}}))
+
+    def test_accepts_comparison_in_patch(self):
+        self.assertTrue(q.tool_call_json_acceptable(
+            {"tool": "patch",
+             "arguments": {"content": "if (a < b && c > d) return;"}}))
+
+    def test_accepts_cxx_template_angle_brackets(self):
+        self.assertTrue(q.tool_call_json_acceptable(
+            {"tool": "write_file",
+             "arguments": {"content": "std::vector<int> v;"}}))
+
+    def test_rejects_real_xml_tags(self):
+        for content in ('<tool_call>{"tool": "x"}</tool_call>',
+                        '</function>',
+                        '<div class="x">y</div>'):
+            self.assertFalse(q.tool_call_json_acceptable(
+                {"tool": "x", "arguments": {"a": content}}), content)
+
+    def test_empty_or_none_is_rejected(self):
+        self.assertFalse(q.tool_call_json_acceptable(None))
+        self.assertFalse(q.tool_call_json_acceptable({}))
+
+
+class TestParseToolCallsPassZero(unittest.TestCase):
+    """Pass 0 (text starting with `{`) must normalize like every other path (M7)."""
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.lazy_tool = False
+        self.loop = q.ChatLoop(self.ctx)
+
+    def test_string_arguments_are_a_dict_after_pass_zero(self):
+        calls = self.loop.parse_tool_calls(
+            '{"tool": "run_command", "arguments": "{\\"command\\": \\"ls\\"}"}')
+        self.assertEqual(len(calls), 1)
+        self.assertIsInstance(calls[0]["arguments"], dict)
+        self.assertEqual(calls[0]["arguments"], {"command": "ls"})
+
+    def test_openai_function_shape_at_the_start_is_normalized(self):
+        calls = self.loop.parse_tool_calls(
+            '{"type": "function", "function": {"name": "run_command", '
+            '"arguments": "{\\"command\\": \\"ls\\"}"}}')
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0]["tool"], "run_command")
+        self.assertEqual(calls[0]["arguments"], {"command": "ls"})
 
 
 class TestParseToolCalls(unittest.TestCase):
@@ -4824,6 +4930,67 @@ class TestAppendToolMessages(unittest.TestCase):
         loop._append_tool_messages(messages, "Let me look.", self._api_calls(), tool_calls,
                                    ["obs"], ["raw"], send_tools_api=True)
         self.assertEqual(messages[0]["content"], "Let me look.")
+
+
+class TestCallStepFinalizesFeedback(unittest.TestCase):
+    """The per-step watchdog must stop on EVERY exit path.
+
+    A transport error used to propagate from `call_with_timeout` straight past
+    `call_step`'s finalize, leaving the StepFeedback daemon printing one dot per
+    second for the rest of the session: the prompt returned but the terminal was
+    spammed, which reads as "Ctrl-C does nothing".
+    """
+
+    def _runner(self):
+        runner = object.__new__(q.AgenticRunner)
+        runner.ctx = q.CommandContext()
+        runner.ctx.model = "m"
+        runner.ctx.context_size = None
+        runner.query_handler = MagicMock()
+        return runner
+
+    def test_worker_exception_still_finalizes(self):
+        runner = self._runner()
+        finalized = []
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("gateway 500")
+
+        runner.call_with_timeout = boom
+        with self.assertRaises(RuntimeError):
+            runner.call_step([], 5, [], {}, lambda *a: None,
+                             lambda: finalized.append(True),
+                             {"event": None, "close": None}, [])
+        self.assertEqual(finalized, [True])
+
+    def test_keyboard_interrupt_finalizes_and_aborts(self):
+        runner = self._runner()
+        finalized = []
+        aborted = []
+
+        def boom(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        runner.call_with_timeout = boom
+        with patch.object(q, "_signal_abort",
+                          side_effect=lambda cancel: aborted.append(True)):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.call_step([], 5, [], {}, lambda *a: None,
+                                 lambda: finalized.append(True),
+                                 {"event": None, "close": None}, [])
+        self.assertEqual(finalized, [True])
+        self.assertEqual(aborted, [True])
+
+    def test_success_finalizes_once(self):
+        runner = self._runner()
+        finalized = []
+
+        runner.call_with_timeout = lambda *a, **k: {"ok": True}
+        response, _start = runner.call_step(
+            [], 5, [], {}, lambda *a: None, lambda: finalized.append(True),
+            {"event": None, "close": None}, [])
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(finalized, [True])
 
 
 if __name__ == "__main__":

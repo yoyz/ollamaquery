@@ -67,7 +67,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 
 
 # ============================================================================
@@ -3831,6 +3831,14 @@ def agentic_system_prompt(ctx, tool_defs_block: str = "",
 # Values are passed as top-level fields to the llama.cpp OpenAI-compatible API.
 # Sources: HuggingFace model card "Best Practices" sections.
 MODEL_INFERENCE_PARAMS_REGISTRY = {
+    # No "glm-5" entry on purpose. One was added (inherited from the validated
+    # glm-4.7-Flash profile, never measured on 5.3) because the family was
+    # thought to overthink on the generic defaults — but on the MaaS gateway
+    # `/agentic` with glm-53-flash stalls under it (one delta, then silence for
+    # as long as the client waits; chat, which sends no inference params, and
+    # gemma4, which falls back to the defaults, both work). Until the profile
+    # has been measured end-to-end on that model, GLM-5.x uses the defaults
+    # like every unlisted family. Do not re-add it without a live run.
     "nemotron-cascade": {
         # https://huggingface.co/nvidia/Nemotron-Cascade-2-30B-A3B
         # HF recommends temperature=1.0 for general use, but we use 0.6 for
@@ -12932,6 +12940,20 @@ class StreamParser:
     def _iter_stream_lines(self, response: object, backend: str) -> tuple:
         """Yield decoded JSON lines from streaming response, stripping SSE prefixes.
 
+        SSE has three kinds of line that are not a JSON payload and must not be
+        fed to `json.loads`:
+
+          - comment frames (`: keep-alive`), which Strata emits while the model
+            is still thinking. They used to be counted as malformed frames, so
+            every Strata step reported "part of the response was lost" and was
+            classified `badstream` (`truncation_reason`) even when the stream
+            was perfectly clean;
+          - named fields without a payload (`event:`, `id:`, `retry:`);
+          - the `[DONE]` sentinel.
+
+        `data:` is stripped with or without the conventional space, since the
+        space is optional in the SSE grammar.
+
         Args:
             response: The streaming HTTP response object.
             backend: Backend name (SSE stripping applies to non-ollama backends).
@@ -12941,8 +12963,12 @@ class StreamParser:
             if not decoded:
                 continue
             if backend in ("llamacpp", "strata", "lmstudio") or backend in CLOUD_BACKENDS:
-                if decoded.startswith('data: '):
-                    decoded = decoded[6:].strip()
+                if decoded.startswith('data:'):
+                    decoded = decoded[5:].strip()
+                elif decoded.startswith(':'):
+                    continue  # SSE comment / keep-alive: no payload
+                elif decoded.startswith(('event:', 'id:', 'retry:')):
+                    continue  # named SSE field: no payload
             if decoded == '[DONE]':
                 continue
             yield decoded
@@ -15247,7 +15273,22 @@ def normalize_tool_json(json_text: str) -> Optional[dict]:
     if not isinstance(obj, dict):
         return None
     if "tool" in obj:
-        return obj
+        # Normalize the internal/OpenAI-ish `{"tool": …, "arguments": …}` shape
+        # too: `arguments` is a JSON *string* on the wire for OpenAI-trained
+        # models, and returning it verbatim made `ToolExecution.run_single` call
+        # `.items()` on a str -> AttributeError -> the whole ReAct session aborted
+        # (M7). Parse it exactly like the `function` branch below; unparsable
+        # text is kept under `raw` so the model still sees its own call.
+        normalized = dict(obj)
+        raw_args = normalized.get("arguments", {})
+        if isinstance(raw_args, str):
+            try:
+                normalized["arguments"] = json.loads(raw_args)
+            except json.JSONDecodeError:
+                normalized["arguments"] = {"raw": raw_args}
+        elif not isinstance(raw_args, dict):
+            normalized["arguments"] = {"value": raw_args} if raw_args is not None else {}
+        return normalized
     tool_name = None
     tool_args = {}
     if "function" in obj and isinstance(obj["function"], dict):
@@ -15356,6 +15397,11 @@ def extract_json_balanced(text: str, start: int) -> Optional[str]:
 def tool_call_json_acceptable(result: Optional[dict]) -> bool:
     """Reject tool-call JSON that looks like an XML/HTML hybrid fragment.
 
+    The old check rejected any arguments containing both `<` and `>`, which
+    silently dropped legitimate calls (`sort < in.txt > out.txt`, a patch with
+    `if (a < b && c > d)`) — the model's raw JSON then leaked out as the "final
+    answer" (M8). Only tag-shaped markup is a hybrid signature.
+
     Args:
         result: Normalized tool call dict (or None).
 
@@ -15365,7 +15411,16 @@ def tool_call_json_acceptable(result: Optional[dict]) -> bool:
     if not result:
         return False
     args_str = json.dumps(result.get("arguments", {}))
-    return not ('<' in args_str and '>' in args_str)
+    return _XML_HYBRID_RE.search(args_str) is None
+
+
+# A *closing* tag, or one of the harness markers opening. That is the hybrid
+# signature a text-format model leaks around a JSON call. Angle brackets alone
+# (`sort < in > out`, `if (a < b && c > d)`, `std::vector<int>`) do not match.
+_XML_HYBRID_RE = re.compile(
+    r"</\s*[A-Za-z][A-Za-z0-9_.:-]*\s*>"
+    r"|<(?:tool_call|function|tool_result|tool_use)\b[^>]*>",
+    re.IGNORECASE)
 
 
 def looks_like_truncated_tool_call(text: str) -> bool:
@@ -15515,14 +15570,14 @@ class ToolCallParser:
 
         # Pass 0: Quick check — if text starts with '{', try direct JSON parse.
         # A proper JSON parser handles braces inside string values correctly,
-        # unlike brace-counting approaches.
+        # unlike brace-counting approaches. Normalization and the XML-hybrid
+        # filter are applied here too: skipping them left `arguments` as a JSON
+        # string for OpenAI-shaped calls, which aborted the session when the
+        # executor called `.items()` on it (M7).
         if text.startswith('{'):
-            try:
-                obj = json.loads(text)
-                if isinstance(obj, dict) and 'tool' in obj:
-                    return [obj]
-            except (json.JSONDecodeError, ValueError):
-                pass
+            normalized = normalize_tool_json(text)
+            if normalized and tool_call_json_acceptable(normalized):
+                return [normalized]
 
         if lazy:
             return self._extract_tool_calls_lazy(text)
@@ -15941,6 +15996,13 @@ class AgenticTimeoutPolicy:
 # tests can exercise them without a thread or terminal state.
 
 
+# Idle-wait marker. A heartbeat '.' means "bytes are arriving" — it is a
+# progress signal. When NOTHING has arrived, printing '.' claims activity that
+# does not exist, so the idle fallback says "sleeping" instead. Keep the two
+# signals distinct: '.' = data flowing, IDLE_WAIT_MARK = waiting for data.
+IDLE_WAIT_MARK = "Zz"
+
+
 class StepFeedback:
     """Live feedback + accumulated output for one agentic ReAct step."""
 
@@ -16104,28 +16166,34 @@ class StepFeedback:
                 self.last_visible = time.time()
 
     def _run_watchdog(self) -> None:
-        """Idle-fallback liveness: a dot ~1/s while the step is silent.
+        """Liveness for a step that renders nothing for a while.
 
-        Token-driven dots (`feed`) cover active streaming; generations that
-        deliver no chunks at all would otherwise leave the terminal silent, so
-        after ~2s without VISIBLE output the watchdog ticks once per second
-        until something is rendered again. This fires even while the
-        `<thinking>` block is open: a silent thinking phase usually means the
-        model has switched to a tool call (native tool-call deltas carry no
-        content, so the block never closes on its own) — the block is closed
-        and the dots keep the user informed. If thinking later resumes, the
-        block reopens. The idle test tracks the last RENDERED output
-        (`last_visible`), not raw chunk arrival: native tool-call deltas stream
-        continuously but render nothing, so chunk activity alone must not
-        starve the heartbeat.
+        Two different situations, two different marks, because one of them is a
+        UI promise:
+
+          - chunks ARE arriving but render nothing (native tool-call deltas,
+            a quiet thinking phase): the model is working, so a '.' heartbeat
+            is honest. `last_activity` stays fresh.
+          - NOTHING has arrived for the grace period: the step is waiting on the
+            network and we do not know whether anything will come. Printing '.'
+            here would claim progress that is not happening, so the mark is
+            `IDLE_WAIT_MARK` ("Zz") — waiting, not streaming.
+
+        The idle test uses `last_activity` (any chunk), not `last_visible`
+        (anything rendered): a long silent tool-call generation must not be
+        mistaken for a dead socket, and a dead socket must not be dressed up as
+        progress.
         """
         idle_grace = 2.0
         while not self.cancelled:
             time.sleep(1.0)
             if self.cancelled:
                 return
-            if time.time() - self.last_visible < idle_grace:
+            now = time.time()
+            if now - self.last_visible < idle_grace and now - self.last_activity < idle_grace:
                 continue
+            idle = (now - self.last_activity) >= idle_grace
+            mark = IDLE_WAIT_MARK if idle else "."
             with self._write_lock:
                 if self.cancelled:
                     return
@@ -16133,8 +16201,8 @@ class StepFeedback:
                     sys.stderr.write(_thinking_close_tag())
                     self.thinking_open = False
                 self.heartbeat_shown = True
-                self.last_visible = time.time()
-                sys.stderr.write(".")
+                self.last_visible = now
+                sys.stderr.write(mark)
                 sys.stderr.flush()
 
 # ============================================================================
@@ -17000,7 +17068,17 @@ class AgenticRunner:
 
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
-        thread.join(timeout_sec)
+        # Short joins instead of one long one: CPython makes a timed
+        # `Thread.join()` interruptible on most builds, but not all, and a
+        # blocking join is the one place where Ctrl-C must never wait for the
+        # whole step timeout to be noticed. The loop is otherwise equivalent
+        # (same deadline, no busy-wait).
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while thread.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(min(0.25, remaining))
         if thread.is_alive():
             return None  # timed out
         if exception[0]:
@@ -17075,9 +17153,15 @@ class AgenticRunner:
             # abort the request, then let the [Interrupted] handler take over
             # (F2 persists completed turns).
             _signal_abort(step_cancel)
-            finalize_step()
             raise
-        finalize_step()
+        finally:
+            # EVERY exit path must stop the feedback watchdog. A transport
+            # error (MaaS 403/500 burst, reset) used to propagate from
+            # `call_with_timeout` without reaching the finalize below, leaving a
+            # daemon thread printing a heartbeat dot per second for the rest of
+            # the session — the prompt came back but the terminal was unusable.
+            # `finalize()` is idempotent (it only closes an open block/flags).
+            finalize_step()
         return response, step_start
 
     def find_partial_write(self, step_tool_calls: list, feedback: 'StepFeedback') -> tuple:
@@ -17439,11 +17523,17 @@ class AgenticRunner:
             # Nothing usable came back. Say "continue where you stopped" instead
             # of "provide a tool call or your final answer": the latter reads as
             # a fresh instruction and makes the model restart the cycle.
+            # A thinking model on a backend without a reasoning off-switch
+            # (e.g. MaaS) can end a clean turn with reasoning only; naming that
+            # cause is what stops it from re-deriving the same analysis.
+            empty_reason = cut_reason
+            if not empty_reason:
+                empty_reason = "reasoning" if (feedback.thought or "").strip() else "empty"
             state.empty_nudges += 1
             if state.empty_nudges <= AGENTIC_TRUNCATED_STEP_MAX:
-                self.push_continuation_nudge(state, cut_reason or "empty")
+                self.push_continuation_nudge(state, empty_reason)
                 print(colorize(
-                    f"\n[Agentic] Empty step ({cut_reason or 'no output'}) — nudging to "
+                    f"\n[Agentic] Empty step ({empty_reason}) — nudging to "
                     f"continue ({state.empty_nudges}/{AGENTIC_TRUNCATED_STEP_MAX}).",
                     'warning'), file=sys.stderr)
                 return "continue"
@@ -17474,6 +17564,10 @@ class AgenticRunner:
             entry = dict(type="turn", iteration=state.iteration,
                          model_response=state.response_text,
                          tool_call=first_call)
+            # Reasoning is not persisted as a message, so its size is otherwise
+            # invisible in the log; on a thinking backend it is the first thing
+            # to check when a step "produced nothing" (see the reasoning nudge).
+            entry["reasoning_chars"] = len(feedback.thought or "")
             if isinstance(stream_info, dict) and stream_info:
                 # Why the turn ended the way it did — the first thing to look at
                 # when a query "stopped by itself".
@@ -17580,8 +17674,14 @@ class AgenticRunner:
             "arguments, or give the final answer. Do not start over."),
         "length": (
             "Your previous response hit the output-token cap before the turn "
-            "finished. Continue from exactly where you stopped: emit the tool call "
-            "you were about to make (or a shorter final answer). Do not start over."),
+            "finished. On a model that always reasons, the reasoning shares that "
+            "cap. Do not re-derive your analysis: emit the tool call you were "
+            "about to make, or a shorter complete final answer."),
+        "reasoning": (
+            "Your previous step ended after reasoning only: that analysis is "
+            "private and was NOT delivered as an answer, and no tool call was "
+            "made. Do not repeat it. Emit the tool call now, or write the "
+            "complete final answer as visible text."),
         "unparsed": (
             "The tool call in your previous response could not be parsed (malformed "
             "or truncated JSON). Do not explain it again — re-emit the same tool "
@@ -20220,7 +20320,7 @@ class ChatLoop:
         attr_map = {
             "iterations": ("agentic_max_iterations", "Max iterations"),
             "timeout": ("agentic_step_timeout", "Step timeout"),
-            "heartbeattokens": ("agentic_heartbeat_tokens", "Tokens per heartbeat dot"),
+            "heartbeattokens": ("agentic_heartbeat_tokens", "Tokens per heartbeat dot (streaming; idle waits show Zz)"),
         }
         attr, label = attr_map[subcmd]
         setattr(self.ctx, attr, val)
@@ -20376,7 +20476,7 @@ class ChatLoop:
             ("lazytool",   "Extract tool calls from anywhere in reply", str(c.lazy_tool).lower()),
             ("iterations", "Max ReAct loop iterations", str(c.agentic_max_iterations)),
             ("timeout",    "Per-step timeout (seconds)", f"{c.agentic_step_timeout}s"),
-            ("heartbeattokens", "Tokens per heartbeat dot", str(c.agentic_heartbeat_tokens)),
+            ("heartbeattokens", "Tokens per heartbeat dot (streaming; idle waits show Zz)", str(c.agentic_heartbeat_tokens)),
             ("compactthreshold", "Agentic auto-compact trigger", f"{c.agentic_compact_threshold:.0%}"),
         ]
         # Column width derives from the longest name ("heartbeattokens",

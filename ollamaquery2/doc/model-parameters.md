@@ -30,6 +30,7 @@ Defined in `MODEL_INFERENCE_PARAMS_REGISTRY` (`ollamaquery2.py:1088`). Keys are 
 |--------------------|-------------|-------|-------|-------|------------------|----------------|----------------------------|----------------------------|
 | `nemotron-cascade` | 0.6         | 0.95  | 40    | 0.0   | 0.0              | 1.0            | Tool calling / coding      | Nemotron-Cascade-2-30B     |
 | `glm-4.7`          | 0.7         | 1.0   | —     | 0.01  | 0.0              | 1.0            | Tool calling               | Medium guide + Gemini 3.5  |
+| `(none: glm-5)`    | —           | —     | —     | —     | —                | —              | MaaS `glm-53-flash` uses the defaults | An inherited glm-4.7 profile stalled `/agentic` on the gateway |
 | `qwen3.8`          | 1.0         | 0.95  | 20    | 0.0   | 0.0              | 1.0            | Reasoning / agentic        | GGUF `general.sampling.*`  |
 | `qwen3.6`          | 0.6         | 0.95  | 20    | 0.0   | 0.0              | 1.0            | Precise coding / tool call | HF Qwen3.6 best practices  |
 | `qwen3.5`          | 0.5         | 0.9   | 20    | 0.0   | 0.0              | 1.0            | Precise coding / tool call | Qwen3.5-9B + Gemini 3.5    |

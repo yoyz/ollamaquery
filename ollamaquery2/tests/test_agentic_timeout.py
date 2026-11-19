@@ -379,27 +379,47 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
         return False
 
     def test_watchdog_liveness_without_chunks(self):
-        """The idle-fallback watchdog emits a liveness dot when no chunks arrive.
+        """Silence is shown as SLEEP, not as a progress dot.
 
-        Long tool-call generations (e.g. llama.cpp buffering the response)
-        stream no chunks for tens of seconds; the token-driven heartbeat has no
-        tokens to count, so after ~2s of silence the watchdog ticks ~1/s.
+        A '.' claims "bytes are arriving". When nothing has arrived for the
+        grace period the UI must say so with IDLE_WAIT_MARK, otherwise it lies
+        about progress. After `finalize` the mark must stop.
         """
         feedback = self.loop._make_agentic_step_feedback()
         self.assertEqual(self._stderr.getvalue(), "")
-        self.assertTrue(self._wait_for(lambda: "." in self._stderr.getvalue(), timeout=5.0))
+        self.assertTrue(self._wait_for(
+            lambda: m.IDLE_WAIT_MARK in self._stderr.getvalue(), timeout=5.0))
+        self.assertNotIn(".", self._stderr.getvalue())
         feedback.finalize()
-        dots = self._stderr.getvalue().count(".")
+        marks = self._stderr.getvalue().count(m.IDLE_WAIT_MARK)
         time.sleep(1.1)
-        self.assertEqual(self._stderr.getvalue().count("."), dots,
+        self.assertEqual(self._stderr.getvalue().count(m.IDLE_WAIT_MARK), marks,
                          "watchdog must stop writing after finalize")
 
+    def test_watchdog_keeps_the_dot_while_chunks_arrive(self):
+        """Chunks with no visible output are activity: the honest mark is '.'.
+
+        Native tool-call deltas carry neither thought nor content, but they do
+        arrive; that is not "waiting", so it must not be shown as sleep.
+        """
+        feedback = self.loop._make_agentic_step_feedback()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and "." not in self._stderr.getvalue():
+            feedback.feed("", "", False)   # a chunk that renders nothing
+            time.sleep(0.2)
+        out = self._stderr.getvalue()
+        self.assertIn(".", out)
+        self.assertNotIn(m.IDLE_WAIT_MARK, out)
+        feedback.finalize()
+
     def test_watchdog_suppressed_while_thinking_streams(self):
-        """No dots while reasoning is being streamed live to the terminal."""
+        """No marks while reasoning is being streamed live to the terminal."""
         self.ctx.agentic_show_thinking = True
         feedback = self.loop._make_agentic_step_feedback()
         feedback.feed("reasoning text", "", False)
-        self.assertFalse(self._wait_for(lambda: "." in self._stderr.getvalue(), timeout=1.5))
+        self.assertFalse(self._wait_for(
+            lambda: ("." in self._stderr.getvalue()
+                     or m.IDLE_WAIT_MARK in self._stderr.getvalue()), timeout=1.5))
         self.assertIn("<thinking>", self._stderr.getvalue())
         feedback.finalize()
 
@@ -436,20 +456,20 @@ class TestAgenticTimeoutPolicy(unittest.TestCase):
         self.assertIn("visible answer text and more", out.getvalue())
         self.assertTrue(feedback.content_streamed)
 
-    def test_watchdog_closes_silent_thinking_and_shows_dots(self):
-        """A quiet thinking phase (model switching to a native tool call, whose
-        deltas carry no content) must not suppress the liveness dots: the
-        watchdog closes the `<thinking>` block and resumes ticking."""
+    def test_watchdog_closes_silent_thinking_and_shows_the_wait_mark(self):
+        """A quiet thinking phase must still close the `<thinking>` block and
+        keep ticking — with the sleep mark, because no chunk is arriving."""
         self.ctx.agentic_show_thinking = True
         feedback = self.loop._make_agentic_step_feedback()
         feedback.feed("reasoning text", "", False)
         self.assertIn("<thinking>", self._stderr.getvalue())
-        self.assertTrue(self._wait_for(lambda: "." in self._stderr.getvalue(), timeout=5.0))
+        self.assertTrue(self._wait_for(
+            lambda: m.IDLE_WAIT_MARK in self._stderr.getvalue(), timeout=5.0))
         self.assertIn("</thinking>", self._stderr.getvalue())
         feedback.finalize()
-        dots = self._stderr.getvalue().count(".")
+        marks = self._stderr.getvalue().count(m.IDLE_WAIT_MARK)
         time.sleep(1.1)
-        self.assertEqual(self._stderr.getvalue().count("."), dots,
+        self.assertEqual(self._stderr.getvalue().count(m.IDLE_WAIT_MARK), marks,
                          "watchdog must stop writing after finalize")
 
     def test_token_driven_heartbeat(self):
