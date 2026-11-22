@@ -2016,18 +2016,31 @@ _MAX_OUTPUT_WINDOW_WARNED = False
 _MAAS_WINDOW_HINTED = False
 
 
+_TOKEN_WORD_RE = re.compile(r'\b\w+\b')
+_TOKEN_PUNCT_RE = re.compile(r'[^\w\s]')
+# Code detection: a keyword anywhere was too broad (`as`, `if`, `for`, `pass`,
+# `return` are ordinary English words), so a single occurrence flipped every
+# narrative paragraph to the ×2.0 multiplier. Look for a code-shaped line
+# start instead; prose that merely contains one of these words stays ×1.5.
+_CODE_LINE_RE = re.compile(
+    r'(?m)^\s*(?:def|class|import|from|return|if|elif|else|for|while|try|'
+    r'except|finally|with|as|pass|raise|lambda|yield|async|await)\b'
+    r'|^\s*#\s*(?:include|define|ifdef|ifndef|endif)\b'
+    r'|^\s*(?:public|private|protected|static|void|int|char|float|double|'
+    r'struct|enum|typedef)\b'
+)
+
+
 def estimate_token_count(text: str) -> int:
     """Estimate token count from text using regex-based heuristic.
 
     Falls back to a safe overestimate when API tokenization is unavailable.
-    Detects code content and uses a higher multiplier for safety.
+    Detects code-shaped lines and uses a higher multiplier for safety.
     """
     if not text:
         return 0
-    tokens = len(re.findall(r'\b\w+\b|[^\w\s]', text))
-    code_keywords = {'def', 'class', 'import', 'from', 'if', 'else', 'elif', 'return', 'for', 'while', 'try', 'except', 'with', 'as', 'pass', 'raise', 'lambda', 'yield', 'async', 'await'}
-    words = set(re.findall(r'\b\w+\b', text.lower()))
-    if words.intersection(code_keywords):
+    tokens = len(_TOKEN_WORD_RE.findall(text)) + len(_TOKEN_PUNCT_RE.findall(text))
+    if _CODE_LINE_RE.search(text):
         return max(1, int(tokens * 2.0))
     return max(1, int(tokens * 1.5))
 
@@ -2666,6 +2679,10 @@ def sanitize_tool_pairing(messages: list[Message]) -> list[Message]:
                 msg['role'] = 'user'
                 msg['content'] = f"{prefix}\n{content}"
                 msg.pop('tool_call_id', None)
+                # The token count was for the old role/content pair. Leaving
+                # `_tokens` behind would keep a stale number forever because
+                # stamp_tokens() early-returns when the key exists.
+                msg.pop('_tokens', None)
         else:
             last_non_tool_ok = (
                 role == 'assistant'
@@ -2786,14 +2803,17 @@ def compact_messages(messages: list[Message], ctx: 'CommandContext', target_toke
     summary_text = _build_compaction_summary(middle)
 
     summary_tokens = ctx.estimate_tokens(summary_text)
-    system_tokens = system_msg.get('_tokens', ctx.estimate_tokens(system_msg.get('content', '')))
-    recent_tokens = sum(m.get('_tokens', ctx.estimate_tokens(m.get('content', ''))) for m in recent)
-    available = target_tokens - system_tokens - recent_tokens - 100 - overhead_tokens
+    # One unit for the fixed part: exact cached counts when present, the same
+    # estimator otherwise. Mixing a raw `_tokens` value with an estimate made
+    # the available budget meaningless. The summary is then shrunk with the
+    # shared token-aware helper instead of a characters/token ratio.
+    fixed_tokens = ctx.calculate_context_tokens([system_msg] + recent)
+    available = target_tokens - fixed_tokens - 100 - overhead_tokens
 
     if available > 0 and summary_tokens > available:
-        ratio = available / summary_tokens
-        max_chars = int(len(summary_text) * ratio)
-        summary_text = summary_text[:max_chars] + "\n[... older history truncated ...]"
+        summary_text = _shrink_text_to_tokens(
+            ctx, summary_text, available,
+            marker="\n[... older history truncated ...]")
 
     compacted_msg = {'role': 'user', 'content': summary_text}
     ctx.stamp_tokens(compacted_msg)
@@ -3034,7 +3054,8 @@ def _shrink_text_to_tokens(ctx: 'CommandContext', text: str, budget: int,
         marker: Inserted where the middle was dropped.
 
     Returns:
-        The original text when it fits, else a head+tail truncation.
+        The original text when it fits, else a head+tail truncation (an empty
+        string when not even one character fits the budget).
     """
     if budget <= 0:
         return ''
@@ -3054,7 +3075,7 @@ def _shrink_text_to_tokens(ctx: 'CommandContext', text: str, budget: int,
             lo = keep + 1
         else:
             hi = keep - 1
-    return best or text[:max(0, budget)]
+    return best
 
 
 def _render_token_breakdown(middle: list[Message], ctx: 'CommandContext',
@@ -3345,6 +3366,32 @@ _PRIVATE_DIR_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 
 
+def _private_dir_error(path: str) -> str:
+    """Create `path` when missing, force mode 0700, and report a failure.
+
+    Unlike `_ensure_private_dir` this does not swallow the OSError: callers
+    that *require* the directory (the bwrap sandbox HOME) must refuse with the
+    real reason instead of handing bwrap a path that does not exist.
+
+    Args:
+        path: Directory to create and/or tighten.
+
+    Returns:
+        An empty string on success, else a user-facing reason.
+    """
+    try:
+        os.makedirs(path, mode=_PRIVATE_DIR_MODE, exist_ok=True)
+    except OSError as exc:
+        return exc.strerror or str(exc)
+    try:
+        os.chmod(path, _PRIVATE_DIR_MODE)
+    except OSError as exc:
+        return f"cannot set mode 0700: {exc.strerror or exc}"
+    if not os.path.isdir(path):
+        return "the path exists but is not a directory"
+    return ""
+
+
 def _ensure_private_dir(path: str) -> None:
     """Create `path` when missing and force it to mode 0700.
 
@@ -3353,13 +3400,10 @@ def _ensure_private_dir(path: str) -> None:
 
     Returns:
         None. makedirs/chmod failures are swallowed — a permission problem
-        must never stop the CLI from starting.
+        must never stop the CLI from starting. Callers that cannot proceed
+        without the directory use `_private_dir_error()` instead.
     """
-    try:
-        os.makedirs(path, mode=_PRIVATE_DIR_MODE, exist_ok=True)
-        os.chmod(path, _PRIVATE_DIR_MODE)
-    except OSError:
-        pass
+    _private_dir_error(path)
 
 
 def _open_private(path: str, mode: str = "w", **kwargs: object) -> IO:
@@ -3386,6 +3430,47 @@ def _open_private(path: str, mode: str = "w", **kwargs: object) -> IO:
         except OSError:
             pass
     return os.fdopen(fd, mode, **kwargs)
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    """Replace `path` atomically with `text` (same-directory temp + os.replace).
+
+    A crash or a full disk while writing used to truncate the original file
+    in place. The temp file lives in the destination directory because
+    os.replace is only atomic on the same filesystem; an existing target keeps
+    its mode, a new one gets 0644.
+
+    Args:
+        path: Destination file.
+        text: Complete new content.
+
+    Raises:
+        OSError: when the directory cannot be created or the rename fails; the
+            original file is left untouched in that case.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    mode = 0o644
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        pass
+    fd, tmp_path = tempfile.mkstemp(prefix=".aq-write-", suffix=".tmp",
+                                    dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        try:
+            os.chmod(tmp_path, mode)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ============================================================================
@@ -3756,7 +3841,7 @@ You are operating in READ-ONLY PLANNING MODE. Your job is to INSPECT and PLAN, n
 
 - You MUST NOT modify, create, delete, move, or overwrite any files, and you MUST NOT change any system state.
 - Only use the tools available to you to read and inspect: read_file, list_directory, glob, grep, fetch_url, diff, git_inspect, kubernetes_cluster_query, path_policy (which paths you may touch), and run_command.
-- For run_command, only issue read-only inspection commands (e.g. ls, cat, head, git status, git diff, ps, grep, find). The user is asked to confirm every command before it runs. Prefer the git_inspect tool over a shell `git` command: it needs no confirmation and cannot mutate anything.
+- For run_command, only issue read-only inspection commands (e.g. ls, cat, head, git status, git diff, ps, grep, find). The user is asked to confirm every command before it runs; the one exception is a harmless `curl`/`wget` GET, which may be served by the read-only fetch_url tool without a prompt. Prefer the git_inspect tool over a shell `git` command: it needs no confirmation and cannot mutate anything.
 - Never attempt write_file, run_python, patch, edit_file, or apply_patch — they are disabled in this mode.
 - When you have gathered enough information, present a clear, step-by-step plan to the user. Do NOT execute the plan yourself."""
 
@@ -4385,6 +4470,26 @@ for _cli in ("oc", "kubectl"):
         DEFAULT_SHELL_PERMISSION["bash"][f"{_cli} {_verb} *"] = "deny"
 
 _SHELL_SESSION_APPROVED = []  # list of {"permission":"bash","pattern":..., "action":"allow"}
+SHELL_SESSION_APPROVED_MAX = 256
+
+
+def _remember_shell_approval(pattern: str) -> None:
+    """Add one session shell approval, deduplicated and bounded.
+
+    `s`/`a` answers are process-scoped by design; without a cap a long session
+    that keeps approving new patterns grows this list forever, and a duplicate
+    pattern changes nothing but makes the list longer. The oldest entries are
+    dropped past `SHELL_SESSION_APPROVED_MAX`.
+
+    Args:
+        pattern: The command/arity pattern to approve for this session.
+    """
+    entry = {"permission": "bash", "pattern": pattern, "action": "allow"}
+    if entry in _SHELL_SESSION_APPROVED:
+        return
+    _SHELL_SESSION_APPROVED.append(entry)
+    if len(_SHELL_SESSION_APPROVED) > SHELL_SESSION_APPROVED_MAX:
+        del _SHELL_SESSION_APPROVED[:-SHELL_SESSION_APPROVED_MAX]
 
 _ANSI_RE_SHELL = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
@@ -6427,16 +6532,16 @@ def _shell_prompt_approval(command: str, verdict: dict) -> Dict:
         return {"approved": True, "effect": "allow", "message": None, "verdict": verdict}
     if reply in ("s", "session"):
         for pat in verdict["patterns"]:
-            _SHELL_SESSION_APPROVED.append({"permission": "bash", "pattern": pat, "action": "allow"})
+            _remember_shell_approval(pat)
         return {"approved": True, "effect": "allow", "message": None, "verdict": verdict}
     if reply in ("a", "always"):
         for pat in verdict["patterns"]:
-            _SHELL_SESSION_APPROVED.append({"permission": "bash", "pattern": pat, "action": "allow"})
+            _remember_shell_approval(pat)
         # Also approve the broader arity pattern (e.g. "ssh *"). Same
         # session-scoped list: there is no on-disk always-list and nothing is
         # loaded at startup.
         for pat in verdict["always"]:
-            _SHELL_SESSION_APPROVED.append({"permission": "bash", "pattern": pat, "action": "allow"})
+            _remember_shell_approval(pat)
         return {"approved": True, "effect": "allow", "message": None, "verdict": verdict}
     return {"approved": False, "effect": "ask", "message": "Denied by user", "verdict": verdict}
 
@@ -6506,6 +6611,7 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
 # ============================================================================
 
 _BWRAP_HOME_CACHE: list = []   # one-slot cache: [path]
+_BWRAP_HOME_ERROR: list = []   # one-slot: why the sandbox HOME is unusable
 
 
 def _sweep_dead_bwrap_homes() -> None:
@@ -6559,15 +6665,33 @@ def _bwrap_sandbox_home() -> str:
 
     The real `$HOME` is never mounted: the sandbox gets a private directory so
     pip/npm caches work without exposing dotfiles or SSH keys.
+
+    The path is cached only when the directory exists. Caching it after a
+    silent creation failure used to surface later as bwrap's "source path
+    missing" (which reads like a broken bwrap install); `_bwrap_home_error()`
+    carries the real reason so the executor refuses before probing.
     """
     if _BWRAP_HOME_CACHE:
         return _BWRAP_HOME_CACHE[0]
     _sweep_dead_bwrap_homes()
     path = os.path.join(BWRAP_SANDBOX_DIR, f"pid-{os.getpid()}", "home")
-    _ensure_private_dir(path)
+    error = _private_dir_error(path)
+    if error:
+        _BWRAP_HOME_ERROR[:] = [f"the private sandbox HOME could not be created "
+                                f"at {path}: {error}"]
+        return path
+    _BWRAP_HOME_ERROR[:] = []
     _BWRAP_HOME_CACHE.append(path)
     atexit.register(_cleanup_bwrap_home)
     return path
+
+
+def _bwrap_home_error() -> str:
+    """Return why the private sandbox HOME is unusable, or "" when it is ready."""
+    if _BWRAP_HOME_CACHE:
+        return ""
+    _bwrap_sandbox_home()
+    return _BWRAP_HOME_ERROR[0] if _BWRAP_HOME_ERROR else ""
 
 
 def _bwrap_shell() -> str:
@@ -6626,6 +6750,33 @@ def _parse_bwrap_bind(spec: str) -> tuple:
     if not path:
         raise ValueError("empty bwrap bind path")
     return os.path.realpath(os.path.expanduser(path)), mode
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGKILL a process group led by `proc` (started with a new session).
+
+    `subprocess.run(..., timeout=...)` only kills the direct shell: a command
+    that spawned children (`sleep 300 &`, `python -m http.server`) left them
+    orphaned. The caller starts the command with `start_new_session=True`, so
+    its pid is the group leader and the whole tree can be killed here.
+
+    Args:
+        proc: The Popen object whose group should be terminated.
+    """
+    if proc is None:
+        return
+    killpg = getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+    if killpg is not None and getpgid is not None:
+        try:
+            killpg(getpgid(proc.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
 
 class Executor:
@@ -6716,6 +6867,16 @@ class Executor:
         self._scratch_warned = False
 
     # --- bwrap -----------------------------------------------------------
+    def _bwrap_home_refusal(self) -> str:
+        """Why the private sandbox HOME is unusable, or "" when it is fine."""
+        if self._bwrap_home_override:
+            path = self._bwrap_home_override
+            if not os.path.isdir(path):
+                return (f"the bwrap HOME override {path} does not exist or is not "
+                        f"a directory")
+            return ""
+        return _bwrap_home_error()
+
     def _bwrap_probe(self) -> bool:
         """Probe bwrap once per executor; a failure is fail-closed.
 
@@ -6727,6 +6888,12 @@ class Executor:
         if self._bwrap_state == "failed":
             return False
         self._bwrap_state = "failed"   # pessimistic until the probe succeeds
+        # Refuse before the probe: a missing sandbox HOME makes bwrap exit with
+        # "source path missing", which reads like a broken bwrap install.
+        home_error = self._bwrap_home_refusal()
+        if home_error:
+            self._bwrap_error = home_error
+            return False
         self.bwrap_path = shutil.which("bwrap")
         if not self.bwrap_path:
             self._bwrap_error = ("bubblewrap (bwrap) is not installed or not in PATH")
@@ -6755,6 +6922,18 @@ class Executor:
 
     def _bwrap_ready(self) -> bool:
         """Probe bwrap and report a refusal once; never fall back to host."""
+        home_error = self._bwrap_home_refusal()
+        if home_error:
+            self._bwrap_error = home_error
+            if not self._bwrap_warned:
+                self._bwrap_warned = True
+                sys.stderr.write(colorize(
+                    f"[Sandbox] REFUSED: {home_error}\n"
+                    f"[Sandbox] tool commands are refused (no silent host fallback): "
+                    f"make {BWRAP_SANDBOX_DIR} writable, or run with "
+                    f"--sandbox-engine host / /agentic preset trusted for an "
+                    f"explicit unsandboxed session\n", 'warning'))
+            return False
         if self._bwrap_probe():
             return True
         if not self._bwrap_warned:
@@ -7150,13 +7329,27 @@ class Executor:
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, timeout=timeout
                 )
-            else:
-                proc = subprocess.run(
-                    command, shell=True,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, timeout=timeout, executable="/bin/bash"
-                )
-            return {"stdout": proc.stdout, "stderr": proc.stderr, "returncode": proc.returncode}
+                return {"stdout": proc.stdout, "stderr": proc.stderr,
+                        "returncode": proc.returncode}
+            # Host mode: own session so a timeout kills the whole tree, not
+            # just bash. `subprocess.run` cannot do that: it kills the direct
+            # child and leaves background grandchildren running.
+            proc = subprocess.Popen(
+                command, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, executable="/bin/bash", start_new_session=True
+            )
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(proc)
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                return {"stdout": "", "stderr": f"Timed out after {timeout}s",
+                        "returncode": -1}
+            return {"stdout": stdout, "stderr": stderr, "returncode": proc.returncode}
         except subprocess.TimeoutExpired:
             return {"stdout": "", "stderr": f"Timed out after {timeout}s", "returncode": -1}
         except Exception as e:
@@ -8058,17 +8251,23 @@ SYSTEM_READ_BLOCKED_BASENAMES = {"mem", "environ", "kcore", "pagemap", "maps", "
 def _is_blocked_system_file(abspath: str) -> bool:
     """True for sensitive /proc or /sys virtual files (secrets / huge dumps).
 
+    The basename check is scoped to `/proc` and `/sys`: `maps`, `mem` and
+    `environ` are ordinary project filenames elsewhere (`docs/maps`,
+    `src/mem`), and blocking them by basename made real files unreadable with
+    no rule able to grant them.
+
     Args:
         abspath: Absolute path to test.
 
     Returns:
         True when the path is a hard-blocked virtual file.
     """
+    parts = abspath.split(os.sep)
+    under_virtual_fs = len(parts) >= 3 and parts[0] == "" and parts[1] in ("proc", "sys")
     base = os.path.basename(abspath)
-    if base in SYSTEM_READ_BLOCKED_BASENAMES:
+    if under_virtual_fs and base in SYSTEM_READ_BLOCKED_BASENAMES:
         return True
     # /proc/<pid>/fd/* can leak open descriptors; refuse the fd tree.
-    parts = abspath.split(os.sep)
     if "/proc" in parts and len(parts) >= 4 and parts[-2] == "fd":
         return True
     return False
@@ -8471,7 +8670,11 @@ class PathAcl:
 
     def prompt(self, op: str, realpath: str, rule: Optional[dict], tool: str = "file", context: str = "") -> bool:
         """Interactive `ask` gate. Bypass-immune (auto_confirm does not
-        auto-approve). Returns True if the user granted session access.
+        auto-approve).
+
+        `y` grants this one access and adds no rule; `s`/`a` install a session
+        allow rule (for a prefix rule, the rule path; otherwise this realpath),
+        which is why the two must not share a branch.
 
         Args:
             op: Operation ("read"/"write").
@@ -8481,7 +8684,7 @@ class PathAcl:
             context: Extra context line to show.
 
         Returns:
-            True when the user granted access (adding a session allow rule).
+            True when the user granted access, False on denial.
         """
         if not sys.stdin.isatty():
             return False
@@ -8496,10 +8699,14 @@ class PathAcl:
         else:
             print(colorize("  rule: outside the project and $HOME", 'muted'), file=sys.stderr)
         try:
-            reply = input(colorize("Allow? [y/N/s/a/d] (s/a = this session, d = deny): ", 'warning')).strip().lower()
+            reply = input(colorize(
+                "Allow? [y/N/s/a/d] (y=once, s/a = this session, d = deny): ",
+                'warning')).strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False
-        if reply in ("y", "yes", "o", "once", "s", "session", "a", "always"):
+        if reply in ("y", "yes", "o", "once"):
+            return True
+        if reply in ("s", "session", "a", "always"):
             if rule and rule.get("kind") == "prefix":
                 self.add(op, "allow", rule["path"], source="session")
             else:
@@ -8558,6 +8765,72 @@ def _acl_policy_block(acl: Optional['PathAcl'], plan_strict: bool = False,
     return "\n".join(lines)
 
 
+def _acl_soft_decision(ctx: Optional['CommandContext'], op: str, realpath: str,
+                       raw_path: Optional[str] = None) -> tuple:
+    """Resolve the ACL verdict without prompting, logging or touching the disk.
+
+    This is the single dry-run definition shared by `_path_acl_decision` (which
+    then asks the user for an `ask`) and the `path_policy` tool (which reports
+    it). It applies the two refinements a bare `PathAcl.evaluate` does not:
+    strict-confinement and the "explicit home request only" gate on the implicit
+    $HOME read allowance. Sharing them is what keeps a `path_policy` verdict
+    from disagreeing with the tool it describes.
+
+    Args:
+        ctx: CommandContext with a path_acl (may be None).
+        op: Operation ("read"/"write").
+        realpath: The realpath being accessed.
+        raw_path: Original tool path; gates the implicit $HOME read allowance.
+
+    Returns:
+        (decision, rule, plan_strict, cause) tuple. `decision` is still "ask"
+        when the caller must prompt; `cause` explains a tightening that no
+        explicit rule covers: "" / "blocked" / "plan" / "home_implicit".
+    """
+    acl = getattr(ctx, "path_acl", None) if ctx is not None else None
+    if acl is None:
+        return "allow", None, False, ""
+    plan_strict = strict_path_confinement(ctx)
+    if _is_blocked_system_file(realpath):
+        return "deny", None, plan_strict, "blocked"
+    decision, rule = acl.evaluate(op, realpath)
+    if plan_strict:
+        # Strict /agentic plan is confined to CWD: any implicit allow outside
+        # CWD (the $HOME read allowance), the session scratch dir and every
+        # `ask` rule become a hard deny — no prompts. Explicit session allow
+        # rules survive, for reads only, so e.g. the cluster spill dir remains
+        # pageable without reopening writes.
+        cwd_real = os.path.realpath(os.getcwd())
+        try:
+            in_cwd = os.path.commonpath([cwd_real, realpath]) == cwd_real
+        except ValueError:
+            in_cwd = False
+        if decision == "allow" and not in_cwd:
+            if not (rule is not None and rule.get("source") == "session" and op == "read"):
+                return "deny", rule, plan_strict, "plan"
+        elif decision == "ask":
+            return "deny", rule, plan_strict, "plan"
+        return decision, rule, plan_strict, ""
+    # Reject implicit home-read allowance for non-explicit home requests.
+    # CWD is always allowed — this only applies to $HOME paths OUTSIDE CWD,
+    # so relative `../` escapes that land in $HOME stay denied.
+    if decision == "allow" and rule is None and op == "read":
+        cwd_real = os.path.realpath(os.getcwd())
+        try:
+            in_cwd = os.path.commonpath([cwd_real, realpath]) == cwd_real
+        except ValueError:
+            in_cwd = False
+        if not in_cwd:
+            home_real = os.path.realpath(os.path.expanduser("~"))
+            try:
+                in_home = os.path.commonpath([home_real, realpath]) == home_real
+            except ValueError:
+                in_home = False
+            if in_home and not _is_home_dotfile(realpath) and not _raw_is_home_explicit(raw_path):
+                return "deny", rule, plan_strict, "home_implicit"
+    return decision, rule, plan_strict, ""
+
+
 def _path_acl_decision(ctx: Optional['CommandContext'], op: str, realpath: str, tool: str, context: str = "", raw_path: Optional[str] = None) -> tuple:
     """Apply PathAcl to an operation. Returns (decision, message|None).
 
@@ -8581,49 +8854,14 @@ def _path_acl_decision(ctx: Optional['CommandContext'], op: str, realpath: str, 
     acl = getattr(ctx, "path_acl", None) if ctx is not None else None
     if acl is None:
         return "allow", None
-    plan_strict = strict_path_confinement(ctx)
-    if _is_blocked_system_file(realpath):
+    decision, rule, plan_strict, cause = _acl_soft_decision(ctx, op, realpath, raw_path)
+    if cause == "blocked":
         acl.log_event(tool, realpath, "deny", None)
         return "deny", (f"[path ACL denied] {op} {realpath} — System file blocked "
                         f"(sensitive virtual file); {ACL_DENIAL_HINT}")
-    decision, rule = acl.evaluate(op, realpath)
-    if plan_strict:
-        # Strict /agentic plan is confined to CWD: any implicit allow outside
-        # CWD (the $HOME read allowance), the session scratch dir and every
-        # `ask` rule become a hard deny — no prompts. Explicit session allow
-        # rules survive, for reads only, so e.g. the cluster spill dir remains
-        # pageable without reopening writes.
-        cwd_real = os.path.realpath(os.getcwd())
-        try:
-            in_cwd = os.path.commonpath([cwd_real, realpath]) == cwd_real
-        except ValueError:
-            in_cwd = False
-        if decision == "allow" and not in_cwd:
-            if not (rule is not None and rule.get("source") == "session" and op == "read"):
-                decision = "deny"
-        elif decision == "ask":
-            decision = "deny"
-    else:
-        # Reject implicit home-read allowance for non-explicit home requests.
-        # CWD is always allowed — this only applies to $HOME paths OUTSIDE CWD,
-        # so relative `../` escapes that land in $HOME stay denied.
-        if decision == "allow" and rule is None and op == "read":
-            cwd_real = os.path.realpath(os.getcwd())
-            try:
-                in_cwd = os.path.commonpath([cwd_real, realpath]) == cwd_real
-            except ValueError:
-                in_cwd = False
-            if not in_cwd:
-                home_real = os.path.realpath(os.path.expanduser("~"))
-                try:
-                    in_home = os.path.commonpath([home_real, realpath]) == home_real
-                except ValueError:
-                    in_home = False
-                if in_home and not _is_home_dotfile(realpath) and not _raw_is_home_explicit(raw_path):
-                    decision = "deny"
-        if decision == "ask":
-            granted = acl.prompt(op, realpath, rule, tool=tool, context=context)
-            decision = "allow" if granted else "deny"
+    if decision == "ask":
+        granted = acl.prompt(op, realpath, rule, tool=tool, context=context)
+        decision = "allow" if granted else "deny"
     acl.log_event(tool, realpath, decision, rule)
     if decision == "deny":
         head = f"[path ACL denied] {op} {realpath}"
@@ -8632,6 +8870,9 @@ def _path_acl_decision(ctx: Optional['CommandContext'], op: str, realpath: str, 
             # would invite a retry that can never succeed.
             reason = ("strict plan mode is confined to "
                       f"{os.path.realpath(os.getcwd())}")
+        elif cause == "home_implicit":
+            reason = ("inside $HOME but not requested explicitly — use ~/... "
+                      "or an absolute path")
         elif rule is not None:
             shown = rule["path"] if rule.get("kind") in ("prefix", "temp_root") else "home dotfile"
             reason = f"denied by path ACL rule: {rule['action']} {shown}"
@@ -8780,9 +9021,7 @@ def _tool_handle_write_file(self, args: dict) -> dict:
     if len(content) > MAX_WRITE_FILE_SIZE:
         return {"success": False, "output": "", "error": "Content too large (max 1M chars)"}
     try:
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
+        _atomic_write_text(os.path.realpath(filepath), content)
         return {"success": True, "output": f"Written {len(content)} chars to {args['file_path']}", "error": None}
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
@@ -8818,21 +9057,44 @@ def _tool_handle_list_directory(self, args: dict) -> dict:
 def _tool_handle_glob(self, args: dict) -> dict:
     """Glob for files matching a pattern, restricted to the working directory.
 
+    Every match is contained by *realpath* (a symlink inside the project cannot
+    point the listing at `/etc`) and checked against the path ACL with the same
+    dry-run decision the file tools use. `ask` is treated as "not listed": a
+    listing is not the place to spend a confirmation, and a recursive pattern
+    must not become a prompt amplifier.
+
     Args:
         args: Tool arguments with "pattern".
 
     Returns:
         {"success": bool, "output": str, "error": str|None}.
     """
-    base_dir = os.path.abspath(os.getcwd())
+    base_dir = os.path.realpath(os.getcwd())
+    ctx = self._ctx if self._ctx is not None else (CommandContext() if CommandContext._initialized else None)
     try:
         matches = sorted(glob.glob(args["pattern"], recursive=True))
         safe_matches = []
+        blocked = 0
         for m in matches:
-            abs_m = os.path.abspath(m)
-            if os.path.commonpath([base_dir, abs_m]) == base_dir:
-                safe_matches.append(m)
-        return {"success": True, "output": "\n".join(safe_matches), "error": None}
+            abs_m = os.path.realpath(m)
+            try:
+                if os.path.commonpath([base_dir, abs_m]) != base_dir:
+                    blocked += 1
+                    continue
+            except ValueError:
+                blocked += 1
+                continue
+            decision, _rule, _plan, _cause = _acl_soft_decision(ctx, "read", abs_m, m)
+            if decision != "allow":
+                blocked += 1
+                continue
+            safe_matches.append(m)
+        output = "\n".join(safe_matches)
+        if blocked:
+            note = (f"[{blocked} match(es) outside the project or denied by "
+                    f"the path ACL, not listed]")
+            output = f"{output}\n{note}" if output else note
+        return {"success": True, "output": output, "error": None}
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
 
@@ -9461,18 +9723,41 @@ def _tool_handle_run_python(self, args: dict) -> dict:
     Returns:
         {"success": bool, "output": str, "error": str|None}.
     """
+    cmd_timeout = int(args.get("timeout", 10))
+    if cmd_timeout <= 0 or cmd_timeout > 300:
+        return {"success": False, "output": "", "error": f"Invalid timeout: {cmd_timeout}. Timeout is in seconds (1-300). Use a value between 1 and 300."}
+    script_path = None
     if "code" in args:
-        command = f"python3 -c {shlex.quote(args['code'])}"
+        # Write the source to the session scratch instead of `python3 -c …`:
+        # the code otherwise appears in /proc/<pid>/cmdline (visible to every
+        # local user) and counts against ARG_MAX.
+        try:
+            fd, script_path = tempfile.mkstemp(
+                prefix="run_python_", suffix=".py", dir=_scratch_root())
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(str(args["code"]))
+        except OSError as e:
+            if script_path:
+                try:
+                    os.unlink(script_path)
+                except OSError:
+                    pass
+            return {"success": False, "output": "", "error": str(e)}
+        command = f"python3 {shlex.quote(script_path)}"
     elif "file_path" in args:
         command = f"python3 {shlex.quote(args['file_path'])}"
     elif "file" in args:
         command = f"python3 {shlex.quote(args['file'])}"
     else:
         return {"success": False, "output": "", "error": "Provide either 'code' or 'file'"}
-    cmd_timeout = int(args.get("timeout", 10))
-    if cmd_timeout <= 0 or cmd_timeout > 300:
-        return {"success": False, "output": "", "error": f"Invalid timeout: {cmd_timeout}. Timeout is in seconds (1-300). Use a value between 1 and 300."}
-    result = self.executor.run(command, timeout=cmd_timeout)
+    try:
+        result = self.executor.run(command, timeout=cmd_timeout)
+    finally:
+        if script_path:
+            try:
+                os.unlink(script_path)
+            except OSError:
+                pass
     output = result["stdout"]
     if result["stderr"]:
         output += f"\n[stderr]\n{result['stderr']}"
@@ -9539,19 +9824,13 @@ def _tool_handle_path_policy(self, args: dict) -> dict:
     else:
         realpath = os.path.realpath(os.path.join(os.getcwd(), raw))
 
-    if _is_blocked_system_file(realpath):
+    # Same dry-run decision the real tools apply (no prompt, no log), so the
+    # announced verdict cannot differ from what read_file/write_file then do.
+    decision, rule, _plan_strict, cause = _acl_soft_decision(ctx, op, realpath, raw)
+    if cause == "blocked":
         return {"success": True, "output": (
             f"{realpath}\n  {op}: DENIED (hard-blocked sensitive virtual file — no rule can allow it)"),
             "error": None}
-    decision, rule = acl.evaluate(op, realpath)
-    if plan_strict:
-        cwd_real = os.path.realpath(os.getcwd())
-        try:
-            in_cwd = os.path.commonpath([cwd_real, realpath]) == cwd_real
-        except ValueError:
-            in_cwd = False
-        if decision == "ask" or (decision == "allow" and rule is None and not in_cwd):
-            decision = "deny"
     advice = {
         "allow": "you may use it",
         "ask": "needs one user confirmation (bypass-immune; non-TTY denies) — prefer an "
@@ -9560,6 +9839,9 @@ def _tool_handle_path_policy(self, args: dict) -> dict:
                 "/agentic acl allow <path> read. The shell is not the way around it: "
                 "it is bounded by the gate on the host and by the mounts in a sandbox",
     }[decision]
+    if cause == "home_implicit":
+        advice += (" — this path is inside $HOME but was not requested explicitly: "
+                   "use ~/... or an absolute path")
     where = ("rule: " + (rule["path"] if rule.get("kind") == "prefix" else "home dotfile")
              if rule is not None else "no explicit rule")
     return {"success": True,
@@ -9658,6 +9940,15 @@ def _tool_handle_edit_file(self, args: dict) -> dict:
         return {"success": False, "output": "", "error": acl_err or "Path traversal denied"}
     if not os.path.isfile(filepath):
         return {"success": False, "output": "", "error": f"File not found: {args['file_path']}"}
+    try:
+        size = os.path.getsize(filepath)
+    except OSError as e:
+        return {"success": False, "output": "", "error": str(e)}
+    if size > MAX_WRITE_FILE_SIZE:
+        return {"success": False, "output": "", "error": (
+            f"File too large to edit safely ({size} bytes; max "
+            f"{MAX_WRITE_FILE_SIZE}) — use read_file paging and apply_patch, "
+            f"or a targeted shell command")}
     old = args["old_string"]
     new_string = args["new_string"]
     if not old:
@@ -9674,8 +9965,7 @@ def _tool_handle_edit_file(self, args: dict) -> dict:
         if count > 1:
             return {"success": False, "output": "", "error": f"Found {count} matches. Provide more surrounding context in old_string to make the match unique."}
         content = content.replace(old, new_string, 1)
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
+        _atomic_write_text(os.path.realpath(filepath), content)
         return {"success": True, "output": f"Replaced 1 occurrence in {args['file_path']}", "error": None}
     except Exception as e:
         return {"success": False, "output": "", "error": str(e)}
@@ -10071,7 +10361,7 @@ def _apply_unified_diff(patch_text: str) -> Dict:
 
         # Read existing content or start empty for new files
         if os.path.isfile(abspath):
-            with open(abspath, "r") as f:
+            with open(abspath, "r", encoding="utf-8", errors="replace") as f:
                 content = f.readlines()
         elif op == "add":
             content = []
@@ -10093,9 +10383,7 @@ def _apply_unified_diff(patch_text: str) -> Dict:
             return {"success": False, "output": "\n".join(applied),
                     "error": f"No hunks matched {path}; patch not applied"}
 
-        os.makedirs(os.path.dirname(abspath), exist_ok=True)
-        with open(abspath, "w") as f:
-            f.writelines(content)
+        _atomic_write_text(os.path.realpath(abspath), "".join(content))
 
         action = "Added" if op == "add" else "Patched"
         applied.append(f"{action} {path}")
@@ -13215,6 +13503,9 @@ class ToolRegistry:
         Returns:
             {"success": bool, "output": str, "error": str|None}.
         """
+        # Alias normalization below rewrites keys; never mutate the caller's
+        # dict, because a salvaged timed-out call can be replayed.
+        args = dict(args)
         # MCP tools are resolved live: the catalog can appear after a lazy
         # connect, so a static handler table would miss tools that were not
         # listed when this registry was constructed.
@@ -22040,9 +22331,15 @@ class ChatLoop:
             'success'), file=sys.stderr)
         if self.executor.mode == "bwrap":
             policy_error = self.executor._bwrap_policy_error()
+            home_error = self.executor._bwrap_home_refusal() if not policy_error else ""
             if policy_error:
                 print(colorize(f"[Sandbox] REFUSED: {policy_error}", 'warning'),
                       file=sys.stderr)
+            elif home_error:
+                print(colorize(f"[Sandbox] REFUSED: {home_error} — tool commands will "
+                               f"be REFUSED (no silent host fallback); make "
+                               f"{BWRAP_SANDBOX_DIR} writable or use /agentic preset "
+                               f"trusted", 'warning'), file=sys.stderr)
             elif self.executor._bwrap_probe():
                 print(colorize(f"[Sandbox] {self.executor.describe()}", 'info'),
                       file=sys.stderr)
@@ -22170,7 +22467,9 @@ class ChatLoop:
             return False
         if action == "reset":
             acl.reset()
-            print(colorize("[Path ACL reset to defaults]", 'info'), file=sys.stderr)
+            _SHELL_SESSION_APPROVED.clear()
+            print(colorize("[Path ACL reset to defaults; shell session approvals "
+                           "cleared]", 'info'), file=sys.stderr)
             self._print_acl(acl)
             return False
         if action in ("allow", "ask", "deny"):
@@ -23839,12 +24138,12 @@ def _build_parser() -> argparse.ArgumentParser:
     info_group.add_argument('--show-details', action="store_true", help='Show full model information')
 
     input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument('-c', '--chat', action="store_true", help='Start interactive chat session')
     input_group.add_argument('-I', '--input-text', help='Direct query text')
     input_group.add_argument('-i', '--input-file', help='Input file path')
     input_group.add_argument('--input-dir', help='Directory of input files')
 
     batch_group = parser.add_mutually_exclusive_group()
-    batch_group.add_argument('-c', '--chat', action="store_true", help='Start interactive chat session')
     batch_group.add_argument('-o', '--output', help='Output file path')
     batch_group.add_argument('--output-dir', help='Output directory for batches')
 
@@ -24574,18 +24873,22 @@ def main() -> None:
     # Listing operations
     if args.list or args.list_all:
         _run_listing(backend, base_url, args)
+        return
 
     # Model info operations
     if args.show or args.show_details:
         _run_model_info(base_url, target_model, args)
+        return
 
     # Interactive chat mode
     if args.chat:
         _run_chat(backend, base_url, target_model, args)
+        return
 
     # Batch / single query processing
     if args.input_dir:
         _run_batch(backend, base_url, target_model, args)
+        return
 
     if args.input_text or args.input_file:
         _run_single(backend, base_url, target_model, args)

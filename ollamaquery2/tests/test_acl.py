@@ -330,6 +330,54 @@ class TestPathAclDecision(unittest.TestCase):
                                            tool="read_file", raw_path=HOME + "/notes.txt")
         self.assertEqual(decision, "allow")
 
+    def test_prompt_y_allows_once_without_installing_a_rule(self):
+        """`y` must not behave like `s`: no session rule, only this access."""
+        rule_count = len(self.ctx.path_acl.rules)
+        with patch("sys.stdin.isatty", return_value=True), \
+                patch("builtins.input", return_value="y"):
+            decision, msg = m._path_acl_decision(
+                self.ctx, "read", "/var/lib/aq-once.log",
+                tool="read_file", raw_path="/var/lib/aq-once.log")
+        self.assertEqual(decision, "allow")
+        self.assertIsNone(msg)
+        self.assertEqual(len(self.ctx.path_acl.rules), rule_count)
+        self.assertEqual(
+            self.ctx.path_acl.evaluate("read", "/var/lib/aq-once.log")[0], "ask")
+
+    def test_prompt_y_on_a_prefix_rule_does_not_open_the_whole_rule(self):
+        """A `y` on the /etc ask rule must not install `allow read /etc`."""
+        with patch("sys.stdin.isatty", return_value=True), \
+                patch("builtins.input", return_value="y"):
+            decision, _ = m._path_acl_decision(
+                self.ctx, "read", "/etc/passwd", tool="read_file",
+                raw_path="/etc/passwd")
+        self.assertEqual(decision, "allow")
+        self.assertEqual(self.ctx.path_acl.evaluate("read", "/etc/shadow")[0], "ask")
+
+    def test_project_files_named_like_proc_entries_are_not_hard_blocked(self):
+        """The hard block is /proc and /sys only, not an ordinary basename."""
+        for path in ("/project/docs/maps", "/project/src/mem",
+                     "/project/tests/environ", "/project/data/smaps"):
+            self.assertFalse(m._is_blocked_system_file(path), path)
+        for path in ("/proc/self/maps", "/proc/1/mem", "/proc/self/environ",
+                     "/proc/kcore", "/sys/kernel/maps"):
+            self.assertTrue(m._is_blocked_system_file(path), path)
+
+    def test_read_file_reads_a_project_file_named_maps(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                os.makedirs("docs")
+                with open(os.path.join("docs", "maps"), "w", encoding="utf-8") as f:
+                    f.write("project map\n")
+                reg = m.ToolRegistry(ctx=self.ctx)
+                result = reg.execute("read_file", {"file": "docs/maps"})
+                self.assertTrue(result["success"], msg=result.get("error"))
+                self.assertIn("project map", result["output"])
+            finally:
+                os.chdir(old_cwd)
+
     def test_sensitive_virtual_file_hard_blocked(self):
         decision, msg = m._path_acl_decision(self.ctx, "read", "/proc/1/mem",
                                              tool="read_file", raw_path="/proc/1/mem")
@@ -973,6 +1021,53 @@ class TestPathPolicyTool(unittest.TestCase):
         self.assertIn("ALLOW", self._tool(path="./x.txt")["output"])
         self.assertIn("DENY", self._tool(path="~/notes.txt")["output"])
 
+    def test_implicit_home_read_is_denied_like_the_real_tool(self):
+        """P2: a relative escape into $HOME must not be announced as ALLOW.
+
+        `path_policy` used the bare `PathAcl.evaluate` implicit home allowance;
+        `_path_acl_decision` additionally requires an explicit home request. A
+        model sent to `../etc/passwd` (which resolves under $HOME) was told
+        ALLOW and then refused by read_file.
+        """
+        if CWD == HOME:
+            self.skipTest("CWD is $HOME: every home path is also inside the project")
+        target = os.path.realpath(os.path.join(HOME, "aq-path-policy-probe.txt"))
+        raw = os.path.relpath(target, CWD)
+        self.assertFalse(m._raw_is_home_explicit(raw))
+        out = self._tool(path=raw, op="read")["output"]
+        self.assertIn("DENY", out)
+        self.assertIn("not requested explicitly", out)
+        decision, msg = m._path_acl_decision(self.ctx, "read", target,
+                                             tool="read_file", raw_path=raw)
+        self.assertEqual(decision, "deny")
+        self.assertIn("not requested explicitly", msg)
+
+    def test_explicit_home_read_is_allowed_like_the_real_tool(self):
+        raw = "~/aq-path-policy-probe.txt"
+        self.assertIn("ALLOW", self._tool(path=raw, op="read")["output"])
+        decision, _ = m._path_acl_decision(
+            self.ctx, "read", os.path.realpath(os.path.expanduser(raw)),
+            tool="read_file", raw_path=raw)
+        self.assertEqual(decision, "allow")
+
+    def test_plan_strict_scratch_dir_is_denied_like_the_real_tool(self):
+        """P2: strict plan denies the default-allow scratch dir outside CWD.
+
+        The tool denies every allow outside CWD that is not an explicit session
+        read grant; `path_policy` accepted any non-None rule and announced
+        ALLOW for the scratch dir.
+        """
+        self.ctx.plan_mode = True
+        self.ctx.plan_run = False
+        target = os.path.realpath(os.path.join(m._scratch_root(), "probe.txt"))
+        if m._path_is_within(target, CWD):
+            self.skipTest("the session scratch dir is inside the project")
+        out = self._tool(path=target, op="read")["output"]
+        self.assertIn("DENY", out)
+        decision, _msg = m._path_acl_decision(self.ctx, "read", target,
+                                              tool="read_file", raw_path=target)
+        self.assertEqual(decision, "deny")
+
 
 class TestAgenticPromptPathPolicy(unittest.TestCase):
     """The prompt states the POSITIVE half only; the map lives behind the tool."""
@@ -1090,6 +1185,15 @@ class TestShellApprovalPrompt(unittest.TestCase):
         added = [rule["pattern"] for rule in m._SHELL_SESSION_APPROVED]
         self.assertEqual(added, ["ssh host"])
 
+    def test_session_approvals_are_deduplicated_and_bounded(self):
+        m._remember_shell_approval("git status")
+        m._remember_shell_approval("git status")
+        self.assertEqual(len(m._SHELL_SESSION_APPROVED), 1)
+        for i in range(m.SHELL_SESSION_APPROVED_MAX + 20):
+            m._remember_shell_approval(f"cmd-{i} *")
+        self.assertLessEqual(len(m._SHELL_SESSION_APPROVED),
+                             m.SHELL_SESSION_APPROVED_MAX)
+
 
 class TestFetchUrlSchemeGuard(unittest.TestCase):
     """fetch_url must not become a local-read primitive (Path ACL bypass)."""
@@ -1162,6 +1266,14 @@ class TestAgenticAclCommand(unittest.TestCase):
         loop._handle_agentic_acl(['/agentic', 'acl', 'reset'])
         decision, _ = loop.ctx.path_acl.evaluate("read", "/etc/passwd")
         self.assertEqual(decision, "ask")
+
+    def test_reset_also_clears_shell_session_approvals(self):
+        """A bad `a` answer must have a way out that is not a process restart."""
+        m._SHELL_SESSION_APPROVED.clear()
+        self.addCleanup(m._SHELL_SESSION_APPROVED.clear)
+        m._remember_shell_approval("ssh *")
+        _loop()._handle_agentic_acl(['/agentic', 'acl', 'reset'])
+        self.assertEqual(m._SHELL_SESSION_APPROVED, [])
 
     def test_list_and_log_no_crash(self):
         loop = _loop()

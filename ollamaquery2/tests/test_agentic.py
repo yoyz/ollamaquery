@@ -985,6 +985,123 @@ class TestToolRegistry(unittest.TestCase):
         result = self.reg.execute("glob", {"pattern": "*.py"})
         self.assertTrue(result["success"])
 
+    def test_plan_run_block_names_the_fetch_exception(self):
+        """Plan run confirms commands; the harmless GET redirect is the one
+        documented exception, so the prompt must say it instead of promising
+        a confirmation that never happens."""
+        self.assertIn("read-only fetch_url tool without a prompt",
+                      q.AGENTIC_PLAN_RUN_BLOCK)
+
+    def test_write_file_keeps_the_original_when_replace_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                with open("keep.txt", "w", encoding="utf-8") as f:
+                    f.write("original")
+                with patch.object(q.os, "replace",
+                                  side_effect=OSError("disk full")):
+                    result = self.reg.execute(
+                        "write_file", {"file_path": "keep.txt",
+                                       "content": "new"})
+                self.assertFalse(result["success"])
+                with open("keep.txt", encoding="utf-8") as f:
+                    self.assertEqual(f.read(), "original")
+            finally:
+                os.chdir(old_cwd)
+
+    def test_write_file_preserves_an_existing_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                with open("mode.txt", "w", encoding="utf-8") as f:
+                    f.write("old")
+                os.chmod("mode.txt", 0o640)
+                result = self.reg.execute(
+                    "write_file", {"file_path": "mode.txt", "content": "new"})
+                self.assertTrue(result["success"], msg=result.get("error"))
+                self.assertEqual(os.stat("mode.txt").st_mode & 0o777, 0o640)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_edit_file_refuses_a_file_too_large_to_load(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                with open("big.txt", "w", encoding="utf-8") as f:
+                    f.truncate(q.MAX_WRITE_FILE_SIZE + 1)
+                result = self.reg.execute(
+                    "edit_file", {"file_path": "big.txt", "old_string": "x",
+                                  "new_string": "y"})
+                self.assertFalse(result["success"])
+                self.assertIn("too large", result["error"])
+            finally:
+                os.chdir(old_cwd)
+
+    def test_apply_patch_roundtrips_utf8(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                with open("accent.txt", "w", encoding="utf-8") as f:
+                    f.write("café\n")
+                patch_text = ("--- a/accent.txt\n+++ b/accent.txt\n"
+                              "@@ -1 +1 @@\n-café\n+thé\n")
+                result = self.reg.execute("apply_patch",
+                                          {"patch_text": patch_text})
+                self.assertTrue(result["success"], msg=result.get("error"))
+                with open("accent.txt", encoding="utf-8") as f:
+                    self.assertEqual(f.read(), "thé\n")
+            finally:
+                os.chdir(old_cwd)
+
+    def test_glob_does_not_follow_a_symlink_outside_the_project(self):
+        """A symlink inside the project must not turn glob into an /etc listing."""
+        outside = tempfile.mkdtemp(prefix="glob-outside-")
+        project = tempfile.mkdtemp(prefix="glob-project-")
+        old_cwd = os.getcwd()
+        try:
+            with open(os.path.join(outside, "secret.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("outside")
+            try:
+                os.symlink(outside, os.path.join(project, "escape"))
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks unavailable")
+            os.chdir(project)
+            result = self.reg.execute("glob", {"pattern": "escape/*"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertNotIn("secret.txt", result["output"])
+            self.assertIn("not listed", result["output"])
+        finally:
+            os.chdir(old_cwd)
+            shutil.rmtree(outside, ignore_errors=True)
+            shutil.rmtree(project, ignore_errors=True)
+
+    def test_glob_honours_a_session_deny(self):
+        project = tempfile.mkdtemp(prefix="glob-deny-")
+        old_cwd = os.getcwd()
+        saved_rules = list(self.ctx.path_acl.rules)
+        try:
+            os.chdir(project)
+            with open("visible.txt", "w", encoding="utf-8") as f:
+                f.write("ok")
+            with open("hidden.txt", "w", encoding="utf-8") as f:
+                f.write("no")
+            self.ctx.path_acl.add(
+                "read", "deny", os.path.join(project, "hidden.txt"),
+                source="session")
+            result = self.reg.execute("glob", {"pattern": "*.txt"})
+            self.assertTrue(result["success"], msg=result.get("error"))
+            self.assertIn("visible.txt", result["output"])
+            self.assertNotIn("hidden.txt", result["output"])
+        finally:
+            os.chdir(old_cwd)
+            self.ctx.path_acl.rules = saved_rules
+            shutil.rmtree(project, ignore_errors=True)
+
     def test_diff(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1450,6 +1567,26 @@ class TestRunPythonPath(unittest.TestCase):
                 self.assertIn("direct", result["output"])
             finally:
                 os.chdir(old_cwd)
+
+    def test_inline_code_is_not_exposed_on_the_command_line(self):
+        """The source goes to a scratch file, not to `python3 -c`."""
+        seen = {}
+
+        def fake_run(command, timeout=10):
+            seen["command"] = command
+            script = shlex.split(command)[1]
+            seen["exists_during_run"] = os.path.exists(script)
+            with open(script, encoding="utf-8") as f:
+                seen["code"] = f.read()
+            return {"stdout": "ok", "stderr": "", "returncode": 0}
+
+        with patch.object(self.reg.executor, "run", side_effect=fake_run):
+            result = self.reg.execute(
+                "run_python", {"code": "print('SECRET-CODE')"})
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertNotIn("SECRET-CODE", seen["command"])
+        self.assertTrue(seen["exists_during_run"])
+        self.assertIn("SECRET-CODE", seen["code"])
 
 
 class TestExecutorContainerModeSafety(unittest.TestCase):
@@ -2009,6 +2146,58 @@ class TestBwrapSandboxConfig(unittest.TestCase):
         self.assertEqual(result["returncode"], -1)
         self.assertIn("not installed", result["stderr"])
         self.assertEqual(seen, [])
+
+    def test_missing_private_home_is_refused_before_the_probe(self):
+        """P2: an uncreatable sandbox HOME is named, not reported by bwrap.
+
+        Caching the path after a silent `_ensure_private_dir` failure made bwrap
+        exit with "source path missing", which reads like a broken bwrap install
+        and sends the user debugging the wrong thing.
+        """
+        seen, err = [], io.StringIO()
+        saved_cache = list(q._BWRAP_HOME_CACHE)
+        saved_error = list(q._BWRAP_HOME_ERROR)
+        q._BWRAP_HOME_CACHE[:] = []
+        q._BWRAP_HOME_ERROR[:] = []
+        try:
+            with patch.object(q, "_private_dir_error", return_value="Permission denied"), \
+                 patch("ollamaquery2.subprocess.run", side_effect=self._fake_run(seen)), \
+                 contextlib.redirect_stderr(err):
+                ex = q.Executor(mode="bwrap", bwrap_project="rw", bwrap_net="shared")
+                first = ex.run("echo hi", timeout=5)
+                second = ex.run("echo hi", timeout=5)
+        finally:
+            q._BWRAP_HOME_CACHE[:] = saved_cache
+            q._BWRAP_HOME_ERROR[:] = saved_error
+        self.assertEqual(first["returncode"], -1)
+        self.assertEqual(second["returncode"], -1)
+        self.assertIn("private sandbox HOME", first["stderr"])
+        self.assertIn("Permission denied", first["stderr"])
+        self.assertNotIn("not installed", first["stderr"])
+        self.assertEqual(seen, [])          # refused BEFORE the probe
+        self.assertEqual(err.getvalue().count("[Sandbox] REFUSED"), 1)
+
+    def test_home_creation_failure_is_not_cached(self):
+        """P2: the path is cached only once the directory actually exists."""
+        saved_cache = list(q._BWRAP_HOME_CACHE)
+        saved_error = list(q._BWRAP_HOME_ERROR)
+        saved_dir = q.BWRAP_SANDBOX_DIR
+        sandbox_dir = tempfile.mkdtemp(prefix="bwrap-root-")
+        q._BWRAP_HOME_CACHE[:] = []
+        q._BWRAP_HOME_ERROR[:] = []
+        try:
+            q.BWRAP_SANDBOX_DIR = sandbox_dir
+            with patch.object(q, "_private_dir_error", return_value="No space left"):
+                self.assertIn("No space left", q._bwrap_home_error())
+            self.assertEqual(q._BWRAP_HOME_CACHE, [])   # nothing cached on failure
+            self.assertEqual(q._bwrap_home_error(), "")  # retried, now succeeds
+            self.assertEqual(len(q._BWRAP_HOME_CACHE), 1)
+            self.assertTrue(os.path.isdir(q._BWRAP_HOME_CACHE[0]))
+        finally:
+            q.BWRAP_SANDBOX_DIR = saved_dir
+            q._BWRAP_HOME_CACHE[:] = saved_cache
+            q._BWRAP_HOME_ERROR[:] = saved_error
+            shutil.rmtree(sandbox_dir, ignore_errors=True)
 
     def test_probe_failure_refuses_and_warns_once(self):
         seen, err = [], io.StringIO()
@@ -3128,6 +3317,39 @@ class TestExecutor(unittest.TestCase):
     def test_timeout(self):
         result = self.exec.run("sleep 10", timeout=1)
         self.assertNotEqual(result["returncode"], 0)
+
+    def test_timeout_kills_background_children(self):
+        """A timed-out shell must not leave `sleep 60 &` orphaned."""
+        with tempfile.TemporaryDirectory() as td:
+            pidfile = os.path.join(td, "child.pid")
+            command = (f"sh -c 'sleep 60 & echo $! > {shlex.quote(pidfile)}; "
+                       f"wait'")
+            with patch("ollamaquery2.check_shell_approval",
+                       return_value={"approved": True, "effect": "allow",
+                                     "message": None, "verdict": None}):
+                result = self.exec.run(command, timeout=1)
+            self.assertEqual(result["returncode"], -1)
+            self.assertIn("Timed out", result["stderr"])
+            deadline = time.time() + 2
+            while time.time() < deadline and not os.path.exists(pidfile):
+                time.sleep(0.05)
+            if not os.path.exists(pidfile):
+                self.skipTest("the child pid was not written before the kill")
+            with open(pidfile, encoding="utf-8") as f:
+                pid = int(f.read().strip())
+            try:
+                for _ in range(30):
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        return
+                    time.sleep(0.05)
+                self.fail(f"background child {pid} survived the timeout")
+            finally:
+                try:
+                    os.kill(pid, 9)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
 
     def test_safety_blocklist(self):
         result = self.exec.run("rm -rf /", timeout=5)
@@ -4440,6 +4662,13 @@ class TestArgumentAliases(unittest.TestCase):
         """list_directory with 'directory' maps to 'path'."""
         result = self.reg.execute("list_directory", {"directory": "."})
         self.assertTrue(result["success"])
+
+    def test_execute_does_not_mutate_the_caller_args(self):
+        """Alias normalization must not rewrite the parser's dict in place."""
+        args = {"directory": "."}
+        result = self.reg.execute("list_directory", args)
+        self.assertTrue(result["success"], msg=result.get("error"))
+        self.assertEqual(args, {"directory": "."})
 
 
 class TestLazyToolMode(unittest.TestCase):

@@ -488,8 +488,13 @@ class TestPathTraversal(unittest.TestCase):
     def test_read_file_rejects_traversal(self):
         result = self.reg.execute("read_file", {"file": "../etc/passwd"})
         self.assertFalse(result["success"])
-        self.assertIn("outside the project and $HOME", result.get("error", ""))
-        self.assertIn("path_policy", result.get("error", ""))
+        error = result.get("error", "")
+        # `../etc/passwd` is outside the project; when the checkout lives under
+        # $HOME it lands inside $HOME but was not requested explicitly, which is
+        # a distinct (and more precise) denial reason.
+        self.assertTrue("outside the project and $HOME" in error
+                        or "not requested explicitly" in error, error)
+        self.assertIn("path_policy", error)
 
     def test_read_file_rejects_absolute_outside(self):
         result = self.reg.execute("read_file", {"file": "/var/lib/aq-probe.txt"})
@@ -540,7 +545,9 @@ class TestPathTraversal(unittest.TestCase):
     def test_list_directory_rejects_traversal(self):
         result = self.reg.execute("list_directory", {"path": "../"})
         self.assertFalse(result["success"])
-        self.assertIn("outside the project and $HOME", result.get("error", ""))
+        error = result.get("error", "")
+        self.assertTrue("outside the project and $HOME" in error
+                        or "not requested explicitly" in error, error)
 
     def test_edit_file_rejects_traversal(self):
         result = self.reg.execute("edit_file", {"file": "../etc/passwd", "old_string": "root", "new_string": "toor"})

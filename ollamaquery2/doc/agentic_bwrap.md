@@ -170,7 +170,10 @@ toggle; the preset alias is `/agentic preset auto`.
 5. **Linux + user namespaces.** The probe is **fail-closed**: a missing bwrap
    or a refused userns makes tool commands return an error and a one-time
    warning; it never silently falls back to host. `--sandbox-engine host` (or
-   `trusted`) is the explicit unsandboxed mode.
+   `trusted`) is the explicit unsandboxed mode. A private sandbox HOME that
+   cannot be created is refused **before** the probe, naming the directory and
+   the OS error (pre-fix it surfaced as bwrap's "source path missing", which
+   read like a broken bwrap install).
 6. **No dedicated seccomp profile in v1** (namespaces + `--cap-drop ALL` only).
 7. **No persistent environment.** Each command starts from the same mounts;
    state lives in the project or the sandbox home.
@@ -190,6 +193,10 @@ toggle; the preset alias is `/agentic preset auto`.
   with `true` (`_bwrap_argv("true")`: `--unshare-all`, `--proc`, `--clearenv`,
   `--cap-drop ALL`, the project/scratch/home binds and the shell), 5 s, memoized.
   A host that passes it cannot then fail on the argv real commands use.
+- `Executor._bwrap_home_refusal` — validates the sandbox HOME (override or the
+  per-session `~/.ollamaquery.d/sandbox/pid-N/home`, created through
+  `_private_dir_error`) before the probe; `_bwrap_sandbox_home` caches the path
+  only when the directory exists.
 - `Executor._bwrap_argv` — the mount policy above as a list; `_bwrap_command`
   only quotes it. The project keeps its **host absolute path**, so model paths
   and ACL stay coherent.

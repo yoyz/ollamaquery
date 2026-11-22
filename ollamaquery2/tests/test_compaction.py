@@ -83,6 +83,31 @@ class TestCompactionBasics(unittest.TestCase):
         self.assertIn('[CONVERSATION HISTORY COMPACTED]', result[1]['content'])
         self.assertEqual(result[-2:], msgs[-2:])
 
+    def test_summary_is_shrunk_with_the_token_aware_helper(self):
+        """The summary budget is one unit and the shrinker enforces it."""
+        system = {'role': 'system', 'content': 'S', '_tokens': 100}
+        recent = {'role': 'assistant', 'content': 'R', '_tokens': 100}
+        middle = [{'role': 'user', 'content': 'x' * 5000}]
+        result = m.compact_messages([system] + middle + [recent], self.ctx,
+                                    target_tokens=400, keep_recent=1)
+        summary = result[1]['content']
+        self.assertIn('[... older history truncated ...]', summary)
+        self.assertLessEqual(self.ctx.estimate_tokens(summary), 100)
+
+
+class TestShrinkTextToTokens(unittest.TestCase):
+    class TwoTokensPerChar:
+        @staticmethod
+        def estimate_tokens(text):
+            return 2 * len(text)
+
+    def test_fallback_never_returns_more_than_the_token_budget(self):
+        """The old fallback sliced `budget` characters for a token budget."""
+        ctx = self.TwoTokensPerChar()
+        self.assertEqual(m._shrink_text_to_tokens(ctx, "abcdef", 1), "")
+        out = m._shrink_text_to_tokens(ctx, "abcdef", 3)
+        self.assertLessEqual(ctx.estimate_tokens(out), 3)
+
 
 class TestQ6StampSummaryTokens(unittest.TestCase):
     def test_compacted_summary_has_tokens_stamped(self):
@@ -271,6 +296,17 @@ class TestSanitizeToolPairing(unittest.TestCase):
         ]
         m.sanitize_tool_pairing(msgs)
         self.assertEqual(msgs[1]['role'], 'user')
+
+    def test_rewritten_message_drops_its_stale_token_count(self):
+        """The repaired content no longer matches the cached `_tokens`."""
+        msgs = [
+            {'role': 'assistant', 'content': 'plain answer'},
+            {'role': 'tool', 'content': 'stray result', 'tool_call_id': 'x',
+             'name': 'read_file', '_tokens': 999},
+        ]
+        m.sanitize_tool_pairing(msgs)
+        self.assertEqual(msgs[1]['role'], 'user')
+        self.assertNotIn('_tokens', msgs[1])
 
 
 class TestSplitCompactionWindow(unittest.TestCase):

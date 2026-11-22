@@ -307,13 +307,16 @@ and session rules override defaults.
 
 **Not covered by the Path ACL** — these rely on the older CWD-containment
 check plus the destructive-tool / shell approval gates instead:
-- `run_python` **inline `code`** — the code is inlined into `python3 -c <code>`
-  and cannot be scanned for operands, so e.g. `open('/etc/passwd')` inside
-  Python is not ACL-checked (use the `file_path` form to get operand
-  coverage).
+- `run_python` **inline `code`** — the code is written to a session-scratch
+  file and run as `python3 <file>` (so it is not exposed on `/proc/<pid>/cmdline`),
+  but its body is still opaque to the ACL, so e.g. `open('/etc/passwd')` inside
+  Python is not ACL-checked (use the `file_path` form to get operand coverage).
 - `diff` and `apply_patch` — paths embedded in the arguments / patch text are
   resolved with plain CWD containment only (no ask).
-- `glob` — restricted to the working directory by design.
+
+`glob` **is** covered: every match is realpath-confined (a project symlink
+cannot list outside the project) and path-ACL checked; an `ask` match is simply
+not listed.
 
 ### Agentic Example
 
@@ -573,8 +576,8 @@ Trust boundaries at a glance; the sections above give the details.
   (which is why `exec` removes the write tools from the surface).
   bwrap has no cgroup ceiling in v1; the throwaway container keeps `--memory`/`--cpus`.
 - **Path ACL coverage.** File tools and shell operands are governed (see
-  "Access Control" above). `run_python` inline code, `diff`/`apply_patch`
-  contents, and `glob` are not scanned.
+  "Access Control" above). `run_python` inline code and `diff`/`apply_patch`
+  contents are still not scanned (`glob` now is).
 - **Network.** `fetch_url` and `/curl` accept `http://` and `https://` only —
   `file://`, `ftp://` and `data:` are rejected, so URL fetch cannot read local
   files. Private/link-local address blocking is **not** implemented; the client

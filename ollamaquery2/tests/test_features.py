@@ -1470,6 +1470,13 @@ class TestTokenCounting(unittest.TestCase):
         count = q.estimate_token_count('def foo(x): return x + 1')
         self.assertGreater(count, q.estimate_token_count('hello world foo bar'))
 
+    def test_estimate_token_count_prose_with_one_code_word_stays_cheap(self):
+        """`as`/`if`/`return` in a sentence must not trigger the ×2.0 multiplier."""
+        text = "I can return this as soon as it is ready."
+        tokens = (len(q._TOKEN_WORD_RE.findall(text))
+                  + len(q._TOKEN_PUNCT_RE.findall(text)))
+        self.assertEqual(q.estimate_token_count(text), int(tokens * 1.5))
+
     def test_estimate_token_count_empty(self):
         self.assertEqual(q.estimate_token_count(''), 0)
 
@@ -2295,6 +2302,12 @@ class TestArgumentParser(unittest.TestCase):
     def test_mutual_exclusion_list_and_show(self):
         """-l and --show are mutually exclusive."""
         with patch.object(sys, 'argv', ['prog', '-l', '--show']):
+            with self.assertRaises(SystemExit):
+                q.main()
+
+    def test_chat_is_mutually_exclusive_with_an_input_mode(self):
+        """`-c --input-file` must not open chat and then replay the file."""
+        with patch.object(sys, 'argv', ['prog', '-c', '--input-file', 'x.txt']):
             with self.assertRaises(SystemExit):
                 q.main()
 
