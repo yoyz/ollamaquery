@@ -5970,7 +5970,7 @@ class TestAgenticStatusDisplay(unittest.TestCase):
     SETTINGS = (
         "agentic", "preset", "plan", "auto", "sandbox", "verbose", "thinking",
         "trace", "log", "lazytool", "iterations", "timeout",
-        "heartbeattokens", "compactthreshold",
+        "heartbeattokens", "compactthreshold", "logretention",
     )
 
     def _render(self) -> str:

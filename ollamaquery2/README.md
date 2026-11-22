@@ -152,7 +152,7 @@ folded. Tab completion on `/resume ` offers every saved slug and id. The newest
 | `git_inspect`              | Read-only git inspection: `status`, `diff`, `diff_staged`, `diff_head`, `log` (any ref, path-scoped, renames followed), `show`, `blame -L` (fixed argv, no shell) |
 | `path_policy`              | Read-only: the session path map (allowed / needs confirmation / forbidden), or the verdict for one path — no filesystem access, no prompt |
 
-Subcommands: `/agentic on|off|full`, `preset [read|exec|work|trusted]`, `plan [on|off|run]`, `sandbox [host|container|bwrap|status|net shared|none|reset]`, `auto`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `iterations <N>`, `timeout <N>`, `status`.
+Subcommands: `/agentic on|off|full`, `preset [read|exec|work|trusted]`, `plan [on|off|run]`, `sandbox [host|container|bwrap|status|net shared|none|reset]`, `auto`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `iterations <N>`, `timeout <N>`, `logretention <days>`, `status`.
 
 The model is steered to use the **dedicated file tools** (`read_file`, `write_file`,
 `edit_file`, `grep`, `glob`, `list_directory`) instead of shell equivalents (`cat`,
@@ -584,7 +584,9 @@ Trust boundaries at a glance; the sections above give the details.
   can reach whatever the host can.
 - **On disk.** Sessions, readline history, agentic JSONL logs and spill files
   are created `0600` in `0700` directories. They can contain anything the model
-  or a `!` command saw, including secrets.
+  or a `!` command saw, including secrets. Agentic logs are pruned after 7 days
+  by default (`/agentic logretention <days>`, or
+  `OLLAMAQUERY_AGENTIC_LOG_RETENTION_DAYS`).
 - **Plan mode.** `/agentic plan` (strict) exposes inspection tools only, with
   no shell and every path confined to the CWD. `/agentic plan run` re-adds
   `run_command`, which always confirms.

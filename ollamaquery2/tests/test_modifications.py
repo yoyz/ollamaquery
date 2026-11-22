@@ -13,6 +13,7 @@ import time
 import json
 import types
 import signal
+import subprocess
 import contextlib
 import socket
 import termios
@@ -2067,6 +2068,49 @@ class TestProcessInlineCommands(unittest.TestCase):
         result = m.execute_os_command('echo hello', timeout=5)
         self.assertIn('hello', result)
 
+    def test_execute_os_command_timeout_returns_the_marker(self):
+        """A timed-out `!` command still returns the user-facing marker."""
+        script = "import time; time.sleep(2)"
+        result = m.execute_os_command(f"python3 -c {json.dumps(script)}", timeout=1)
+        self.assertIn("Time limit exceeded", result)
+
+    def test_communicate_or_kill_reaps_grandchildren(self):
+        """The helper kills the whole group, not just the direct bash child."""
+        def _alive(pid):
+            try:
+                with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                    fields = fh.read().rsplit(")", 1)[1].split()
+                return fields[0] != "Z"
+            except (OSError, IndexError):
+                return False
+
+        child_pid = None
+        with tempfile.TemporaryDirectory() as td:
+            script = ("import subprocess, time; "
+                      "p = subprocess.Popen(['sleep', '30']); "
+                      "open('child.pid', 'w').write(str(p.pid)); "
+                      "time.sleep(30)")
+            proc = subprocess.Popen(
+                ["/bin/bash", "-c", f"python3 -c {json.dumps(script)}"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, start_new_session=True, cwd=td)
+            try:
+                _out, _err, _rc, timed_out = m._communicate_or_kill(proc, timeout=1)
+                self.assertTrue(timed_out)
+                with open(os.path.join(td, "child.pid"), encoding="utf-8") as fh:
+                    child_pid = int(fh.read().strip())
+                deadline = time.time() + 3
+                while time.time() < deadline and _alive(child_pid):
+                    time.sleep(0.05)
+                self.assertFalse(_alive(child_pid),
+                                 f"grandchild {child_pid} survived the timeout")
+            finally:
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+
 
 # ============================================================================
 # 16. stop/continue (Ctrl+Z + bg/fg) terminal repair
@@ -3054,6 +3098,99 @@ class TestAgenticLoggerResilience(unittest.TestCase):
         self.assertEqual(entries[0]["type"], "turn")
         self.assertEqual(entries[0]["iteration"], 2)
         self.assertIn("timestamp", entries[0])
+
+    def test_retention_default_is_seven_days(self):
+        """The documented default is 7 days, not the old hardcoded 1."""
+        with patch.dict(os.environ, {m.AGENTIC_LOG_RETENTION_ENV: ""}, clear=False):
+            self.assertEqual(m._resolve_agentic_log_retention(None), 7)
+
+    def test_retention_env_overrides_and_invalid_falls_back(self):
+        """A numeric env wins; garbage warns once and keeps the default."""
+        with patch.dict(os.environ, {m.AGENTIC_LOG_RETENTION_ENV: "3"}, clear=False):
+            self.assertEqual(m._resolve_agentic_log_retention(None), 3)
+        err = io.StringIO()
+        with patch.dict(os.environ, {m.AGENTIC_LOG_RETENTION_ENV: "nope"}, clear=False), \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(m._resolve_agentic_log_retention(None), 7)
+        self.assertIn("ignoring invalid", err.getvalue())
+
+    def test_cleanup_uses_the_configured_window(self):
+        """A 2-day-old file survives 7 days; an 8-day-old one is pruned."""
+        now = time.time()
+        with tempfile.TemporaryDirectory() as td:
+            fresh = os.path.join(td, "fresh.jsonl")
+            old = os.path.join(td, "old.jsonl")
+            for path, age_days in ((fresh, 2), (old, 8)):
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("{}\n")
+                stamp = now - age_days * 86400
+                os.utime(path, (stamp, stamp))
+            log = object.__new__(m.AgenticLogger)
+            log.retention_days = 7
+            log._cleanup_old_logs(td)
+            self.assertTrue(os.path.exists(fresh))
+            self.assertFalse(os.path.exists(old))
+
+    def test_constructor_applies_the_retention_window(self):
+        """AgenticLogger(retention_days=1) prunes an 8-day-old file on open."""
+        with tempfile.TemporaryDirectory() as td:
+            log_dir = os.path.join(td, ".ollamaquery.d", "agentic")
+            os.makedirs(log_dir)
+            old = os.path.join(log_dir, "old.jsonl")
+            with open(old, "w", encoding="utf-8") as fh:
+                fh.write("{}\n")
+            stamp = time.time() - 8 * 86400
+            os.utime(old, (stamp, stamp))
+            with patch.dict(os.environ, {"HOME": td,
+                                         m.AGENTIC_LOG_RETENTION_ENV: ""}, clear=False):
+                log = m.AgenticLogger(retention_days=1)
+                log.close()
+            self.assertFalse(os.path.exists(old))
+
+
+class TestLogRetentionCommand(unittest.TestCase):
+    """`/agentic logretention` sets, shows and resets the session override."""
+
+    def _loop(self, current=None):
+        loop = object.__new__(m.ChatLoop)
+        loop.ctx = types.SimpleNamespace(agentic_log_retention_days=current)
+        return loop
+
+    def test_sets_days(self):
+        loop = self._loop()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop._agentic_set_log_retention(["/agentic", "logretention", "3"])
+        self.assertEqual(loop.ctx.agentic_log_retention_days, 3)
+        self.assertIn("3 day", err.getvalue())
+
+    def test_reset_clears_the_override(self):
+        loop = self._loop(3)
+        with contextlib.redirect_stderr(io.StringIO()):
+            loop._agentic_set_log_retention(["/agentic", "logretention", "reset"])
+        self.assertIsNone(loop.ctx.agentic_log_retention_days)
+
+    def test_invalid_value_keeps_the_current_setting(self):
+        loop = self._loop(3)
+        with contextlib.redirect_stderr(io.StringIO()):
+            loop._agentic_set_log_retention(["/agentic", "logretention", "0"])
+        self.assertEqual(loop.ctx.agentic_log_retention_days, 3)
+
+    def test_bare_command_shows_the_effective_window(self):
+        loop = self._loop()
+        err = io.StringIO()
+        with patch.dict(os.environ, {m.AGENTIC_LOG_RETENTION_ENV: "5"}, clear=False), \
+             contextlib.redirect_stderr(err):
+            loop._agentic_set_log_retention(["/agentic", "logretention"])
+        self.assertIn("5 day", err.getvalue())
+
+    def test_dispatch_routes_logretention(self):
+        """`/agentic logretention <days>` reaches the setter."""
+        loop = self._loop()
+        with contextlib.redirect_stderr(io.StringIO()):
+            result = loop.run_handle_agentic("/agentic logretention 9")
+        self.assertFalse(result)
+        self.assertEqual(loop.ctx.agentic_log_retention_days, 9)
 
 
 # ============================================================================

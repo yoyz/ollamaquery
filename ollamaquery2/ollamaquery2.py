@@ -2162,6 +2162,7 @@ class CommandContext:
         self.agentic_show_thinking: bool = False
         self.agentic_trace: bool = False
         self.agentic_logging: bool = True
+        self.agentic_log_retention_days: Optional[int] = None  # /agentic logretention
         self.agentic_max_iterations: int = 50
         # Per-step generation budget. The budget covers reasoning AND answer, so
         # a reasoning-heavy model writing a large file pays for its thinking out
@@ -6779,6 +6780,37 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         pass
 
 
+def _communicate_or_kill(proc: subprocess.Popen, timeout: int,
+                         kill_grace: int = 5) -> tuple:
+    """Collect a Popen's output, killing its whole process group on timeout.
+
+    The child must have been started with `start_new_session=True`, so its pid
+    is the process-group leader and `_kill_process_group` can reap the whole
+    tree. `subprocess.run(..., timeout=...)` only kills the direct shell and
+    leaves background grandchildren running.
+
+    Args:
+        proc: The Popen object to wait for.
+        timeout: Seconds to wait for normal completion.
+        kill_grace: Seconds to wait for the pipes to close after SIGKILL.
+
+    Returns:
+        (stdout, stderr, returncode, timed_out). On timeout the streams are
+        empty, the return code is -1 and `timed_out` is True; the caller owns
+        the user-facing message.
+    """
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return stdout, stderr, proc.returncode, False
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        try:
+            proc.communicate(timeout=kill_grace)
+        except subprocess.TimeoutExpired:
+            pass
+        return "", "", -1, True
+
+
 class Executor:
     """Runs shell commands on host, in a container, or in a bwrap sandbox.
 
@@ -7339,17 +7371,11 @@ class Executor:
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, executable="/bin/bash", start_new_session=True
             )
-            try:
-                stdout, stderr = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                _kill_process_group(proc)
-                try:
-                    proc.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
+            stdout, stderr, returncode, timed_out = _communicate_or_kill(proc, timeout)
+            if timed_out:
                 return {"stdout": "", "stderr": f"Timed out after {timeout}s",
                         "returncode": -1}
-            return {"stdout": stdout, "stderr": stderr, "returncode": proc.returncode}
+            return {"stdout": stdout, "stderr": stderr, "returncode": returncode}
         except subprocess.TimeoutExpired:
             return {"stdout": "", "stderr": f"Timed out after {timeout}s", "returncode": -1}
         except Exception as e:
@@ -13607,11 +13633,48 @@ class ToolRegistry:
 # ============= AGENTIC SESSION LOGGER          ================================
 # ============================================================================
 
+DEFAULT_AGENTIC_LOG_RETENTION_DAYS = 7
+AGENTIC_LOG_RETENTION_ENV = "OLLAMAQUERY_AGENTIC_LOG_RETENTION_DAYS"
+
+
+def _resolve_agentic_log_retention(explicit: Optional[int] = None) -> int:
+    """Resolve the JSONL retention window in days.
+
+    Precedence is explicit (session setting) > environment > default, with a
+    minimum of one day. The value is resolved when a logger is created, not at
+    import time, so a session command or an env change applies to the next
+    purge.
+
+    Args:
+        explicit: `/agentic logretention` value, or None.
+
+    Returns:
+        The retention window in days (>= 1).
+    """
+    if explicit is not None:
+        try:
+            return max(1, int(explicit))
+        except (TypeError, ValueError):
+            pass
+    raw = os.environ.get(AGENTIC_LOG_RETENTION_ENV, "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            sys.stderr.write(colorize(
+                f"[Agentic] ignoring invalid {AGENTIC_LOG_RETENTION_ENV}={raw!r} "
+                f"(expected a number of days); using {DEFAULT_AGENTIC_LOG_RETENTION_DAYS}\n",
+                'warning'))
+    return max(1, int(AgenticLogger.AGENTIC_LOG_RETENTION_DAYS))
+
+
 class AgenticLogger:
     """Logs agentic session turns to a structured JSONL file.
 
-    Automatically cleans up log files older than AGENTIC_LOG_RETENTION_DAYS
-    (default 1) on initialization to prevent unbounded disk growth.
+    Automatically cleans up log files older than the retention window (7 days
+    by default; `/agentic logretention <days>` or
+    OLLAMAQUERY_AGENTIC_LOG_RETENTION_DAYS overrides it) on initialization to
+    prevent unbounded disk growth.
 
     Logging is best-effort by contract: a full disk, an EIO or an
     unserializable payload disables the logger with one warning instead of
@@ -13624,13 +13687,18 @@ class AgenticLogger:
       close() → flushes file (idempotent, no-op once disabled)
     """
 
-    AGENTIC_LOG_RETENTION_DAYS = 1
+    AGENTIC_LOG_RETENTION_DAYS = DEFAULT_AGENTIC_LOG_RETENTION_DAYS
 
-    def __init__(self) -> None:
-        """Open a fresh timestamped JSONL log after pruning old ones."""
+    def __init__(self, retention_days: Optional[int] = None) -> None:
+        """Open a fresh timestamped JSONL log after pruning old ones.
+
+        Args:
+            retention_days: Session override; None uses the env/default.
+        """
         self.disabled = False
         self.file: Optional[IO] = None
         self.path = ""
+        self.retention_days = _resolve_agentic_log_retention(retention_days)
         log_dir = os.path.expanduser("~/.ollamaquery.d/agentic")
         _ensure_private_dir(log_dir)
         self._cleanup_old_logs(log_dir)
@@ -13644,8 +13712,8 @@ class AgenticLogger:
         self.path = path
 
     def _cleanup_old_logs(self, log_dir: str) -> None:
-        """Remove log files older than AGENTIC_LOG_RETENTION_DAYS."""
-        cutoff = time.time() - (self.AGENTIC_LOG_RETENTION_DAYS * 86400)
+        """Remove log files older than the configured retention window."""
+        cutoff = time.time() - (self.retention_days * 86400)
         try:
             for fname in os.listdir(log_dir):
                 fpath = os.path.join(log_dir, fname)
@@ -15629,7 +15697,7 @@ class ModelQuery:
 AGENTIC_SUBCOMMANDS = [
     'on', 'off', 'full', 'auto', 'preset', 'plan', 'sandbox', 'verbose',
     'thinking', 'trace', 'log', 'lazytool', 'iterations', 'timeout',
-    'heartbeattokens', 'compactthreshold', 'acl', 'scratch', 'status',
+    'heartbeattokens', 'compactthreshold', 'logretention', 'acl', 'scratch', 'status',
 ]
 AGENTIC_PLAN_ARGS = ['on', 'off', 'run']
 AGENTIC_ACL_ACTIONS = ['list', 'status', 'log', 'allow', 'ask', 'deny', 'remove', 'reset']
@@ -15640,6 +15708,7 @@ AGENTIC_SANDBOX_NET_ARGS = ['shared', 'none', 'reset', 'status']
 AGENTIC_SECOND_LEVEL = {'plan': AGENTIC_PLAN_ARGS, 'acl': AGENTIC_ACL_ACTIONS,
                         'scratch': AGENTIC_SCRATCH_ACTIONS,
                         'preset': AGENTIC_PRESET_NAMES,
+                        'logretention': ['1', '7', '30', 'reset'],
                         'sandbox': AGENTIC_SANDBOX_ARGS}
 # Third level: /agentic sandbox net <TAB>
 AGENTIC_THIRD_LEVEL = {('sandbox', 'net'): AGENTIC_SANDBOX_NET_ARGS}
@@ -16635,31 +16704,29 @@ def execute_os_command(command: str, timeout: Optional[int] = None) -> str:
     print(f"[--- Executing (max {timeout}s): {command} ---]", file=sys.stderr)
 
     try:
-        process = subprocess.run(
+        # Own session so a timeout kills the whole tree, not just bash (the
+        # same rule as Executor host mode).
+        process = subprocess.Popen(
             command, shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            timeout=timeout,
-            executable="/bin/bash"
+            executable="/bin/bash",
+            start_new_session=True,
         )
+        raw_output, _stderr, _returncode, timed_out = _communicate_or_kill(process, timeout)
+        raw_output = raw_output or ""
 
-        raw_output = process.stdout if process.stdout else ""
-
-        # --- THE FIX: Print the output to the user's terminal! ---
-        if raw_output.strip():
-            print(colorize(raw_output, 'info'))
+        if timed_out:
+            print(f"[Command timed out after {timeout} seconds!]", file=sys.stderr)
+            output = f"[Command execution interrupted: Time limit exceeded ({timeout}s)]"
         else:
-            print(colorize("[Command executed successfully with no output]", 'muted'))
-        # ---------------------------------------------------------
-
-
-        output = raw_output or "[Command executed successfully with no output]"
-
-    except subprocess.TimeoutExpired:
-        print(f"[Command timed out after {timeout} seconds!]", file=sys.stderr)
-        output = f"[Command execution interrupted: Time limit exceeded ({timeout}s)]"
+            if raw_output.strip():
+                print(colorize(raw_output, 'info'))
+            else:
+                print(colorize("[Command executed successfully with no output]", 'muted'))
+            output = raw_output or "[Command executed successfully with no output]"
 
     except Exception as e:
         print(f"[Failed to execute command: {e}]", file=sys.stderr)
@@ -21691,6 +21758,8 @@ class ChatLoop:
             return self._agentic_set_number(subcmd, parts)
         if subcmd == "compactthreshold":
             return self._agentic_set_threshold(parts)
+        if subcmd == "logretention":
+            return self._agentic_set_log_retention(parts)
         if subcmd in self._AGENTIC_TOGGLE_MAP:
             return self._agentic_toggle_named(subcmd)
         if subcmd == "acl":
@@ -21700,7 +21769,7 @@ class ChatLoop:
         if subcmd == "plan":
             return self._agentic_toggle_plan(parts)
 
-        print(colorize("[Usage: /agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status|reset|net shared|none|reset]|verbose|thinking|trace|log|lazytool|acl|scratch [path|list|clear]|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|status]]", 'warning'), file=sys.stderr)
+        print(colorize("[Usage: /agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status|reset|net shared|none|reset]|verbose|thinking|trace|log|lazytool|acl|scratch [path|list|clear]|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|logretention <days>|status]]", 'warning'), file=sys.stderr)
         return False
 
     def _print_preset_list(self) -> bool:
@@ -22446,6 +22515,40 @@ class ChatLoop:
         print(colorize(f"[Agentic] Auto-compact threshold set to {val:.0%}.", 'success'), file=sys.stderr)
         return False
 
+    def _agentic_set_log_retention(self, parts: list) -> bool:
+        """Show or set the agentic JSONL retention window (days).
+
+        Args:
+            parts: Split /agentic args (parts[2] is the value or omitted).
+
+        Returns:
+            False to keep the chat loop running.
+        """
+        if len(parts) < 3:
+            current = _resolve_agentic_log_retention(
+                getattr(self.ctx, "agentic_log_retention_days", None))
+            print(colorize(f"[Agentic] JSONL retention: {current} day(s) "
+                           f"(env {AGENTIC_LOG_RETENTION_ENV})", 'info'), file=sys.stderr)
+            print(colorize("[Usage: /agentic logretention <days>|reset]", 'muted'),
+                  file=sys.stderr)
+            return False
+        value = parts[2].strip().lower()
+        if value == "reset":
+            self.ctx.agentic_log_retention_days = None
+            effective = _resolve_agentic_log_retention(None)
+            print(colorize(f"[Agentic] JSONL retention reset to {effective} day(s) "
+                           "(environment/default).", 'success'), file=sys.stderr)
+            return False
+        if not value.isdigit() or int(value) < 1:
+            print(colorize("[Usage: /agentic logretention <days>|reset]  (days >= 1)",
+                           'warning'), file=sys.stderr)
+            return False
+        days = int(value)
+        self.ctx.agentic_log_retention_days = days
+        print(colorize(f"[Agentic] JSONL retention set to {days} day(s).", 'success'),
+              file=sys.stderr)
+        return False
+
     def _agentic_toggle_named(self, subcmd: str) -> bool:
         """Toggle one of the named boolean agentic settings."""
         attr, label = self._AGENTIC_TOGGLE_MAP[subcmd]
@@ -22555,7 +22658,7 @@ class ChatLoop:
         print(colorize("\n[Agentic Settings - Use /agentic <option> [value]]", 'info'), file=sys.stderr)
         print("  Subcommands: on, off, full, auto, preset [read|exec|work|trusted], plan [on|off|run], sandbox [host|container|bwrap|status|reset|net shared|none|reset],", file=sys.stderr)
         print("               verbose, thinking, trace, log, lazytool, iterations <N>, timeout <N>, heartbeattokens <N>,", file=sys.stderr)
-        print("               compactthreshold <v>, acl, scratch [path|list|clear], status", file=sys.stderr)
+        print("               compactthreshold <v>, logretention <days>, acl, scratch [path|list|clear], status", file=sys.stderr)
         print(file=sys.stderr)
 
         plan_value = "off" if not c.plan_mode else ("run" if getattr(c, "plan_run", False) else "on")
@@ -22574,6 +22677,8 @@ class ChatLoop:
             ("timeout",    "Per-step timeout (seconds)", f"{c.agentic_step_timeout}s"),
             ("heartbeattokens", "Tokens per heartbeat dot (streaming; idle waits show Zz)", str(c.agentic_heartbeat_tokens)),
             ("compactthreshold", "Agentic auto-compact trigger", f"{c.agentic_compact_threshold:.0%}"),
+            ("logretention", "Agentic JSONL retention (days)",
+             str(_resolve_agentic_log_retention(getattr(c, "agentic_log_retention_days", None)))),
         ]
         # Column width derives from the longest name ("heartbeattokens",
         # "compactthreshold"), else the value brackets stop lining up when a
@@ -22875,7 +22980,8 @@ class ChatLoop:
         if len(self.messages) > 1:
             messages.extend(self.messages[1:])
 
-        logger = AgenticLogger() if self.ctx.agentic_logging else None
+        logger = (AgenticLogger(retention_days=getattr(self.ctx, "agentic_log_retention_days", None))
+                  if self.ctx.agentic_logging else None)
         if logger:
             logger.write(type="start", user_input=final_content)
 
