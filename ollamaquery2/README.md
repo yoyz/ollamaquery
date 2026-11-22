@@ -21,6 +21,10 @@ Auto-detects available **local** backends. Cloud backends are selected with
 `-b` and read their API key from the environment (`GEMINI_HOST`,
 `OPENCODEGO_HOST`, etc. override the host).
 
+Prefer `--api-key-file <0600 file>` or the backend's env var: `-k/--api-key` is
+visible in `argv` (`/proc/<pid>/cmdline`) and prints a warning when it is the
+value actually used. Precedence is file > env var > `-k`.
+
 Strata shares Llama.cpp's default port (8080) and OpenAI dialect but streams
 reasoning via `delta.reasoning_content` and exposes Anthropic
 `/v1/messages/count_tokens`; it is recognized by its unique `/health` marker.

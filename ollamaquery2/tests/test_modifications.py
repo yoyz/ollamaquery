@@ -2112,6 +2112,86 @@ class TestProcessInlineCommands(unittest.TestCase):
                         pass
 
 
+class TestApiKeyFile(unittest.TestCase):
+    """--api-key-file and the env-over-argv precedence (TODO.md §0)."""
+
+    def _args(self, api_key=None, api_key_file=None):
+        return types.SimpleNamespace(api_key=api_key, api_key_file=api_key_file)
+
+    def _key_file(self, td, text="file-key\nsecond-line\n", mode=0o600):
+        path = os.path.join(td, "key")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(path, mode)
+        return path
+
+    def test_file_key_is_read_and_stripped(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._key_file(td)
+            with patch.dict(os.environ, {"GEMINI_API_KEY": ""}, clear=False):
+                key = m._resolve_api_key_argument("gemini", self._args(api_key_file=path))
+        self.assertEqual(key, "file-key")
+
+    def test_file_wins_over_env_and_argv(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._key_file(td)
+            err = io.StringIO()
+            with patch.dict(os.environ, {"GEMINI_API_KEY": "env-key"}, clear=False), \
+                 contextlib.redirect_stderr(err):
+                key = m._resolve_api_key_argument(
+                    "gemini", self._args(api_key="argv-key", api_key_file=path))
+        self.assertEqual(key, "file-key")
+        self.assertIn("using --api-key-file instead", err.getvalue())
+
+    def test_env_wins_over_argv_with_a_warning(self):
+        err = io.StringIO()
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "env-key"}, clear=False), \
+             contextlib.redirect_stderr(err):
+            key = m._resolve_api_key_argument("gemini", self._args(api_key="argv-key"))
+        self.assertEqual(key, "env-key")
+        self.assertIn("visible in /proc", err.getvalue())
+        self.assertIn("GEMINI_API_KEY", err.getvalue())
+
+    def test_argv_is_used_only_as_a_warned_fallback(self):
+        err = io.StringIO()
+        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}, clear=False), \
+             contextlib.redirect_stderr(err):
+            key = m._resolve_api_key_argument("gemini", self._args(api_key="argv-key"))
+        self.assertEqual(key, "argv-key")
+        self.assertIn("prefer --api-key-file", err.getvalue())
+
+    def test_missing_file_falls_back_to_env(self):
+        err = io.StringIO()
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "env-key"}, clear=False), \
+             contextlib.redirect_stderr(err):
+            key = m._resolve_api_key_argument(
+                "gemini", self._args(api_key_file="/nonexistent/key"))
+        self.assertEqual(key, "env-key")
+        self.assertIn("Cannot read --api-key-file", err.getvalue())
+
+    def test_world_readable_file_warns_but_is_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._key_file(td, mode=0o644)
+            err = io.StringIO()
+            with patch.dict(os.environ, {"GEMINI_API_KEY": ""}, clear=False), \
+                 contextlib.redirect_stderr(err):
+                key = m._resolve_api_key_argument("gemini", self._args(api_key_file=path))
+        self.assertEqual(key, "file-key")
+        self.assertIn("chmod 600", err.getvalue())
+
+    def test_maas_api_key_file_env_is_used(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._key_file(td)
+            env = {"MAAS_API_KEY": "", "MAAS_API_KEY_FILE": path}
+            with patch.dict(os.environ, env, clear=False):
+                key = m._resolve_api_key_argument("maas", self._args())
+        self.assertEqual(key, "file-key")
+
+    def test_parser_exposes_api_key_file(self):
+        args = m._build_parser().parse_args(["--api-key-file", "/tmp/key"])
+        self.assertEqual(args.api_key_file, "/tmp/key")
+
+
 # ============================================================================
 # 16. stop/continue (Ctrl+Z + bg/fg) terminal repair
 # ============================================================================

@@ -15334,7 +15334,9 @@ class ModelQuery:
             if isinstance(e, HTTPError) and e.code == 403:
                 if self.backend in CLOUD_BACKENDS:
                     env_hint = CLOUD_API_KEY_ENV
-                    msg += f"\n[HINT] {self.backend} authentication failed. Check your --api-key or {env_hint.get(self.backend, 'API_KEY')} env var."
+                    msg += (f"\n[HINT] {self.backend} authentication failed. Check your "
+                            f"{env_hint.get(self.backend, 'API_KEY')} env var or "
+                            "--api-key-file (--api-key is visible in argv).")
                 elif ":cloud" in model:
                     msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
             sys.stderr.write(colorize(msg, 'error'))
@@ -15493,7 +15495,9 @@ class ModelQuery:
         if isinstance(e, HTTPError) and e.code == 403:
             if backend in CLOUD_BACKENDS:
                 env_hint = CLOUD_API_KEY_ENV
-                msg += f"\n[HINT] {backend} authentication failed. Check your --api-key or {env_hint.get(backend, 'API_KEY')} env var."
+                msg += (f"\n[HINT] {backend} authentication failed. Check your "
+                        f"{env_hint.get(backend, 'API_KEY')} env var or "
+                        "--api-key-file (--api-key is visible in argv).")
             elif ":cloud" in model:
                 msg += "\n[HINT] Cloud models require authentication. Check your Ollama cloud API key or pull a local model instead."
         return msg
@@ -24232,7 +24236,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--context-size', type=int, metavar='TOKENS', default=None,
                         help='Context window override in tokens (MaaS cannot expose it; '
                              'otherwise the window is detected from the server)')
-    parser.add_argument('-k', '--api-key', help='API key for cloud backends (Gemini, etc.)')
+    parser.add_argument('-k', '--api-key',
+                        help='API key for cloud backends (visible in argv; '
+                             'prefer --api-key-file or the env var)')
+    parser.add_argument('--api-key-file', metavar='PATH', default=None,
+                        help='Read the API key from a 0600 file (preferred over --api-key)')
     parser.add_argument('--version', action='store_true', help='Show version and exit')
 
     list_group = parser.add_mutually_exclusive_group()
@@ -24395,13 +24403,17 @@ def _verify_server(backend: str, base_url: str, args: argparse.Namespace) -> tup
             if not api_key:
                 sys.stderr.write(colorize(
                     "[ERROR] maas requires an API key. Set MAAS_API_KEY, "
-                    "MAAS_API_KEY_FILE (a 0600 file), or --api-key.\n", 'error'))
+                    "MAAS_API_KEY_FILE (a 0600 file), --api-key-file, or --api-key.\n",
+                    'error'))
                 sys.exit(1)
             server_reachable = check_maas(base_url, api_key)
         else:
             api_key = args.api_key or os.environ.get(CLOUD_API_KEY_ENV.get(backend, ''), '')
             if not api_key:
-                sys.stderr.write(colorize(f"[ERROR] {backend} requires an API key. Set --api-key, {CLOUD_API_KEY_ENV.get(backend, '')} env var, or save to config.\n", 'error'))
+                env_name = CLOUD_API_KEY_ENV.get(backend, '')
+                sys.stderr.write(colorize(
+                    f"[ERROR] {backend} requires an API key. Set {env_name} env var, "
+                    "--api-key-file, or --api-key.\n", 'error'))
                 sys.exit(1)
             server_reachable = check_gemini(base_url, api_key)
     else:
@@ -24506,6 +24518,87 @@ def _select_model(backend: str, base_url: str, args: argparse.Namespace) -> str:
     label = LABELS.get(backend, "Llama.cpp")
     print(colorize(f"\n[No models available on {backend} server. Use /listmodel to see available models.]", 'warning'), file=sys.stderr)
     return ""
+
+
+def _read_api_key_file(path: str) -> str:
+    """Read the first line of an API key file, warning on lax permissions.
+
+    The file is user-supplied and trusted; the permission check is advisory
+    (a world-readable key is already exposed, but the warning makes it
+    actionable). The first line is stripped because a trailing newline is the
+    usual mistake.
+
+    Args:
+        path: File passed with --api-key-file.
+
+    Returns:
+        The stripped key, or "" when the file is empty/unreadable (a warning
+        is printed in both cases).
+    """
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        if mode & 0o077:
+            sys.stderr.write(colorize(
+                f"[Security] {path} is accessible by other users (mode "
+                f"{mode:03o}); chmod 600 it.\n", 'warning'))
+        with open(path, "r", encoding="utf-8") as fh:
+            key = fh.readline().strip()
+    except OSError as exc:
+        sys.stderr.write(colorize(
+            f"[ERROR] Cannot read --api-key-file {path}: {exc}\n", 'warning'))
+        return ""
+    if not key:
+        sys.stderr.write(colorize(
+            f"[ERROR] --api-key-file {path} is empty\n", 'warning'))
+    return key
+
+
+def _resolve_api_key_argument(backend: str, args: argparse.Namespace) -> Optional[str]:
+    """Resolve the CLI API key without keeping it in argv when possible.
+
+    Precedence is --api-key-file > the backend's key env var (and
+    MAAS_API_KEY_FILE) > -k/--api-key. The argv form remains supported for
+    compatibility but prints one warning: it is visible in
+    `/proc/<pid>/cmdline` for the process lifetime.
+
+    Args:
+        backend: Resolved backend name.
+        args: Parsed CLI arguments (api_key, api_key_file).
+
+    Returns:
+        The key, or None when none is configured.
+    """
+    argv_key = (getattr(args, "api_key", None) or "").strip()
+    file_path = (getattr(args, "api_key_file", None) or "").strip()
+    if file_path:
+        key = _read_api_key_file(file_path)
+        if key:
+            if argv_key:
+                sys.stderr.write(colorize(
+                    "[Security] --api-key is visible in /proc/<pid>/cmdline; "
+                    "using --api-key-file instead.\n", 'warning'))
+            return key
+    env_name = CLOUD_API_KEY_ENV.get(backend, "")
+    env_key = os.environ.get(env_name, "").strip() if env_name else ""
+    source = env_name
+    if not env_key and backend == "maas":
+        # MAAS_API_KEY_FILE is the one documented file env var; reuse its
+        # resolver rather than inventing a second precedence table.
+        env_key = maas_api_key(None)
+        source = "MAAS_API_KEY_FILE"
+    if env_key:
+        if argv_key:
+            sys.stderr.write(colorize(
+                "[Security] --api-key is visible in /proc/<pid>/cmdline; "
+                f"using {source or 'the environment'} instead.\n", 'warning'))
+        return env_key
+    if argv_key:
+        sys.stderr.write(colorize(
+            "[Security] --api-key is visible in /proc/<pid>/cmdline; prefer "
+            f"--api-key-file or {env_name or 'the backend API-key env var'}.\n",
+            'warning'))
+        return argv_key
+    return None
 
 
 def _cloud_api_key(backend: str, api_key: Optional[str] = None) -> str:
@@ -24969,6 +25062,7 @@ def main() -> None:
         _print_no_action_help(args)
 
     backend, base_url = resolve_connection(args)
+    args.api_key = _resolve_api_key_argument(backend, args)
     backend, base_url = _verify_server(backend, base_url, args)
     save_backend_config(backend, base_url)
     target_model = _select_model(backend, base_url, args)
