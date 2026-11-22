@@ -152,7 +152,7 @@ folded. Tab completion on `/resume ` offers every saved slug and id. The newest
 | `git_inspect`              | Read-only git inspection: `status`, `diff`, `diff_staged`, `diff_head`, `log` (any ref, path-scoped, renames followed), `show`, `blame -L` (fixed argv, no shell) |
 | `path_policy`              | Read-only: the session path map (allowed / needs confirmation / forbidden), or the verdict for one path — no filesystem access, no prompt |
 
-Subcommands: `/agentic on|off|full`, `preset [read|exec|work|trusted]`, `plan [on|off|run]`, `sandbox [host|container|bwrap|status]`, `auto`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `iterations <N>`, `timeout <N>`, `status`.
+Subcommands: `/agentic on|off|full`, `preset [read|exec|work|trusted]`, `plan [on|off|run]`, `sandbox [host|container|bwrap|status|net shared|none|reset]`, `auto`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `iterations <N>`, `timeout <N>`, `status`.
 
 The model is steered to use the **dedicated file tools** (`read_file`, `write_file`,
 `edit_file`, `grep`, `glob`, `list_directory`) instead of shell equivalents (`cat`,
@@ -189,27 +189,40 @@ backstop and the `Executor` cannot disagree.
 | Preset                       | Surface                                                                                      | Sandbox                               | Promise                                                   |
 | ---------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------- | --------------------------------------------------------- |
 | **`read`** (alias `plan`)    | inspection tools only, no shell                                                              | none                                  | no write, no code                                         |
-| **`exec`**                   | read + `run_command`/`run_python`, **no** `write_file`/`edit_file`/`apply_patch`/`fetch_url` | bwrap, project **ro**, net **none**   | runs commands, cannot modify the project                  |
-| **`work`** (default)         | every tool                                                                                   | bwrap, project **rw**, net **shared** | works in the project; the rest of the host is not mounted |
+| **`exec`**                   | read + `run_command`/`run_python`, **no** write tools, no `fetch_url`, no cluster tool        | bwrap, project **ro**, net **none**   | runs commands, cannot modify the project                  |
+| **`work`** (default)         | every tool                                                                                   | bwrap, project **rw**, net **shared** | project writable; host binaries/config mounted **ro** (the real `$HOME` is not) |
 | **`trusted`** (alias `full`) | every tool                                                                                   | **host**, auto-confirm                | everything allowed, only the hard denies                  |
 
 ```text
 /agentic preset                 # list the presets and the active one
 /agentic preset exec            # read + run, project read-only, no network
 /agentic preset show            # the active quadruplet + the effective tool surface
-/agentic preset work            # the daily stance (also what `/agentic on` selects)
+/agentic preset work            # the daily stance (first `/agentic on` selects it)
 /agentic plan                   # alias for the read preset
+/agentic plan run               # adds run_command on the HOST, confirmed per call
 /agentic full                   # alias for the trusted preset
 ```
 
 `/agentic auto` keeps its historical meaning (toggle auto-confirm); the preset
 alias `auto` is available as `/agentic preset auto` = `trusted`.
 
+`/agentic on` applies **`work` on its first activation**, then resumes the last
+stance: an `exec` or `trusted` session survives `/agentic off` → `/agentic on`
+instead of silently becoming `work`. `/agentic plan run` is the deeper plan tier
+(the resolver reports it as the internal `read-run` stance): it re-adds
+`run_command` **on the host** with a confirmation for every call — plan mode
+never runs a shell inside a sandbox, where the gate would be bypassed.
+
 Three invariants: **shell writes** are bounded by the bwrap mounts (the kernel
 returns EROFS), **file writes** stay governed by the Path ACL, and **host**
-execution only happens in `trusted` (or with an explicit `--sandbox-engine host`).
+execution only happens in `trusted`, in `/agentic plan run` (one confirmed
+command at a time), or with an explicit `--sandbox-engine host`.
 File tools run in the harness, not in the sandbox; `exec` therefore removes the
 write tools from the surface instead of pretending the mount protects them.
+`kubernetes_cluster_query` also runs in the harness (it needs KUBECONFIG,
+`~/.kube/config` or a must-gather under `$HOME`, none of which the sandbox
+mounts) and can reach a cluster, so `exec` — which promises **no network** —
+does not offer it; use `read` to inspect a cluster.
 
 
 Each step's stream is also checked for **completeness**: a turn cut mid-generation
@@ -349,7 +362,7 @@ instantly — no image, no pull, no container runtime.
 [Sandbox] bwrap (project rw, net shared, host ro; no cgroup cap (v1)]
 
 > /agentic preset exec
-[Agentic preset: exec — tools=10 read/exec sandbox=bwrap approve=auto]
+[Agentic preset: exec — tools=9 read/exec sandbox=bwrap approve=auto]
 [Sandbox] bwrap (project ro, net none, host ro; no cgroup cap (v1))
 ```
 
@@ -358,7 +371,8 @@ like a container):
 
 | Path / object                                                             | Mount                                                                     | Why                                                                |
 | ------------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, `/var`, `/run`, `/opt` | `--ro-bind-try`                                                           | host binaries, config, DNS (`/etc/resolv.conf` points into `/run`) |
+| `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, `/var`, `/opt`         | `--ro-bind-try`                                                           | host binaries and config                                           |
+| `/run/systemd/resolve`, `/run/NetworkManager`                             | `--ro-bind-try`                                                           | resolver state only — the rest of `/run` (sockets!) is **not** mounted |
 | `/tmp`, `/var/tmp`                                                        | `--tmpfs`                                                                 | disposable; the session scratch is re-bound inside                 |
 | project (CWD)                                                             | `--bind` rw (work) or `--ro-bind` (exec)                                  | same absolute path as the host, so model paths stay coherent       |
 | session scratch `/tmp/ollamaquery/pid-N`                                  | `--bind` rw                                                               | `/agentic scratch` keeps working                                   |
@@ -367,12 +381,40 @@ like a container):
 | network                                                                   | `--share-net` (work) or `--unshare-net` (exec)                            | builds/installs vs no DNS/no downloads                             |
 | isolation                                                                 | `--unshare-all --die-with-parent --new-session --cap-drop ALL --clearenv` | namespaces, caps, minimal env                                      |
 
+> **`net none` is absolute.** A read-only mount does not stop `connect(2)` on a
+> Unix socket, so `/run` is *not* mounted whole (a sandboxed command could
+> otherwise drive `podman.sock`/`dbus` — measured). And the harness itself has
+> no side door under `net none`: `fetch_url` and `kubernetes_cluster_query` are
+> removed from the tool surface, and a `curl` GET is no longer promoted to a
+> host-side fetch. Restore the network when you need it:
+
+```bash
+/agentic sandbox net status   # current stance + where it comes from
+/agentic sandbox net shared   # network back on, immediately
+/agentic sandbox net none     # cut it again
+/agentic sandbox net reset    # hand the decision back to the active preset
+```
+
+`shared`/`none` are explicit overrides (they survive preset changes, like a CLI
+flag); `reset` clears the override. The `exec` preset refuses `shared` — switch
+preset first — and plan mode refuses any change until it ends.
+
+Four cases are **refused by construction** rather than silently weakened:
+`/` as the project (it would mount the whole host), a read-only project that
+contains the session scratch (`TMPDIR=$PWD/tmp`) or the sandbox HOME
+(`CWD=$HOME`) — both are re-bound writable after the ro-bind — and, in `exec`,
+any rw bind that overlaps the project. The preset banner prints the reason and
+the command returns `returncode -1` instead of running somewhere else.
+
 ```bash
 python3 ollamaquery2.py -c --sandbox-engine bwrap \
   --sandbox-bwrap-project ro --sandbox-bwrap-rw "$PWD/build" \
   --sandbox-bwrap-net none --sandbox-bwrap-bind /data:ro
+# work/trusted accept the rw subtree; `exec` refuses it (its project is ro)
 
 /agentic sandbox bwrap|container|host|status   # switch/inspect at runtime
+/agentic sandbox reset                         # clear the engine override, back to the preset
+/agentic sandbox net shared|none|reset|status  # network stance at runtime
 ```
 
 Limits, stated rather than implied: **no cgroup cap** in v1 (a fork bomb or a
@@ -524,8 +566,11 @@ Trust boundaries at a glance; the sections above give the details.
 - **Container and bwrap sandboxes are a different, looser boundary.** `run_command` /
   `run_python` execute inside the sandbox and skip the host shell gate and ACL
   operand scan. Containers bind the project read-write; bwrap does too in `work`
-  and read-only in `exec`. The file tools still run on the host and stay under
-  the Path ACL (which is why `exec` removes the write tools from the surface).
+  and read-only in `exec`. **`exec` bounds writes, not reads**: host binaries,
+  libraries and config are mounted read-only, so `cat /etc/...` works inside the
+  sandbox even though `read_file` on the same path is denied by the strict path
+  rules. The file tools still run on the host and stay under the Path ACL
+  (which is why `exec` removes the write tools from the surface).
   bwrap has no cgroup ceiling in v1; the throwaway container keeps `--memory`/`--cpus`.
 - **Path ACL coverage.** File tools and shell operands are governed (see
   "Access Control" above). `run_python` inline code, `diff`/`apply_patch`

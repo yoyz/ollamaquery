@@ -1782,6 +1782,10 @@ class TestBuildPrompt(unittest.TestCase):
         self.ctx.agentic_mode = True
         self.loop.executor.mode = "container"
         self.assertTrue(self.loop.run_build_prompt("localhost").startswith("[agentic:box] "))
+        # bwrap also bypasses the host gate: the mounts, not the approvals,
+        # decide what the shell can do.
+        self.loop.executor.mode = "bwrap"
+        self.assertTrue(self.loop.run_build_prompt("localhost").startswith("[agentic:box] "))
 
 
 # ============================================================================

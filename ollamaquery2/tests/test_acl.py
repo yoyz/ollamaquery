@@ -1777,5 +1777,26 @@ class TestShellWrapperApproval(unittest.TestCase):
         self.assertEqual(res["effect"], "allow")
 
 
+class TestAclPolicyBlockWording(unittest.TestCase):
+    """The prompt/tool text must not promise what the engine does not do."""
+
+    def test_bwrap_mode_names_the_mounts_not_the_gate(self):
+        ctx = m.CommandContext()
+        text = m._acl_policy_block(ctx.path_acl, detail="full", executor_mode="bwrap")
+        self.assertIn("MOUNTS", text)
+        self.assertIn("not this ACL", text)
+        self.assertNotIn("same policy applies to run_command", text)
+
+    def test_host_mode_keeps_the_gate_promise(self):
+        ctx = m.CommandContext()
+        text = m._acl_policy_block(ctx.path_acl, detail="full", executor_mode="host")
+        self.assertIn("shell gate", text)
+        self.assertNotIn("MOUNTS", text)
+
+    def test_denial_hint_does_not_promise_the_gate_in_a_sandbox(self):
+        self.assertNotIn("same policy applies to run_command", m.ACL_DENIAL_HINT)
+        self.assertIn("mounts bound a sandboxed one", m.ACL_DENIAL_HINT)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

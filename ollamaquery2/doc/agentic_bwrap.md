@@ -37,7 +37,8 @@ Default policy (built by `Executor._bwrap_command`):
 
 | Path / object                                                              | Mount                                                                                             | Why                                                                 |
 | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, `/var`, `/run`, `/opt`  | `--ro-bind-try`                                                                                   | host binaries, libraries, config, DNS (`/etc/resolv.conf` → `/run`) |
+| `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, `/var`, `/opt`            | `--ro-bind-try`                                                                                   | host binaries, libraries and config                                 |
+| `/run/systemd/resolve`, `/run/NetworkManager`                               | `--ro-bind-try`                                                                                   | resolver state only (`/etc/resolv.conf` points into it)             |
 | `/tmp`, `/var/tmp`                                                         | `--tmpfs`                                                                                         | disposable; the session scratch is re-bound inside                  |
 | project (CWD)                                                              | `--bind` rw (`work`) or `--ro-bind` (`exec`)                                                      | same absolute path as the host                                      |
 | session scratch `/tmp/ollamaquery/pid-N`                                   | `--bind` rw                                                                                       | `/agentic scratch` keeps working                                    |
@@ -67,6 +68,17 @@ Measured on this machine (bwrap 0.11.1):
 | `sed -i` on a project file (`project ro`)     | `EROFS` (temp file creation)            |
 | `echo x > $HOME/cache` (sandbox home)         | works                                   |
 | `touch /var/tmp/x`, `touch /tmp/x`            | works (tmpfs)                           |
+| reach `/run/user/<uid>/podman/podman.sock`    | absent (resolver mounts only)           |
+| `getent hosts example.com` (`--share-net`)    | resolves with only `/run/systemd/resolve` |
+
+> **Why `/run` is not mounted whole.** A read-only mount does not prevent
+> `connect(2)` on a Unix socket, and `/run/user/<uid>/podman/podman.sock` (or
+> `docker.sock`, `/run/dbus/system_bus_socket`) is a full host compromise: the
+> API can start a container with `-v /:/host`. Measured 2026-11-22 with the
+> production argv (`--unshare-all --unshare-net --cap-drop ALL`):
+> `curl --unix-socket …/podman.sock …/_ping` answered `OK`. Only the resolver
+> directories are mounted now, and the live test
+> `test_host_runtime_sockets_are_not_reachable` pins it.
 
 ## 3. Engine selection
 
@@ -93,25 +105,46 @@ At runtime:
 
 ```text
 /agentic sandbox                # historical host <-> container toggle
-/agentic sandbox status         # current engine, project/net mode, bind counts
+/agentic sandbox status         # current engine, project/net mode (+ its source), bind counts
 /agentic sandbox bwrap          # switch (probes first; refusal keeps the old engine)
 /agentic sandbox host|container
+/agentic sandbox reset          # clear the engine override, back to the preset's engine
+/agentic sandbox net status     # network stance, and whether it comes from an override
+/agentic sandbox net shared     # network back on (immediate: executors are rebuilt)
+/agentic sandbox net none       # cut it (also hides the harness network tools)
+/agentic sandbox net reset      # hand the decision back to the active preset
 ```
+
+`net shared`/`net none` write an explicit override (same effect as the CLI flag,
+so later preset changes keep it); `reset` clears it. The `exec` preset refuses
+anything but `none` (switch preset first) and plan mode refuses any change until
+it ends. Under `none`, the **surface** follows the mounts: `fetch_url`,
+`kubernetes_cluster_query` and MCP tools are hidden, and a `curl`/`wget` GET in
+`run_command` runs in the sandbox instead of being served by the harness.
 
 ## 4. Presets and bwrap
 
-| Preset    | Engine | Project | Net    | Surface                                              | Approval |
-| --------- | ------ | ------- | ------ | ---------------------------------------------------- | -------- |
-| `read`    | none   | n/a     | n/a    | 9 inspection tools, no shell                         | plan     |
-| `exec`    | bwrap  | ro      | none   | read + `run_command`/`run_python` (no write tools)   | auto     |
-| `work`    | bwrap  | rw      | shared | every tool                                           | auto     |
-| `trusted` | host   | n/a     | n/a    | every tool                                           | auto     |
+| Preset      | Engine | Project | Net    | Surface                                              | Approval |
+| ----------- | ------ | ------- | ------ | ---------------------------------------------------- | -------- |
+| `read`      | none   | n/a     | n/a    | 9 inspection tools, no shell                         | plan     |
+| `read-run`  | host   | n/a     | n/a    | `read` + `run_command`, confirmed per call (internal) | plan     |
+| `exec`      | bwrap  | ro      | none   | read + `run_command`/`run_python` (no write tools, no `fetch_url`, no cluster tool) | auto     |
+| `work`      | bwrap  | rw      | shared | every tool                                           | auto     |
+| `trusted`   | host   | n/a     | n/a    | every tool                                           | auto     |
 
-`/agentic on` selects `work`; `plan`/`full` are aliases for `read`/`trusted`.
-`auto_confirm` is a **derived** value in the MVP: `read` forces plan mode,
-`exec`/`work` run sandboxed without prompts, `trusted` is the host escape hatch.
-The bare `/agentic auto` command keeps its historical auto-confirm toggle; the
-preset alias is `/agentic preset auto`.
+`read-run` is the internal projection of `/agentic plan run` (not selectable by
+name): it exists so `resolve_preset` describes the surface the tier really has
+(`PLAN_MODE_RUN_TOOLS`) instead of claiming `read` without `run_command`. Entering
+plan mode sets the engine to `host` (or the explicit `--sandbox-engine`), because
+`plan run` is a gate-confirmed host shell, not a bwrap command; `plan off`
+restores the previous engine from the snapshot.
+
+`/agentic on` applies `work` on first activation, then resumes the last stance
+(`exec`/`trusted` survive an `off` → `on`). `plan`/`full` are aliases for
+`read`/`trusted`. `auto_confirm` is a **derived** value in the MVP: `read` forces
+plan mode, `exec`/`work` run sandboxed without prompts, `trusted` is the host
+escape hatch. The bare `/agentic auto` command keeps its historical auto-confirm
+toggle; the preset alias is `/agentic preset auto`.
 
 ## 5. What bwrap does not cover
 
@@ -119,7 +152,14 @@ preset alias is `/agentic preset auto`.
    `apply_patch`, `git_inspect`, `fetch_url` do not go through the Executor;
    their policy is the Path ACL. `exec` removes the write tools from the
    surface rather than claiming the mount protects them. A bare
-   `--sandbox-bwrap-rw <project path>` is an explicit escape hatch.
+   `--sandbox-bwrap-rw <project path>` is an explicit escape hatch — **except in
+   `exec`**, which refuses any rw bind (or rw `--sandbox-bwrap-bind`) that
+   overlaps the project in either direction; rw binds outside the project stay
+   legal.
+   **`kubernetes_cluster_query` is harness-side too** (it spawns `oc`/`kubectl`/
+   `omc` where `KUBECONFIG`, `~/.kube/config`, `~/.omc/omc.json` and the
+   must-gather directory are), so it is removed from `exec`, whose `net none`
+   promise it would otherwise break. `read`/`work`/`trusted` keep it.
 2. **A rw project is destructible.** `work` is the trust stance, exactly like a
    container with `-v cwd:/workspace`. Use `exec` (ro) or git when that matters.
 3. **No cgroup caps in v1.** A fork bomb or a RAM-hungry build is not contained.
@@ -134,18 +174,34 @@ preset alias is `/agentic preset auto`.
 6. **No dedicated seccomp profile in v1** (namespaces + `--cap-drop ALL` only).
 7. **No persistent environment.** Each command starts from the same mounts;
    state lives in the project or the sandbox home.
-8. **Shared network can exfiltrate.** Use `--sandbox-bwrap-net none` for code
-   that must not reach the network; builds that fetch will fail.
+8. **Shared network can exfiltrate.** Use `--sandbox-bwrap-net none` (or
+   `/agentic sandbox net none`) for code that must not reach the network; builds
+   that fetch will fail. `none` is enforced on both sides: `--unshare-net` for
+   the shell, and a reduced tool surface (no `fetch_url`, no
+   `kubernetes_cluster_query`, no MCP) plus no `curl`→host-fetch promotion for
+   the harness. `net shared`/`net reset` restore it at runtime.
 9. **No image reproducibility.** The environment is the host's.
 
 ## 6. Implementation map
 
 - `Executor.__init__` — `bwrap_project`, `bwrap_net`, `bwrap_binds`,
   `bwrap_rw`, `bwrap_home` (tests).
-- `Executor._bwrap_probe` — `shutil.which("bwrap")` + `bwrap --dev /dev
-  --ro-bind / / true` (5 s), memoized.
-- `Executor._bwrap_command` — the argv above; the project keeps its **host
-  absolute path**, so model paths and ACL stay coherent.
+- `Executor._bwrap_probe` — `shutil.which("bwrap")` + **the production argv** run
+  with `true` (`_bwrap_argv("true")`: `--unshare-all`, `--proc`, `--clearenv`,
+  `--cap-drop ALL`, the project/scratch/home binds and the shell), 5 s, memoized.
+  A host that passes it cannot then fail on the argv real commands use.
+- `Executor._bwrap_argv` — the mount policy above as a list; `_bwrap_command`
+  only quotes it. The project keeps its **host absolute path**, so model paths
+  and ACL stay coherent.
+- `Executor._bwrap_policy_error` — the invariants no flag can make safe, checked
+  before every command: the filesystem root as the project is refused, and a
+  **read-only** project must not contain the session scratch or the sandbox HOME
+  (both are re-bound writable after the ro-bind; `TMPDIR=$PWD/tmp` and a CWD of
+  `$HOME` were the two measured holes). `run()` refuses with `returncode -1` and
+  one warning, `_print_preset_status` warns at activation.
+- `ChatLoop._apply_preset_state("exec")` — refuses rw binds (`bwrap_rw` or a
+  `:rw` bind) that contain the project or live inside it, since they are applied
+  after the ro-bind and would re-open it.
 - `Executor.run` — a failed probe returns `bwrap unavailable: …` and never
   executes on the host.
 - `Executor.describe` — `bwrap (project rw, net shared, host ro; no cgroup cap (v1))`.

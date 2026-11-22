@@ -80,6 +80,7 @@ class TestStrataDetectionOffline(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()   # shutdown() stops serve_forever, not the fd
 
     def test_detects_strata(self):
         _HealthHandler.service = "strata"
