@@ -48,7 +48,9 @@ Default policy (built by `Executor._bwrap_command`):
 | isolation                                                                  | `--unshare-all --die-with-parent --new-session --cap-drop ALL --clearenv`                         | namespaces, parent death, terminal safety, caps, minimal env        |
 
 Environment inside the sandbox: `PATH`, `HOME` (the private sandbox home),
-`TERM`, `LANG=C.UTF-8`, `TMPDIR=/tmp`, plus `GIT_OPTIONAL_LOCKS=0` and
+`TERM`, `LANG=C.UTF-8`, `TMPDIR` (the session scratch, bind-mounted rw, so
+build temporaries persist between commands and are wiped at exit), plus
+`GIT_OPTIONAL_LOCKS=0` and
 `GIT_TERMINAL_PROMPT=0` so a read-only project can still run `git status`
 without an `index.lock` fight or a credential prompt. The sandbox home is
 removed at exit and dead-PID homes are swept at startup; `OLLAMAQUERY_KEEP_SCRATCH=1`

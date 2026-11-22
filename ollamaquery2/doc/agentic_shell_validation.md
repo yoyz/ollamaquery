@@ -190,6 +190,21 @@ Key faithful details:
     `_shell_all_operands_inside_cwd` and the home guard's sensitive-cwd check
     (`_shell_cwd_is_sensitive`, which also catches a subshell inheriting `/`).
     `tests/test_acl.py::TestShellEffectiveCwd` (16).
+*   **Write targets and `$TMPDIR` (H0 + TMPDIR, closed 2026-11-22).**
+    Only redirections were graded `write`; `cp f /var/x`, `sed -i … /var/x`,
+    `gcc -o /var/x`, `tar -cf /var/x.tar`, `find /var -delete` and
+    `git config --global` were operands, therefore reads. The bounded table
+    `_shell_write_targets` (decision (a)) now marks the destination of
+    `cp`/`mv`/`ln`/`install`, every operand of `touch`/`mkdir`/`rm`/`tee`/…,
+    `sed -i`, `dd of=`, `tar -f` in create mode, `gcc -o`, destructive
+    `find` roots, `git config` (`~/.gitconfig`/`/etc/gitconfig`/`.git/config`)
+    and `curl`/`wget` outputs; an unknown command keeps the old read-only
+    scan. The same traversal produces `_shell_access_plan` (read/write/
+    unknown events) for A1's session inventory. Host and bwrap commands get
+    `TMPDIR` = the session scratch, and the scanner resolves `$TMPDIR` with a
+    per-command context (the process value for `!`); the scratch is wiped at
+    exit. `tests/test_acl.py::TestShellWriteTargets` (7) and
+    `TestShellTmpdir` (6), `TestExecutor.test_host_command_gets_tmpdir_scratch`.
 *   **`-c` payloads are gated too (M2, closed 2026-11-19).** The guard used to
     read only the first-level tokens, so `bash -c "rm -rf ~"` was a plain `ask`
     that `auto_confirm` approved while a direct `rm -rf ~` is denied — a hole

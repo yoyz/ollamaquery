@@ -3818,6 +3818,7 @@ AGENTIC_RULES_BLOCK = """## General rules
 - Be precise with file paths. If you create a file in a subdirectory, use the same path when compiling or reading it later.
 - Mirror the user's language — if they write in French, reply in French.
 - Use the dedicated tools instead of shell equivalents (`cat`, `head`, `tail`, `find`, `sed -i`, `echo >`): read_file pages large files and returns the `next` offset, grep/glob/list_directory are path-ACL checked, their output is not cut off by the observation cap, and they act on the host project even in sandbox mode. Write with write_file/edit_file whenever writing is allowed. Use run_command (when a shell is available) to RUN things — compilers, builds, tests, binaries, system inspection — and for what no tool covers.
+- Temporary files: write under `$TMPDIR` (the session scratch), not `/tmp`; the scratch is wiped at exit, so move anything you must keep into the project.
 - A path refused by the path ACL (`[path ACL denied]`) means stop that attempt: do NOT retry it with run_command/run_python. Call path_policy once to see what you may use, then continue with an allowed path or tell the user what to grant.
 - The user's message may already include file contents they referenced (marked `[Content of local file ...]`). If the information you need is already in the conversation, answer directly — do NOT call tools merely to confirm, re-read, or "explore" what you were already given."""
 
@@ -5391,12 +5392,14 @@ def _shell_cd_target(tokens: list) -> Optional[str]:
     return None
 
 
-def _shell_cd_resolved(target: Optional[str], effective_cwd: str) -> Optional[str]:
+def _shell_cd_resolved(target: Optional[str], effective_cwd: str,
+                       tmpdir: Optional[str] = None) -> Optional[str]:
     """Resolve a `cd` target against the directory in force, or None.
 
     Args:
         target: The directory operand, or None.
         effective_cwd: The directory in force before this `cd`.
+        tmpdir: Value of `$TMPDIR` for this command, or None to leave it opaque.
 
     Returns:
         The realpath of the target, or None for an opaque target (`$VAR`,
@@ -5406,6 +5409,7 @@ def _shell_cd_resolved(target: Optional[str], effective_cwd: str) -> Optional[st
         return None
     t = target.strip().strip("'\"")
     t = _shell_expand_home_refs(t)
+    t = _shell_expand_unset_refs(t, tmpdir=tmpdir)
     if (not t or t.startswith("-") or t.startswith("+")
             or "$" in t or "`" in t or "*" in t or "?" in t):
         return None
@@ -5415,7 +5419,8 @@ def _shell_cd_resolved(target: Optional[str], effective_cwd: str) -> Optional[st
 
 
 def _shell_cd_target_allowed(target: str, effective_cwd: str, project_cwd: str,
-                             extra_roots: Optional[list]) -> bool:
+                             extra_roots: Optional[list],
+                             tmpdir: Optional[str] = None) -> bool:
     """True when a `cd` target stays inside the project or a scratch root.
 
     Args:
@@ -5423,11 +5428,12 @@ def _shell_cd_target_allowed(target: str, effective_cwd: str, project_cwd: str,
         effective_cwd: The directory in force before this `cd`.
         project_cwd: The session's original working directory (realpath).
         extra_roots: Additional allowed roots (the session scratch dir).
+        tmpdir: Value of `$TMPDIR` for this command, or None to leave it opaque.
 
     Returns:
         True when the resolved target is inside the project or an extra root.
     """
-    resolved = _shell_cd_resolved(target, effective_cwd)
+    resolved = _shell_cd_resolved(target, effective_cwd, tmpdir=tmpdir)
     if resolved is None:
         return False
     if _path_is_within(resolved, project_cwd):
@@ -5443,7 +5449,7 @@ def _shell_node_attr(node, name: str, default=None):
 
 
 def _shell_apply_cd(head: str, tokens: list, current: Optional[str],
-                    stack: list) -> tuple:
+                    stack: list, tmpdir: Optional[str] = None) -> tuple:
     """Return `(new_cwd, new_stack)` after a `cd`/`pushd`/`popd` node.
 
     A failed `cd` (target missing or not a directory) leaves the directory
@@ -5456,6 +5462,7 @@ def _shell_apply_cd(head: str, tokens: list, current: Optional[str],
         tokens: The node's command tokens.
         current: Directory in force before this node, or None when unknown.
         stack: The group's `pushd` stack.
+        tmpdir: Value of `$TMPDIR` for this command, or None to leave it opaque.
 
     Returns:
         `(new_cwd, new_stack)`; `new_cwd is None` means "unknown".
@@ -5467,7 +5474,7 @@ def _shell_apply_cd(head: str, tokens: list, current: Optional[str],
     if current is None:
         return None, stack
     target = _shell_cd_target(tokens)
-    resolved = _shell_cd_resolved(target, current)
+    resolved = _shell_cd_resolved(target, current, tmpdir=tmpdir)
     if resolved is None:
         return None, stack
     if not os.path.isdir(resolved):
@@ -5477,7 +5484,8 @@ def _shell_apply_cd(head: str, tokens: list, current: Optional[str],
     return resolved, stack
 
 
-def _shell_effective_cwds(nodes: list, cwd: Optional[str] = None) -> list:
+def _shell_effective_cwds(nodes: list, cwd: Optional[str] = None,
+                          tmpdir: Optional[str] = None) -> list:
     """Return the directory in force for each node (`None` = unknown).
 
     The result is parallel to `nodes` and gives the cwd **before** the node,
@@ -5497,6 +5505,8 @@ def _shell_effective_cwds(nodes: list, cwd: Optional[str] = None) -> list:
     Args:
         nodes: List of _ShellNode (or their dict form from shell_check_command).
         cwd: Starting directory (defaults to os.getcwd()).
+        tmpdir: Value of `$TMPDIR` for this command, so `cd $TMPDIR` resolves
+            to the scratch instead of making the directory unknown.
 
     Returns:
         One entry per node: a realpath, or None when the directory is unknown.
@@ -5532,7 +5542,8 @@ def _shell_effective_cwds(nodes: list, cwd: Optional[str] = None) -> list:
         if head not in _SHELL_CWD:
             previous[gid] = sep
             continue
-        new_cwd, new_stack = _shell_apply_cd(head, tokens, eff, stacks[gid])
+        new_cwd, new_stack = _shell_apply_cd(head, tokens, eff, stacks[gid],
+                                             tmpdir=tmpdir)
         if not in_pipeline and sep != "&":
             state[gid] = new_cwd
             stacks[gid] = new_stack
@@ -5596,7 +5607,8 @@ def _shell_command_word_inside_cwd(word: str, cwd: str,
 
 
 def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
-                                   extra_roots: Optional[list] = None) -> bool:
+                                   extra_roots: Optional[list] = None,
+                                   tmpdir: Optional[str] = None) -> bool:
     """Return True when every operand of the parsed nodes is inside CWD.
 
     A node with no operand earns no leniency unless its command word is a
@@ -5614,12 +5626,14 @@ def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
         cwd: Directory to test against (defaults to os.getcwd()).
         extra_roots: Additional absolute roots that earn the same leniency
             (the session scratch dir: disposable, so `rm` there needs no prompt).
+        tmpdir: Value of `$TMPDIR` for this command, so a `cd $TMPDIR` target
+            resolves to the scratch.
     """
     if cwd is None:
         cwd = os.getcwd()
     project_cwd = os.path.realpath(cwd)
     roots = [os.path.realpath(root) for root in extra_roots or []]
-    cwds = _shell_effective_cwds(nodes, cwd)
+    cwds = _shell_effective_cwds(nodes, cwd, tmpdir=tmpdir)
     for n, eff in zip(nodes, cwds):
         toks = n.get("tokens") if isinstance(n, dict) else n.tokens
         if not toks:
@@ -5628,7 +5642,7 @@ def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
         if head in _SHELL_CWD:
             target = _shell_cd_target(toks)
             if eff is None or not _shell_cd_target_allowed(
-                    target, eff, project_cwd, roots):
+                    target, eff, project_cwd, roots, tmpdir=tmpdir):
                 return False
             continue
         if eff is None or not (
@@ -6426,21 +6440,24 @@ _SHELL_VAR_NAME_START = frozenset(
 _SHELL_VAR_NAME_CHARS = _SHELL_VAR_NAME_START | frozenset("0123456789")
 
 
-def _shell_expand_unset_refs(text: str) -> str:
+def _shell_expand_unset_refs(text: str, tmpdir: Optional[str] = None) -> str:
     """Expand undefined simple variables to "" the way bash does (M3).
 
     `_shell_operand_realpath` bailed out on any `$` (an env ref is not a
     simple path), so `echo x > $UNSET/tmp/x` reached no rule at all while bash
     expands the empty variable and writes `/tmp/x`. This pass follows bash for
-    the two simple spellings only:
+    the simple spellings:
 
     * `$NAME` / `${NAME}` whose name is absent from `os.environ` -> "" ;
+    * `$TMPDIR` / `${TMPDIR}` -> `tmpdir` when the caller supplies it (the
+      session scratch for tool commands, the process value for `!`) ;
     * a defined name stays opaque (`$XDG_CONFIG_HOME` can still hold a path;
       the ACL is steering, not a sandbox).
 
+    Without a `tmpdir` context, `$TMPDIR` stays opaque: turning it into "" would
+    resolve `$TMPDIR/x` to `/x` before the TMPDIR step knows the scratch.
     `$HOME` is left to `_shell_expand_home_refs`, which is deliberately blind
-    (a quoted `$HOME` over-prompts; pinned by G1). `$TMPDIR` is expanded by
-    the TMPDIR pass with a context value, not here.
+    (a quoted `$HOME` over-prompts; pinned by G1).
 
     Quotes follow bash: single quotes suppress expansion (`'$UNSET/tmp/x'` is
     a literal name under the CWD, not `/tmp/x`), double quotes allow it, and a
@@ -6517,10 +6534,17 @@ def _shell_expand_unset_refs(text: str) -> str:
             out.append(text[start:end])
             i = end
             continue
-        if name not in ("HOME", "TMPDIR") and name not in os.environ:
+        if name == "TMPDIR":
+            if tmpdir is not None:
+                out.append(tmpdir)
+                i = end
+                continue
+            out.append(text[start:end])
+            i = end
+            continue
+        if name != "HOME" and name not in os.environ:
             # bash: an unset variable is the empty string. HOME has its own
-            # G1 pass; TMPDIR is the TMPDIR step (context value), so leaving
-            # it here avoids turning `$TMPDIR/x` into `/x`.
+            # G1 pass.
             i = end
             continue
         out.append(text[start:end])
@@ -6529,7 +6553,8 @@ def _shell_expand_unset_refs(text: str) -> str:
 
 
 def _shell_operand_realpath(tok: str, cwd: Optional[str] = None,
-                            force_path: bool = False) -> Optional[str]:
+                            force_path: bool = False,
+                            tmpdir: Optional[str] = None) -> Optional[str]:
     """Best-effort resolve of a shell token to an absolute realpath.
 
     Args:
@@ -6540,6 +6565,8 @@ def _shell_operand_realpath(tok: str, cwd: Optional[str] = None,
         force_path: Treat a bare word as a file path. A redirect target is
             always a path (`> rel`), while a bare operand (`git status foo`)
             is not; the scan sets this for write targets.
+        tmpdir: Value of `$TMPDIR` for this command (the session scratch for
+            tool commands, the process value for `!`); None leaves it opaque.
 
     Returns:
         A realpath string, or None if the token is not a resolvable path
@@ -6550,10 +6577,12 @@ def _shell_operand_realpath(tok: str, cwd: Optional[str] = None,
     # honour bash's no-expansion rule (M3). `$HOME` stays the blind G1 pass
     # (a quoted `$HOME` over-prompts; pinned by G1).
     t = _shell_expand_home_refs(t)  # $HOME/.x == ~/.x (G1)
-    t = _shell_expand_unset_refs(t)  # $UNSET/tmp/x -> /tmp/x (M3)
+    t = _shell_expand_unset_refs(t, tmpdir=tmpdir)  # $UNSET/tmp/x -> /tmp/x (M3)
     t = t.strip().strip("'\"")
     if not t or t.startswith("-"):
         return None
+    if "://" in t:
+        return None  # URL, not a local path
     if "*" in t or "?" in t:
         base = t.split("*")[0].split("?")[0].rstrip("/")
         if not base:
@@ -6597,7 +6626,8 @@ _SHELL_CODE_PROGRAMS = frozenset({
 _SHELL_CODE_CHARS = frozenset("()=;$`")
 
 
-def _shell_token_is_relative_path(tok: str) -> bool:
+def _shell_token_is_relative_path(tok: str,
+                                  tmpdir: Optional[str] = None) -> bool:
     """True when a token looks like a relative file target.
 
     Used only when the effective cwd is unknown (`_shell_effective_cwds`
@@ -6605,15 +6635,17 @@ def _shell_token_is_relative_path(tok: str) -> bool:
     project, so `_shell_acl_scan` refuses it. Absolute spellings (`/x`, `~`),
     flags, URLs and empty tokens are not relative targets. A defined `$VAR`
     stays opaque, so a write to `$VAR/x` after an unknown `cd` is refused too
-    (fail-closed).
+    (fail-closed). `$TMPDIR` is absolute once the caller supplies its value.
 
     Args:
         tok: A shell token (operand or redirect target).
+        tmpdir: Value of `$TMPDIR` for this command, or None to leave it opaque.
 
     Returns:
         True for a token that would resolve against the cwd.
     """
-    t = _shell_expand_unset_refs(_shell_expand_home_refs(tok.strip()))
+    t = _shell_expand_unset_refs(_shell_expand_home_refs(tok.strip()),
+                                 tmpdir=tmpdir)
     t = t.lstrip("<>").strip().strip("'\"")
     if not t or t.startswith("-"):
         return False
@@ -6626,7 +6658,8 @@ def _shell_token_is_relative_path(tok: str) -> bool:
 
 def _shell_token_path_candidates(tok: str, program: str = "",
                                  cwd: Optional[str] = None,
-                                 force_path: bool = False) -> list:
+                                 force_path: bool = False,
+                                 tmpdir: Optional[str] = None) -> list:
     """Resolve one shell token to candidate realpaths for ACL scanning.
 
     Returns the whole-token resolution (when the token looks like a path), plus
@@ -6649,12 +6682,14 @@ def _shell_token_path_candidates(tok: str, program: str = "",
         program: The node's command word, used to recognise interpreters.
         cwd: Directory for relative tokens (the effective cwd from H1).
         force_path: Treat a bare word as a file path (write targets).
+        tmpdir: Value of `$TMPDIR` for this command, or None to leave it opaque.
 
     Returns:
         List of realpaths (may be empty).
     """
     out = []
-    rp = _shell_operand_realpath(tok, cwd, force_path=force_path)
+    rp = _shell_operand_realpath(tok, cwd, force_path=force_path,
+                                 tmpdir=tmpdir)
     if rp:
         out.append(rp)
     prog = os.path.basename(program or "").lower()
@@ -6665,7 +6700,8 @@ def _shell_token_path_candidates(tok: str, program: str = "",
     # the regex cannot match a `/` that follows the `E` of `$HOME`, and with
     # `${HOME}` it matched the wrong path (`/.bashrc`). The unset pass (M3)
     # does the same for `$UNSET/tmp/x` -> `/tmp/x`.
-    expanded = _shell_expand_unset_refs(_shell_expand_home_refs(tok))
+    expanded = _shell_expand_unset_refs(_shell_expand_home_refs(tok),
+                                        tmpdir=tmpdir)
     for frag in _EMBEDDED_ABS_PATH_RE.findall(expanded):
         try:
             real = os.path.realpath(os.path.expanduser(frag))
@@ -6676,7 +6712,371 @@ def _shell_token_path_candidates(tok: str, program: str = "",
     return out
 
 
-def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[dict]:
+# --- Write-target table (H0, decision (a)) ---
+# A bounded list on purpose: only these verbs have their write targets graded
+# as writes. A command absent from the table keeps the historical read-only
+# operand scan, so an unknown writer cannot produce a new deny.
+_SHELL_WRITE_ALL = frozenset({
+    "touch", "mkdir", "rm", "rmdir", "tee", "truncate", "shred",
+    "chmod", "chown",
+})
+_SHELL_WRITE_LAST = frozenset({"cp", "mv", "ln", "install"})
+_SHELL_WRITE_COMPILERS = frozenset({
+    "gcc", "cc", "c++", "g++", "clang", "clang++", "ld",
+})
+_SHELL_WRITE_VALUE_FLAGS = {
+    "touch": frozenset({"-d", "--date", "-t", "-r", "--reference"}),
+    "mkdir": frozenset({"-m", "--mode"}),
+    "truncate": frozenset({"-s", "--size", "-r", "--reference"}),
+    "shred": frozenset({"-n", "--iterations", "-s", "--size",
+                        "--random-source"}),
+    "cp": frozenset({"-t", "--target-directory"}),
+    "mv": frozenset({"-t", "--target-directory"}),
+    "ln": frozenset({"-t", "--target-directory"}),
+    "install": frozenset({"-t", "--target-directory", "-m", "--mode"}),
+    "chmod": frozenset({"--reference"}),
+    "chown": frozenset({"--reference"}),
+}
+_SHELL_WRITE_HEADS = (_SHELL_WRITE_ALL | _SHELL_WRITE_LAST
+                      | _SHELL_WRITE_COMPILERS
+                      | {"sed", "dd", "tar", "find", "git", "curl", "wget"})
+_SHELL_READ_VERBS = frozenset({
+    "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg",
+    "wc", "stat", "file", "sha1sum", "sha224sum", "sha256sum", "sha384sum",
+    "sha512sum", "md5sum", "diff", "cmp", "ls", "du", "df", "readlink",
+    "realpath", "basename", "dirname", "tree", "jq", "yq", "cut", "sort",
+    "uniq",
+})
+
+
+def _shell_option_value(args: list, names: tuple) -> Optional[str]:
+    """Return the value of the first matching option, or None."""
+    for i, raw in enumerate(args):
+        a = raw.strip("'\"")
+        for name in names:
+            if a == name and i + 1 < len(args):
+                return args[i + 1].strip("'\"")
+            if name.startswith("--") and a.startswith(name + "="):
+                return a[len(name) + 1:]
+            if (not name.startswith("--") and a.startswith(name)
+                    and len(a) > len(name) and not a.startswith("--")):
+                return a[len(name):]
+    return None
+
+
+def _shell_operands(args: list, value_flags: frozenset = frozenset()) -> list:
+    """Return non-option operands, skipping the values of known options."""
+    out = []
+    i = 0
+    while i < len(args):
+        a = args[i].strip("'\"")
+        if a == "--":
+            out.extend(args[i + 1:])
+            break
+        if a.startswith("-") and a != "-":
+            flag = a.split("=", 1)[0]
+            if "=" not in a and flag in value_flags:
+                i += 2
+                continue
+            i += 1
+            continue
+        out.append(args[i])
+        i += 1
+    return out
+
+
+def _shell_sed_files(args: list) -> tuple:
+    """Return `(file operands, in_place)` for a `sed` argument list."""
+    in_place = any(
+        a.strip("'\"") == "--in-place"
+        or a.strip("'\"").startswith("--in-place=")
+        or (a.strip("'\"").startswith("-") and not a.strip("'\"").startswith("--")
+            and "i" in a.strip("'\"")[1:])
+        for a in args)
+    operands = []
+    script_flag = False
+    i = 0
+    while i < len(args):
+        a = args[i].strip("'\"")
+        if a == "--":
+            operands.extend(args[i + 1:])
+            break
+        if a.startswith("-") and a != "-":
+            if a in ("-e", "--expression", "-f", "--file"):
+                script_flag = True
+                i += 2
+                continue
+            if a.startswith("--expression=") or a.startswith("--file="):
+                script_flag = True
+                i += 1
+                continue
+            i += 1
+            continue
+        operands.append(args[i])
+        i += 1
+    if not script_flag:
+        operands = operands[1:]  # first non-option is the sed script
+    return operands, in_place
+
+
+def _shell_grep_files(args: list) -> list:
+    """Return the file operands of `grep`/`rg` (skip the pattern)."""
+    operands = []
+    pattern_flag = False
+    i = 0
+    while i < len(args):
+        a = args[i].strip("'\"")
+        if a == "--":
+            operands.extend(args[i + 1:])
+            break
+        if a.startswith("-") and a != "-":
+            if a in ("-e", "--regexp", "-f", "--file"):
+                pattern_flag = True
+                i += 2
+                continue
+            if a.startswith("--regexp=") or a.startswith("--file="):
+                pattern_flag = True
+                i += 1
+                continue
+            i += 1
+            continue
+        operands.append(args[i])
+        i += 1
+    if not pattern_flag:
+        operands = operands[1:]
+    return operands
+
+
+def _shell_tar_write_targets(args: list) -> list:
+    """Return the archive target of a `tar` create/append command."""
+    create = False
+    archive = None
+    i = 0
+    while i < len(args):
+        a = args[i].strip("'\"")
+        if a in ("--create", "--append", "--update", "--concatenate",
+                 "--catenate"):
+            create = True
+            i += 1
+            continue
+        if a == "--file" and i + 1 < len(args):
+            archive = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--file="):
+            archive = a.split("=", 1)[1]
+            i += 1
+            continue
+        if a.startswith("-") and not a.startswith("--"):
+            flags = a[1:]
+            if any(ch in flags for ch in "cruA"):
+                create = True
+            for j, ch in enumerate(flags):
+                if ch == "f":
+                    if j == len(flags) - 1 and i + 1 < len(args):
+                        archive = args[i + 1]
+                        i += 1
+                    else:
+                        archive = flags[j + 1:]
+                    break
+        i += 1
+    return [archive] if create and archive else []
+
+
+def _shell_git_config_targets(args: list) -> list:
+    """Return the config file written by `git config`, or [] for a read."""
+    i = 0
+    sub = None
+    while i < len(args):
+        a = args[i].strip("'\"")
+        if a in ("-C", "-c", "--git-dir", "--work-tree"):
+            i += 2
+            continue
+        if a.startswith(("--git-dir=", "--work-tree=", "-c")):
+            i += 1
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        sub = a
+        i += 1
+        break
+    if sub != "config":
+        return []
+    rest = [a.strip("'\"") for a in args[i:]]
+    if any(a in ("--get", "--get-all", "--get-regexp", "--get-urlmatch",
+                 "--list", "-l", "--show-origin", "--show-scope")
+           for a in rest):
+        return []
+    target = _shell_option_value(rest, ("-f", "--file"))
+    if target:
+        return [target]
+    if "--global" in rest:
+        return ["~/.gitconfig"]
+    if "--system" in rest:
+        return ["/etc/gitconfig"]
+    return [".git/config"]
+
+
+def _shell_download_targets(head: str, args: list) -> list:
+    """Return where `curl`/`wget` writes its output."""
+    if head == "curl":
+        target = _shell_option_value(args, ("-o", "--output"))
+        if target and target != "-":
+            return [target]
+        target = _shell_option_value(args, ("--output-dir",))
+        if target:
+            return [target]
+        if any(a.strip("'\"") in ("-O", "--remote-name") for a in args):
+            return ["."]
+        return []
+    target = _shell_option_value(args, ("-O", "--output-document"))
+    if target and target != "-":
+        return [target]
+    target = _shell_option_value(args, ("-P", "--directory-prefix"))
+    if target:
+        return [target]
+    return ["."]
+
+
+def _shell_write_targets(head: str, args: list) -> list:
+    """Return the raw write targets of a known writer (H0, decision (a)).
+
+    The table is bounded: `cp` writes its destination, `mv` writes (deletes)
+    every operand, `sed` writes only with `-i`, `find` writes its roots only
+    with a destructive predicate, and so on. An unknown command returns [],
+    which leaves the historical read-only operand scan untouched.
+    """
+    if head in _SHELL_WRITE_LAST:
+        tdir = _shell_option_value(args, ("-t", "--target-directory"))
+        operands = _shell_operands(
+            args, _SHELL_WRITE_VALUE_FLAGS.get(head, frozenset()))
+        if head == "mv":
+            return ([tdir] if tdir else []) + operands
+        if tdir:
+            return [tdir]
+        return operands[-1:] if operands else []
+    if head in _SHELL_WRITE_ALL:
+        operands = _shell_operands(
+            args, _SHELL_WRITE_VALUE_FLAGS.get(head, frozenset()))
+        if head in ("chmod", "chown"):
+            reference = any(a.strip("'\"") == "--reference"
+                            or a.strip("'\"").startswith("--reference=")
+                            for a in args)
+            if not reference and operands:
+                operands = operands[1:]  # mode/owner, not a path
+        return operands
+    if head == "sed":
+        files, in_place = _shell_sed_files(args)
+        return files if in_place else []
+    if head == "dd":
+        return [a.split("=", 1)[1] for a in args
+                if a.strip("'\"").startswith("of=")]
+    if head == "tar":
+        return _shell_tar_write_targets(args)
+    if head in _SHELL_WRITE_COMPILERS:
+        target = _shell_option_value(args, ("-o",))
+        return [target] if target else []
+    if head == "find":
+        if not _shell_find_args_destructive(args):
+            return []
+        return _shell_find_roots(args) or ["."]
+    if head == "git":
+        return _shell_git_config_targets(args)
+    if head in ("curl", "wget"):
+        return _shell_download_targets(head, args)
+    return []
+
+
+def _shell_node_write_targets(node) -> list:
+    """Return the write targets of one parsed node (table + redirections)."""
+    toks = node.tokens
+    if not toks:
+        return []
+    head, args = _shell_effective_command(toks)
+    raws = _shell_write_targets(head, args) if head else []
+    raws.extend(t for t in node.redirect_targets
+                if not _shell_redirect_target_is_discardable(t))
+    return list(dict.fromkeys(raws))
+
+
+def _shell_access_plan(command: str, cwd: Optional[str] = None,
+                       tmpdir: Optional[str] = None) -> list:
+    """Return the read/write/unknown events observed in a shell command (H0).
+
+    One traversal, two consumers: the policy (`_shell_acl_scan`) grades the
+    write events, and A1's session inventory (`TODO.md` §6.5) reads the whole
+    plan. `real` is a realpath; `raw` is the token the command used (`via`
+    names the command, `command` the parsed segment). A relative write after
+    an unknown cwd is emitted with `real=None`; the policy refuses it.
+    """
+    nodes = _shell_breakdown(command)
+    cwds = _shell_effective_cwds(nodes, cwd, tmpdir=tmpdir)
+    events = []
+    seen = set()
+
+    def add(op: str, raw: str, eff: Optional[str], via: str,
+            source: str, force: bool) -> None:
+        """Append one event per realpath, deduplicated."""
+        for real in _shell_token_path_candidates(
+                raw, via, cwd=eff, force_path=force, tmpdir=tmpdir):
+            key = (op, real, raw.strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append({"op": op, "raw": raw.strip(), "real": real,
+                           "via": via, "command": source})
+
+    for node, eff in zip(nodes, cwds):
+        toks = node.tokens
+        if not toks:
+            continue
+        head, args = _shell_effective_command(toks)
+        write_raws = _shell_node_write_targets(node)
+        write_set = set(write_raws)
+        for raw in write_raws:
+            add("write", raw, eff, head or "redirect", node.source, force=True)
+        if head in _SHELL_CWD:
+            continue  # cd is navigation; its redirects were already added
+        if head == "sed":
+            read_raws = _shell_sed_files(args)[0]
+        elif head in ("grep", "egrep", "fgrep", "rg"):
+            read_raws = _shell_grep_files(args)
+        elif head == "git":
+            read_raws = []
+        else:
+            read_raws = [t for t in toks[1:] if t not in write_set]
+        if head in _SHELL_READ_VERBS:
+            op = "read"
+        elif head in _SHELL_WRITE_HEADS:
+            op = "read"
+        else:
+            op = "unknown"
+        if head in _SHELL_CODE_PROGRAMS and _shell_c_payloads(args):
+            # A code blob: only its embedded absolute paths are visible, and
+            # the direction (read/write) is unknown.
+            for raw in read_raws:
+                text = _shell_expand_unset_refs(
+                    _shell_expand_home_refs(raw), tmpdir=tmpdir)
+                for real in _EMBEDDED_ABS_PATH_RE.findall(text):
+                    real = os.path.realpath(os.path.expanduser(real))
+                    key = ("unknown", real, raw.strip())
+                    if key not in seen:
+                        seen.add(key)
+                        events.append({"op": "unknown", "raw": raw.strip(),
+                                       "real": real,
+                                       "via": head or "?", "command": node.source})
+            continue
+        force = (head in _SHELL_READ_VERBS or head in _SHELL_WRITE_HEADS)
+        if head in ("git", "dd", "curl", "wget"):
+            force = False
+        for raw in read_raws:
+            add(op, raw, eff, head or "?", node.source, force=force)
+    return events
+
+
+def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
+                    tmpdir: Optional[str] = None) -> Optional[dict]:
     """Scan command operands against PathAcl (run_command path awareness).
 
     Only *explicit* ACL rules trigger here — /proc, /sys, /etc, home dotfiles,
@@ -6690,6 +7090,8 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
     `cd $VAR`, `cd -`, a glob, a failed `popd`), a relative **write** target
     is refused outright because it cannot be proven inside the project;
     relative reads keep the old behaviour (explicit-only, no new deny).
+    `tmpdir` is the command's `$TMPDIR` (the session scratch for tool commands,
+    the process value for `!`); it is resolved by the path scanner.
 
     Operands are scanned both as-is and, for code blobs (`python3 -c`,
     `sh -c`, `if=/etc/shadow`), by extracting absolute paths embedded inside
@@ -6714,31 +7116,29 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
     deny_info = None
     ask_info = None
     nodes = _shell_breakdown(command)
-    cwds = _shell_effective_cwds(nodes)
+    cwds = _shell_effective_cwds(nodes, tmpdir=tmpdir)
     for node, eff in zip(nodes, cwds):
         toks = node.tokens
         if not toks:
             continue
-        # Redirection targets are destinations, not arguments, but they are the
-        # file the command writes: `echo x >> /etc/hosts` and
-        # `echo hacked > ~/.bashrc` must reach the same rules as `touch` would.
-        # They are also the one token whose direction is unambiguous, so they are
-        # graded as `write`: `>> /etc/hosts` is a hard deny, where the read half
-        # of the policy only asks (and `auto_confirm` answers yes) — the C2 fix
-        # promised "writes outside the project stay deny" (G4).
-        scanned = ([(t, "read") for t in toks[1:]] +
-                   [(t, "write") for t in node.redirect_targets
-                    if not _shell_redirect_target_is_discardable(t)])
+        # H0: the write table's targets are graded as writes, not as reads.
+        # Redirection targets are always writes (C2/G4). A command absent from
+        # the table keeps the old read-only operand scan.
+        write_raws = _shell_node_write_targets(node)
+        write_set = set(write_raws)
+        scanned = ([(t, "read") for t in toks[1:] if t not in write_set] +
+                   [(t, "write") for t in write_raws])
         for tok, op in scanned:
             if (eff is None and op == "write"
-                    and _shell_token_is_relative_path(tok)):
+                    and _shell_token_is_relative_path(tok, tmpdir=tmpdir)):
                 acl.log_event("run_command", tok.strip(), "deny", None)
                 return {"approved": False,
                         "reason": "[path ACL denied] relative write after an "
                                   "unresolved cd — the working directory is "
                                   f"unknown; {ACL_DENIAL_HINT}"}
             for rp in _shell_token_path_candidates(
-                    tok, toks[0], cwd=eff, force_path=(op == "write")):
+                    tok, toks[0], cwd=eff, force_path=(op == "write"),
+                    tmpdir=tmpdir):
                 if _is_blocked_system_file(rp):
                     acl.log_event("run_command", rp, "deny", None)
                     return {"approved": False,
@@ -6872,7 +7272,8 @@ def _shell_prompt_approval(command: str, verdict: dict) -> Dict:
     return {"approved": False, "effect": "ask", "message": "Denied by user", "verdict": verdict}
 
 
-def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, executor_mode: str = "host") -> Dict:
+def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, executor_mode: str = "host",
+                         tmpdir: Optional[str] = None) -> Dict:
     """Gate: home hard-deny → opencode breakdown → CWD leniency → prompt.
 
     Args:
@@ -6880,6 +7281,9 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
         ctx: Optional CommandContext (for path ACL + auto_confirm).
         executor_mode: "host", "container" or "bwrap" (sandboxed modes skip
             the gate: their mount/namespace policy is the contract).
+        tmpdir: Value of `$TMPDIR` for the scanner. Tool commands pass the
+            session scratch; `!` passes the process value (it keeps the user's
+            env). None leaves `$TMPDIR` opaque.
 
     Returns:
         dict: {"approved": bool, "effect": str, "message": str|None, "verdict": dict}
@@ -6914,7 +7318,7 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
     # exact command), so those returns are left untouched.
     def _final_allow(**extra: dict) -> dict:
         """Final allow wrapper that applies the path-ACL operand scan."""
-        res = _shell_acl_scan(command, ctx)
+        res = _shell_acl_scan(command, ctx, tmpdir=tmpdir)
         if res is not None and not res["approved"]:
             return {"approved": False, "effect": "deny", "message": res["reason"], "verdict": verdict}
         return {"approved": True, "effect": "allow", "message": None, "verdict": verdict, **extra}
@@ -6922,7 +7326,8 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
     if verdict["effect"] == "allow":
         return _final_allow()
     # effect == ask → check CWD leniency (and the disposable scratch dir)
-    if _shell_all_operands_inside_cwd(nodes, extra_roots=[_scratch_root()]):
+    if _shell_all_operands_inside_cwd(nodes, extra_roots=[_scratch_root()],
+                                      tmpdir=tmpdir):
         return _final_allow(cwd_leniency=True)
     # Auto-confirm (yolo) respects home deny but allows ask
     if ctx is not None and getattr(ctx, "auto_confirm", False):
@@ -7342,7 +7747,7 @@ class Executor:
             ("HOME", home),
             ("TERM", os.environ.get("TERM", "dumb")),
             ("LANG", BWRAP_ENV_LANG),
-            ("TMPDIR", "/tmp"),
+            ("TMPDIR", scratch),
             # git must not try to lock the index or prompt for credentials in
             # a read-only project; both were measured to bite in `project ro`.
             ("GIT_OPTIONAL_LOCKS", "0"),
@@ -7675,7 +8080,8 @@ class Executor:
         """
         if not is_container:
             ctx = CommandContext() if CommandContext._initialized else None
-            res = check_shell_approval(command, ctx=ctx, executor_mode=self.mode)
+            res = check_shell_approval(command, ctx=ctx, executor_mode=self.mode,
+                                       tmpdir=_scratch_root())
             if not res["approved"]:
                 return {"stdout": "", "stderr": res.get("message") or "Blocked by shell approval gate", "returncode": -1}
         try:
@@ -7691,10 +8097,13 @@ class Executor:
             # Host mode: own session so a timeout kills the whole tree, not
             # just bash. `subprocess.run` cannot do that: it kills the direct
             # child and leaves background grandchildren running.
+            env = os.environ.copy()
+            env["TMPDIR"] = _scratch_root()
             proc = subprocess.Popen(
                 command, shell=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, executable="/bin/bash", start_new_session=True
+                text=True, executable="/bin/bash", start_new_session=True,
+                env=env
             )
             stdout, stderr, returncode, timed_out = _communicate_or_kill(proc, timeout)
             if timed_out:
@@ -17024,7 +17433,8 @@ def execute_os_command(command: str, timeout: Optional[int] = None) -> str:
         return "[Command rejected: too long]"
     ctx = CommandContext() if CommandContext._initialized else None
     # Use host mode for inline ! commands (never container)
-    gate = check_shell_approval(command, ctx=ctx, executor_mode="host")
+    gate = check_shell_approval(command, ctx=ctx, executor_mode="host",
+                                tmpdir=os.environ.get("TMPDIR") or tempfile.gettempdir())
     if not gate["approved"]:
         msg = gate.get("message") or "[Command rejected by shell approval gate]"
         print(colorize(msg, 'error'), file=sys.stderr)

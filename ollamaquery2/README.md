@@ -295,6 +295,10 @@ File tools (`read_file`, `write_file`, `edit_file`, `list_directory`) and
   variable expands to the empty string, so `echo x > $UNSET/tmp/x` is a
   `/tmp` write and is denied; a **defined** variable stays opaque (documented
   limit), and a single-quoted spelling is a literal name.
+- Host and bwrap commands receive `TMPDIR` = the session scratch
+  (`/tmp/ollamaquery/pid-N`), so build temporaries go there; the scratch is
+  wiped at exit, and a hardcoded `/tmp/...` write is denied. Container
+  commands keep the container's own temp dir.
 - The shell gate follows `cd`/`pushd`/`popd`: a relative **write** target is
   resolved against the directory the shell is actually in, so
   `cd / && echo x > rel` is `/rel` (denied). A `cd` inside a pipeline, `&` or

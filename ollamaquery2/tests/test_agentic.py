@@ -2008,6 +2008,7 @@ class TestBwrapSandboxConfig(unittest.TestCase):
         self.assertTrue(env["PATH"].startswith("/usr/local/bin"))
         self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(env["TMPDIR"], self.scratch)
         for path in q.BWRAP_READ_ONLY_BINDS:
             self.assertIn(["--ro-bind-try", path, path],
                           [argv[i:i + 3] for i in range(len(argv) - 2)])
@@ -3309,6 +3310,10 @@ class TestExecutor(unittest.TestCase):
         result = self.exec.run("echo hello", timeout=5)
         self.assertEqual(result["stdout"].strip(), "hello")
         self.assertEqual(result["returncode"], 0)
+
+    def test_host_command_gets_tmpdir_scratch(self):
+        result = self.exec.run("echo $TMPDIR", timeout=5)
+        self.assertEqual(result["stdout"].strip(), q._scratch_root())
 
     def test_failure(self):
         result = self.exec.run("false", timeout=5)

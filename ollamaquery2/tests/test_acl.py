@@ -984,6 +984,153 @@ class TestShellEffectiveCwd(unittest.TestCase):
         self.assertFalse(m._shell_is_home_destructive(m._shell_breakdown(cmd)))
 
 
+class TestShellTmpdir(unittest.TestCase):
+    """TMPDIR is the session scratch for tool commands, the process value for `!`.
+
+    The scanner gets it as a context value (`_shell_acl_scan(..., tmpdir=...)`),
+    so `$TMPDIR/out` is the scratch (allowed) and
+    `$TMPDIR/../../../etc/passwd` escapes to `/etc` and is denied. Without a
+    context it stays opaque: turning it into "" would resolve to `/out`.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+        self.scratch = m._scratch_root()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx, tmpdir=self.scratch)
+
+    def test_tmpdir_expands_to_the_scratch(self):
+        expected = os.path.realpath(os.path.join(self.scratch, "out.bin"))
+        self.assertEqual(
+            m._shell_operand_realpath("$TMPDIR/out.bin", tmpdir=self.scratch),
+            expected)
+        self.assertEqual(
+            m._shell_expand_unset_refs("$TMPDIR/out.bin", tmpdir=self.scratch),
+            os.path.join(self.scratch, "out.bin"))
+
+    def test_tmpdir_write_is_allowed(self):
+        self.assertIsNone(self._scan('echo x > "$TMPDIR/out.bin"'))
+
+    def test_tmpdir_escape_is_denied(self):
+        res = self._scan('echo x > "$TMPDIR/../../../etc/passwd"')
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+
+    def test_cd_tmpdir_is_resolved(self):
+        self.assertIsNone(self._scan("cd $TMPDIR && echo x > rel.bin"))
+        res = self._scan("cd $TMPDIR && echo x > ../../../etc/x")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+
+    def test_hardcoded_tmp_is_still_denied(self):
+        res = self._scan("echo x > /tmp/out.bin")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+
+    def test_without_a_context_tmpdir_stays_opaque(self):
+        self.assertIsNone(
+            m._shell_acl_scan('echo x > "$TMPDIR/out.bin"', self.ctx))
+
+
+class TestShellWriteTargets(unittest.TestCase):
+    """H0 (a): a known writer's targets are graded as writes, not operands.
+
+    Only the table's verbs change: `cp`/`sed -i`/`tar -cf`/`gcc -o`/`find
+    -delete`/`git config` get their targets graded `write` (and resolved
+    against the effective cwd), while an unknown command keeps the historical
+    read-only operand scan.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx)
+
+    def test_table(self):
+        cases = [
+            (("cp", ["a", "b"]), ["b"]),
+            (("cp", ["-t", "dir", "a", "b"]), ["dir"]),
+            (("mv", ["a", "b"]), ["a", "b"]),
+            (("touch", ["a", "b"]), ["a", "b"]),
+            (("mkdir", ["-p", "d"]), ["d"]),
+            (("chmod", ["-R", "755", "f"]), ["f"]),
+            (("chmod", ["--reference=a", "f"]), ["f"]),
+            (("sed", ["-i", "s/x/y/", "f"]), ["f"]),
+            (("sed", ["s/x/y/", "f"]), []),
+            (("dd", ["if=a", "of=b"]), ["b"]),
+            (("tar", ["-cf", "out.tar", "."]), ["out.tar"]),
+            (("tar", ["--create", "--file", "out.tar", "."]), ["out.tar"]),
+            (("tar", ["-tf", "out.tar"]), []),
+            (("gcc", ["-o", "out", "main.c"]), ["out"]),
+            (("find", ["/var", "-delete"]), ["/var"]),
+            (("find", ["/var", "-name", "*.log"]), []),
+            (("git", ["config", "--global", "core.pager", "id"]),
+             ["~/.gitconfig"]),
+            (("git", ["config", "--get", "core.pager"]), []),
+            (("curl", ["-o", "out", "https://x"]), ["out"]),
+            (("wget", ["-O", "out", "https://x"]), ["out"]),
+        ]
+        for (head, args), expected in cases:
+            with self.subTest(head=head, args=args):
+                self.assertEqual(m._shell_write_targets(head, args), expected)
+
+    def test_graded_as_writes(self):
+        for cmd in ("cp f /var/x",
+                    "sed -i 's/a/b/' /var/x",
+                    "gcc -o /var/x main.c",
+                    "tar -cf /var/x.tar .",
+                    "find /var -delete",
+                    "find /var -exec rm {} +",
+                    "cd / && cp f rel",
+                    "cd / && touch rel",
+                    "cd / && sed -i 's/x/y/' rel"):
+            with self.subTest(cmd=cmd):
+                res = self._scan(cmd)
+                self.assertIsNotNone(res, cmd)
+                self.assertFalse(res["approved"], cmd)
+
+    def test_non_regressions(self):
+        for cmd in ("cp a b", "touch a", "gcc -o out main.c",
+                    "tar -cf out.tar dir", "cat /var/log/x",
+                    "sed 's/x/y/' file", "find . -name '*.py'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self._scan(cmd), cmd)
+
+    def test_git_config_global_is_an_ask(self):
+        with patch.object(m.PathAcl, "prompt", return_value=False):
+            res = self._scan("git config --global core.pager id")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+
+    def test_gate_denies_with_auto_confirm(self):
+        self.ctx.auto_confirm = True
+        res = m.check_shell_approval("cp f /var/x", self.ctx)
+        self.assertFalse(res["approved"])
+
+    def test_tmpdir_compiler_output(self):
+        self.assertIsNone(m._shell_acl_scan(
+            'gcc -o "$TMPDIR/a.out" main.c', self.ctx,
+            tmpdir=m._scratch_root()))
+        res = m._shell_acl_scan("gcc -o /tmp/a.out main.c", self.ctx)
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+
+    def test_access_plan(self):
+        events = m._shell_access_plan("cp a b")
+        ops = {(e["op"], os.path.basename(e["real"])) for e in events}
+        self.assertIn(("write", "b"), ops)
+        self.assertIn(("read", "a"), ops)
+        self.assertEqual(
+            m._shell_access_plan("cd / && echo x > rel")[-1]["real"], "/rel")
+        git = m._shell_access_plan("git config --global core.pager id")
+        self.assertEqual([e["raw"] for e in git], ["~/.gitconfig"])
+        sed = m._shell_access_plan("sed -i 's/x/y/' f")
+        self.assertEqual({(e["op"], os.path.basename(e["real"])) for e in sed},
+                         {("write", "f"), ("read", "f")})
+
+
 class TestShellLineContinuationInWords(unittest.TestCase):
     """`\\`+newline is deleted before tokenizing, even inside a word (G2).
 
