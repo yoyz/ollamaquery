@@ -5484,6 +5484,13 @@ def _shell_apply_cd(head: str, tokens: list, current: Optional[str],
     return resolved, stack
 
 
+# Sentinel for `_shell_effective_cwds`: the inherited directory cannot be
+# proven (the outer `cd` target was opaque, or a nested payload runs below an
+# unresolved cwd). `None` keeps its historical meaning — "start at the process
+# cwd" — so a bare `node` never silently becomes fail-open.
+_SHELL_CWD_UNKNOWN = object()
+
+
 def _shell_effective_cwds(nodes: list, cwd: Optional[str] = None,
                           tmpdir: Optional[str] = None) -> list:
     """Return the directory in force for each node (`None` = unknown).
@@ -5504,14 +5511,20 @@ def _shell_effective_cwds(nodes: list, cwd: Optional[str] = None,
 
     Args:
         nodes: List of _ShellNode (or their dict form from shell_check_command).
-        cwd: Starting directory (defaults to os.getcwd()).
+        cwd: Starting directory (defaults to os.getcwd()). The internal
+            `_SHELL_CWD_UNKNOWN` sentinel means the inherited directory cannot
+            be proven: every node then reports None, so relative writes are
+            refused (fail-closed).
         tmpdir: Value of `$TMPDIR` for this command, so `cd $TMPDIR` resolves
             to the scratch instead of making the directory unknown.
 
     Returns:
         One entry per node: a realpath, or None when the directory is unknown.
     """
-    start = os.path.realpath(cwd or os.getcwd())
+    if cwd is _SHELL_CWD_UNKNOWN:
+        start = None
+    else:
+        start = os.path.realpath(cwd or os.getcwd())
     state = {0: start}          # group id -> current cwd
     stacks = {0: []}            # group id -> pushd stack
     pipeline = {}               # group id -> cwd at the start of a pipeline
@@ -6296,12 +6309,98 @@ def _shell_wrapper_requires_approval(nodes: list) -> bool:
     return False
 
 
+def _shell_find_exec_commands(args: list) -> list:
+    """Return the command strings run by `find`'s `-exec`-family actions.
+
+    `find` is allow-listed, so its `-exec` payload is a command-execution
+    channel: `find . -exec rm -rf ~ \\;` and
+    `find . -exec sh -c 'rm -rf ~' \\;` were `allow` while the same commands
+    spelled directly are hard-denied (M2 only looked at the roots for the
+    home/root check). The action ends at the `;` or `+` terminator; everything
+    before it is returned as one command line for the recursive gate.
+
+    Args:
+        args: Tokens after the effective `find` command word.
+
+    Returns:
+        One command string per `-exec`/`-execdir`/`-ok`/`-okdir` action.
+    """
+    out = []
+    for index, raw in enumerate(args):
+        if raw.strip("'\"") not in ("-exec", "-execdir", "-ok", "-okdir"):
+            continue
+        inner = []
+        for candidate in args[index + 1:]:
+            # `;` (or the shell-escaped `\;`) always terminates the action;
+            # `+` does so only in the batching form (`{} +`). A bare `+` is a
+            # literal argument (`find . -exec echo + \;` prints `+`), and
+            # treating it as a terminator would truncate the payload and hide
+            # the operand after it (`-exec rm + ~ \;`).
+            token = candidate.strip("'\"").lstrip("\\")
+            if token == ";":
+                break
+            if (token == "+" and inner
+                    and inner[-1].strip("'\"").lstrip("\\") == "{}"):
+                break
+            inner.append(candidate)
+        if inner:
+            out.append(" ".join(inner))
+    return out
+
+
+def _shell_xargs_command(args: list) -> list:
+    """Return the command `xargs` will run (nothing for its default `echo`).
+
+    `xargs` appends the input items to that command, so
+    `echo x | xargs sh -c 'rm -rf ~'` runs a shell payload. M2 only checked
+    `xargs rm` after a home/root `find`; the command itself must be gated
+    whatever the pipeline feeds it.
+
+    Args:
+        args: Tokens after the effective `xargs` command word.
+
+    Returns:
+        The command string, or an empty list when `xargs` keeps its default.
+    """
+    index = _shell_xargs_command_index(args)
+    if index >= len(args):
+        return []
+    return [" ".join(args[index:])]
+
+
+def _shell_unwrap_nested_command(command: str) -> list:
+    """Return the executable payload of a nested command string.
+
+    A `find -exec`/`xargs` command that is itself a wrapper (`sh -c …`,
+    `env -S …`, `python -c "os.system(…)"`, another `xargs`) is represented by
+    its payload: the wrapper has no write target, and keeping it would make the
+    last-resort text check mistake an echoed string for an execution
+    (`sh -c 'echo "rm -rf ~"'`). A command with no embedded payload is
+    returned unchanged, so `find . -exec tee /etc/x \\;` is still scanned as a
+    command.
+
+    Args:
+        command: One command string (a `find -exec` action or an `xargs`
+            command line).
+
+    Returns:
+        The payloads to gate recursively, or `[command]` when it is not a
+        wrapper.
+    """
+    nested = []
+    for node in _shell_breakdown(command):
+        nested.extend(_shell_embedded_commands(node.tokens))
+    return nested or [command]
+
+
 def _shell_embedded_commands(tokens: list) -> list:
     """Extract nested command strings from one shell command node.
 
     Handles a leading wrapper (`sudo`, `env`, `nohup`, …), shell interpreters
-    (`sh -c`, `bash -lc`, `busybox sh -c`) and `python -c` payloads that call
-    `os.system`/`os.popen`/`subprocess.*` with a string.
+    (`sh -c`, `bash -lc`, `busybox sh -c`), `python -c` payloads that call
+    `os.system`/`os.popen`/`subprocess.*` with a string, `find -exec` actions
+    (reduced to their own payload when the action is a wrapper) and the
+    command `xargs` will run.
 
     Args:
         tokens: Word tokens of the command node.
@@ -6322,6 +6421,12 @@ def _shell_embedded_commands(tokens: list) -> list:
     elif _PYTHON_HEAD_RE.match(head):
         for code in _shell_c_payloads(body):
             commands.extend(match.group(2) for match in _PY_SHELL_CALL_RE.finditer(code))
+    elif head == "find":
+        for command in _shell_find_exec_commands(body):
+            commands.extend(_shell_unwrap_nested_command(command))
+    elif head == "xargs":
+        for command in _shell_xargs_command(body):
+            commands.extend(_shell_unwrap_nested_command(command))
     return commands
 
 
@@ -7001,14 +7106,20 @@ def _shell_node_write_targets(node) -> list:
 
 
 def _shell_access_plan(command: str, cwd: Optional[str] = None,
-                       tmpdir: Optional[str] = None) -> list:
+                       tmpdir: Optional[str] = None, depth: int = 1) -> list:
     """Return the read/write/unknown events observed in a shell command (H0).
 
     One traversal, two consumers: the policy (`_shell_acl_scan`) grades the
     write events, and A1's session inventory (`TODO.md` §6.5) reads the whole
     plan. `real` is a realpath; `raw` is the token the command used (`via`
-    names the command, `command` the parsed segment). A relative write after
-    an unknown cwd is emitted with `real=None`; the policy refuses it.
+    names the command, `command` the parsed segment). A token resolved against
+    an unknown cwd is emitted with `real=None`; the policy refuses the relative
+    writes.
+
+    Nested commands (`sh -c`, `python -c "os.system(…)"`, `find -exec`,
+    `xargs`) are traversed too (H3), with the cwd the outer node runs in; the
+    recursion is bounded by `_SHELL_NESTED_MAX_DEPTH`. Beyond the bound the
+    events keep their pre-H3 shape (the absolute-path scan only).
     """
     nodes = _shell_breakdown(command)
     cwds = _shell_effective_cwds(nodes, cwd, tmpdir=tmpdir)
@@ -7018,6 +7129,16 @@ def _shell_access_plan(command: str, cwd: Optional[str] = None,
     def add(op: str, raw: str, eff: Optional[str], via: str,
             source: str, force: bool) -> None:
         """Append one event per realpath, deduplicated."""
+        if eff is None and _shell_token_is_relative_path(raw, tmpdir=tmpdir):
+            # The inherited cwd is unknown: resolving against the process cwd
+            # would invent a path. The policy refuses the relative write; the
+            # inventory records it with no realpath.
+            key = (op, None, raw.strip())
+            if key not in seen:
+                seen.add(key)
+                events.append({"op": op, "raw": raw.strip(), "real": None,
+                               "via": via, "command": source})
+            return
         for real in _shell_token_path_candidates(
                 raw, via, cwd=eff, force_path=force, tmpdir=tmpdir):
             key = (op, real, raw.strip())
@@ -7026,6 +7147,22 @@ def _shell_access_plan(command: str, cwd: Optional[str] = None,
             seen.add(key)
             events.append({"op": op, "raw": raw.strip(), "real": real,
                            "via": via, "command": source})
+
+    def collect_nested(node, eff: Optional[str]) -> None:
+        """Append the events of the commands embedded in this node (H3)."""
+        if depth >= _SHELL_NESTED_MAX_DEPTH:
+            return
+        base = eff if eff is not None else _SHELL_CWD_UNKNOWN
+        for payload in _shell_embedded_commands(node.tokens):
+            if not payload.strip():
+                continue
+            for event in _shell_access_plan(payload, cwd=base,
+                                            tmpdir=tmpdir, depth=depth + 1):
+                key = (event["op"], event["real"], event["raw"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                events.append(event)
 
     for node, eff in zip(nodes, cwds):
         toks = node.tokens
@@ -7066,17 +7203,21 @@ def _shell_access_plan(command: str, cwd: Optional[str] = None,
                         events.append({"op": "unknown", "raw": raw.strip(),
                                        "real": real,
                                        "via": head or "?", "command": node.source})
+            collect_nested(node, eff)
             continue
         force = (head in _SHELL_READ_VERBS or head in _SHELL_WRITE_HEADS)
         if head in ("git", "dd", "curl", "wget"):
             force = False
         for raw in read_raws:
             add(op, raw, eff, head or "?", node.source, force=force)
+        collect_nested(node, eff)
     return events
 
 
 def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
-                    tmpdir: Optional[str] = None) -> Optional[dict]:
+                    tmpdir: Optional[str] = None, cwd: Optional[str] = None,
+                    depth: int = 1,
+                    writes_only: bool = False) -> Optional[dict]:
     """Scan command operands against PathAcl (run_command path awareness).
 
     Only *explicit* ACL rules trigger here — /proc, /sys, /etc, home dotfiles,
@@ -7103,9 +7244,25 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
     looked at (the target is not a command argument, so arity reduction dropped
     it). `/dev/null` and the other discard devices stay silent.
 
+    H3: the commands embedded in a node (`sh -c`, `env -S`, `python -c
+    "os.system(…)"`, `find -exec`, `xargs`) are scanned with the cwd the outer
+    node runs in, so `bash -c 'cd / && echo x > rel'` is denied instead of
+    resolving `rel` against the project. Reads inside a payload are left to
+    the pre-existing embedded-absolute-path pass (`writes_only` in the
+    recursion), so `bash -c 'cat /etc/passwd'` prompts once, not twice. The
+    recursion is bounded by `_SHELL_NESTED_MAX_DEPTH`; beyond it, relative
+    writes inside payloads are a documented limit (absolute paths are still
+    caught by the embedded scan).
+
     Args:
         command: The raw command string.
         ctx: CommandContext with a path_acl.
+        tmpdir: Value of `$TMPDIR` for this command, or None to leave it opaque.
+        cwd: Inherited directory for a nested command (H3); None means the
+            process cwd, `_SHELL_CWD_UNKNOWN` means it cannot be proven.
+        depth: Current recursion depth (bounded).
+        writes_only: Grade only write targets (the nested pass; reads are
+            already covered by the embedded-absolute-path scan).
 
     Returns:
         None (no concern) or a dict {"approved": bool, "reason": str|None}.
@@ -7116,7 +7273,7 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
     deny_info = None
     ask_info = None
     nodes = _shell_breakdown(command)
-    cwds = _shell_effective_cwds(nodes, tmpdir=tmpdir)
+    cwds = _shell_effective_cwds(nodes, cwd, tmpdir=tmpdir)
     for node, eff in zip(nodes, cwds):
         toks = node.tokens
         if not toks:
@@ -7126,8 +7283,11 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
         # the table keeps the old read-only operand scan.
         write_raws = _shell_node_write_targets(node)
         write_set = set(write_raws)
-        scanned = ([(t, "read") for t in toks[1:] if t not in write_set] +
-                   [(t, "write") for t in write_raws])
+        if writes_only:
+            scanned = [(t, "write") for t in write_raws]
+        else:
+            scanned = ([(t, "read") for t in toks[1:] if t not in write_set] +
+                       [(t, "write") for t in write_raws])
         for tok, op in scanned:
             if (eff is None and op == "write"
                     and _shell_token_is_relative_path(tok, tmpdir=tmpdir)):
@@ -7173,6 +7333,17 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
                     deny_info = (tok, rp, rule, op)
                 elif decision == "ask" and ask_info is None:
                     ask_info = (tok, rp, rule, op)
+        # H3: re-gate the commands embedded in this node with the cwd it runs
+        # in. Writes only: absolute reads are already covered above.
+        if depth < _SHELL_NESTED_MAX_DEPTH:
+            base = eff if eff is not None else _SHELL_CWD_UNKNOWN
+            for payload in _shell_embedded_commands(toks):
+                if not payload.strip():
+                    continue
+                nested = _shell_acl_scan(payload, ctx, tmpdir=tmpdir, cwd=base,
+                                         depth=depth + 1, writes_only=True)
+                if nested is not None:
+                    return nested
     if deny_info:
         _, rp, rule, _op = deny_info
         acl.log_event("run_command", rp, "deny", rule)
@@ -7221,8 +7392,9 @@ def _shell_hard_block(command: str, verdict: dict) -> Optional[Dict]:
     if nested:
         shown = nested if len(nested) <= 200 else nested[:200] + "…"
         return {"approved": False, "effect": "deny",
-                "message": "BLOCKED (rejected): a nested `-c` command deletes the home directory "
-                           f"(~/ or $HOME) or the root filesystem, which is never allowed: {shown}",
+                "message": "BLOCKED (rejected): a nested `-c`/`find -exec`/`xargs` command "
+                           "deletes the home directory (~/ or $HOME) or the root filesystem, "
+                           f"which is never allowed: {shown}",
                 "verdict": verdict}
     # Also catch opencode deny (explicit rules) — include 'rejected' for compat with safety_blocklist test
     if verdict["effect"] == "deny":

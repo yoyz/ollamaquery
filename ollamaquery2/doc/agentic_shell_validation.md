@@ -174,8 +174,7 @@ Key faithful details:
     `echo x > '$UNSET/tmp/x'` stays a CWD name instead of a false `/tmp`
     deny. `$TMPDIR` is deliberately left to the TMPDIR pass (a context value,
     not an unset variable). A nested `-c` payload keeps its M2 home/root scan;
-    its relative ACL paths (and `$UNSET` inside the payload, where the inner
-    shell expands it) are H3's job.
+    its relative ACL paths and `$UNSET` are expanded by H3 (below).
     `tests/test_acl.py::TestShellUnsetVarExpansion` (9).
 *   **Effective cwd for relative paths (H1, closed 2026-11-22).**
     `cd / && echo x > rel` was allowed because `_shell_operand_realpath`
@@ -205,21 +204,43 @@ Key faithful details:
     per-command context (the process value for `!`); the scratch is wiped at
     exit. `tests/test_acl.py::TestShellWriteTargets` (7) and
     `TestShellTmpdir` (6), `TestExecutor.test_host_command_gets_tmpdir_scratch`.
-*   **`-c` payloads are gated too (M2, closed 2026-11-19).** The guard used to
-    read only the first-level tokens, so `bash -c "rm -rf ~"` was a plain `ask`
-    that `auto_confirm` approved while a direct `rm -rf ~` is denied — a hole
-    in the "bypass-immune" promise. `_shell_embedded_commands` extracts the
-    payload after a `-c`/bundled `-xc` flag for the shell interpreters
-    (`sh|bash|dash|zsh|ksh|mksh|ash`, also `busybox sh`) through the wrappers
-    (`sudo -u <user>`, `env VAR=x`, `nohup`, `command`, `exec`, `time`, `nice`),
-    and for `python -c` the string arguments of `os.system`/`os.popen`/
-    `subprocess.*` (`shell=True` or not — the list form does not expand `~`, so
-    it is not a home delete). The payload is unquoted once (a double-quoted
-    payload also unescapes `\"`), re-tokenized, normalized like the top level
-    (`/home/<user>` → `~`), and the recursion is bounded at 6 levels; at the
-    limit a conservative text check decides. Recursion terminates on repeated
-    `bash -c "bash -c …"`; a 200 KB payload costs ~170 ms.
-    `tests/test_acl.py::TestShellDashCDecomposition` (18).
+*   **`-c` payloads are gated too (M2, closed 2026-11-19; extended 2026-11-23).**
+    The guard used to read only the first-level tokens, so `bash -c "rm -rf ~"`
+    was a plain `ask` that `auto_confirm` approved while a direct `rm -rf ~` is
+    denied — a hole in the "bypass-immune" promise. `_shell_embedded_commands`
+    extracts the payload after a `-c`/bundled `-xc` flag for the shell
+    interpreters (`sh|bash|dash|zsh|ksh|mksh|ash`, also `busybox sh`) through
+    the wrappers (`sudo -u <user>`, `env VAR=x`, `nohup`, `command`, `exec`,
+    `time`, `nice`), and for `python -c` the string arguments of
+    `os.system`/`os.popen`/`subprocess.*` (`shell=True` or not — the list form
+    does not expand `~`, so it is not a home delete). The payload is unquoted
+    once (a double-quoted payload also unescapes `\"`), re-tokenized, normalized
+    like the top level (`/home/<user>` → `~`), and the recursion is bounded at
+    6 levels; at the limit a conservative text check decides. Recursion
+    terminates on repeated `bash -c "bash -c …"`; a 200 KB payload costs
+    ~170 ms. **Since 2026-11-23 the same helper also returns `find
+    -exec`/`-execdir`/`-ok`/`-okdir` actions and the command `xargs` will run:**
+    `find . -exec rm -rf ~ \;` and `xargs rm -rf ~` used to be `allow` because
+    only the `find` roots were checked, and `xargs` only after a home/root
+    `find`. A wrapper action is reduced to its own payload first
+    (`sh -c 'echo "rm -rf ~"'` stays allowed; `xargs sh -c 'rm -rf ~'` is
+    denied), so the last-resort text check cannot mistake an echoed string for
+    an execution. `tests/test_acl.py::TestShellDashCDecomposition` (18),
+    `TestShellNestedFindXargs` (6).
+*   **Relative writes in nested payloads (H3, closed 2026-11-23).**
+    `_shell_acl_scan` recurses into `_shell_embedded_commands` with the cwd the
+    outer node runs in, so `bash -c 'cd / && echo x > rel'` writes `/rel` and is
+    denied (it used to resolve `rel` against the project, or not be seen at
+    all). The nested pass is `writes_only`: absolute reads in a payload are
+    already covered by the embedded-path scan, so `bash -c 'cat /etc/passwd'`
+    prompts once. An unknown inherited cwd (`cd $UNSET && bash -c …`, or a
+    `cd $VAR` inside the payload) is carried by a `_SHELL_CWD_UNKNOWN`
+    sentinel and refuses the relative write (fail-closed). The recursion is
+    bounded by the same 6 levels; beyond it, relative writes inside a payload are
+    a documented limit (absolute paths are still caught). The same traversal
+    feeds `_shell_access_plan`, which emits `real=None` for a token resolved
+    against an unknown cwd instead of inventing a project-relative path (A1).
+    `tests/test_acl.py::TestShellNestedPayloads` (9).
 *   Group nodes `( … )`, `$(…)`, `<(…)` contribute no own pattern, only nested
     nodes (`opencode_implementation_detail_shell_permission_parser.md:401`).
 
@@ -254,9 +275,14 @@ Guard `ollamaquery2.py:5307` `_shell_is_home_destructive`:
     home. A home/root root with `-delete` or a destructive
     `-exec`/`-execdir`/`-ok`/`-okdir` (`rm`, `shred`, `truncate`, `dd`, `mv`,
     `chmod`, `chown`, a shell interpreter, Python, awk/sed/perl/ruby/node/php)
-    is denied.
-*   `xargs`: a destructive command after a home/root `find` in the same
-    command is denied (`find ~ -print0 | xargs -0 rm -rf`).
+    is denied. **Since 2026-11-23 the `-exec` command itself is also parsed as
+    a nested command**, so `find . -exec rm -rf ~ \;` and
+    `find . -exec sh -c 'rm -rf ~' \;` are denied even though the root is the
+    project (`find *` is allow-listed; the root alone is not the whole story).
+*   `xargs`: the command `xargs` will run is parsed as a nested command, so
+    `xargs rm -rf ~` and `echo x | xargs sh -c 'rm -rf ~'` are denied whatever
+    the pipeline feeds it. A destructive `xargs` after a home/root `find` stays
+    covered (`find ~ -print0 | xargs -0 rm -rf`).
 *   `cd` tracking: a `cd` outside the project into the home tree, `/`, `/tmp`
     or an ancestor of the project, followed by `rm`, a destructive `find` or a
     destructive `xargs`, is denied. `cd / && rm -rf *`, `cd .. && rm -rf *`,
@@ -388,8 +414,9 @@ the model both Hermes and opencode v2 use (`ollamaquery2_inline_approval_proposa
 a bare `env`/`env FOO=1` stays allow. `find *`, `tar *` and `git *` remain
 broad allow rules: Lot D of `TODO_security.md` tracks the targeted asks for
 `find -exec`, `tar --checkpoint-action`, `git -c` and upload `curl`. The hard
-guard covers home/root `find`/`xargs`; the rest is consent + audit, not a
-sandbox.
+guard covers home/root deletes through `find`/`xargs` (including the `-exec`
+command and the `xargs` command itself), and H3 re-gates relative writes in
+those payloads; the rest is consent + audit, not a sandbox.
 
 Extensible in-code; could be loaded from `~/.ollamaquery.d/shell_permissions.json` later.
 
@@ -412,6 +439,9 @@ Extensible in-code; could be loaded from `~/.ollamaquery.d/shell_permissions.jso
 | `rm -rf /`                           | `rm -rf /`                   | `deny`        | `deny` (hard)       | L1 root guard       |
 | `find ~ -delete`                     | `find ~ -delete`             | `deny`        | `deny` (hard)       | find delete         |
 | `find ~ -print0 \| xargs -0 rm -rf`  | `find …`, `xargs …`          | `deny`        | `deny` (hard)       | xargs after find    |
+| `find . -exec rm -rf ~ \;`           | `find . -exec rm -rf ~`      | `allow`       | `deny` (hard)       | `-exec` payload     |
+| `xargs rm -rf ~`                     | `xargs rm -rf ~`             | `ask`         | `deny` (hard)       | xargs payload       |
+| `bash -c 'cd / && echo x > rel'`     | `bash -c …`                  | `ask`         | `deny` (ACL, auto)  | H3 nested write     |
 | `cd / && rm -rf *`                   | `cd /`, `rm -rf *`           | `deny`        | `deny` (hard)       | cd escapes + delete |
 | `cd build && rm -rf *`               | `cd build`, `rm -rf *`       | `ask`→lenient | `allow`             | cd inside           |
 | `rm -rf /tmp/junk`                   | `rm -rf /tmp/junk`           | `ask`         | `ask` → yolo/prompt | soft, not hard      |

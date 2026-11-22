@@ -567,17 +567,25 @@ to building a local test server with the `Neumann-Labs/mcp-cpp` SDK.
 Trust boundaries at a glance; the sections above give the details.
 
 - **Shell gate.** Per-component allow/ask/deny, `rm ~/` / `rm /`,
-  home/root `find -delete` / destructive `find -exec` and home/root
-  `xargs rm` hard-blocked (bypass-immune, `auto_confirm` included),
+  home/root `find -delete` and destructive `find -exec` / `xargs rm`
+  hard-blocked (bypass-immune, `auto_confirm` included),
   effective-command normalization
   (wrappers, `VAR=value`, `/bin/rm`), CWD leniency and a path-ACL operand scan.
   Leniency only covers project paths: `sh` / `curl … | sh` ask, and a `cd`
   outside the project disables it; a `cd` into home/root/tmp (or an ancestor)
   followed by a delete is hard-denied. A wrapper with a command (`env sh -c …`)
-  asks even though `env *` is allow-listed. The `s` and `a` approval answers are
-  **session-scoped**; nothing is written to disk. Broader allow rules
-  (`find -exec`, `git -c`, `tar --checkpoint-action`, upload `curl`) remain
-  allow-listed: the gate is consent + audit, not a sandbox.
+  asks even though `env *` is allow-listed. **Nested commands are inspected:**
+  a `-c`/`env -S` payload, a `find -exec` action and the command `xargs` will
+  run are parsed, so `find . -exec rm -rf ~ \;` is a hard deny and a relative
+  write inside `bash -c 'cd / && echo x > rel'` is denied by the path ACL (it
+  resolves against the directory the payload actually runs in; an unknown
+  directory refuses the write). The inspection is bounded at 6 nesting levels,
+  so a relative write buried deeper is a documented limit (absolute paths are
+  still seen); see `doc/agentic_shell_validation.md` §2.2. The `s` and `a`
+  approval answers are **session-scoped**; nothing is written to disk. Broader
+  allow rules (`git -c`, `tar --checkpoint-action`, upload `curl`) remain
+  allow-listed, and a `find -exec` with a harmless payload still runs without a
+  prompt: the gate is consent + audit, not a sandbox.
 - **`/agentic auto` is host-bash trust.** It auto-approves ask-level shell
   commands and skips destructive-tool confirmations. Home/root hard-denies and
   Path-ACL `ask` rules still apply, but the model can otherwise execute on the
