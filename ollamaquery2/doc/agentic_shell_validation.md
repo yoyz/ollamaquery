@@ -198,12 +198,28 @@ Key faithful details:
     `sed -i`, `dd of=`, `tar -f` in create mode, `gcc -o`, destructive
     `find` roots, `git config` (`~/.gitconfig`/`/etc/gitconfig`/`.git/config`)
     and `curl`/`wget` outputs; an unknown command keeps the old read-only
-    scan. The same traversal produces `_shell_access_plan` (read/write/
-    unknown events) for A1's session inventory. Host and bwrap commands get
-    `TMPDIR` = the session scratch, and the scanner resolves `$TMPDIR` with a
-    per-command context (the process value for `!`); the scratch is wiped at
-    exit. `tests/test_acl.py::TestShellWriteTargets` (7) and
-    `TestShellTmpdir` (6), `TestExecutor.test_host_command_gets_tmpdir_scratch`.
+    scan. **2026-11-23 extension (review P0):** the common allow-listed
+    writers now expose their visible targets too — `git clone`/`init`/`-C`/
+    `--git-dir`/`--work-tree`, `git submodule add`/`worktree add`, `tar -x -C`
+    (and `-P` as the filesystem root), `sort -o`, `awk -i inplace`, `perl -i`,
+    `patch -d`/`-o` (default cwd), `npm`/`pnpm`/`yarn` `--prefix`/`--cwd`/`-g`
+    (default cwd for mutating subcommands), `unzip -d`, `gzip`/`bzip2`/`xz`/
+    `zstd` operands, `rsync` destination, `pip --target`/`--prefix`, `cargo
+    --target-dir` (default `target`), `go build -o`, and `make -C` (default
+    cwd). They resolve against the effective cwd (H1), so `cd /var/lib && npm
+    install` is denied and the project form stays allowed. The same traversal
+    produces `_shell_access_plan` (read/write/unknown events) for A1's session
+    inventory. **Residual, host-mode by design:** a command that executes
+    arbitrary code (`python script.py`, `node script.js`, `make` recipes,
+    `npm run`, cargo build scripts, `pip install` without `--target`) writes
+    wherever its code decides; no static table can see that. Those need
+    `ask`/bwrap or the explicit `trusted` trust stance (see H6 in
+    `TODO_security.md`). Host and bwrap commands get `TMPDIR` = the session
+    scratch, and the scanner resolves `$TMPDIR` with a per-command context (the
+    process value for `!`); the scratch is wiped at exit.
+    `tests/test_acl.py::TestShellWriteTargets` (7),
+    `TestShellCommonWriters` (7), `TestShellTmpdir` (6),
+    `TestExecutor.test_host_command_gets_tmpdir_scratch`.
 *   **`-c` payloads are gated too (M2, closed 2026-11-19; extended 2026-11-23).**
     The guard used to read only the first-level tokens, so `bash -c "rm -rf ~"`
     was a plain `ask` that `auto_confirm` approved while a direct `rm -rf ~` is

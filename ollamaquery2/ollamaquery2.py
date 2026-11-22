@@ -6889,7 +6889,10 @@ _SHELL_WRITE_VALUE_FLAGS = {
 }
 _SHELL_WRITE_HEADS = (_SHELL_WRITE_ALL | _SHELL_WRITE_LAST
                       | _SHELL_WRITE_COMPILERS
-                      | {"sed", "dd", "tar", "find", "git", "curl", "wget"})
+                      | {"sed", "dd", "tar", "find", "git", "curl", "wget",
+                         "sort", "awk", "perl", "patch", "npm", "pnpm",
+                         "yarn", "unzip", "gzip", "bzip2", "xz", "zstd",
+                         "rsync", "pip", "cargo", "go", "make"})
 _SHELL_READ_VERBS = frozenset({
     "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg",
     "wc", "stat", "file", "sha1sum", "sha224sum", "sha256sum", "sha384sum",
@@ -6998,15 +7001,26 @@ def _shell_grep_files(args: list) -> list:
 
 
 def _shell_tar_write_targets(args: list) -> list:
-    """Return the archive target of a `tar` create/append command."""
+    """Return the archive/extraction target of a `tar` command."""
     create = False
+    extract = False
+    absolute = False
     archive = None
+    directory = None
     i = 0
     while i < len(args):
         a = args[i].strip("'\"")
         if a in ("--create", "--append", "--update", "--concatenate",
                  "--catenate"):
             create = True
+            i += 1
+            continue
+        if a in ("--extract", "--get"):
+            extract = True
+            i += 1
+            continue
+        if a in ("--absolute-names", "-P"):
+            absolute = True
             i += 1
             continue
         if a == "--file" and i + 1 < len(args):
@@ -7017,10 +7031,30 @@ def _shell_tar_write_targets(args: list) -> list:
             archive = a.split("=", 1)[1]
             i += 1
             continue
+        if a in ("--directory", "-C") and i + 1 < len(args):
+            directory = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--directory="):
+            directory = a.split("=", 1)[1]
+            i += 1
+            continue
         if a.startswith("-") and not a.startswith("--"):
             flags = a[1:]
             if any(ch in flags for ch in "cruA"):
                 create = True
+            if "x" in flags:
+                extract = True
+            if "P" in flags:
+                absolute = True
+            if "C" in flags:
+                pos = flags.index("C")
+                value = flags[pos + 1:]
+                if value:
+                    directory = value
+                elif i + 1 < len(args):
+                    directory = args[i + 1]
+                    i += 1
             for j, ch in enumerate(flags):
                 if ch == "f":
                     if j == len(flags) - 1 and i + 1 < len(args):
@@ -7030,6 +7064,12 @@ def _shell_tar_write_targets(args: list) -> list:
                         archive = flags[j + 1:]
                     break
         i += 1
+    if extract:
+        # `-P` lets archive members keep absolute paths: the extraction root is
+        # the filesystem, not the target directory.
+        if absolute:
+            return ["/"]
+        return [directory or "."]
     return [archive] if create and archive else []
 
 
@@ -7089,6 +7129,292 @@ def _shell_download_targets(head: str, args: list) -> list:
     return ["."]
 
 
+def _shell_awk_write_targets(args: list) -> list:
+    """Return the files rewritten by `awk -i inplace` (gawk extension)."""
+    in_place = False
+    for i, raw in enumerate(args):
+        a = raw.strip("'\"")
+        if a in ("-i", "--include") and i + 1 < len(args):
+            if "inplace" in args[i + 1].strip("'\""):
+                in_place = True
+        elif a.startswith("--include=") and "inplace" in a.split("=", 1)[1]:
+            in_place = True
+        elif (a.startswith("-i") and not a.startswith("--")
+              and "inplace" in a[2:]):
+            in_place = True
+    if not in_place:
+        return []
+    operands = []
+    program_flag = False
+    i = 0
+    while i < len(args):
+        a = args[i].strip("'\"")
+        if a == "--":
+            operands.extend(args[i + 1:])
+            break
+        if a.startswith("-") and a != "-":
+            if a in ("-f", "--file", "-e", "--source"):
+                program_flag = True
+                i += 2
+                continue
+            if a.startswith(("--file=", "--source=")):
+                program_flag = True
+                i += 1
+                continue
+            if a in ("-i", "--include", "-v", "--assign", "-F"):
+                i += 2
+                continue
+            i += 1
+            continue
+        operands.append(args[i])
+        i += 1
+    if not program_flag:
+        operands = operands[1:]  # first non-option is the awk program
+    return operands
+
+
+def _shell_perl_in_place(tok: str) -> bool:
+    """True for a perl `-i` flag, without mistaking `-MList::Util` for it."""
+    t = tok.strip("'\"")
+    if t == "--in-place" or t.startswith("--in-place="):
+        return True
+    if t == "-i" or t.startswith("-i"):
+        return True
+    if not t.startswith("-") or t.startswith("--"):
+        return False
+    if t.startswith(("-M", "-I", "-e", "-E", "-m")):
+        return False
+    body = t[1:].split(".", 1)[0]
+    return body.isalpha() and "i" in body
+
+
+def _shell_perl_write_targets(args: list) -> list:
+    """Return the files rewritten by `perl -i` (in-place edit)."""
+    if not any(_shell_perl_in_place(a) for a in args):
+        return []
+    operands = []
+    code_flag = False
+    i = 0
+    while i < len(args):
+        a = args[i].strip("'\"")
+        if a == "--":
+            operands.extend(args[i + 1:])
+            break
+        if a.startswith("-") and a != "-":
+            if a in ("-e", "-E"):
+                code_flag = True
+                i += 2
+                continue
+            if a.startswith(("-e", "-E")) and len(a) > 2:
+                code_flag = True
+            if a in ("-I", "-M", "-m"):
+                i += 2
+                continue
+            i += 1
+            continue
+        operands.append(args[i])
+        i += 1
+    if not code_flag and operands:
+        operands = operands[1:]  # first operand is the script file
+    return operands
+
+
+def _shell_patch_write_targets(args: list) -> list:
+    """Return where `patch` writes: `-o`, `-d` or the current directory."""
+    if any(a.strip("'\"") == "--dry-run" for a in args):
+        return []
+    target = _shell_option_value(args, ("-o", "--output"))
+    if target:
+        return [target]
+    directory = _shell_option_value(args, ("-d", "--directory"))
+    return [directory] if directory else ["."]
+
+
+def _shell_package_write_targets(args: list) -> list:
+    """Return the install directory of `npm`/`pnpm`/`yarn`."""
+    prefix = _shell_option_value(args, ("--prefix", "--cwd", "--dir", "-C"))
+    if any(a.strip("'\"") in ("-g", "--global")
+           or a.strip("'\"").startswith("--location=global") for a in args):
+        return [prefix] if prefix else ["/"]
+    if prefix:
+        return [prefix]
+    operands = _shell_operands(args, frozenset({
+        "--prefix", "--cwd", "--dir", "-C", "--registry", "--tag",
+        "--cache", "--userconfig", "--loglevel", "--workspace", "-w",
+        "--location",
+    }))
+    sub = operands[0].strip("'\"") if operands else ""
+    if sub == "global":
+        action = operands[1].strip("'\"") if len(operands) > 1 else ""
+        if action in ("add", "remove", "upgrade"):
+            return [prefix] if prefix else ["/"]
+        return []
+    if sub in ("install", "i", "ci", "add", "remove", "rm", "uninstall",
+               "update", "up", "dedupe", "prune", "publish", "link",
+               "unlink", "rebuild"):
+        return ["."]
+    return []
+
+
+def _shell_unzip_write_targets(args: list) -> list:
+    """Return the extraction directory of `unzip` (default: cwd)."""
+    if any(a.strip("'\"") in ("-l", "-t", "-p", "-v", "-Z") for a in args):
+        return []  # list/test/pipe/list-verbose/zipinfo: no extraction
+    directory = _shell_option_value(args, ("-d", "--directory"))
+    return [directory] if directory else ["."]
+
+
+def _shell_compress_write_targets(args: list) -> list:
+    """Return the files `gzip`/`bzip2`/`xz`/`zstd` (de)compress in place."""
+    if any(a.strip("'\"") in ("-l", "--list", "-t", "--test", "-c",
+                              "--stdout", "--to-stdout", "-h", "--help",
+                              "-V", "--version") for a in args):
+        return []
+    output = _shell_option_value(args, ("-o", "--output"))
+    if output and output != "-":
+        return [output]
+    return _shell_operands(args, frozenset({
+        "-S", "--suffix", "-T", "--threads",
+    }))
+
+
+def _shell_rsync_write_targets(args: list) -> list:
+    """Return the destination of `rsync` (the last local operand)."""
+    if any(a.strip("'\"") in ("-n", "--dry-run", "--list-only")
+           for a in args):
+        return []
+    operands = _shell_operands(args, frozenset({
+        "-e", "--rsh", "--exclude", "--include", "--filter", "--files-from",
+        "--rsync-path", "--chmod", "--chown", "--timeout", "--bwlimit",
+        "--port", "--sockopts", "-f", "--password-file", "--backup-dir",
+        "--suffix", "--compress-level", "--skip-compress",
+    }))
+    if len(operands) < 2:
+        return []
+    destination = operands[-1].strip("'\"")
+    if re.match(r"^[^/]*:", destination) and not destination.startswith("/"):
+        return []  # remote destination: no local write target
+    return [operands[-1]]
+
+
+def _shell_git_write_targets(args: list) -> list:
+    """Return where a mutating `git` subcommand writes (clone/init/-C)."""
+    cwd_opt = None
+    work_tree = None
+    git_dir = None
+    index = 0
+    sub = ""
+    while index < len(args):
+        a = args[index].strip("'\"")
+        if a == "-C" and index + 1 < len(args):
+            cwd_opt = args[index + 1].strip("'\"")
+            index += 2
+            continue
+        if a.startswith("-C") and len(a) > 2:
+            cwd_opt = a[2:]
+            index += 1
+            continue
+        if a == "--git-dir" and index + 1 < len(args):
+            git_dir = args[index + 1].strip("'\"")
+            index += 2
+            continue
+        if a.startswith("--git-dir="):
+            git_dir = a.split("=", 1)[1]
+            index += 1
+            continue
+        if a == "--work-tree" and index + 1 < len(args):
+            work_tree = args[index + 1].strip("'\"")
+            index += 2
+            continue
+        if a.startswith("--work-tree="):
+            work_tree = a.split("=", 1)[1]
+            index += 1
+            continue
+        if a == "-c" and index + 1 < len(args):
+            index += 2
+            continue
+        if a.startswith(("-c", "--")):
+            index += 1
+            continue
+        if a.startswith("-"):
+            index += 1
+            continue
+        sub = a
+        index += 1
+        break
+    rest = args[index:]
+    value_flags = frozenset({
+        "-b", "--branch", "--depth", "--origin", "-o", "--reference",
+        "--separate-git-dir", "-c", "--config", "--jobs", "-j", "--filter",
+        "--shallow-since", "--shallow-exclude", "--recurse-submodules",
+        "--template", "-u", "--upload-pack", "--initial-branch", "--name",
+    })
+    if sub == "config":
+        targets = _shell_git_config_targets(args)
+        if not targets:
+            return []
+        if git_dir and targets == [".git/config"]:
+            if cwd_opt and not os.path.isabs(git_dir) and not git_dir.startswith("~"):
+                return [os.path.join(cwd_opt, git_dir)]
+            return [git_dir]
+        base = work_tree or cwd_opt
+        if base:
+            return [t if os.path.isabs(t) or t.startswith("~")
+                    else os.path.join(base, t) for t in targets]
+        return targets
+    if sub in ("clone", "init"):
+        operands = _shell_operands(rest, value_flags)
+        target = operands[-1] if operands else "."
+        targets = [os.path.join(cwd_opt, target) if cwd_opt else target]
+        separate = _shell_option_value(rest, ("--separate-git-dir",))
+        if separate:
+            targets.append(separate)
+        return targets
+    if sub in ("submodule", "worktree"):
+        action = rest[0].strip("'\"") if rest else ""
+        if action in ("add", "remove", "move", "repair"):
+            operands = _shell_operands(rest[1:], value_flags)
+            if action == "move":
+                targets = operands or ["."]
+                return [os.path.join(cwd_opt, t) if cwd_opt else t
+                        for t in targets]
+            if sub == "submodule":
+                # `submodule add <repository> [<path>]`: the path is second.
+                target = operands[1] if len(operands) >= 2 else "."
+            else:
+                # `worktree add <path> [<commit-ish>]`: the path is first.
+                target = operands[0] if operands else "."
+            return [os.path.join(cwd_opt, target) if cwd_opt else target]
+        if action in ("update", "init", "sync", "deinit", "absorbgitdirs",
+                      "prune", "lock", "unlock"):
+            return [work_tree or cwd_opt or git_dir or "."]
+        return []
+    flags = [a.strip("'\"") for a in rest]
+    if sub == "tag" and (not flags or any(f in ("-l", "--list") for f in flags)):
+        return []  # `git tag` / `git tag -l` list tags
+    if sub == "branch":
+        write_flags = ("-d", "-D", "-m", "-M", "-c", "-C", "-f", "-u",
+                       "--set-upstream-to", "--unset-upstream")
+        if (all(f.startswith("-") for f in flags)
+                and not any(f.startswith(write_flags) for f in flags)):
+            return []  # `git branch`, `git branch -a/-v/--show-current`
+    if sub == "remote" and (not flags
+                            or flags[0] in ("-v", "--verbose", "show",
+                                            "get-url")):
+        return []
+    if sub == "stash" and flags and flags[0] in ("list", "show"):
+        return []
+    if sub == "apply" and any(f in ("--check", "--stat", "--numstat",
+                                    "--summary") for f in flags):
+        return []
+    if sub in ("add", "commit", "checkout", "switch", "reset", "pull",
+               "fetch", "merge", "rebase", "apply", "am", "cherry-pick",
+               "revert", "clean", "mv", "rm", "restore", "stash", "tag",
+               "branch", "remote", "gc", "prune", "repack", "update-ref"):
+        return [work_tree or cwd_opt or git_dir or "."]
+    return []
+
+
 def _shell_write_targets(head: str, args: list) -> list:
     """Return the raw write targets of a known writer (H0, decision (a)).
 
@@ -7119,6 +7445,10 @@ def _shell_write_targets(head: str, args: list) -> list:
     if head == "sed":
         files, in_place = _shell_sed_files(args)
         return files if in_place else []
+    if head == "awk":
+        return _shell_awk_write_targets(args)
+    if head == "perl":
+        return _shell_perl_write_targets(args)
     if head == "dd":
         return [a.split("=", 1)[1] for a in args
                 if a.strip("'\"").startswith("of=")]
@@ -7132,9 +7462,51 @@ def _shell_write_targets(head: str, args: list) -> list:
             return []
         return _shell_find_roots(args) or ["."]
     if head == "git":
-        return _shell_git_config_targets(args)
+        return _shell_git_write_targets(args)
     if head in ("curl", "wget"):
         return _shell_download_targets(head, args)
+    if head == "sort":
+        target = _shell_option_value(args, ("-o", "--output"))
+        return [target] if target and target != "-" else []
+    if head == "patch":
+        return _shell_patch_write_targets(args)
+    if head in ("npm", "pnpm", "yarn"):
+        return _shell_package_write_targets(args)
+    if head == "unzip":
+        return _shell_unzip_write_targets(args)
+    if head in ("gzip", "bzip2", "xz", "zstd"):
+        return _shell_compress_write_targets(args)
+    if head == "rsync":
+        return _shell_rsync_write_targets(args)
+    if head == "pip":
+        target = _shell_option_value(args, ("-t", "--target", "--prefix",
+                                            "--root"))
+        return [target] if target else []
+    if head == "cargo":
+        target = _shell_option_value(args, ("--target-dir",))
+        if target:
+            return [target]
+        operands = _shell_operands(args)
+        sub = operands[0].strip("'\"") if operands else ""
+        if sub in ("build", "b", "check", "c", "run", "r", "test", "t",
+                   "bench", "doc", "clean", "update", "fetch", "add",
+                   "remove", "rm"):
+            return ["target"]
+        return []
+    if head == "go":
+        operands = _shell_operands(args)
+        sub = operands[0].strip("'\"") if operands else ""
+        if sub == "build":
+            target = _shell_option_value(args, ("-o",))
+            if target:
+                return [target]
+        return []
+    if head == "make":
+        if any(a.strip("'\"") in ("-n", "--just-print", "--dry-run",
+                                  "--recon", "-q", "--question") for a in args):
+            return []
+        directory = _shell_option_value(args, ("-C", "--directory"))
+        return [directory] if directory else ["."]
     return []
 
 

@@ -1314,6 +1314,159 @@ class TestShellNestedFindXargs(unittest.TestCase):
             self.assertNotIn("nested `-c`", res.get("message") or "", cmd)
 
 
+class TestShellCommonWriters(unittest.TestCase):
+    """H0 extension: the allow-listed common tools get their targets graded.
+
+    The default permission config allow-lists `git`, `tar`, `sort`, `awk`,
+    `npm`, `unzip`, `gzip`, `pip`, `cargo`, `go` and `make`. Their explicit
+    write targets were invisible (`git clone … /var/lib/x`, `tar -x -C …`,
+    `sort -o …`, `awk -i inplace …`, `npm --prefix …`, `unzip -d …`,
+    `rsync … dest`, `pip --target …`, `cargo --target-dir …`, `go build -o …`,
+    `make -C …`), so the ACL allowed writes outside the project. They are now
+    in the write table, resolved against the effective cwd (H1); the
+    project-local forms stay allowed. Arbitrary script execution (`python
+    script.py`, `node script.js`, `make` recipes) remains a documented
+    host-mode limit: no static table can see what the code writes.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx)
+
+    def test_table(self):
+        cases = [
+            (("sort", ["-o", "out", "in"]), ["out"]),
+            (("tar", ["-xf", "a.tar", "-C", "/var/lib/x"]), ["/var/lib/x"]),
+            (("tar", ["-xPf", "a.tar"]), ["/"]),
+            (("tar", ["-cf", "out.tar", "."]), ["out.tar"]),
+            (("awk", ["-i", "inplace", "{print}", "f"]), ["f"]),
+            (("perl", ["-pi", "-e", "s/x/y/", "f"]), ["f"]),
+            (("patch", ["-d", "/var/lib", "-i", "f"]), ["/var/lib"]),
+            (("patch", ["-p1", "-i", "f"]), ["."]),
+            (("npm", ["--prefix", "/var/lib", "install"]), ["/var/lib"]),
+            (("npm", ["-g", "install", "pkg"]), ["/"]),
+            (("unzip", ["a.zip", "-d", "/var/lib"]), ["/var/lib"]),
+            (("gzip", ["f"]), ["f"]),
+            (("rsync", ["-a", "src/", "dest/"]), ["dest/"]),
+            (("pip", ["install", "--target", "/var/lib", "pkg"]),
+             ["/var/lib"]),
+            (("cargo", ["build", "--target-dir", "/var/lib"]),
+             ["/var/lib"]),
+            (("cargo", ["build"]), ["target"]),
+            (("go", ["build", "-o", "/var/lib/x", "."]), ["/var/lib/x"]),
+            (("make", ["-C", "/var/lib"]), ["/var/lib"]),
+            (("git", ["clone", "https://x", "/var/lib/x"]),
+             ["/var/lib/x"]),
+            (("git", ["-C", "/var/lib", "checkout", "main"]),
+             ["/var/lib"]),
+            (("git", ["worktree", "add", "/var/lib/wt", "main"]),
+             ["/var/lib/wt"]),
+            (("git", ["submodule", "add", "https://x", "/var/lib/sub"]),
+             ["/var/lib/sub"]),
+        ]
+        for (head, args), expected in cases:
+            with self.subTest(head=head, args=args):
+                self.assertEqual(m._shell_write_targets(head, args), expected)
+
+    def test_outside_targets_are_denied(self):
+        for cmd in ("git clone https://x.invalid/r /var/lib/gitclone",
+                    "git -C /var/lib/repo checkout main",
+                    "git -C /var/lib/repo config user.name x",
+                    "git --git-dir /var/lib/repo/.git config user.name x",
+                    "git -C /var/lib/repo --git-dir .mygit config user.name x",
+                    "git worktree add /var/lib/wt main",
+                    "git -C /var/lib/repo tag v1",
+                    "git -C /var/lib/repo branch new",
+                    "git -C /var/lib/repo remote add origin https://x",
+                    "git -C /var/lib/repo stash",
+                    "tar -xf a.tar -C /var/lib/tarout",
+                    "tar -xP -f a.tar",
+                    "sort -o /var/lib/sorted.txt input",
+                    "awk -i inplace '{print}' /var/lib/awkfile",
+                    "patch -d /var/lib -p0 -i f.patch",
+                    "npm --prefix /var/lib/npm install",
+                    "npm -g install pkg",
+                    "yarn global add pkg",
+                    "unzip a.zip -d /var/lib/unzip",
+                    "gzip /var/lib/file",
+                    "rsync -a src/ /var/lib/rsync/",
+                    "pip install --target /var/lib/pip pkg",
+                    "cargo build --target-dir /var/lib/cargo",
+                    "go build -o /var/lib/go/bin .",
+                    "make -C /var/lib"):
+            with self.subTest(cmd=cmd):
+                res = self._scan(cmd)
+                self.assertIsNotNone(res, cmd)
+                self.assertFalse(res["approved"], cmd)
+
+    def test_project_targets_are_allowed(self):
+        for cmd in ("git clone https://x.invalid/r",
+                    "git checkout main",
+                    "tar -xf a.tar",
+                    "tar -cf out.tar .",
+                    "sort -o out.txt input",
+                    "awk -i inplace '{print}' f",
+                    "patch -p1 -i f.patch",
+                    "npm install",
+                    "unzip a.zip",
+                    "gzip f",
+                    "rsync -a src/ dest/",
+                    "pip install --target ./vendor pkg",
+                    "cargo build",
+                    "go build -o bin/app .",
+                    "make",
+                    "perl -pi -e 's/x/y/' f"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self._scan(cmd), cmd)
+
+    def test_effective_cwd_is_used(self):
+        # `/var/lib` exists, so `cd` succeeds and the write is outside.
+        self.assertIsNotNone(self._scan("cd /var/lib && npm install"))
+        self.assertIsNotNone(self._scan("cd /var/lib && make"))
+        # A nonexistent target makes the `cd` fail, as bash does.
+        self.assertIsNone(self._scan("cd /nonexistent-aq-dir && npm install"))
+
+    def test_gate_denies_with_auto_confirm(self):
+        self.ctx.auto_confirm = True
+        for cmd in ("git clone https://x.invalid/r /var/lib/x",
+                    "tar -xf a.tar -C /var/lib/x",
+                    "make -C /var/lib"):
+            with self.subTest(cmd=cmd):
+                res = m.check_shell_approval(cmd, self.ctx)
+                self.assertFalse(res["approved"], cmd)
+                self.assertEqual(res["effect"], "deny", cmd)
+
+    def test_read_only_forms_are_not_writes(self):
+        for cmd in ("tar -tf out.tar",
+                    "sort input",
+                    "awk '{print}' f",
+                    "npm ls",
+                    "unzip -l a.zip",
+                    "gzip -c f",
+                    "rsync -n -a src/ /var/lib/x/",
+                    "make -n",
+                    "git status",
+                    "git -C /var/lib/repo tag",
+                    "git -C /var/lib/repo tag -l",
+                    "git -C /var/lib/repo branch -a",
+                    "git -C /var/lib/repo remote -v",
+                    "git -C /var/lib/repo stash list",
+                    "git apply --check f.patch",
+                    "perl -MList::Util -e 'print 1' /var/lib/x"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self._scan(cmd), cmd)
+
+    def test_access_plan_reports_the_visible_targets(self):
+        plan = m._shell_access_plan("sort -o /var/lib/x input")
+        self.assertIn(("write", "/var/lib/x"),
+                      {(e["op"], e["real"]) for e in plan})
+        plan = m._shell_access_plan("cd /var/lib && npm install")
+        self.assertIn(("write", "/var/lib"),
+                      {(e["op"], e["real"]) for e in plan})
+
+
 class TestShellExecdirCwd(unittest.TestCase):
     """`find -execdir` does not inherit the cwd (H3 review P1).
 

@@ -584,11 +584,20 @@ Trust boundaries at a glance; the sections above give the details.
   (with `-L` a symlink can leave the project) and a destructive payload there
   is a hard deny; `-exec` keeps the inherited cwd. The inspection is bounded at 6 nesting levels,
   so a relative write buried deeper is a documented limit (absolute paths are
-  still seen); see `doc/agentic_shell_validation.md` §2.2. The `s` and `a`
-  approval answers are **session-scoped**; nothing is written to disk. Broader
-  allow rules (`git -c`, `tar --checkpoint-action`, upload `curl`) remain
-  allow-listed, and a `find -exec` with a harmless payload still runs without a
-  prompt: the gate is consent + audit, not a sandbox.
+  still seen); see `doc/agentic_shell_validation.md` §2.2. The write-target
+  table now covers the common allow-listed writers with a visible destination
+  (`git clone`/`-C`, `tar -x -C`, `sort -o`, `awk -i inplace`, `perl -i`,
+  `patch -d`, `npm`/`yarn`/`pnpm --prefix`, `unzip -d`, `gzip`, `rsync`,
+  `pip --target`, `cargo --target-dir`, `go -o`, `make -C`), so
+  `git clone … /var/lib/x` or `cd /var/lib && npm install` hit the same write
+  deny as `cp f /var/lib/x`. **Arbitrary script/build execution** (`python
+  script.py`, `node script.js`, `make` recipes, `npm run`, cargo build
+  scripts) can still write wherever its code decides — use bwrap (`work`/
+  `exec`) or the explicit `trusted` stance; see `TODO_security.md` H6. The
+  `s` and `a` approval answers are **session-scoped**; nothing is written to
+  disk. Broader allow rules (`git -c`, `tar --checkpoint-action`, upload
+  `curl`) remain allow-listed, and a `find -exec` with a harmless payload still
+  runs without a prompt: the gate is consent + audit, not a sandbox.
 - **`/agentic auto` is host-bash trust.** It auto-approves ask-level shell
   commands and skips destructive-tool confirmations. Home/root hard-denies and
   Path-ACL `ask` rules still apply, but the model can otherwise execute on the
