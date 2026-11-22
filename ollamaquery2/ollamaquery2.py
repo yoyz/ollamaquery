@@ -6265,6 +6265,116 @@ def _shell_expand_home_refs(text: str) -> str:
     return _SHELL_HOME_REF_RE.sub(lambda _m: home, text)
 
 
+# Simple shell variable names (`$NAME`, `${NAME}`). Specials (`$1`, `$?`,
+# `$$`), parameter operators (`${VAR:-x}`) and substitutions (`$(...)`) are
+# deliberately left alone: they are not simple names.
+_SHELL_VAR_NAME_START = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")
+_SHELL_VAR_NAME_CHARS = _SHELL_VAR_NAME_START | frozenset("0123456789")
+
+
+def _shell_expand_unset_refs(text: str) -> str:
+    """Expand undefined simple variables to "" the way bash does (M3).
+
+    `_shell_operand_realpath` bailed out on any `$` (an env ref is not a
+    simple path), so `echo x > $UNSET/tmp/x` reached no rule at all while bash
+    expands the empty variable and writes `/tmp/x`. This pass follows bash for
+    the two simple spellings only:
+
+    * `$NAME` / `${NAME}` whose name is absent from `os.environ` -> "" ;
+    * a defined name stays opaque (`$XDG_CONFIG_HOME` can still hold a path;
+      the ACL is steering, not a sandbox).
+
+    `$HOME` is left to `_shell_expand_home_refs`, which is deliberately blind
+    (a quoted `$HOME` over-prompts; pinned by G1). `$TMPDIR` is expanded by
+    the TMPDIR pass with a context value, not here.
+
+    Quotes follow bash: single quotes suppress expansion (`'$UNSET/tmp/x'` is
+    a literal name under the CWD, not `/tmp/x`), double quotes allow it, and a
+    backslash escapes the next character outside single quotes. A blind pass
+    would turn the quoted literal into a false temp-root deny.
+
+    Args:
+        text: A shell word, operand, or code blob (quotes still attached).
+
+    Returns:
+        The text with undefined simple variables replaced; defined variables,
+        `$HOME`, specials and parameter operators are preserved.
+    """
+    if "$" not in text:
+        return text
+    out = []
+    i = 0
+    n = len(text)
+    in_single = False
+    in_double = False
+    while i < n:
+        c = text[i]
+        if in_single:
+            out.append(c)
+            if c == "'":
+                in_single = False
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            # Outside single quotes a backslash escapes the next character:
+            # `\$VAR` is a literal `$VAR`, not an expansion.
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            in_single = True
+            out.append(c)
+            i += 1
+            continue
+        if c == '"':
+            in_double = not in_double
+            out.append(c)
+            i += 1
+            continue
+        if c != "$":
+            out.append(c)
+            i += 1
+            continue
+        start = i
+        j = i + 1
+        braced = j < n and text[j] == "{"
+        if braced:
+            close = text.find("}", j + 1)
+            if close == -1:
+                out.append(c)
+                i += 1
+                continue
+            name = text[j + 1:close]
+            end = close + 1
+        else:
+            if j >= n or text[j] not in _SHELL_VAR_NAME_START:
+                out.append(c)
+                i += 1
+                continue
+            k = j + 1
+            while k < n and text[k] in _SHELL_VAR_NAME_CHARS:
+                k += 1
+            name = text[j:k]
+            end = k
+        valid = (bool(name) and name[0] in _SHELL_VAR_NAME_START
+                 and all(ch in _SHELL_VAR_NAME_CHARS for ch in name))
+        if not valid:
+            # `${VAR:-x}`, `${1}`, an unclosed brace: keep the whole spelling.
+            out.append(text[start:end])
+            i = end
+            continue
+        if name not in ("HOME", "TMPDIR") and name not in os.environ:
+            # bash: an unset variable is the empty string. HOME has its own
+            # G1 pass; TMPDIR is the TMPDIR step (context value), so leaving
+            # it here avoids turning `$TMPDIR/x` into `/x`.
+            i = end
+            continue
+        out.append(text[start:end])
+        i = end
+    return "".join(out)
+
+
 def _shell_operand_realpath(tok: str) -> Optional[str]:
     """Best-effort resolve of a shell token to an absolute realpath.
 
@@ -6275,9 +6385,13 @@ def _shell_operand_realpath(tok: str) -> Optional[str]:
         A realpath string, or None if the token is not a resolvable path
         (flags, env assignments, bare words, URLs, empty tokens).
     """
-    t = tok.strip().strip("'\"")
-    t = t.lstrip("<>")  # strip redirection markers (>>/etc/foo)
+    t = tok.strip().lstrip("<>")  # strip redirection markers (>>/etc/foo)
+    # Expand before stripping the quotes: the unset pass must see `'...'` to
+    # honour bash's no-expansion rule (M3). `$HOME` stays the blind G1 pass
+    # (a quoted `$HOME` over-prompts; pinned by G1).
     t = _shell_expand_home_refs(t)  # $HOME/.x == ~/.x (G1)
+    t = _shell_expand_unset_refs(t)  # $UNSET/tmp/x -> /tmp/x (M3)
+    t = t.strip().strip("'\"")
     if not t or t.startswith("-"):
         return None
     if "*" in t or "?" in t:
@@ -6357,8 +6471,10 @@ def _shell_token_path_candidates(tok: str, program: str = "") -> list:
     # Expand the home spellings before looking for embedded paths, so
     # `sh -c 'cat $HOME/.bashrc'` yields `~/.bashrc` just like `~` would (G1):
     # the regex cannot match a `/` that follows the `E` of `$HOME`, and with
-    # `${HOME}` it matched the wrong path (`/.bashrc`).
-    for frag in _EMBEDDED_ABS_PATH_RE.findall(_shell_expand_home_refs(tok)):
+    # `${HOME}` it matched the wrong path (`/.bashrc`). The unset pass (M3)
+    # does the same for `$UNSET/tmp/x` -> `/tmp/x`.
+    expanded = _shell_expand_unset_refs(_shell_expand_home_refs(tok))
+    for frag in _EMBEDDED_ABS_PATH_RE.findall(expanded):
         try:
             real = os.path.realpath(os.path.expanduser(frag))
         except Exception:

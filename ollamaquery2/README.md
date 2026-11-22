@@ -291,7 +291,10 @@ File tools (`read_file`, `write_file`, `edit_file`, `list_directory`) and
   paths hidden inside a code blob are seen too — `python3 -c
   "open('/etc/passwd')"`, `sh -c 'cat /etc/passwd'`, `dd if=/etc/shadow` are
   caught, while prose that merely names a path (`git commit -m 'fix /etc
-  handling'`) is not scanned.
+  handling'`) is not scanned. Shell variables follow bash: an **unset** simple
+  variable expands to the empty string, so `echo x > $UNSET/tmp/x` is a
+  `/tmp` write and is denied; a **defined** variable stays opaque (documented
+  limit), and a single-quoted spelling is a literal name.
 
 Inspect and influence the policy with `/agentic acl`:
 

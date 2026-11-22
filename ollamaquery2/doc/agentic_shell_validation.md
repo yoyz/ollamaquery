@@ -161,6 +161,22 @@ Key faithful details:
     `TestShellRedirectWriteSemantics` (23 tests).
     Conservative over-blocking is deliberate and pinned: a *quoted* `~`/`$HOME`
     (which bash does not expand) still asks.
+*   **Unset variables expand like bash (M3, closed 2026-11-22).**
+    `_shell_operand_realpath` bailed out on any `$`, so `echo x > $UNSET/tmp/x`
+    was `allow` while bash expands the empty variable and writes `/tmp/x`,
+    bypassing the temp-root deny; `${UNSET}/etc/hosts` was caught only by
+    accident (the `}` slips past the embedded-path lookbehind).
+    `_shell_expand_unset_refs` now replaces a **simple** `$NAME`/`${NAME}`
+    absent from `os.environ` with the empty string before the scan, and leaves
+    a **defined** variable opaque (a path held in `$XDG_CONFIG_HOME` is still
+    a documented limit) and `$HOME` to the G1 pass. Single quotes suppress
+    expansion, double quotes allow it, and `\$` is literal, so
+    `echo x > '$UNSET/tmp/x'` stays a CWD name instead of a false `/tmp`
+    deny. `$TMPDIR` is deliberately left to the TMPDIR pass (a context value,
+    not an unset variable). A nested `-c` payload keeps its M2 home/root scan;
+    its relative ACL paths (and `$UNSET` inside the payload, where the inner
+    shell expands it) are H3's job.
+    `tests/test_acl.py::TestShellUnsetVarExpansion` (9).
 *   **`-c` payloads are gated too (M2, closed 2026-11-19).** The guard used to
     read only the first-level tokens, so `bash -c "rm -rf ~"` was a plain `ask`
     that `auto_confirm` approved while a direct `rm -rf ~` is denied — a hole

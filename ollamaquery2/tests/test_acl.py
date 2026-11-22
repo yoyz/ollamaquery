@@ -747,8 +747,15 @@ class TestShellHomeRefExpansion(unittest.TestCase):
         self.assertIsNone(self._scan("echo x > ~/notes.txt"))
 
     def test_longer_variable_name_is_not_rewritten(self):
+        # `$HOMEDIR` is not `$HOME`: the G1 pass leaves it alone. Under M3 it
+        # is an *unset* simple variable, so bash writes `/notes.txt` and the
+        # scan now denies it (it used to be opaque). Pin the new behaviour.
         self.assertEqual(m._shell_expand_home_refs("$HOMEDIR/x"), "$HOMEDIR/x")
-        self.assertIsNone(self._scan("echo x > $HOMEDIR/notes.txt"))
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HOMEDIR", None)
+            res = self._scan("echo x > $HOMEDIR/notes.txt")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
 
     def test_quoted_home_still_asks_conservatively(self):
         # bash expands neither `~` nor `$HOME` inside quotes, so these create a
@@ -758,6 +765,73 @@ class TestShellHomeRefExpansion(unittest.TestCase):
         for cmd in ('echo x > "~/.bashrc"', "echo x > '$HOME/.bashrc'"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(self._scan(cmd))
+
+
+class TestShellUnsetVarExpansion(unittest.TestCase):
+    """M3: an unset simple variable expands to "" like bash.
+
+    `_shell_operand_realpath` bailed out on any `$`, so
+    `echo x > $UNSET/tmp/x` was `allow` while bash expands the empty variable
+    and writes `/tmp/x` — bypassing the temp-root deny. Single quotes suppress
+    expansion, so a quoted spelling must stay a literal CWD name (no false
+    deny). `$HOME` keeps its own G1 pass, and `$TMPDIR` is the TMPDIR step
+    (a context value, not an unset variable).
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx)
+
+    def test_unset_var_in_a_redirect_is_denied(self):
+        for cmd in ("echo x > $UNSET/tmp/x",
+                    'echo x > "$UNSET/tmp/x"',
+                    "echo x > ${UNSET}/etc/hosts",
+                    "echo x > $UNSET/.bashrc"):
+            with self.subTest(cmd=cmd):
+                res = self._scan(cmd)
+                self.assertIsNotNone(res, cmd)
+                self.assertFalse(res["approved"], cmd)
+
+    def test_unset_var_in_a_read_operand_is_seen(self):
+        with patch.object(m.PathAcl, "prompt", return_value=False):
+            res = self._scan("cat $UNSET/etc/passwd")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+
+    def test_gate_denies_even_with_auto_confirm(self):
+        self.ctx.auto_confirm = True
+        res = m.check_shell_approval("echo x > $UNSET/tmp/x", self.ctx)
+        self.assertFalse(res["approved"])
+
+    def test_single_quoted_unset_var_is_literal(self):
+        # bash does not expand inside '...': this is a literal CWD name.
+        self.assertIsNone(self._scan("echo x > '$UNSET/tmp/x'"))
+
+    def test_escaped_dollar_is_literal(self):
+        self.assertIsNone(self._scan(r"echo x > \$UNSET/tmp/x"))
+
+    def test_defined_var_stays_opaque(self):
+        # Documented limit: a path held in a defined variable is not resolved.
+        with patch.dict(os.environ, {"AQ_TEST_PATH": "/etc"}, clear=False):
+            self.assertIsNone(self._scan("echo x > $AQ_TEST_PATH/passwd"))
+
+    def test_unset_var_in_a_code_blob_is_expanded(self):
+        res = self._scan("python3 -c \"open('$UNSET/tmp/x','w')\"")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+
+    def test_unset_var_alone_is_not_a_path(self):
+        self.assertEqual(m._shell_expand_unset_refs("$UNSET"), "")
+        self.assertIsNone(m._shell_operand_realpath("$UNSET"))
+
+    def test_tmpdir_is_left_to_the_tmpdir_pass(self):
+        # M3 must not turn `$TMPDIR` into "" (that would resolve to `/out`
+        # before the TMPDIR step sets the context value).
+        self.assertEqual(m._shell_expand_unset_refs("$TMPDIR/out"),
+                         "$TMPDIR/out")
+        self.assertIsNone(m._shell_operand_realpath("$TMPDIR/out"))
 
 
 class TestShellLineContinuationInWords(unittest.TestCase):
