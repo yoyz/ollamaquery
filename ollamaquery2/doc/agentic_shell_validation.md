@@ -38,7 +38,7 @@ agent command (whole string)
     │
     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  L0  container-skip         Executor.mode == "container" → allow     │
+│  L0  sandbox-skip          Executor.mode is container or bwrap → allow  │
 ├─────────────────────────────────────────────────────────────────────┤
 │  L1  home/root hard-guard   rm with ~/ $HOME /  → deny (immune)     │
 ├─────────────────────────────────────────────────────────────────────┤
@@ -285,8 +285,10 @@ stays `ask` → `auto_confirm` or prompt.
 `check_shell_approval:6352` signature
 `check_shell_approval(command, ctx, executor_mode) → {approved, effect, message, verdict}`:
 
-1.  `executor_mode == container` → `allow` (host paths bind-mounted but
-    container is sandboxed; matches `hermes_style_approval.py:619` skip).
+1.  `executor_mode` is `container` or `bwrap` → `allow` (the sandbox is the
+    boundary: container namespaces/image, or bwrap's mount policy; matches
+    `hermes_style_approval.py:619` skip). bwrap was added in 0.5.0: the gate is
+    bypassed by design there, and `doc/agentic_bwrap.md` owns that contract.
 2.  `norm + shell_check_command` on both forms → home guard → `deny` with
     `BLOCKED (rejected): …` (contains `rejected` for `test_agentic.py:401`
     compat).
@@ -419,7 +421,7 @@ Borrowed **only** the de-obfuscation slice:
 *   Approval UX `[o]nce/[s]ession/[a]lways/[d]eny` timeout + `smart` LLM judge —
     simplified to `[y/N/s/a/d]`; `smart` not needed.
 *   Container skip for `docker`/`singularity`/`modal` — kept minimal
-    `executor_mode == container → allow`.
+    `executor_mode in (container, bwrap) → allow`.
 *   Config file `~/.hermes_style_approval.json` — session
     `_SHELL_SESSION_APPROVED` only (no disk persistence yet).
 

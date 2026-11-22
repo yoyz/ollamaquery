@@ -411,11 +411,17 @@ class TestSubcommandCompletion(unittest.TestCase):
     def test_first_level_subcommands(self):
         c = self._completer()
         matches = self._candidates(c, '/agentic ', '')
-        for sub in ('on', 'off', 'full', 'auto', 'plan', 'sandbox', 'verbose',
+        for sub in ('on', 'off', 'full', 'auto', 'preset', 'plan', 'sandbox', 'verbose',
                     'thinking', 'trace', 'log', 'lazytool', 'iterations',
                     'timeout', 'heartbeattokens', 'compactthreshold', 'acl',
                     'status'):
             self.assertIn(sub, matches)
+
+    def test_preset_second_level(self):
+        c = self._completer()
+        matches = self._candidates(c, '/agentic preset ', '')
+        for name in ('read', 'exec', 'work', 'trusted'):
+            self.assertIn(name, matches)
 
     def test_first_level_no_top_level_commands(self):
         c = self._completer()

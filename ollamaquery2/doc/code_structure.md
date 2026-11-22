@@ -1,6 +1,6 @@
 # Code Structure — ollamaquery2.py
 
-Snapshot: **2026-11-19**, `__version__ = "0.4.5"`, **22 695 lines**.
+Snapshot: **2026-11-22**, `__version__ = "0.5.0"`, **24 088 lines**.
 Regenerated from the section markers (`# ============= …`) and an AST pass, not
 patched by hand — see §8. Numbers drift; regenerate rather than trust a diff.
 
@@ -18,8 +18,12 @@ patched by hand — see §8. Numbers drift; regenerate rather than trust a diff.
 > the per-backend wiring in the request/listing paths; every range below the
 > utility section is shifted once more. The `0.4.5` pass (2026-11-19) is net
 > **+11 lines** over `0.4.4` (a sampling entry withdrawn, the reasoning-only
-> nudge, two parser fixes and the SSE keep-alive filter added), so the ranges
-> below are unchanged. The header count is current.
+> nudge, two parser fixes and the SSE keep-alive filter added). The `0.5.0`
+> pass (2026-11-22) adds ~700 lines: the bwrap engine (`Executor`, the
+> sandbox-home lifecycle, the probe), the preset resolver
+> (`AgenticPreset`/`resolve_preset`/`agentic_active_tools`), the `/agentic
+> preset` and `sandbox` surfaces, and the CLI/env wiring. Every range after
+> the Executor is shifted; the header count is current.
 
 > Historical note: the previous revision of this file described a ~4 300-line
 > version and placed `ChatLoop` at lines 2109–2737. That document was stale by

@@ -152,7 +152,7 @@ folded. Tab completion on `/resume ` offers every saved slug and id. The newest
 | `git_inspect`              | Read-only git inspection: `status`, `diff`, `diff_staged`, `diff_head`, `log` (any ref, path-scoped, renames followed), `show`, `blame -L` (fixed argv, no shell) |
 | `path_policy`              | Read-only: the session path map (allowed / needs confirmation / forbidden), or the verdict for one path — no filesystem access, no prompt |
 
-Subcommands: `/agentic auto`, `plan [on|off|run]`, `sandbox`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `iterations <N>`, `timeout <N>`.
+Subcommands: `/agentic on|off|full`, `preset [read|exec|work|trusted]`, `plan [on|off|run]`, `sandbox [host|container|bwrap|status]`, `auto`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `iterations <N>`, `timeout <N>`, `status`.
 
 The model is steered to use the **dedicated file tools** (`read_file`, `write_file`,
 `edit_file`, `grep`, `glob`, `list_directory`) instead of shell equivalents (`cat`,
@@ -177,7 +177,40 @@ is the deeper tier: it re-adds `run_command`, which always asks for confirmation
 (bypass-immune), for shell-only inspection. In both tiers the model can only
 query, never modify.
 
-Safety features: destructive tool confirmation, path ACL (see below), shell approval gate, step timeout (default 300s), stuck detection, same-tool-loop abort (after 10 consecutive identical calls), optional container sandbox (podman/docker).
+Safety features: destructive tool confirmation, path ACL (see below), shell approval gate, step timeout (default 300s), stuck detection, same-tool-loop abort (after 10 consecutive identical calls), and a rootless bwrap sandbox (default for agentic) or a container sandbox (podman/docker).
+
+#### Presets — the stance, not just a toggle
+
+An agentic session has four presets. A preset is a **quadruplet**: the intent put
+in the prompt, the tool surface, the approval rule, and the sandbox mount policy.
+The same resolver drives all four, so the prompt, the native `tools` schema, the
+backstop and the `Executor` cannot disagree.
+
+| Preset                       | Surface                                                                                      | Sandbox                               | Promise                                                   |
+| ---------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------- | --------------------------------------------------------- |
+| **`read`** (alias `plan`)    | inspection tools only, no shell                                                              | none                                  | no write, no code                                         |
+| **`exec`**                   | read + `run_command`/`run_python`, **no** `write_file`/`edit_file`/`apply_patch`/`fetch_url` | bwrap, project **ro**, net **none**   | runs commands, cannot modify the project                  |
+| **`work`** (default)         | every tool                                                                                   | bwrap, project **rw**, net **shared** | works in the project; the rest of the host is not mounted |
+| **`trusted`** (alias `full`) | every tool                                                                                   | **host**, auto-confirm                | everything allowed, only the hard denies                  |
+
+```text
+/agentic preset                 # list the presets and the active one
+/agentic preset exec            # read + run, project read-only, no network
+/agentic preset show            # the active quadruplet + the effective tool surface
+/agentic preset work            # the daily stance (also what `/agentic on` selects)
+/agentic plan                   # alias for the read preset
+/agentic full                   # alias for the trusted preset
+```
+
+`/agentic auto` keeps its historical meaning (toggle auto-confirm); the preset
+alias `auto` is available as `/agentic preset auto` = `trusted`.
+
+Three invariants: **shell writes** are bounded by the bwrap mounts (the kernel
+returns EROFS), **file writes** stay governed by the Path ACL, and **host**
+execution only happens in `trusted` (or with an explicit `--sandbox-engine host`).
+File tools run in the harness, not in the sandbox; `exec` therefore removes the
+write tools from the surface instead of pretending the mount protects them.
+
 
 Each step's stream is also checked for **completeness**: a turn cut mid-generation
 (dropped connection, `finish_reason: length` output cap, malformed frames) or a
@@ -302,6 +335,54 @@ local kernel check.
 Only enable this if you trust the model's reliability — a compromised or
 unpredictable model could read, write, or execute arbitrary commands without
 oversight.
+
+### Sandbox engines: bwrap (default for agentic), container, host
+
+`run_command` / `run_python` run in one of three engines. The `work` and `exec`
+presets select **bwrap**; `trusted` selects **host**; `--sandbox-engine` is the
+explicit override (CLI beats env). bwrap is rootless, daemon-free and starts
+instantly — no image, no pull, no container runtime.
+
+```text
+> /agentic on
+[Agentic preset: work — tools=all sandbox=bwrap approve=auto]
+[Sandbox] bwrap (project rw, net shared, host ro; no cgroup cap (v1)]
+
+> /agentic preset exec
+[Agentic preset: exec — tools=10 read/exec sandbox=bwrap approve=auto]
+[Sandbox] bwrap (project ro, net none, host ro; no cgroup cap (v1))
+```
+
+The mount policy **is** the contract in this mode (the shell gate is bypassed,
+like a container):
+
+| Path / object                                                             | Mount                                                                     | Why                                                                |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, `/var`, `/run`, `/opt` | `--ro-bind-try`                                                           | host binaries, config, DNS (`/etc/resolv.conf` points into `/run`) |
+| `/tmp`, `/var/tmp`                                                        | `--tmpfs`                                                                 | disposable; the session scratch is re-bound inside                 |
+| project (CWD)                                                             | `--bind` rw (work) or `--ro-bind` (exec)                                  | same absolute path as the host, so model paths stay coherent       |
+| session scratch `/tmp/ollamaquery/pid-N`                                  | `--bind` rw                                                               | `/agentic scratch` keeps working                                   |
+| `~/.ollamaquery.d/sandbox/pid-N/home`                                     | `--bind` rw                                                               | pip/npm caches; **the real `$HOME` is never mounted**              |
+| `/dev`, `/proc`                                                           | `--dev`, `--proc`                                                         | the namespace's own                                                |
+| network                                                                   | `--share-net` (work) or `--unshare-net` (exec)                            | builds/installs vs no DNS/no downloads                             |
+| isolation                                                                 | `--unshare-all --die-with-parent --new-session --cap-drop ALL --clearenv` | namespaces, caps, minimal env                                      |
+
+```bash
+python3 ollamaquery2.py -c --sandbox-engine bwrap \
+  --sandbox-bwrap-project ro --sandbox-bwrap-rw "$PWD/build" \
+  --sandbox-bwrap-net none --sandbox-bwrap-bind /data:ro
+
+/agentic sandbox bwrap|container|host|status   # switch/inspect at runtime
+```
+
+Limits, stated rather than implied: **no cgroup cap** in v1 (a fork bomb or a
+huge build is not contained; use the container for that), host binaries only
+(no package installation), Linux with unprivileged user namespaces, no
+dedicated seccomp profile, and shared network = the sandbox can exfiltrate.
+The probe is **fail-closed**: if bwrap is missing or user namespaces are
+refused, tool commands are refused with a clear message — never silently run on
+the host. `--sandbox-engine host` (or `trusted`) is the explicit way to run
+unsandboxed. Full detail: `doc/agentic_bwrap.md`.
 
 ### Running Agentic in a Container Sandbox
 
@@ -440,10 +521,12 @@ Trust boundaries at a glance; the sections above give the details.
   commands and skips destructive-tool confirmations. Home/root hard-denies and
   Path-ACL `ask` rules still apply, but the model can otherwise execute on the
   host without a prompt.
-- **Container sandbox is a different, looser boundary.** `run_command` /
-  `run_python` execute inside the container and skip the host shell gate and
-  ACL operand scan. The working directory is bind-mounted read-write; the file
-  tools still run on the host and stay under the Path ACL.
+- **Container and bwrap sandboxes are a different, looser boundary.** `run_command` /
+  `run_python` execute inside the sandbox and skip the host shell gate and ACL
+  operand scan. Containers bind the project read-write; bwrap does too in `work`
+  and read-only in `exec`. The file tools still run on the host and stay under
+  the Path ACL (which is why `exec` removes the write tools from the surface).
+  bwrap has no cgroup ceiling in v1; the throwaway container keeps `--memory`/`--cpus`.
 - **Path ACL coverage.** File tools and shell operands are governed (see
   "Access Control" above). `run_python` inline code, `diff`/`apply_patch`
   contents, and `glob` are not scanned.
@@ -530,12 +613,14 @@ See `doc/similar_project.md` for a detailed comparison with Aider, Open Interpre
 
 ## References
 
-| Reference                                                       | What it is                                                                                                                           |
-| --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| [MCP specification](https://modelcontextprotocol.io)            | Protocol source of truth; the built-in MCP client targets revision `2025-11-25`                                                      |
-| [Neumann-Labs/mcp-cpp](https://github.com/Neumann-Labs/mcp-cpp) | Spec-faithful C++20 MCP SDK. Used as a wire-format oracle; check its license before vendoring source                                 |
-| `doc/mcp.md`                                                    | MCP configuration reference, security model, and local test-server guide                                                             |
-| `doc/mcp-conformance.md`                                        | Conformance review of the built-in MCP client against mcp-cpp: findings, capability matrix, fix plan                                 |
+| Reference                                                       | What it is                                                                                                                          |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| [MCP specification](https://modelcontextprotocol.io)            | Protocol source of truth; the built-in MCP client targets revision `2025-11-25`                                                     |
+| [Neumann-Labs/mcp-cpp](https://github.com/Neumann-Labs/mcp-cpp) | Spec-faithful C++20 MCP SDK. Used as a wire-format oracle; check its license before vendoring source                                |
+| `doc/mcp.md`                                                    | MCP configuration reference, security model, and local test-server guide                                                            |
+| `doc/mcp-conformance.md`                                        | Conformance review of the built-in MCP client against mcp-cpp: findings, capability matrix, fix plan                                |
+| `doc/agentic_bwrap.md`                                          | Rootless bwrap execution engine: mount policy, measured limits, presets, CLI/env, test commands                                     |
+| `doc/self_ai_review.md`                                         | Read-only self-AI review workflow: freeze a diff bundle, run the `read` preset, budgets/timeouts, verify the findings before acting |
 
 ## License
 

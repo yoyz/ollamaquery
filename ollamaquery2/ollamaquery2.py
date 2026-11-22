@@ -67,7 +67,7 @@ except ImportError:
 import atexit
 
 
-__version__ = "0.4.5"
+__version__ = "0.5.0"
 
 
 # ============================================================================
@@ -267,6 +267,22 @@ DEFAULT_CONTAINER_IMAGE = "docker.io/library/python:3.12-alpine"
 # container is the user's, with its own limits).
 DEFAULT_CONTAINER_MEMORY = "1g"
 DEFAULT_CONTAINER_CPUS = "1"
+# Agentic execution engine. "host" runs through the shell gate; "container"
+# uses podman/docker; "bwrap" (bubblewrap) is a rootless sandbox whose mount
+# policy is the contract (the shell gate is bypassed, as with container).
+DEFAULT_SANDBOX_ENGINE = "host"
+SANDBOX_ENGINES = ("host", "container", "bwrap")
+DEFAULT_BWRAP_PROJECT = "rw"
+DEFAULT_BWRAP_NET = "shared"
+BWRAP_PROBE_TIMEOUT = 5
+BWRAP_SANDBOX_DIR = os.path.expanduser("~/.ollamaquery.d/sandbox")
+# Read-only host mounts: binaries, libraries, config and DNS. /run must stay
+# readable because /etc/resolv.conf is a symlink into /run/systemd/resolve on
+# systemd hosts; without it getent/DNS fails inside the sandbox (measured).
+BWRAP_READ_ONLY_BINDS = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc",
+                         "/var", "/run", "/opt")
+BWRAP_ENV_PATH = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+BWRAP_ENV_LANG = "C.UTF-8"
 # Per-response output cap (always on; see /maxtokens). Sent to the backend as
 # Ollama `options.num_predict` or OpenAI-compatible `max_tokens`; it includes
 # reasoning/thinking tokens. The cap is lowered at request time so the prompt
@@ -490,7 +506,7 @@ COMMANDS = {
         'aliases': ['/agentic'],
         'category': 'Settings',
         'description': 'Configure agentic mode and sub-options',
-        'usage': '/agentic [on|off|full|auto|plan [on|off|run]|sandbox|verbose|thinking|trace|log|acl|iterations|timeout|status]',
+        'usage': '/agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status]|verbose|thinking|trace|log|acl|iterations|timeout|status]',
         'handler': None
     },
     'listtool': {
@@ -2057,13 +2073,26 @@ class CommandContext:
         # Execution state
         self.debug_mode: bool = False
         self.stream_enabled: bool = True
-        # Container sandbox (Executor); --sandbox-* flags fill these in
-        self.executor_mode: str = "host"
+        # Container/bwrap sandbox (Executor); --sandbox-* flags fill these in
+        self.executor_mode: str = DEFAULT_SANDBOX_ENGINE
+        self.sandbox_engine_override: Optional[str] = None
         self.container_runtime: Optional[str] = None
         self.container_image: Optional[str] = None
         self.container_name: Optional[str] = None
         self.container_memory: Optional[str] = None
         self.container_cpus: Optional[str] = None
+        # bwrap sandbox policy (see Executor._bwrap_command): the mount policy
+        # is the contract, since the shell gate is bypassed in this mode.
+        self.bwrap_project: str = DEFAULT_BWRAP_PROJECT
+        self.bwrap_net: str = DEFAULT_BWRAP_NET
+        self.bwrap_project_override: Optional[str] = None
+        self.bwrap_net_override: Optional[str] = None
+        self.bwrap_binds: list = []   # [(path, "ro"|"rw"), ...]
+        self.bwrap_rw: list = []      # extra rw subtrees when project is ro
+        # Agentic preset: read / exec / work / trusted (see resolve_preset).
+        # It is the stance (intent + surface + approval + mounts); the legacy
+        # flags above remain the mechanism the rest of the code reads.
+        self.preset: str = "work"
 
         # Statistics (cumulative)
         self.total_queries: int = 0
@@ -2175,16 +2204,21 @@ class CommandContext:
         """Create an Executor for agentic tool execution.
 
         Reads the sandbox settings from the context, so `--sandbox-image`,
-        `--sandbox-container` and `--sandbox-runtime` (stored by
-        `_apply_sandbox_args`) reach both the loop's executor and the tool
-        registry's executor without either of them knowing about argparse.
+        `--sandbox-container`, `--sandbox-runtime` and the bwrap policy
+        (stored by `_apply_sandbox_args` and by `/agentic preset`) reach both
+        the loop's executor and the tool registry's executor without either of
+        them knowing about argparse.
         """
         return Executor(mode=getattr(self, "executor_mode", "host"),
                         container_runtime=getattr(self, "container_runtime", None),
                         container_image=getattr(self, "container_image", None),
                         container_name=getattr(self, "container_name", None),
                         container_memory=getattr(self, "container_memory", None),
-                        container_cpus=getattr(self, "container_cpus", None))
+                        container_cpus=getattr(self, "container_cpus", None),
+                        bwrap_project=getattr(self, "bwrap_project", DEFAULT_BWRAP_PROJECT),
+                        bwrap_net=getattr(self, "bwrap_net", DEFAULT_BWRAP_NET),
+                        bwrap_binds=getattr(self, "bwrap_binds", None),
+                        bwrap_rw=getattr(self, "bwrap_rw", None))
 
     def create_tool_registry(self) -> 'ToolRegistry':
         """Create a ToolRegistry for agentic mode."""
@@ -3686,6 +3720,17 @@ You are operating in READ-ONLY PLANNING MODE. Your job is to INSPECT and PLAN, n
 - Never attempt write_file, run_python, patch, edit_file, or apply_patch — they are disabled in this mode.
 - When you have gathered enough information, present a clear, step-by-step plan to the user. Do NOT execute the plan yourself."""
 
+# `exec` preset block: read + run, but the project is mounted read-only in the
+# sandbox. The shell gate is bypassed (mounts are the barrier), so the model
+# must be told why a write fails instead of retrying it another way.
+AGENTIC_EXEC_BLOCK = """## Execution preset (read + run, no project writes)
+You may inspect files and run commands, but you must NOT modify the project.
+
+- The project is mounted READ-ONLY in the command sandbox: writes to it fail with "Read-only file system" (EROFS). The session scratch directory and the sandbox HOME are writable and are the only places to put temporary artifacts.
+- write_file, edit_file, patch and apply_patch are disabled in this preset. There is no way to change project files here — do not try to route around it with a shell command.
+- There is no network in the command sandbox and fetch_url is disabled. Do not attempt downloads or installs. (The read-only cluster tool runs in the harness, not in the sandbox, and may still reach its configured cluster.)
+- Use read_file/list_directory/glob/grep/git_inspect/kubernetes_cluster_query/path_policy to inspect, and run_command/run_python to build, test or execute. Report what you find; state clearly what the user would need to change (a file edit, a grant, or the `work` preset)."""
+
 # Registry mapping format style names to their blocks.
 AGENTIC_FORMAT_REGISTRY = {
     "strict": AGENTIC_FORMAT_STRICT,
@@ -3753,7 +3798,8 @@ def get_prompt_style(model_name: str) -> str:
 
 def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
                        include_tool_defs: bool = True, plan_mode: bool = False,
-                       plan_run: bool = False, persona: str = "") -> str:
+                       plan_run: bool = False, persona: str = "",
+                       preset: str = "") -> str:
     """Assemble the agentic system prompt from composable blocks.
 
     Args:
@@ -3774,6 +3820,9 @@ def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
             handle multiple system turns, and the persona goes first so the
             protocol rules win any conflict. Empty means no persona (unchanged
             output, e.g. a test double).
+        preset: The active preset name (`read`/`exec`/`work`/`trusted`). `exec`
+            appends its own block; `read` is expressed by plan_mode; `work` and
+            `trusted` need no extra prose.
 
     Format selection:
         - openai tool format (native tools API): AGENTIC_FORMAT_NATIVE — never
@@ -3796,6 +3845,8 @@ def get_agentic_prompt(model_name: str, tool_defs_block: str = "",
         blocks.append(AGENTIC_EXAMPLE_REGISTRY[style])
     if plan_mode:
         blocks.append(AGENTIC_PLAN_RUN_BLOCK if plan_run else AGENTIC_PLAN_BLOCK)
+    elif preset == "exec":
+        blocks.append(AGENTIC_EXEC_BLOCK)
     blocks.append(AGENTIC_RULES_BLOCK)
     return "\n\n".join(blocks)
 
@@ -3823,7 +3874,8 @@ def agentic_system_prompt(ctx, tool_defs_block: str = "",
         ctx.model, tool_defs_block, include_tool_defs=include_tool_defs,
         plan_mode=bool(getattr(ctx, "plan_mode", False)),
         plan_run=bool(getattr(ctx, "plan_run", False)),
-        persona=getattr(ctx, "_saved_system_prompt", "") or "")
+        persona=getattr(ctx, "_saved_system_prompt", "") or "",
+        preset=getattr(ctx, "preset", ""))
 
 
 # Model-specific inference parameters for agentic/tool-calling mode.
@@ -6355,14 +6407,15 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
     Args:
         command: The raw command string.
         ctx: Optional CommandContext (for path ACL + auto_confirm).
-        executor_mode: "host" or "container" (container skips the gate).
+        executor_mode: "host", "container" or "bwrap" (sandboxed modes skip
+            the gate: their mount/namespace policy is the contract).
 
     Returns:
         dict: {"approved": bool, "effect": str, "message": str|None, "verdict": dict}
     """
     if not command or not command.strip():
         return {"approved": False, "effect": "deny", "message": "Empty command", "verdict": None}
-    if executor_mode == "container":
+    if executor_mode in ("container", "bwrap"):
         return {"approved": True, "effect": "allow", "message": None, "verdict": None}
 
     # Build verdict via opencode
@@ -6409,11 +6462,101 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
     return _shell_prompt_approval(command, verdict)
 
 # ============================================================================
-# ============= EXECUTOR (CONTAINER/HOST)  ===================================
+# ============= EXECUTOR (HOST/CONTAINER/BWRAP)  =============================
 # ============================================================================
 
+_BWRAP_HOME_CACHE: list = []   # one-slot cache: [path]
+
+
+def _sweep_dead_bwrap_homes() -> None:
+    """Remove sandbox-home trees left behind by dead sessions.
+
+    The directory is per-process (`<root>/pid-<n>/home`), so a crashed session
+    must not accumulate gigabytes of pip/npm caches forever. A live session is
+    never touched, however idle (the same liveness rule as the spill dirs).
+    """
+    try:
+        entries = os.listdir(BWRAP_SANDBOX_DIR)
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.startswith("pid-"):
+            continue
+        try:
+            pid = int(entry[4:])
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, 0)
+            continue          # owner still alive
+        except ProcessLookupError:
+            pass
+        except (PermissionError, OSError):
+            continue          # cannot prove it is dead -> leave it alone
+        try:
+            shutil.rmtree(os.path.join(BWRAP_SANDBOX_DIR, entry))
+        except OSError:
+            pass
+
+
+def _cleanup_bwrap_home() -> None:
+    """Remove this session's sandbox home at exit (best effort)."""
+    if not _BWRAP_HOME_CACHE:
+        return
+    if os.environ.get("OLLAMAQUERY_KEEP_SCRATCH"):
+        return
+    leaf = os.path.dirname(_BWRAP_HOME_CACHE[0])
+    try:
+        shutil.rmtree(leaf)
+    except OSError:
+        pass
+
+
+def _bwrap_sandbox_home() -> str:
+    """Return this session's writable sandbox HOME (created on first use).
+
+    The real `$HOME` is never mounted: the sandbox gets a private directory so
+    pip/npm caches work without exposing dotfiles or SSH keys.
+    """
+    if _BWRAP_HOME_CACHE:
+        return _BWRAP_HOME_CACHE[0]
+    _sweep_dead_bwrap_homes()
+    path = os.path.join(BWRAP_SANDBOX_DIR, f"pid-{os.getpid()}", "home")
+    _ensure_private_dir(path)
+    _BWRAP_HOME_CACHE.append(path)
+    atexit.register(_cleanup_bwrap_home)
+    return path
+
+
+def _parse_bwrap_bind(spec: str) -> tuple:
+    """Parse one `PATH[:ro|rw]` bind specification.
+
+    Args:
+        spec: A path, optionally suffixed with `:ro` or `:rw` (default ro).
+
+    Returns:
+        (path, "ro"|"rw") with the path realpath'd and `~` expanded.
+
+    Raises:
+        ValueError: when the mode is neither `ro` nor `rw`.
+    """
+    mode = "ro"
+    path = spec
+    if ":" in spec:
+        candidate_path, _, candidate_mode = spec.rpartition(":")
+        if candidate_mode in ("ro", "rw"):
+            path, mode = candidate_path, candidate_mode
+        elif candidate_mode:
+            raise ValueError(f"invalid bwrap bind mode '{candidate_mode}' (use ro or rw)")
+    if not path:
+        raise ValueError("empty bwrap bind path")
+    return os.path.realpath(os.path.expanduser(path)), mode
+
+
 class Executor:
-    """Runs shell commands on host or inside a container sandbox.
+    """Runs shell commands on host, in a container, or in a bwrap sandbox.
 
     Two container flavours, selected by `container_name`:
 
@@ -6427,20 +6570,33 @@ class Executor:
     local image, and an unpullable image used to be retried (silently) on every
     single command.
 
+    bwrap mode is a rootless sandbox with no daemon and no image. Its mount
+    policy is the contract: host trees are read-only, the project is rw or ro,
+    the session scratch dir and a private sandbox HOME are rw, and the shell
+    gate is bypassed (there is nothing to approve — the kernel enforces the
+    mounts). The probe is fail-closed: a missing/unusable bwrap refuses the
+    command instead of silently running it on the host.
+
     Call map:
-      run() → _container_command() → _run_shell()
+      run() → _container_command() | _bwrap_command() → _run_shell()
       _container_command() → _pre_pull_image() | _container_workdir()
+      _bwrap_command() → _bwrap_probe() | _bwrap_sandbox_home()
     """
 
     def __init__(self, mode: str = "host", container_runtime: Optional[str] = None,
                  container_image: Optional[str] = None,
                  container_name: Optional[str] = None,
                  container_memory: Optional[str] = None,
-                 container_cpus: Optional[str] = None) -> None:
-        """Initialize the executor with host/container mode and runtime settings.
+                 container_cpus: Optional[str] = None,
+                 bwrap_project: str = DEFAULT_BWRAP_PROJECT,
+                 bwrap_net: str = DEFAULT_BWRAP_NET,
+                 bwrap_binds: Optional[list] = None,
+                 bwrap_rw: Optional[list] = None,
+                 bwrap_home: Optional[str] = None) -> None:
+        """Initialize the executor with its mode and sandbox settings.
 
         Args:
-            mode: "host" or "container".
+            mode: "host", "container" or "bwrap".
             container_runtime: podman/docker runtime (defaults to env or podman).
             container_image: Image for container mode (defaults to env or
                 DEFAULT_CONTAINER_IMAGE).
@@ -6451,6 +6607,12 @@ class Executor:
                 container_name: that container's limits are the user's.
             container_cpus: CPU ceiling for the throwaway container (defaults to
                 env or DEFAULT_CONTAINER_CPUS); same caveat.
+            bwrap_project: "rw" or "ro" mount mode for the project in bwrap.
+            bwrap_net: "shared" or "none" network in bwrap.
+            bwrap_binds: Extra [(path, "ro"|"rw")] mounts, applied after the
+                default policy (so an rw bind can lift a read-only subtree).
+            bwrap_rw: Extra rw paths (bound after the project ro-bind).
+            bwrap_home: Override for the private sandbox HOME (tests).
         """
         self.mode = mode
         self.runtime = (container_runtime or os.environ.get("OLLAMAQUERY_CONTAINER_RT")
@@ -6463,6 +6625,15 @@ class Executor:
                        or DEFAULT_CONTAINER_MEMORY)
         self.cpus = (container_cpus or os.environ.get("OLLAMAQUERY_CONTAINER_CPUS")
                      or DEFAULT_CONTAINER_CPUS)
+        self.bwrap_project = "ro" if bwrap_project == "ro" else "rw"
+        self.bwrap_net = "none" if bwrap_net == "none" else "shared"
+        self.bwrap_binds = list(bwrap_binds or [])
+        self.bwrap_rw = list(bwrap_rw or [])
+        self._bwrap_home_override = bwrap_home
+        self.bwrap_path: Optional[str] = None
+        self._bwrap_state = "pending"   # pending | ok | failed
+        self._bwrap_error = ""
+        self._bwrap_warned = False
         self._pull_state = "pending"   # pending | done | failed
         self._workdir_state = "pending"  # pending | resolved
         self._container_workdir: Optional[str] = None
@@ -6470,20 +6641,127 @@ class Executor:
         self._container_mounts_cache: list = []
         self._scratch_warned = False
 
+    # --- bwrap -----------------------------------------------------------
+    def _bwrap_probe(self) -> bool:
+        """Probe bwrap once per executor; a failure is fail-closed.
+
+        Returns:
+            True when bwrap exists and can create a sandbox on this host.
+        """
+        if self._bwrap_state == "ok":
+            return True
+        if self._bwrap_state == "failed":
+            return False
+        self._bwrap_state = "failed"   # pessimistic until the probe succeeds
+        self.bwrap_path = shutil.which("bwrap")
+        if not self.bwrap_path:
+            self._bwrap_error = ("bubblewrap (bwrap) is not installed or not in PATH")
+            return False
+        try:
+            proc = subprocess.run(
+                [self.bwrap_path, "--dev", "/dev", "--ro-bind", "/", "/", "true"],
+                capture_output=True, text=True, timeout=BWRAP_PROBE_TIMEOUT, check=False)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            self._bwrap_error = f"bwrap probe failed: {exc}"
+            return False
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            self._bwrap_error = (f"bwrap probe failed: {tail[-1] if tail else 'exit %d' % proc.returncode}")
+            return False
+        self._bwrap_state = "ok"
+        return True
+
+    def _bwrap_sandbox_home(self) -> str:
+        """Return the private sandbox HOME for this executor."""
+        return self._bwrap_home_override or _bwrap_sandbox_home()
+
+    def _bwrap_ready(self) -> bool:
+        """Probe bwrap and report a refusal once; never fall back to host."""
+        if self._bwrap_probe():
+            return True
+        if not self._bwrap_warned:
+            self._bwrap_warned = True
+            sys.stderr.write(colorize(
+                f"[Sandbox] bwrap unavailable: {self._bwrap_error}\n"
+                f"[Sandbox] tool commands are REFUSED (no silent host fallback): "
+                f"install bubblewrap, or run with --sandbox-engine host / "
+                f"/agentic preset trusted for an explicit unsandboxed session\n",
+                'warning'))
+        return False
+
+    def _bwrap_command(self, command: str) -> str:
+        """Build the bwrap invocation for one sandboxed command.
+
+        Args:
+            command: Shell command to run inside the sandbox.
+
+        Returns:
+            A shell-quoted command string (split again by `_run_shell` with
+            shell=False, so nothing is interpreted twice).
+        """
+        cwd = os.path.realpath(os.getcwd())
+        scratch = _scratch_root()
+        home = self._bwrap_sandbox_home()
+        argv = [self.bwrap_path or "bwrap", "--unshare-all"]
+        argv.append("--share-net" if self.bwrap_net == "shared" else "--unshare-net")
+        argv += ["--die-with-parent", "--new-session", "--cap-drop", "ALL",
+                 "--clearenv"]
+        env = (
+            ("PATH", BWRAP_ENV_PATH),
+            ("HOME", home),
+            ("TERM", os.environ.get("TERM", "dumb")),
+            ("LANG", BWRAP_ENV_LANG),
+            ("TMPDIR", "/tmp"),
+            # git must not try to lock the index or prompt for credentials in
+            # a read-only project; both were measured to bite in `project ro`.
+            ("GIT_OPTIONAL_LOCKS", "0"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+        )
+        for key, value in env:
+            argv += ["--setenv", key, value]
+        for path in BWRAP_READ_ONLY_BINDS:
+            argv += ["--ro-bind-try", path, path]
+        argv += ["--tmpfs", "/tmp", "--tmpfs", "/var/tmp",
+                 "--dev", "/dev", "--proc", "/proc"]
+        if self.bwrap_project == "ro":
+            argv += ["--ro-bind", cwd, cwd]
+        else:
+            argv += ["--bind", cwd, cwd]
+        # The scratch and sandbox HOME stay writable even with project ro:
+        # /tmp is a fresh tmpfs, so the mount points are created by bwrap.
+        argv += ["--bind", scratch, scratch, "--bind", home, home]
+        for path, bind_mode in self.bwrap_binds:
+            flag = "--ro-bind-try" if bind_mode == "ro" else "--bind-try"
+            argv += [flag, path, path]
+        for path in self.bwrap_rw:
+            # Applied after the project's ro-bind, so a subtree can be lifted
+            # back to rw for one command (build/, a generated file's dir).
+            argv += ["--bind-try", path, path]
+        argv += ["--chdir", cwd, "--", "/bin/bash", "-c", command]
+        return " ".join(shlex.quote(part) for part in argv)
+
     def describe(self) -> str:
         """One-line description of what commands run in (for banners/status)."""
+        if self.mode == "bwrap":
+            probe = "" if self._bwrap_state != "failed" else " — UNAVAILABLE"
+            return f"bwrap ({self.describe_target()}; {self.describe_limits()}{probe})"
         if self.mode != "container":
             return "host"
         return f"container ({self.describe_target()}; {self.describe_limits()})"
 
     def describe_target(self) -> str:
-        """What the sandbox is: an image we start, or a container we exec into."""
+        """What the sandbox is: an image, a running container, or a bwrap policy."""
+        if self.mode == "bwrap":
+            net = "net shared" if self.bwrap_net == "shared" else "net none"
+            return f"project {self.bwrap_project}, {net}, host ro"
         if self.container_name:
             return f"exec into {self.container_name}"
         return f"image {self.image}"
 
     def describe_limits(self) -> str:
         """Human form of the resource ceiling in force for this sandbox."""
+        if self.mode == "bwrap":
+            return "no cgroup cap (v1)"
         if self.container_name:
             return "the container's own limits"
         return f"{self.cpus} cpu, {self.memory} memory"
@@ -6673,15 +6951,21 @@ class Executor:
         return " ".join(shlex.quote(part) for part in argv)
 
     def run(self, command: str, timeout: int = 120) -> dict:
-        """Run a shell command on the host or inside a container.
+        """Run a shell command on the host, in a container, or in bwrap.
 
         Args:
             command: The command string to run.
             timeout: Timeout in seconds (default 120).
 
         Returns:
-            dict with stdout, stderr, returncode.
+            dict with stdout, stderr, returncode. In bwrap mode a failed probe
+            returns a refusal message and never falls back to the host.
         """
+        if self.mode == "bwrap":
+            if not self._bwrap_ready():
+                return {"stdout": "", "stderr": f"bwrap unavailable: {self._bwrap_error}",
+                        "returncode": -1}
+            return self._run_shell(self._bwrap_command(command), timeout, is_container=True)
         if self.mode == "container":
             return self._run_shell(self._container_command(command), timeout, is_container=True)
         return self._run_shell(command, timeout)
@@ -6692,7 +6976,9 @@ class Executor:
         Args:
             command: The command string to run.
             timeout: Timeout in seconds.
-            is_container: Whether to run via the container runtime (no gate).
+            is_container: Whether to run through a sandbox launcher (container
+                or bwrap): the gate is skipped and the pre-quoted argv is split
+                with shell=False.
 
         Returns:
             dict with stdout, stderr, returncode.
@@ -6957,6 +7243,131 @@ def plan_active_tools(ctx) -> set:
         return base | set(manager.plan_read_only_names())
     except Exception:
         return base
+
+
+# `exec` preset surface: read + execute, but no write tool and no fetch_url
+# (so `net none` is true for everything the harness does too). run_python is
+# included because writes are bounded by bwrap's read-only project mount, not
+# by the tool list; write_file/edit_file/patch/apply_patch are the tools that
+# would bypass the sandbox entirely.
+EXEC_MODE_TOOLS = (PLAN_MODE_TOOLS - {"fetch_url"}) | {"run_command", "run_python"}
+
+# Agentic presets (TODO.md §7.8 MVP). A preset is a stance: intent (prompt),
+# surface (visible tools), approval and mount policy. The MVP keeps four fixed
+# presets and no subset/allow-ask-gate map; the resolver is still the single
+# source so the prompt, the tools schema, the confirmation gate and the
+# Executor cannot disagree.
+PRESET_NAMES = ("read", "exec", "work", "trusted")
+PRESET_ALIASES = {"plan": "read", "full": "trusted", "auto": "trusted"}
+
+
+@dataclass(frozen=True)
+class AgenticPreset:
+    """One preset's four projections (prompt, tools, approval, mounts)."""
+
+    name: str
+    intent: str                  # "read" | "exec" | "work" | "trusted"
+    tools: Optional[frozenset]   # None = every tool
+    approval: str                # "plan" | "auto"
+    engine: str                  # "none" | "bwrap" | "host"
+    project: str                 # "none" | "rw" | "ro"
+    net: str                     # "none" | "shared"
+
+    def labels(self) -> str:
+        """Human-readable surface + sandbox summary (status line)."""
+        surface = "all" if self.tools is None else f"{len(self.tools)} read/exec"
+        if self.engine == "none":
+            sandbox = "none"
+        elif self.engine == "bwrap":
+            sandbox = f"bwrap(project {self.project}, net {self.net})"
+        else:
+            sandbox = "host"
+        return f"tools={surface} sandbox={sandbox} approve={self.approval}"
+
+
+_PRESETS = {
+    "read": AgenticPreset(
+        name="read", intent="read", tools=frozenset(PLAN_MODE_TOOLS),
+        approval="plan", engine="none", project="none", net="none"),
+    "exec": AgenticPreset(
+        name="exec", intent="exec", tools=frozenset(EXEC_MODE_TOOLS),
+        approval="auto", engine="bwrap", project="ro", net="none"),
+    "work": AgenticPreset(
+        name="work", intent="work", tools=None,
+        approval="auto", engine="bwrap", project="rw", net="shared"),
+    "trusted": AgenticPreset(
+        name="trusted", intent="trusted", tools=None,
+        approval="auto", engine="host", project="rw", net="shared"),
+}
+
+
+def resolve_preset(name_or_ctx) -> AgenticPreset:
+    """Resolve a preset name (or a ctx's active preset) to its four projections.
+
+    Args:
+        name_or_ctx: A preset name/alias, or a CommandContext (its `preset`
+            attribute wins; `plan_mode` is honoured for legacy `/agentic plan`).
+
+    Returns:
+        The frozen AgenticPreset.
+
+    Raises:
+        ValueError: when a string name/alias is unknown (callers that accept user
+            input should catch it to print usage).
+    """
+    if not isinstance(name_or_ctx, str):
+        ctx = name_or_ctx
+        if getattr(ctx, "plan_mode", False) and not getattr(ctx, "plan_run", False):
+            return _PRESETS["read"]
+        name = getattr(ctx, "preset", "work")
+    else:
+        name = name_or_ctx
+    name = PRESET_ALIASES.get(name, name)
+    if name not in _PRESETS:
+        raise ValueError(f"unknown preset '{name_or_ctx}' (choose from {', '.join(PRESET_NAMES)})")
+    return _PRESETS[name]
+
+
+def strict_path_confinement(ctx) -> bool:
+    """True when file-tool paths are confined to the CWD with no prompts.
+
+    Strict `/agentic plan` and the `exec` preset share this behaviour: `ask`
+    becomes a hard deny and implicit home reads are refused, while explicit
+    session read grants survive (cluster spill paging). `exec` needs it so a
+    read-only preset cannot be used to read `~/.ssh` while its shell is
+    confined by mounts.
+
+    Args:
+        ctx: CommandContext (or None).
+
+    Returns:
+        True for strict plan and for the `exec` preset.
+    """
+    if ctx is None:
+        return False
+    if getattr(ctx, "plan_mode", False) and not getattr(ctx, "plan_run", False):
+        return True
+    if getattr(ctx, "preset", "") == "read":
+        return not getattr(ctx, "plan_run", False)
+    return getattr(ctx, "preset", "") == "exec"
+
+
+def agentic_active_tools(ctx) -> Optional[set]:
+    """Return the effective tool surface, or None when every tool is allowed.
+
+    Args:
+        ctx: CommandContext (or None).
+
+    Returns:
+        A set of allowed tool names for `read`/`exec`, else None.
+    """
+    if getattr(ctx, "plan_mode", False) or getattr(ctx, "preset", "") == "read":
+        return plan_active_tools(ctx)
+    if getattr(ctx, "preset", "") == "exec":
+        # No MCP here: their "read-only" is declarative and several can reach
+        # the network, which would make the preset's `net none` a lie.
+        return set(EXEC_MODE_TOOLS)
+    return None
 
 # Kubernetes / OpenShift read-only consultation (kubernetes_cluster_query tool).
 # cluster_type auto: KUBECONFIG env var set → online; else omc configured
@@ -7954,8 +8365,7 @@ def _path_acl_decision(ctx: Optional['CommandContext'], op: str, realpath: str, 
     acl = getattr(ctx, "path_acl", None) if ctx is not None else None
     if acl is None:
         return "allow", None
-    plan_strict = (ctx is not None and getattr(ctx, "plan_mode", False)
-                   and not getattr(ctx, "plan_run", False))
+    plan_strict = strict_path_confinement(ctx)
     if _is_blocked_system_file(realpath):
         acl.log_event(tool, realpath, "deny", None)
         return "deny", (f"[path ACL denied] {op} {realpath} — System file blocked "
@@ -8783,8 +9193,7 @@ def _tool_handle_grep(self, args: dict) -> dict:
 
     acl = getattr(ctx, "path_acl", None) if ctx is not None else None
     blocked = {"n": 0}
-    plan_strict = (ctx is not None and getattr(ctx, "plan_mode", False)
-                   and not getattr(ctx, "plan_run", False))
+    plan_strict = strict_path_confinement(ctx)
     cwd_real = os.path.realpath(os.getcwd())
     home_explicit = _raw_is_home_explicit(raw)
 
@@ -8896,8 +9305,7 @@ def _tool_handle_path_policy(self, args: dict) -> dict:
     if acl is None:
         return {"success": True, "output": "No path ACL is mounted (all paths allowed).",
                 "error": None}
-    plan_strict = (ctx is not None and getattr(ctx, "plan_mode", False)
-                   and not getattr(ctx, "plan_run", False))
+    plan_strict = strict_path_confinement(ctx)
     raw = args.get("path")
     if not raw:
         return {"success": True, "output": _acl_policy_block(acl, plan_strict=plan_strict),
@@ -12358,7 +12766,11 @@ class ToolRegistry:
         """
         definitions = dict(AGENTIC_TOOL_DEFS)
         manager = getattr(self._ctx, "mcp_manager", None) if self._ctx else None
-        if manager is not None:
+        # The exec preset promises no network for the harness too; MCP tools are
+        # diagnostic/declarative read-only and can reach the network, so they are
+        # not even started or aggregated there.
+        exec_surface = bool(self._ctx) and getattr(self._ctx, "preset", "") == "exec"
+        if manager is not None and not exec_surface:
             try:
                 # Connect lazy servers once, when the user is already in an
                 # agentic/plan session - never on a plain chat turn, and never
@@ -12371,10 +12783,11 @@ class ToolRegistry:
                 # A broken MCP layer must not take the tool surface down with it.
                 print(colorize(f"[MCP] tool catalog unavailable: {exc}", 'warning'),
                       file=sys.stderr)
-        if self._ctx and getattr(self._ctx, 'plan_mode', False):
-            allowed = plan_active_tools(self._ctx)
-            return {name: defn for name, defn in definitions.items()
-                    if name in allowed}
+        if self._ctx:
+            allowed = agentic_active_tools(self._ctx)
+            if allowed is not None:
+                return {name: defn for name, defn in definitions.items()
+                        if name in allowed}
         return definitions
 
     def get_system_prompt_block(self) -> str:
@@ -12577,14 +12990,17 @@ class ToolRegistry:
                   and mcp_manager.resolve(tool_name) is not None)
         if tool_name not in self._handlers and not is_mcp:
             return {"success": False, "output": "", "error": f"Unknown tool '{tool_name}'"}
-        # Plan mode backstop: even if the model hallucinates a write tool (or a
-        # hidden tool leaks through the surface filter), deny it here. Defense
+        # Preset/plan backstop: even if the model hallucinates a write tool (or
+        # a hidden tool leaks through the surface filter), deny it here. Defense
         # in depth — the prompt and tool schema already hide these tools.
-        if self._ctx and getattr(self._ctx, 'plan_mode', False):
-            allowed = plan_active_tools(self._ctx)
-            if tool_name not in allowed:
+        if self._ctx:
+            allowed = agentic_active_tools(self._ctx)
+            if allowed is not None and tool_name not in allowed:
+                label = ("read-only plan mode" if getattr(self._ctx, "plan_mode", False)
+                         or getattr(self._ctx, "preset", "") == "read"
+                         else "the exec preset (read + run, no project writes)")
                 return {"success": False, "output": "",
-                        "error": f"Tool '{tool_name}' is disabled in read-only plan mode "
+                        "error": f"Tool '{tool_name}' is disabled in {label} "
                                  f"(allowed: {', '.join(sorted(allowed))})"}
         # Normalize argument name aliases (e.g. "path" -> "file")
         if tool_name in TOOL_ARG_ALIASES:
@@ -12597,8 +13013,15 @@ class ToolRegistry:
         # A harmless read-only GET fetch (curl/wget hitting a URL) is served by
         # the fetch_url builtin instead of the shell — no confirmation prompt,
         # no side effects, and the model is nudged to use fetch_url directly.
+        # Never in the exec preset: fetch_url is deliberately absent there (the
+        # sandbox has no network), so redirecting to it would bypass the policy
+        # and make "net none" a lie. The curl then runs in the sandbox and fails
+        # to resolve, which is the honest outcome.
         if tool_name == "run_command":
-            fetch_url_arg = _is_harmless_get_fetch(args.get("command", ""))
+            allowed_surface = agentic_active_tools(self._ctx)
+            fetch_allowed = allowed_surface is None or "fetch_url" in allowed_surface
+            fetch_url_arg = (_is_harmless_get_fetch(args.get("command", ""))
+                             if fetch_allowed else None)
             if fetch_url_arg:
                 return self._serve_fetch_redirect(fetch_url_arg)
         if not self._confirm(tool_name, args):
@@ -14656,15 +15079,17 @@ class ModelQuery:
 
 # /agentic subcommands for tab completion (mirrors run_handle_agentic usage)
 AGENTIC_SUBCOMMANDS = [
-    'on', 'off', 'full', 'auto', 'plan', 'sandbox', 'verbose', 'thinking',
-    'trace', 'log', 'lazytool', 'iterations', 'timeout', 'heartbeattokens',
-    'compactthreshold', 'acl', 'scratch', 'status',
+    'on', 'off', 'full', 'auto', 'preset', 'plan', 'sandbox', 'verbose',
+    'thinking', 'trace', 'log', 'lazytool', 'iterations', 'timeout',
+    'heartbeattokens', 'compactthreshold', 'acl', 'scratch', 'status',
 ]
 AGENTIC_PLAN_ARGS = ['on', 'off', 'run']
 AGENTIC_ACL_ACTIONS = ['list', 'status', 'log', 'allow', 'ask', 'deny', 'remove', 'reset']
 AGENTIC_SCRATCH_ACTIONS = ['path', 'list', 'clear']
+AGENTIC_PRESET_NAMES = ['read', 'exec', 'work', 'trusted', 'plan', 'full', 'auto', 'show']
 AGENTIC_SECOND_LEVEL = {'plan': AGENTIC_PLAN_ARGS, 'acl': AGENTIC_ACL_ACTIONS,
-                        'scratch': AGENTIC_SCRATCH_ACTIONS}
+                        'scratch': AGENTIC_SCRATCH_ACTIONS,
+                        'preset': AGENTIC_PRESET_NAMES}
 
 # /compact subcommands for tab completion (mirrors run_handle_compact usage)
 COMPACT_SUBCOMMANDS = ['now', 'force', 'llm', 'threshold', 'list', 'status']
@@ -17769,7 +18194,7 @@ class AgenticRunner:
         # tool, so a denial can stay one line.
         policy = _acl_policy_block(
             getattr(self.ctx, "path_acl", None),
-            plan_strict=(self.ctx.plan_mode and not getattr(self.ctx, "plan_run", False)),
+            plan_strict=strict_path_confinement(self.ctx),
             detail="allowed")
         if policy:
             content += "\n\n## Path access\n" + policy
@@ -20681,7 +21106,23 @@ class ChatLoop:
         if subcmd == "full":
             return self._agentic_set_full()
         if subcmd == "sandbox":
-            return self._agentic_toggle_sandbox()
+            return self._agentic_toggle_sandbox(parts)
+        if subcmd == "preset":
+            if len(parts) < 3:
+                return self._print_preset_list()
+            if parts[2].lower() in ("show", "status"):
+                active = resolve_preset(self.ctx)
+                self._print_preset_status()
+                allowed = agentic_active_tools(self.ctx)
+                if allowed is not None:
+                    print(colorize(f"[Tools restricted to: {', '.join(sorted(allowed))}]",
+                                   'muted'), file=sys.stderr)
+                else:
+                    print(colorize("[Tools: every agentic tool]", 'muted'), file=sys.stderr)
+                print(colorize(f"[Executor: {self.executor.describe()}]", 'muted'),
+                      file=sys.stderr)
+                return False
+            return self._agentic_apply_preset(parts[2])
         if subcmd in ("iterations", "timeout", "heartbeattokens"):
             return self._agentic_set_number(subcmd, parts)
         if subcmd == "compactthreshold":
@@ -20695,7 +21136,22 @@ class ChatLoop:
         if subcmd == "plan":
             return self._agentic_toggle_plan(parts)
 
-        print(colorize("[Usage: /agentic [on|off|full|auto|plan [on|off|run]|sandbox|verbose|thinking|trace|log|lazytool|acl|scratch [path|list|clear]|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|status]]", 'warning'), file=sys.stderr)
+        print(colorize("[Usage: /agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status]|verbose|thinking|trace|log|lazytool|acl|scratch [path|list|clear]|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|status]]", 'warning'), file=sys.stderr)
+        return False
+
+    def _print_preset_list(self) -> bool:
+        """List the four MVP presets, their policy and the active one."""
+        active = resolve_preset(self.ctx).name
+        print(colorize("\n[Agentic presets]", 'info'), file=sys.stderr)
+        for name in PRESET_NAMES:
+            preset = _PRESETS[name]
+            marker = ">" if name == active else " "
+            print(f"  {marker} {name:<8} [{preset.labels()}]", file=sys.stderr)
+        print(colorize(
+            "  aliases: plan=read, full=trusted; /agentic preset auto = trusted "
+            "(the bare /agentic auto stays the auto-confirm toggle)",
+            'muted'), file=sys.stderr)
+        print(file=sys.stderr)
         return False
 
     def _handle_agentic_scratch(self, parts: list) -> bool:
@@ -20792,15 +21248,20 @@ class ChatLoop:
         if self.ctx.agentic_mode:
             if not getattr(self.ctx, '_saved_system_prompt', None):
                 self.ctx._saved_system_prompt = self.ctx.system_prompt
-            self.ctx.system_prompt = agentic_system_prompt(self.ctx)
+            # `/agentic on` is the `work` preset: full surface, bwrap project rw,
+            # shared network. The explicit engine (--sandbox-engine) still wins.
+            self._apply_preset_state("work")
         else:
             # Leaving agentic mode also clears plan mode; otherwise a later
             # `/agentic on` would silently re-apply read-only plan restrictions.
             self.ctx.plan_mode = False
             self.ctx.plan_run = False
+            self.ctx.preset = "work"
             if hasattr(self.ctx, '_saved_system_prompt'):
                 self.ctx.system_prompt = self.ctx._saved_system_prompt
         print(colorize(f"[Agentic mode: {state}]", 'success' if self.ctx.agentic_mode else 'warning'), file=sys.stderr)
+        if self.ctx.agentic_mode:
+            self._print_preset_status()
         # The request shape changed (system prompt and/or tools array), so the
         # bar must follow immediately instead of waiting for the next query.
         self._refresh_context_bar()
@@ -20816,7 +21277,7 @@ class ChatLoop:
             print(colorize("[Agentic plan mode: OFF — read-only restrictions lifted]", 'warning'), file=sys.stderr)
         if not getattr(self.ctx, '_saved_system_prompt', None):
             self.ctx._saved_system_prompt = self.ctx.system_prompt
-        self.ctx.system_prompt = agentic_system_prompt(self.ctx)
+        self._apply_preset_state("trusted")
         self.ctx.agentic_mode = True
         self.ctx.agentic_verbose = True
         self.ctx.agentic_show_thinking = True
@@ -20830,6 +21291,7 @@ class ChatLoop:
         print(colorize("[Trace: ON]", 'info'), file=sys.stderr)
         print(colorize("[Auto-confirm: ON]", 'info'), file=sys.stderr)
         print(colorize("[Lazy tool extraction: ON]", 'info'), file=sys.stderr)
+        self._print_preset_status()
         self._refresh_context_bar()
         return False
 
@@ -20863,6 +21325,7 @@ class ChatLoop:
                 return False
             self.ctx.plan_mode = False
             self.ctx.plan_run = False
+            self.ctx.preset = getattr(self.ctx, '_plan_prev_preset', 'work')
             self.ctx.agentic_mode = getattr(self.ctx, '_plan_prev_agentic', False)
             # Restore the prompt that was active before plan mode was entered —
             # it may legitimately be the agentic prompt when plan was entered
@@ -20892,8 +21355,10 @@ class ChatLoop:
             return False
 
         self.ctx._plan_prev_agentic = self.ctx.agentic_mode
+        self.ctx._plan_prev_preset = getattr(self.ctx, "preset", "work")
         self.ctx.plan_mode = True
         self.ctx.plan_run = want_run
+        self.ctx.preset = "read"
         self.ctx.agentic_mode = True
         # Plan keeps its own previous-prompt slot: unconditionally overwriting
         # `_saved_system_prompt` here would make a later `/agentic off` restore
@@ -20965,14 +21430,172 @@ class ChatLoop:
         print(colorize("[/mcp tools --plan lists them with descriptions]", 'info'),
               file=sys.stderr)
 
-    def _agentic_toggle_sandbox(self) -> bool:
-        """Toggle the executor between container and host mode."""
-        new_mode = "container" if self.executor.mode != "container" else "host"
+    def _agentic_toggle_sandbox(self, parts: Optional[list] = None) -> bool:
+        """Select or toggle the executor engine (`/agentic sandbox ...`).
+
+        Bare `/agentic sandbox` keeps the historical host↔container toggle.
+        Explicit `host`/`container`/`bwrap` selects an engine; `status` prints
+        the policy. Selecting bwrap probes it first and refuses the switch when
+        bubblewrap cannot run (fail-closed, never a silent host fallback).
+
+        Args:
+            parts: Split /agentic args (`parts[2]` is the engine/action).
+
+        Returns:
+            False to keep the chat loop running.
+        """
+        arg = (parts[2].lower() if parts and len(parts) > 2 else "")
+        if not arg:
+            new_mode = "container" if self.executor.mode != "container" else "host"
+        elif arg == "status":
+            print(colorize(f"[Executor mode: {self.executor.describe()}]", 'info'),
+                  file=sys.stderr)
+            ctx = getattr(self, "ctx", None)
+            if ctx is not None:
+                print(colorize(
+                    f"  project={ctx.bwrap_project} net={ctx.bwrap_net} "
+                    f"binds={len(ctx.bwrap_binds)} rw_extra={len(ctx.bwrap_rw)}",
+                    'muted'), file=sys.stderr)
+            return False
+        elif arg in SANDBOX_ENGINES:
+            new_mode = arg
+        else:
+            print(colorize("[Usage: /agentic sandbox [host|container|bwrap|status]]",
+                           'warning'), file=sys.stderr)
+            return False
+        ctx = getattr(self, "ctx", None)
+        if ctx is not None and getattr(ctx, "preset", "") == "exec" and new_mode != "bwrap":
+            print(colorize(
+                "[Sandbox] the exec preset requires bwrap (read-only project mounts); "
+                "switch preset first (/agentic preset work or trusted)", 'warning'),
+                file=sys.stderr)
+            return False
+        if new_mode == "bwrap" and arg:   # explicit selection: probe now
+            if ctx is not None:
+                probe = ctx.create_executor()
+                probe.mode = "bwrap"
+                if not probe._bwrap_ready():
+                    print(colorize(
+                        "[Sandbox] bwrap is unavailable — engine NOT changed; "
+                        "use host/container or --sandbox-engine host explicitly",
+                        'warning'), file=sys.stderr)
+                    return False
+        if ctx is not None:
+            ctx.executor_mode = new_mode
+            ctx.sandbox_engine_override = new_mode
         self.executor.mode = new_mode
-        self.tool_registry.executor.mode = new_mode
-        detail = (f" — {self.executor.describe_target()}, {self.executor.describe_limits()}"
-                  if new_mode == "container" else "")
+        if getattr(self, "tool_registry", None) is not None:
+            self.tool_registry.executor.mode = new_mode
+        detail = ""
+        if new_mode == "container":
+            detail = f" — {self.executor.describe_target()}, {self.executor.describe_limits()}"
+        elif new_mode == "bwrap":
+            detail = (f" — {self.executor.describe_target()}; "
+                      f"the shell gate is bypassed, mounts are the contract")
         print(colorize(f"[Executor mode: {self.executor.mode}{detail}]", 'info'), file=sys.stderr)
+        return False
+
+    def _apply_preset_state(self, name: str) -> None:
+        """Apply one preset's flags, prompt, surface and sandbox policy.
+
+        The prompt is rebuilt from `agentic_system_prompt()`, so the intent
+        block always matches the preset. The executor is recreated from the
+        context so both the loop and the ToolRegistry get the same policy
+        object (a preset is a quadruplet: intent + surface + approval + mounts).
+
+        Args:
+            name: Canonical preset name (already resolved).
+        """
+        preset = resolve_preset(name)
+        engine = self.ctx.sandbox_engine_override or preset.engine
+        if preset.name == "exec" and engine != "bwrap":
+            raise ValueError(
+                "the exec preset requires the bwrap engine (read-only project mounts); "
+                f"--sandbox-engine {engine} overrides it")
+        if preset.name == "exec":
+            project = getattr(self.ctx, "bwrap_project_override", None) or "ro"
+            net = getattr(self.ctx, "bwrap_net_override", None) or "none"
+            if project != "ro" or net != "none":
+                raise ValueError(
+                    "the exec preset requires --sandbox-bwrap-project ro and "
+                    "--sandbox-bwrap-net none (it promises a read-only project and no network)")
+        else:
+            project = getattr(self.ctx, "bwrap_project_override", None) or preset.project
+            net = getattr(self.ctx, "bwrap_net_override", None) or preset.net
+        self.ctx.preset = preset.name
+        self.ctx.plan_mode = False
+        self.ctx.plan_run = False
+        self.ctx.auto_confirm = preset.approval == "auto"
+        self.ctx.executor_mode = engine
+        if engine == "bwrap":
+            self.ctx.bwrap_project = project
+            self.ctx.bwrap_net = net
+        self.ctx.system_prompt = agentic_system_prompt(self.ctx)
+        self.executor = self.ctx.create_executor()
+        if getattr(self, "tool_registry", None) is not None:
+            self.tool_registry.executor = self.executor
+
+    def _print_preset_status(self) -> None:
+        """Print the active preset, its policy and the effective tool surface."""
+        preset = resolve_preset(self.ctx)
+        surface = "all" if preset.tools is None else f"{len(preset.tools)} read/exec"
+        # The engine/sandbox part is read from the *actual* executor, not from
+        # the preset: an explicit --sandbox-engine / --sandbox-bwrap-* override
+        # must not be described as the preset's nominal policy.
+        print(colorize(
+            f"[Agentic preset: {preset.name} — tools={surface} "
+            f"sandbox={self.executor.mode} approve={preset.approval}]",
+            'success'), file=sys.stderr)
+        if self.executor.mode == "bwrap":
+            if self.executor._bwrap_probe():
+                print(colorize(f"[Sandbox] {self.executor.describe()}", 'info'),
+                      file=sys.stderr)
+            else:
+                print(colorize(
+                    f"[Sandbox] bwrap unavailable: {self.executor._bwrap_error} — "
+                    f"tool commands will be REFUSED (no silent host fallback); "
+                    f"use /agentic preset trusted or --sandbox-engine host explicitly",
+                    'warning'), file=sys.stderr)
+        elif self.executor.mode == "container":
+            print(colorize(f"[Sandbox] {self.executor.describe()}", 'info'),
+                  file=sys.stderr)
+        elif preset.name == "trusted":
+            print(colorize("[Sandbox] host — hard denies only; this is the unsandboxed stance",
+                           'warning'), file=sys.stderr)
+        elif preset.name == "read":
+            print(colorize("[Sandbox] none — no shell; paths confined to the CWD",
+                           'info'), file=sys.stderr)
+
+    def _agentic_apply_preset(self, name: str) -> bool:
+        """Handle `/agentic preset <name>` and the plan/full aliases.
+
+        Args:
+            name: Preset name or alias (read/exec/work/trusted/plan/full/auto).
+
+        Returns:
+            False to keep the chat loop running.
+        """
+        try:
+            preset = resolve_preset(name)
+        except ValueError as exc:
+            print(colorize(f"[Agentic] {exc}", 'warning'), file=sys.stderr)
+            return False
+        if preset.name == "read":
+            return self._agentic_toggle_plan(['/agentic', 'plan', 'on'])
+        if not self.ctx.agentic_mode:
+            # Enter agentic mode without the `/agentic on` (work) banner: the
+            # selected preset below is the stance the user actually asked for.
+            if not getattr(self.ctx, '_saved_system_prompt', None):
+                self.ctx._saved_system_prompt = self.ctx.system_prompt
+            self.ctx.agentic_mode = True
+            print(colorize("[Agentic mode: ON]", 'success'), file=sys.stderr)
+        try:
+            self._apply_preset_state(preset.name)
+        except ValueError as exc:
+            print(colorize(f"[Agentic] {exc}", 'warning'), file=sys.stderr)
+            return False
+        self._print_preset_status()
+        self._refresh_context_bar()
         return False
 
     def _agentic_set_number(self, subcmd: str, parts: list) -> bool:
@@ -21123,13 +21746,15 @@ class ChatLoop:
         """Display current agentic settings like /debug output."""
         c = self.ctx
         print(colorize("\n[Agentic Settings - Use /agentic <option> [value]]", 'info'), file=sys.stderr)
-        print("  Subcommands: on, off, full, auto, plan [on|off|run], sandbox, verbose, thinking, trace, log, lazytool,", file=sys.stderr)
-        print("               iterations <N>, timeout <N>, heartbeattokens <N>, compactthreshold <v>, acl, scratch [path|list|clear], status", file=sys.stderr)
+        print("  Subcommands: on, off, full, auto, preset [read|exec|work|trusted], plan [on|off|run], sandbox [host|container|bwrap|status],", file=sys.stderr)
+        print("               verbose, thinking, trace, log, lazytool, iterations <N>, timeout <N>, heartbeattokens <N>,", file=sys.stderr)
+        print("               compactthreshold <v>, acl, scratch [path|list|clear], status", file=sys.stderr)
         print(file=sys.stderr)
 
         plan_value = "off" if not c.plan_mode else ("run" if getattr(c, "plan_run", False) else "on")
         settings = [
             ("agentic",    "Master toggle",             str(c.agentic_mode).lower()),
+            ("preset",     "Stance: intent + surface + approval + mounts", resolve_preset(c).name),
             ("plan",       "Read-only planner (on=query/CWD-confined, run=+shell)", plan_value),
             ("auto",       "Skip destructive tool confirmation", str(c.auto_confirm).lower()),
             ("sandbox",    f"Run tool subprocesses in {self.executor.describe()}", self.executor.mode),
@@ -22728,7 +23353,12 @@ def _build_parser() -> argparse.ArgumentParser:
                              '~/.ollamaquery.d/mcp.json)')
     parser.add_argument('--no-mcp', action="store_true",
                         help='Disable MCP tool servers for this session')
-    sandbox_group = parser.add_argument_group('Container sandbox (/agentic sandbox)')
+    sandbox_group = parser.add_argument_group('Execution sandbox (/agentic sandbox)')
+    sandbox_group.add_argument('--sandbox-engine', choices=list(SANDBOX_ENGINES), default=None,
+                               help='Engine for tool commands: host (shell gate), container '
+                                    '(podman/docker), or bwrap (rootless bubblewrap). Default: '
+                                    'the preset chooses (work/exec=bwrap, trusted=host), or host '
+                                    'when no preset is selected')
     sandbox_group.add_argument('--sandbox-image', metavar='IMAGE', default=None,
                                help='Image for sandboxed tool commands (default: '
                                     f'{DEFAULT_CONTAINER_IMAGE}, or OLLAMAQUERY_CONTAINER_IMAGE). '
@@ -22749,6 +23379,21 @@ def _build_parser() -> argparse.ArgumentParser:
                                     f'(default: {DEFAULT_CONTAINER_CPUS}, or '
                                     f'OLLAMAQUERY_CONTAINER_CPUS); ignored with '
                                     f'--sandbox-container')
+    sandbox_group.add_argument('--sandbox-bwrap-project', choices=['rw', 'ro'], default=None,
+                               help='bwrap: mount the project read-write (default, work) or '
+                                    'read-only (exec / inspection)')
+    sandbox_group.add_argument('--sandbox-bwrap-net', choices=['shared', 'none'], default=None,
+                               help='bwrap: share the host network (default) or unshare it '
+                                    '(no DNS/downloads; builds that fetch fail)')
+    sandbox_group.add_argument('--sandbox-bwrap-bind', metavar='PATH[:ro|rw]', action='append',
+                               default=None,
+                               help='bwrap: extra mount, repeatable (default ro; missing paths are '
+                                    'skipped). Applied after the default policy, so an rw bind can '
+                                    'lift a read-only subtree')
+    sandbox_group.add_argument('--sandbox-bwrap-rw', metavar='PATH', action='append',
+                               default=None,
+                               help='bwrap: extra read-write subtree, repeatable (used with '
+                                    '--sandbox-bwrap-project ro; bind a directory, not a new file)')
     parser.add_argument('--shell-timeout', type=int, default=5, help='Timeout in seconds for shell commands (default: 5)')
 
     return parser
@@ -23076,12 +23721,49 @@ def _attach_mcp_manager(ctx: CommandContext, args: argparse.Namespace) -> None:
           file=sys.stderr)
 
 
+def _sandbox_env(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Read a sandbox environment variable, treating an empty value as unset."""
+    value = os.environ.get(name)
+    return value if value else default
+
+
+def _parse_bwrap_specs(raw_specs) -> list:
+    """Parse repeated `--sandbox-bwrap-bind` specs (or a comma-separated env value).
+
+    Args:
+        raw_specs: A list of specs, or a comma-separated string (env form).
+
+    Returns:
+        [(path, "ro"|"rw"), ...]
+
+    Raises:
+        ValueError: on an invalid mode or an empty path.
+    """
+    if not raw_specs:
+        return []
+    if isinstance(raw_specs, str):
+        raw_specs = [part.strip() for part in raw_specs.split(",") if part.strip()]
+    return [_parse_bwrap_bind(str(spec)) for spec in raw_specs]
+
+
+def _parse_bwrap_rw(raw_specs) -> list:
+    """Parse repeated `--sandbox-bwrap-rw` paths (or a comma-separated env value)."""
+    if not raw_specs:
+        return []
+    if isinstance(raw_specs, str):
+        raw_specs = [part.strip() for part in raw_specs.split(",") if part.strip()]
+    return [os.path.realpath(os.path.expanduser(str(spec))) for spec in raw_specs]
+
+
 def _apply_sandbox_args(ctx: 'CommandContext', args: argparse.Namespace) -> None:
     """Store the --sandbox-* flags on the context, choosing the executor mode.
 
     Passing an image or a container name means the user wants commands to run
     there, so container mode is enabled here instead of demanding a second
     `/agentic sandbox` step (`/agentic sandbox` can still toggle it off).
+    `--sandbox-engine` is the explicit override: it wins over the preset's
+    engine and conflicts with the container flags (a contradictory request is
+    an error, not a silent precedence rule).
 
     Args:
         ctx: The shared CommandContext.
@@ -23097,7 +23779,49 @@ def _apply_sandbox_args(ctx: 'CommandContext', args: argparse.Namespace) -> None
         ctx.container_memory = args.sandbox_memory
     if args.sandbox_cpus:
         ctx.container_cpus = args.sandbox_cpus
-    if args.sandbox_image or args.sandbox_container:
+
+    engine = (getattr(args, "sandbox_engine", None)
+              or _sandbox_env("OLLAMAQUERY_SANDBOX_ENGINE"))
+    if engine and engine not in SANDBOX_ENGINES:
+        sys.stderr.write(colorize(
+            f"[Sandbox] unknown engine '{engine}' (choose from {', '.join(SANDBOX_ENGINES)})\n",
+            'error'))
+        raise SystemExit(2)
+    if engine and engine != "container" and (args.sandbox_image or args.sandbox_container):
+        sys.stderr.write(colorize(
+            f"[Sandbox] --sandbox-engine {engine} conflicts with "
+            f"--sandbox-image/--sandbox-container (choose one)\n", 'error'))
+        raise SystemExit(2)
+
+    project = (getattr(args, "sandbox_bwrap_project", None)
+               or _sandbox_env("OLLAMAQUERY_BWRAP_PROJECT"))
+    net = (getattr(args, "sandbox_bwrap_net", None)
+           or _sandbox_env("OLLAMAQUERY_BWRAP_NET"))
+    if project is not None and project not in ("rw", "ro"):
+        sys.stderr.write(colorize(f"[Sandbox] invalid bwrap project mode '{project}'\n", 'error'))
+        raise SystemExit(2)
+    if net is not None and net not in ("shared", "none"):
+        sys.stderr.write(colorize(f"[Sandbox] invalid bwrap network mode '{net}'\n", 'error'))
+        raise SystemExit(2)
+    try:
+        binds = _parse_bwrap_specs(getattr(args, "sandbox_bwrap_bind", None)
+                                   or _sandbox_env("OLLAMAQUERY_BWRAP_BINDS"))
+        rw_extra = _parse_bwrap_rw(getattr(args, "sandbox_bwrap_rw", None)
+                                   or _sandbox_env("OLLAMAQUERY_BWRAP_RW"))
+    except ValueError as exc:
+        sys.stderr.write(colorize(f"[Sandbox] {exc}\n", 'error'))
+        raise SystemExit(2)
+    ctx.bwrap_project = project or DEFAULT_BWRAP_PROJECT
+    ctx.bwrap_net = net or DEFAULT_BWRAP_NET
+    ctx.bwrap_project_override = project
+    ctx.bwrap_net_override = net
+    ctx.bwrap_binds = binds
+    ctx.bwrap_rw = rw_extra
+
+    if engine:
+        ctx.sandbox_engine_override = engine
+        ctx.executor_mode = engine
+    elif args.sandbox_image or args.sandbox_container:
         ctx.executor_mode = "container"
 
 
@@ -23129,9 +23853,14 @@ def _run_chat(backend: str, base_url: str, target_model: str, args: argparse.Nam
 
     should_stream = not args.no_stream and sys.stdout.isatty()
     loop = ChatLoop(ctx)
-    if ctx.executor_mode == "container":
+    if ctx.executor_mode != "host":
         print(colorize(f"[Sandbox] tool commands run in {loop.executor.describe()}"
-                       f" — /agentic sandbox switches back to host", 'info'), file=sys.stderr)
+                       f" — /agentic sandbox status to inspect", 'info'), file=sys.stderr)
+        if ctx.executor_mode == "bwrap" and not loop.executor._bwrap_probe():
+            print(colorize(
+                f"[Sandbox] bwrap unavailable: {loop.executor._bwrap_error} — "
+                f"tool commands will be REFUSED (no silent host fallback); use "
+                f"--sandbox-engine host to run unsandboxed", 'warning'), file=sys.stderr)
     loop.run(stream_enabled=should_stream, debug=args.debug, images=images_list)
     sys.exit(0)
 

@@ -7,6 +7,7 @@ import re
 import sys
 import json
 import time
+import shlex
 import shutil
 import tempfile
 import threading
@@ -27,6 +28,11 @@ STRATA_HOST = os.environ.get('STRATA_HOST', 'http://127.0.0.1:8080')
 # many minutes and produces a large file. It is off by default; export
 # RUN_SLOW_DNS_E2E=1 to re-enable it (e.g. before a release run).
 SLOW_DNS_E2E = os.environ.get('RUN_SLOW_DNS_E2E', '') == '1'
+
+# bwrap is local and fast, but it is a Linux/userns feature: the offline argv
+# tests always run, the real sandbox writes are opt-in (RUN_BWRAP_E2E=1).
+BWRAP_AVAILABLE = shutil.which("bwrap") is not None
+RUN_BWRAP_E2E = os.environ.get('RUN_BWRAP_E2E', '') == '1'
 
 # Auto-detect available backend
 BACKEND = None
@@ -1796,6 +1802,601 @@ class TestContainerSandboxConfig(unittest.TestCase):
         self.assertEqual(loop.executor.mode, "container")
         self.assertEqual(loop.tool_registry.executor.mode, "container")
         self.assertIn("img:6", err.getvalue())
+
+
+class TestBwrapSandboxConfig(unittest.TestCase):
+    """bwrap engine: mount policy, probe fail-closed, CLI/env wiring (offline).
+
+    The mount policy is the contract in this mode (the shell gate is bypassed),
+    so what is pinned here is the exact argv and the refusal behaviour, not a
+    real sandbox. The opt-in live class below proves the daemon-free writes.
+    """
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="bwrap-home-")
+        self.cwd = os.path.realpath(os.getcwd())
+        self.scratch = os.path.realpath(q._scratch_root())
+
+    def tearDown(self):
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def _executor(self, **kwargs):
+        kwargs.setdefault("bwrap_home", self.home)
+        kwargs.setdefault("bwrap_project", "rw")
+        kwargs.setdefault("bwrap_net", "shared")
+        ex = q.Executor(mode="bwrap", **kwargs)
+        ex.bwrap_path = "/usr/bin/bwrap"
+        ex._bwrap_state = "ok"          # skip the probe unless a test wants it
+        return ex
+
+    def _fake_run(self, seen, probe_rc=0, cmd_out="ok", cmd_err=""):
+        """subprocess.run stand-in recording argv and answering the probe."""
+        def _run(argv, **_kwargs):
+            argv = list(argv)
+            seen.append(argv)
+            if argv[1:2] == ["--dev"]:      # the bwrap probe
+                return types.SimpleNamespace(
+                    returncode=probe_rc, stdout="",
+                    stderr="probe denied" if probe_rc else "")
+            return types.SimpleNamespace(returncode=0, stdout=cmd_out, stderr=cmd_err)
+        return _run
+
+    def _argv_for(self, command, **kwargs):
+        seen = []
+        with patch("ollamaquery2.subprocess.run", side_effect=self._fake_run(seen)):
+            ex = self._executor(**kwargs)
+            result = ex.run(command, timeout=5)
+        return seen[-1], result
+
+    def test_bwrap_argv_implements_the_mount_policy(self):
+        argv, result = self._argv_for("echo hi")
+        self.assertEqual(result["stdout"], "ok")
+        self.assertEqual(argv[0], "/usr/bin/bwrap")
+        self.assertIn("--unshare-all", argv)
+        self.assertIn("--share-net", argv)
+        self.assertIn("--die-with-parent", argv)
+        self.assertIn("--new-session", argv)
+        self.assertEqual(argv[argv.index("--cap-drop") + 1], "ALL")
+        self.assertIn("--clearenv", argv)
+        env = {}
+        for i, part in enumerate(argv):
+            if part == "--setenv":
+                env[argv[i + 1]] = argv[i + 2]
+        self.assertEqual(env["HOME"], self.home)
+        self.assertTrue(env["PATH"].startswith("/usr/local/bin"))
+        self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        for path in q.BWRAP_READ_ONLY_BINDS:
+            self.assertIn(["--ro-bind-try", path, path],
+                          [argv[i:i + 3] for i in range(len(argv) - 2)])
+        self.assertEqual(argv[argv.index("--tmpfs") + 1], "/tmp")
+        self.assertIn("/var/tmp", argv)
+        self.assertIn("--dev", argv)
+        self.assertIn("/dev", argv)
+        self.assertIn("--proc", argv)
+        self.assertIn("/proc", argv)
+        # The project keeps its host path, so model paths and ACL stay coherent.
+        self.assertIn(["--bind", self.cwd, self.cwd],
+                      [argv[i:i + 3] for i in range(len(argv) - 2)])
+        self.assertIn(["--bind", self.scratch, self.scratch],
+                      [argv[i:i + 3] for i in range(len(argv) - 2)])
+        self.assertIn(["--bind", self.home, self.home],
+                      [argv[i:i + 3] for i in range(len(argv) - 2)])
+        self.assertEqual(argv[argv.index("--chdir") + 1], self.cwd)
+        self.assertEqual(argv[-3:], ["/bin/bash", "-c", "echo hi"])
+
+    def test_project_ro_uses_ro_bind_and_extra_rw_comes_after(self):
+        build = os.path.join(self.cwd, "build")
+        argv, _ = self._argv_for("echo hi", bwrap_project="ro", bwrap_rw=[build])
+        pairs = [argv[i:i + 3] for i in range(len(argv) - 2)]
+        self.assertIn(["--ro-bind", self.cwd, self.cwd], pairs)
+        self.assertNotIn(["--bind", self.cwd, self.cwd], pairs)
+        ro_index = next(i for i, part in enumerate(argv)
+                        if part == "--ro-bind" and argv[i + 1] == self.cwd)
+        rw_index = next(i for i, part in enumerate(argv)
+                        if part == "--bind-try" and argv[i + 1] == build)
+        self.assertLess(ro_index, rw_index)
+
+    def test_net_none_unshares_the_network(self):
+        argv, _ = self._argv_for("echo hi", bwrap_net="none")
+        self.assertIn("--unshare-net", argv)
+        self.assertNotIn("--share-net", argv)
+
+    def test_extra_binds_are_parsed_and_try_mounted(self):
+        ro = os.path.join(self.cwd, "ro-dir")
+        rw = os.path.join(self.cwd, "rw-dir")
+        argv, _ = self._argv_for("echo hi", bwrap_binds=[(ro, "ro"), (rw, "rw")])
+        pairs = [argv[i:i + 3] for i in range(len(argv) - 2)]
+        self.assertIn(["--ro-bind-try", ro, ro], pairs)
+        self.assertIn(["--bind-try", rw, rw], pairs)
+
+    def test_gate_is_not_called_in_bwrap_mode(self):
+        with patch("ollamaquery2.check_shell_approval") as gate, \
+             patch("ollamaquery2.subprocess.run", side_effect=self._fake_run([])):
+            ex = self._executor()
+            # A command the host gate would deny outright: the mounts are the
+            # barrier, so the gate must not even be consulted.
+            result = ex.run("rm -rf /", timeout=5)
+        gate.assert_not_called()
+        self.assertEqual(result["returncode"], 0)
+
+    def test_missing_bwrap_refuses_and_never_runs_on_the_host(self):
+        seen = []
+        with patch("ollamaquery2.shutil.which", return_value=None), \
+             patch("ollamaquery2.subprocess.run", side_effect=self._fake_run(seen)):
+            ex = q.Executor(mode="bwrap", bwrap_home=self.home)
+            result = ex.run("echo hi", timeout=5)
+        self.assertEqual(result["returncode"], -1)
+        self.assertIn("not installed", result["stderr"])
+        self.assertEqual(seen, [])
+
+    def test_probe_failure_refuses_and_warns_once(self):
+        seen, err = [], io.StringIO()
+        with patch("ollamaquery2.shutil.which", return_value="/usr/bin/bwrap"), \
+             patch("ollamaquery2.subprocess.run",
+                   side_effect=self._fake_run(seen, probe_rc=1)), \
+             contextlib.redirect_stderr(err):
+            ex = q.Executor(mode="bwrap", bwrap_home=self.home)
+            first = ex.run("echo hi", timeout=5)
+            second = ex.run("echo hi", timeout=5)
+        self.assertEqual(first["returncode"], -1)
+        self.assertEqual(second["returncode"], -1)
+        self.assertIn("bwrap unavailable", first["stderr"])
+        # Exactly one warning, one probe, and no command ever ran.
+        self.assertEqual(err.getvalue().count("[Sandbox] bwrap unavailable"), 1)
+        self.assertEqual(len([a for a in seen if a[1:2] == ["--dev"]]), 1)
+        self.assertEqual(len(seen), 1)
+
+    def test_probe_is_memoized(self):
+        seen = []
+        with patch("ollamaquery2.shutil.which", return_value="/usr/bin/bwrap"), \
+             patch("ollamaquery2.subprocess.run", side_effect=self._fake_run(seen)):
+            ex = q.Executor(mode="bwrap", bwrap_home=self.home)
+            ex.run("echo one", timeout=5)
+            ex.run("echo two", timeout=5)
+        self.assertEqual(len([a for a in seen if a[1:2] == ["--dev"]]), 1)
+        self.assertEqual(len(seen), 3)   # probe + two commands
+
+    def test_describe_reports_the_policy_and_the_missing_ceiling(self):
+        ex = self._executor(bwrap_project="ro", bwrap_net="none")
+        self.assertEqual(ex.describe_target(), "project ro, net none, host ro")
+        self.assertEqual(ex.describe_limits(), "no cgroup cap (v1)")
+        self.assertEqual(ex.describe(),
+                         "bwrap (project ro, net none, host ro; no cgroup cap (v1))")
+
+    def test_cli_flags_reach_the_executor(self):
+        args = q._build_parser().parse_args([
+            "--sandbox-engine", "bwrap", "--sandbox-bwrap-project", "ro",
+            "--sandbox-bwrap-net", "none",
+            "--sandbox-bwrap-bind", f"{self.cwd}/a:rw",
+            "--sandbox-bwrap-bind", f"{self.cwd}/b",
+            "--sandbox-bwrap-rw", f"{self.cwd}/build"])
+        ctx = types.SimpleNamespace()
+        q._apply_sandbox_args(ctx, args)
+        self.assertEqual(ctx.executor_mode, "bwrap")
+        self.assertEqual((ctx.bwrap_project, ctx.bwrap_net), ("ro", "none"))
+        self.assertEqual(ctx.bwrap_binds, [(os.path.realpath(f"{self.cwd}/a"), "rw"),
+                                           (os.path.realpath(f"{self.cwd}/b"), "ro")])
+        self.assertEqual(ctx.bwrap_rw, [os.path.realpath(f"{self.cwd}/build")])
+        ex = q.CommandContext.create_executor(ctx)
+        self.assertEqual((ex.mode, ex.bwrap_project, ex.bwrap_net),
+                         ("bwrap", "ro", "none"))
+        self.assertEqual(ex.bwrap_binds, ctx.bwrap_binds)
+
+    def test_engine_env_var_and_defaults(self):
+        with patch.dict(os.environ, {"OLLAMAQUERY_SANDBOX_ENGINE": "bwrap",
+                                     "OLLAMAQUERY_BWRAP_PROJECT": "ro",
+                                     "OLLAMAQUERY_BWRAP_NET": "none"}):
+            args = q._build_parser().parse_args([])
+            ctx = types.SimpleNamespace()
+            q._apply_sandbox_args(ctx, args)
+        self.assertEqual((ctx.executor_mode, ctx.sandbox_engine_override),
+                         ("bwrap", "bwrap"))
+        self.assertEqual((ctx.bwrap_project, ctx.bwrap_net), ("ro", "none"))
+
+    def test_engine_conflicts_with_container_flags(self):
+        args = q._build_parser().parse_args(
+            ["--sandbox-engine", "bwrap", "--sandbox-image", "img:1"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                q._apply_sandbox_args(types.SimpleNamespace(), args)
+
+    def test_invalid_bind_mode_is_an_error(self):
+        args = q._build_parser().parse_args(
+            ["--sandbox-engine", "bwrap", "--sandbox-bwrap-bind", "/tmp/x:bogus"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                q._apply_sandbox_args(types.SimpleNamespace(), args)
+
+    def test_bwrap_toggle_sets_both_executors(self):
+        ctx = q.CommandContext()
+        ctx.executor_mode = "host"
+        loop = object.__new__(q.ChatLoop)
+        loop.ctx = ctx
+        loop.executor = q.Executor(mode="host")
+        loop.tool_registry = types.SimpleNamespace(executor=loop.executor)
+        with patch.object(q.Executor, "_bwrap_probe", return_value=True), \
+             contextlib.redirect_stderr(io.StringIO()):
+            loop._agentic_toggle_sandbox(['/agentic', 'sandbox', 'bwrap'])
+        self.assertEqual(loop.executor.mode, "bwrap")
+        self.assertEqual(loop.tool_registry.executor.mode, "bwrap")
+        self.assertEqual(ctx.executor_mode, "bwrap")
+
+    def test_bwrap_toggle_refuses_when_the_probe_fails(self):
+        ctx = q.CommandContext()
+        ctx.executor_mode = "host"
+        loop = object.__new__(q.ChatLoop)
+        loop.ctx = ctx
+        loop.executor = q.Executor(mode="host")
+        loop.tool_registry = types.SimpleNamespace(executor=loop.executor)
+        with patch.object(q.Executor, "_bwrap_probe", return_value=False), \
+             contextlib.redirect_stderr(io.StringIO()):
+            loop._agentic_toggle_sandbox(['/agentic', 'sandbox', 'bwrap'])
+        self.assertEqual(loop.executor.mode, "host")
+        self.assertEqual(ctx.executor_mode, "host")
+
+    def test_file_tools_stay_in_the_harness(self):
+        """The documented limit: write_file is governed by the Path ACL, not bwrap."""
+        ctx = q.CommandContext()
+        ctx.preset = "work"
+        ctx.auto_confirm = True
+        td = tempfile.mkdtemp(prefix="bwrap-acl-")
+        try:
+            target = os.path.join(td, "written.txt")
+            ctx.path_acl.add("write", "allow", td, source="session")
+            ctx.path_acl.add("read", "allow", td, source="session")
+            registry = ctx.create_tool_registry()
+            registry.executor = self._executor(bwrap_project="ro")
+            with patch.object(registry.executor, "run",
+                              side_effect=AssertionError("file tools must not use bwrap")):
+                result = registry.execute("write_file",
+                                          {"file_path": target, "content": "hello"})
+            self.assertTrue(result["success"], msg=result.get("error", ""))
+            with open(target) as fh:
+                self.assertEqual(fh.read(), "hello")
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+class TestAgenticPresets(unittest.TestCase):
+    """The four MVP presets: one resolver, four projections, no drift."""
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        self.ctx.system_prompt = "BASE PROMPT"
+        self.ctx._saved_system_prompt = None
+        self.ctx._plan_prev_prompt = None
+        self.ctx._plan_prev_preset = None
+        self.ctx.agentic_mode = False
+        self.ctx.plan_mode = False
+        self.ctx.plan_run = False
+        self.ctx.preset = "work"
+        self.ctx.executor_mode = "host"
+        self.ctx.sandbox_engine_override = None
+        self.ctx.auto_confirm = False
+        self.ctx.bwrap_project = q.DEFAULT_BWRAP_PROJECT
+        self.ctx.bwrap_net = q.DEFAULT_BWRAP_NET
+        self.ctx.bwrap_project_override = None
+        self.ctx.bwrap_net_override = None
+
+    def tearDown(self):
+        self.setUp()
+
+    def _loop(self):
+        loop = object.__new__(q.ChatLoop)
+        loop.ctx = self.ctx
+        loop.executor = self.ctx.create_executor()
+        loop.tool_registry = self.ctx.create_tool_registry()
+        return loop
+
+    def test_resolver_projections_do_not_drift(self):
+        read = q.resolve_preset("read")
+        exec_ = q.resolve_preset("exec")
+        work = q.resolve_preset("work")
+        trusted = q.resolve_preset("trusted")
+        self.assertEqual(read.engine, "none")
+        self.assertEqual(read.tools, frozenset(q.PLAN_MODE_TOOLS))
+        self.assertIn("run_command", exec_.tools)
+        self.assertIn("run_python", exec_.tools)
+        self.assertNotIn("write_file", exec_.tools)
+        self.assertNotIn("fetch_url", exec_.tools)
+        self.assertEqual((exec_.engine, exec_.project, exec_.net),
+                         ("bwrap", "ro", "none"))
+        self.assertIsNone(work.tools)
+        self.assertEqual((work.engine, work.project, work.net),
+                         ("bwrap", "rw", "shared"))
+        self.assertIsNone(trusted.tools)
+        self.assertEqual(trusted.engine, "host")
+        self.assertEqual(q.resolve_preset("plan"), read)
+        self.assertEqual(q.resolve_preset("full"), trusted)
+        self.assertEqual(q.resolve_preset("auto"), trusted)
+
+    def test_unknown_preset_raises(self):
+        with self.assertRaises(ValueError):
+            q.resolve_preset("yolo-max")
+
+    def test_read_preset_is_the_existing_plan(self):
+        loop = self._loop()
+        with contextlib.redirect_stderr(io.StringIO()):
+            loop.run_handle_agentic("/agentic preset read")
+        self.assertTrue(self.ctx.plan_mode)
+        self.assertFalse(self.ctx.plan_run)
+        self.assertEqual(self.ctx.preset, "read")
+        self.assertIn("Read-only planning mode", self.ctx.system_prompt)
+        self.assertNotIn("run_command", q.agentic_active_tools(self.ctx))
+
+    def test_exec_preset_is_bwrap_ro_without_write_tools(self):
+        loop = self._loop()
+        with patch.object(q.Executor, "_bwrap_probe", return_value=True), \
+             contextlib.redirect_stderr(io.StringIO()):
+            loop.run_handle_agentic("/agentic preset exec")
+        self.assertEqual(self.ctx.preset, "exec")
+        self.assertEqual(self.ctx.executor_mode, "bwrap")
+        self.assertEqual((self.ctx.bwrap_project, self.ctx.bwrap_net), ("ro", "none"))
+        self.assertTrue(self.ctx.auto_confirm)
+        self.assertIn("Execution preset", self.ctx.system_prompt)
+        surface = q.agentic_active_tools(self.ctx)
+        self.assertIn("run_command", surface)
+        self.assertIn("run_python", surface)
+        self.assertNotIn("write_file", surface)
+        self.assertNotIn("fetch_url", surface)
+        self.assertEqual(loop.tool_registry.executor.mode, "bwrap")
+        self.assertEqual(loop.tool_registry.executor.bwrap_project, "ro")
+
+    def test_exec_preset_refuses_an_explicit_non_bwrap_engine(self):
+        self.ctx.sandbox_engine_override = "host"
+        loop = self._loop()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop.run_handle_agentic("/agentic preset exec")
+        self.assertNotEqual(self.ctx.preset, "exec")
+        self.assertIn("requires the bwrap engine", err.getvalue())
+
+    def test_work_preset_is_the_default_stance(self):
+        loop = self._loop()
+        with patch.object(q.Executor, "_bwrap_probe", return_value=True), \
+             contextlib.redirect_stderr(io.StringIO()):
+            loop.run_handle_agentic("/agentic on")
+        self.assertTrue(self.ctx.agentic_mode)
+        self.assertEqual(self.ctx.preset, "work")
+        self.assertEqual(self.ctx.executor_mode, "bwrap")
+        self.assertEqual((self.ctx.bwrap_project, self.ctx.bwrap_net), ("rw", "shared"))
+        self.assertIsNone(q.agentic_active_tools(self.ctx))
+        self.assertNotIn("Execution preset", self.ctx.system_prompt)
+
+    def test_trusted_preset_is_host_and_auto(self):
+        loop = self._loop()
+        with contextlib.redirect_stderr(io.StringIO()):
+            loop.run_handle_agentic("/agentic preset trusted")
+        self.assertEqual(self.ctx.preset, "trusted")
+        self.assertEqual(self.ctx.executor_mode, "host")
+        self.assertTrue(self.ctx.auto_confirm)
+        self.assertTrue(self.ctx.agentic_mode)
+        self.assertIsNone(q.agentic_active_tools(self.ctx))
+
+    def test_full_alias_selects_trusted(self):
+        loop = self._loop()
+        with contextlib.redirect_stderr(io.StringIO()):
+            loop.run_handle_agentic("/agentic full")
+        self.assertEqual(self.ctx.preset, "trusted")
+        self.assertEqual(self.ctx.executor_mode, "host")
+
+    def test_plan_alias_selects_read_and_off_restores_the_previous_preset(self):
+        loop = self._loop()
+        with patch.object(q.Executor, "_bwrap_probe", return_value=True), \
+             contextlib.redirect_stderr(io.StringIO()):
+            loop.run_handle_agentic("/agentic preset exec")
+            loop.run_handle_agentic("/agentic preset plan")
+            self.assertEqual(self.ctx.preset, "read")
+            loop.run_handle_agentic("/agentic plan off")
+        self.assertEqual(self.ctx.preset, "exec")
+        self.assertEqual(self.ctx.executor_mode, "bwrap")
+        self.assertEqual(self.ctx.bwrap_project, "ro")
+
+    def test_preset_list_and_show(self):
+        loop = self._loop()
+        err = io.StringIO()
+        with patch.object(q.Executor, "_bwrap_probe", return_value=True), \
+             contextlib.redirect_stderr(err):
+            loop.run_handle_agentic("/agentic preset exec")
+            err.truncate(0)
+            err.seek(0)
+            loop.run_handle_agentic("/agentic preset")
+            listing = err.getvalue()
+            err.truncate(0)
+            err.seek(0)
+            loop.run_handle_agentic("/agentic preset show")
+            shown = err.getvalue()
+        for name in q.PRESET_NAMES:
+            self.assertIn(name, listing)
+        self.assertIn("aliases", listing)
+        self.assertIn("Tools restricted to", shown)
+        self.assertIn("run_command", shown)
+
+    def test_exec_backstop_denies_a_hallucinated_write_tool(self):
+        self.ctx.preset = "exec"
+        self.ctx.agentic_mode = True
+        registry = self.ctx.create_tool_registry()
+        result = registry.execute("write_file",
+                                  {"file_path": "should-not-exist.txt", "content": "x"})
+        self.assertFalse(result["success"])
+        self.assertIn("disabled", result["error"])
+        self.assertFalse(os.path.exists("should-not-exist.txt"))
+
+    def test_exec_surface_filters_the_prompt_and_schema(self):
+        self.ctx.preset = "exec"
+        self.ctx.agentic_mode = True
+        registry = self.ctx.create_tool_registry()
+        names = set(registry._plan_allowed_tools())
+        self.assertIn("run_command", names)
+        self.assertNotIn("write_file", names)
+        self.assertNotIn("apply_patch", names)
+        self.assertNotIn("fetch_url", names)
+        tool_names = {t["function"]["name"] for t in registry.openai_tools_spec()}
+        self.assertEqual(tool_names, names)
+
+    def test_exec_confines_file_tool_paths_to_the_cwd(self):
+        self.ctx.preset = "exec"
+        decision, message = q._path_acl_decision(
+            self.ctx, "read", os.path.realpath("/etc/passwd"), "read_file")
+        self.assertEqual(decision, "deny")
+        self.assertIn("strict", message.lower())
+
+    def test_work_honours_an_explicit_project_override(self):
+        self.ctx.bwrap_project_override = "ro"
+        loop = self._loop()
+        with patch.object(q.Executor, "_bwrap_probe", return_value=True), \
+             contextlib.redirect_stderr(io.StringIO()):
+            loop.run_handle_agentic("/agentic preset work")
+        self.assertEqual(self.ctx.bwrap_project, "ro")
+
+    def test_exec_refuses_an_override_that_breaks_its_promise(self):
+        self.ctx.bwrap_project_override = "rw"
+        loop = self._loop()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop.run_handle_agentic("/agentic preset exec")
+        self.assertNotEqual(self.ctx.preset, "exec")
+        self.assertIn("requires --sandbox-bwrap-project ro", err.getvalue())
+
+    def test_exec_refuses_a_runtime_engine_switch_to_host(self):
+        self.ctx.preset = "exec"
+        self.ctx.executor_mode = "bwrap"
+        loop = self._loop()
+        loop.executor.mode = "bwrap"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop.run_handle_agentic("/agentic sandbox host")
+        self.assertEqual(loop.executor.mode, "bwrap")
+        self.assertEqual(self.ctx.executor_mode, "bwrap")
+        self.assertIn("requires bwrap", err.getvalue())
+
+    def test_trusted_on_bwrap_keeps_the_rw_shared_policy(self):
+        self.ctx.sandbox_engine_override = "bwrap"
+        self.ctx.bwrap_project = "ro"
+        self.ctx.bwrap_net = "none"
+        loop = self._loop()
+        with patch.object(q.Executor, "_bwrap_probe", return_value=True), \
+             contextlib.redirect_stderr(io.StringIO()):
+            loop.run_handle_agentic("/agentic preset trusted")
+        self.assertEqual(self.ctx.preset, "trusted")
+        self.assertEqual(self.ctx.executor_mode, "bwrap")
+        self.assertEqual((self.ctx.bwrap_project, self.ctx.bwrap_net),
+                         ("rw", "shared"))
+
+    def test_exec_does_not_start_or_expose_mcp_tools(self):
+        self.ctx.preset = "exec"
+        self.ctx.agentic_mode = True
+        manager = types.SimpleNamespace()
+        manager.ensure_started_all = MagicMock()
+        manager.aggregate_tools = MagicMock(return_value={
+            "srv__lookup": {"description": "net tool", "parameters": {
+                "type": "object", "properties": {}, "required": []}}})
+        self.ctx.mcp_manager = manager
+        try:
+            registry = self.ctx.create_tool_registry()
+            names = set(registry._plan_allowed_tools())
+            manager.ensure_started_all.assert_not_called()
+            manager.aggregate_tools.assert_not_called()
+            self.assertNotIn("srv__lookup", names)
+        finally:
+            self.ctx.mcp_manager = None
+
+    def test_exec_does_not_redirect_curl_to_the_host_fetch_tool(self):
+        """A harmless GET must still run in bwrap (and fail with no network)."""
+        self.ctx.preset = "exec"
+        self.ctx.agentic_mode = True
+        self.ctx.auto_confirm = True
+        registry = self.ctx.create_tool_registry()
+        registry.executor = q.Executor(mode="bwrap")
+        with patch.object(registry.executor, "run",
+                          return_value={"stdout": "", "stderr": "Could not resolve host",
+                                        "returncode": 6}) as run, \
+             patch.object(registry, "_serve_fetch_redirect") as redirect:
+            result = registry.execute("run_command",
+                                      {"command": "curl -s http://example.com"})
+        redirect.assert_not_called()
+        run.assert_called_once()
+        self.assertFalse(result["success"])
+        self.assertIn("Could not resolve host", result["error"])
+
+    def test_full_alias_honours_a_bwrap_override_with_rw_shared(self):
+        self.ctx.sandbox_engine_override = "bwrap"
+        self.ctx.bwrap_project = "ro"
+        self.ctx.bwrap_net = "none"
+        loop = self._loop()
+        with patch.object(q.Executor, "_bwrap_probe", return_value=True), \
+             contextlib.redirect_stderr(io.StringIO()):
+            loop.run_handle_agentic("/agentic full")
+        self.assertEqual(self.ctx.preset, "trusted")
+        self.assertEqual(self.ctx.executor_mode, "bwrap")
+        self.assertEqual((self.ctx.bwrap_project, self.ctx.bwrap_net),
+                         ("rw", "shared"))
+
+    def test_read_preset_does_not_confine_beyond_plan(self):
+        self.ctx.preset = "work"
+        self.assertFalse(q.strict_path_confinement(self.ctx))
+
+
+class TestBwrapSandboxLive(unittest.TestCase):
+    """Opt-in real bwrap runs (RUN_BWRAP_E2E=1; skipped when bwrap is absent)."""
+
+    def setUp(self):
+        if not (RUN_BWRAP_E2E and BWRAP_AVAILABLE):
+            self.skipTest("set RUN_BWRAP_E2E=1 with bwrap installed")
+        self.tmp = tempfile.mkdtemp(prefix="bwrap-e2e-")
+        self.home = os.path.join(self.tmp, "home")
+        self.project = os.path.join(self.tmp, "project")
+        os.makedirs(self.home)
+        os.makedirs(self.project)
+        self._old_cwd = os.getcwd()
+        os.chdir(self.project)
+
+    def tearDown(self):
+        if getattr(self, "tmp", None):
+            os.chdir(self._old_cwd)
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, command, project="rw", net="none", timeout=20):
+        ex = q.Executor(mode="bwrap", bwrap_project=project, bwrap_net=net,
+                        bwrap_home=self.home)
+        return ex.run(command, timeout=timeout)
+
+    def test_project_rw_writes_scratch_and_etc_is_read_only(self):
+        result = self._run(
+            "echo ok > in-project.txt; echo s > $HOME/cache.txt; "
+            "echo x > /etc/should-not-exist; echo etc=$?")
+        self.assertEqual(result["returncode"], 0)
+        self.assertTrue(os.path.exists(os.path.join(self.project, "in-project.txt")))
+        self.assertTrue(os.path.exists(os.path.join(self.home, "cache.txt")))
+        self.assertFalse(os.path.exists("/etc/should-not-exist"))
+        self.assertIn("etc=1", result["stdout"])
+
+    def test_project_ro_refuses_writes_but_the_scratch_stays_rw(self):
+        result = self._run("echo x > refused.txt; echo rc=$?; "
+                           "echo y > $HOME/ok.txt; echo home=$?",
+                           project="ro")
+        self.assertIn("rc=1", result["stdout"])
+        self.assertIn("home=0", result["stdout"])
+        self.assertFalse(os.path.exists(os.path.join(self.project, "refused.txt")))
+
+    def test_net_none_blocks_dns_and_tcp(self):
+        result = self._run("getent hosts example.com >/dev/null 2>&1; echo dns=$?; "
+                           "timeout 3 bash -c 'echo > /dev/tcp/192.168.1.20/8090' "
+                           "2>/dev/null; echo tcp=$?")
+        self.assertIn("dns=2", result["stdout"])
+        self.assertNotIn("tcp=0", result["stdout"])
+
+    def test_host_home_is_not_mounted(self):
+        host_home = os.path.expanduser("~")
+        result = self._run(f"test -e {shlex.quote(host_home)}; echo home=$?")
+        self.assertIn("home=1", result["stdout"])
+
+    @unittest.skipUnless(shutil.which("gcc"), "gcc not installed")
+    def test_gcc_builds_and_runs_inside_the_sandbox(self):
+        result = self._run(
+            "printf 'int main(){return 0;}\\n' > m.c && gcc m.c -o m && ./m && echo BUILD_OK")
+        self.assertIn("BUILD_OK", result["stdout"])
 
 
 class TestAgenticStreamObservations(unittest.TestCase):
@@ -4580,9 +5181,9 @@ class TestAgenticStatusDisplay(unittest.TestCase):
     """`/agentic` status table: every setting listed, value brackets aligned."""
 
     SETTINGS = (
-        "agentic", "plan", "auto", "sandbox", "verbose", "thinking", "trace",
-        "log", "lazytool", "iterations", "timeout", "heartbeattokens",
-        "compactthreshold",
+        "agentic", "preset", "plan", "auto", "sandbox", "verbose", "thinking",
+        "trace", "log", "lazytool", "iterations", "timeout",
+        "heartbeattokens", "compactthreshold",
     )
 
     def _render(self) -> str:
@@ -4623,6 +5224,10 @@ class TestAgenticPlanCommand(unittest.TestCase):
         ctx.plan_mode = False
         ctx.plan_run = False
         ctx.agentic_mode = False
+        ctx.preset = "work"
+        ctx.executor_mode = "host"
+        ctx.auto_confirm = False
+        ctx.sandbox_engine_override = None
 
     def _loop(self):
         loop = object.__new__(q.ChatLoop)
@@ -4720,6 +5325,7 @@ class TestAgenticPlanCommand(unittest.TestCase):
         self.assertFalse(loop.ctx.agentic_mode)
         self.assertFalse(loop.ctx.plan_mode)
         self.assertFalse(loop.ctx.plan_run)
+        self.assertEqual(loop.ctx.preset, "work")
         # Re-enabling agentic must NOT silently restore plan restrictions.
         loop._agentic_toggle_on_off(True)
         self.assertFalse(loop.ctx.plan_mode)
@@ -4828,6 +5434,10 @@ class TestPersonaInAgenticPrompt(unittest.TestCase):
         self.ctx._saved_system_prompt = None
         self.ctx._plan_prev_prompt = None
         self.ctx.system_prompt = q.DEFAULT_SYSTEM_PROMPT
+        self.ctx.preset = "work"
+        self.ctx.executor_mode = "host"
+        self.ctx.auto_confirm = False
+        self.ctx.sandbox_engine_override = None
 
     def test_persona_leads_and_the_protocol_follows(self):
         self.loop._agentic_toggle_on_off(True)
