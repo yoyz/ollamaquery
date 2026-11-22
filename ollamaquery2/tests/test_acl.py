@@ -1131,6 +1131,189 @@ class TestShellWriteTargets(unittest.TestCase):
                          {("write", "f"), ("read", "f")})
 
 
+class TestShellNestedPayloads(unittest.TestCase):
+    """H3: nested payloads inherit the effective cwd and are re-gated.
+
+    `bash -c 'cd / && echo x > rel'` was `allow`: the `-c` argument is one
+    opaque token, so the relative write inside it resolved against the project
+    (or not at all). The decomposition M2 already uses
+    (`_shell_embedded_commands`) is now recursed with the cwd the outer node
+    runs in, so a relative write inside a payload is graded like a top-level
+    one, and an unresolved cwd refuses it (fail-closed). Reads keep the
+    pre-existing embedded-absolute-path pass: `bash -c 'cat /etc/passwd'`
+    prompts once, not twice.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx)
+
+    def test_payload_cd_out_relative_write_is_denied(self):
+        for cmd in (
+            "bash -c 'cd / && echo x > rel'",
+            "sh -c 'cd / && echo x > rel'",
+            "bash -lc 'cd / && echo x > rel'",
+            "sudo bash -c 'cd / && echo x > rel'",
+            "env -S 'cd / && echo x > rel'",
+            "python3 -c \"import os; os.system('cd / && echo x > rel')\"",
+            "bash -c \"bash -c 'cd / && echo x > rel'\"",
+        ):
+            with self.subTest(cmd=cmd):
+                res = self._scan(cmd)
+                self.assertIsNotNone(res, cmd)
+                self.assertFalse(res["approved"], cmd)
+                self.assertIn("/rel", res["reason"], cmd)
+
+    def test_outer_effective_cwd_is_inherited(self):
+        for cmd in ("cd / && bash -c 'echo x > rel'",
+                    "cd /; bash -c 'echo x > rel'"):
+            with self.subTest(cmd=cmd):
+                res = self._scan(cmd)
+                self.assertIsNotNone(res, cmd)
+                self.assertFalse(res["approved"], cmd)
+                self.assertIn("/rel", res["reason"], cmd)
+
+    def test_unresolved_outer_cd_refuses_the_payload_write(self):
+        res = self._scan("cd $UNSET && bash -c 'echo x > rel'")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+        self.assertIn("unresolved cd", res["reason"])
+
+    def test_unresolved_payload_cd_refuses_the_write(self):
+        res = self._scan("bash -c 'cd $UNSET && echo x > rel'")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+        self.assertIn("unresolved cd", res["reason"])
+
+    def test_payload_in_the_project_is_allowed(self):
+        for cmd in ("bash -c 'echo x > rel'",
+                    "bash -c 'cp a b'",
+                    "bash -c 'cd / && echo x > /dev/null'",
+                    "bash -c 'cd / && cat rel'"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self._scan(cmd), cmd)
+
+    def test_payload_cd_into_a_project_subdir(self):
+        sub = tempfile.mkdtemp(dir=os.getcwd())
+        try:
+            name = shlex.quote(os.path.basename(sub))
+            self.assertIsNone(self._scan(f"bash -c 'cd {name} && echo x > rel'"))
+            res = self._scan(f"bash -c 'cd {name} && echo x > ../../outside'")
+            self.assertIsNotNone(res)
+            self.assertFalse(res["approved"])
+        finally:
+            os.rmdir(sub)
+
+    def test_embedded_read_prompts_once(self):
+        calls = []
+
+        def fake_prompt(_self, op, realpath, rule, tool="file", context=""):
+            calls.append((op, realpath))
+            return True
+
+        with patch.object(m.PathAcl, "prompt", fake_prompt):
+            self.assertIsNone(self._scan("bash -c 'cat /etc/passwd'"))
+        self.assertEqual(calls, [("read", "/etc/passwd")])
+
+    def test_gate_denies_with_auto_confirm(self):
+        self.ctx.auto_confirm = True
+        res = m.check_shell_approval("bash -c 'cd / && echo x > rel'", self.ctx)
+        self.assertFalse(res["approved"])
+        self.assertEqual(res["effect"], "deny")
+
+    def test_access_plan_includes_nested_events(self):
+        plan = m._shell_access_plan("bash -c 'cd / && echo x > rel'")
+        self.assertIn(("write", "/rel"), {(e["op"], e["real"]) for e in plan})
+        plan = m._shell_access_plan("cd $UNSET && bash -c 'echo x > rel'")
+        self.assertIn(("write", None), {(e["op"], e["real"]) for e in plan})
+        plan = m._shell_access_plan("find . -exec sh -c 'cd / && echo x > rel' \\;")
+        self.assertIn(("write", "/rel"), {(e["op"], e["real"]) for e in plan})
+        plan = m._shell_access_plan("xargs sh -c 'cd / && echo x > rel'")
+        self.assertIn(("write", "/rel"), {(e["op"], e["real"]) for e in plan})
+
+
+class TestShellNestedFindXargs(unittest.TestCase):
+    """`find -exec` and `xargs` payloads are commands too.
+
+    `find` and `xargs` are allow-listed, and M2 only looked at the roots of a
+    `find`, so `find . -exec rm -rf ~ \\;` and `xargs rm -rf ~` were `allow`
+    while the same commands spelled directly are hard-denied.
+    `_shell_embedded_commands` now returns those payloads, so the bypass-immune
+    home guard and the H3 ACL recursion both see them.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _res(self, command, auto=True):
+        self.ctx.auto_confirm = auto
+        return m.check_shell_approval(command, ctx=self.ctx)
+
+    def _assert_nested_deny(self, command):
+        res = self._res(command)
+        self.assertFalse(res["approved"], command)
+        self.assertEqual(res["effect"], "deny", command)
+        self.assertIn("BLOCKED (rejected)", res.get("message", ""), command)
+        self.assertIn("nested `-c`", res.get("message", ""), command)
+
+    def test_find_exec_home_and_root(self):
+        for cmd in ("find . -exec rm -rf ~ \\;",
+                    "find . -exec rm -rf / \\;",
+                    "find . -execdir rm -rf ~ \\;",
+                    "find . -exec sh -c 'rm -rf ~' \\;",
+                    "find . -exec bash -lc 'rm -rf $HOME' \\;",
+                    # A bare `+` is a literal argument, not the batch terminator:
+                    # the `~` after it must still be seen.
+                    "find . -exec rm + ~ \\;"):
+            with self.subTest(cmd=cmd):
+                self._assert_nested_deny(cmd)
+
+    def test_find_exec_batching_terminator(self):
+        # `{}` `+` is the batched form: the payload ends there and the project
+        # itself is the target, which CWD leniency allows.
+        res = self._res("find . -exec rm -rf {} +")
+        self.assertNotEqual(res["effect"], "deny")
+        self.assertNotIn("nested `-c`", res.get("message") or "")
+
+    def test_xargs_destructive(self):
+        for cmd in ("xargs rm -rf ~",
+                    "echo x | xargs sh -c 'rm -rf ~'",
+                    "find . -print0 | xargs -0 rm -rf /"):
+            with self.subTest(cmd=cmd):
+                self._assert_nested_deny(cmd)
+
+    def test_acl_reaches_find_exec_relative_writes(self):
+        command = "find . -exec sh -c 'cd / && echo x > rel' \\;"
+        res = m._shell_acl_scan(command, self.ctx)
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+        self.assertIn("/rel", res["reason"])
+        # `find *` is allow-listed, so the gate reaches the ACL scan without
+        # an approval prompt: the relative write is denied on the allow path.
+        self.ctx.auto_confirm = False
+        gate = m.check_shell_approval(command, self.ctx)
+        self.assertFalse(gate["approved"])
+        self.assertEqual(gate["effect"], "deny")
+
+    def test_acl_reaches_a_find_exec_write_target(self):
+        res = m._shell_acl_scan("find . -exec tee /etc/x \\;", self.ctx)
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+        self.assertIn("/etc/x", res["reason"])
+
+    def test_harmless_payloads_are_not_blocked(self):
+        for cmd in ("find . -exec grep -l x {} \\;",
+                    "find . -exec echo hi {} \\;",
+                    "find . -exec sh -c 'echo \"rm -rf ~\"' \\;",
+                    "xargs sh -c 'echo \"rm -rf ~\"'",
+                    "echo x | xargs echo"):
+            res = self._res(cmd)
+            self.assertNotEqual(res["effect"], "deny", cmd)
+            self.assertNotIn("nested `-c`", res.get("message") or "", cmd)
+
+
 class TestShellLineContinuationInWords(unittest.TestCase):
     """`\\`+newline is deleted before tokenizing, even inside a word (G2).
 
