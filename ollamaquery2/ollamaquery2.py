@@ -5052,6 +5052,11 @@ def _shell_path_inside_cwd(path_str: str, cwd: Optional[str] = None) -> bool:
         cwd = os.getcwd()
     # Strip quotes
     p = path_str.strip().strip("'\"")
+    # A code/command blob is not a project path: spaces and shell
+    # metacharacters make the token opaque, so the leniency asks instead of
+    # treating it as an in-CWD operand (`ssh host 'rm -rf /'` used to pass).
+    if any(ch in p for ch in " \t\r\n|;&$`()<>{}!"):
+        return False
     # Skip flags, globs without slash, bare commands
     if not p or p.startswith("-"):
         return True
@@ -5126,9 +5131,116 @@ def _shell_redirect_target_is_discardable(tok: str) -> bool:
     return tok.strip().strip("'\"").lstrip("<>") in _SHELL_DISCARD_TARGETS
 
 
+def _shell_cd_target(tokens: list) -> Optional[str]:
+    """Return the directory operand of a `cd`/`pushd` node, or None.
+
+    Args:
+        tokens: The node's command tokens.
+
+    Returns:
+        The target word (quotes stripped), or None when the target is unknown
+        (`popd`, `cd` with no argument, `cd -`, `pushd +1`).
+    """
+    head = tokens[0].strip("'\"").lower()
+    if head == "popd":
+        return None
+    saw_dash = False
+    for raw in tokens[1:]:
+        tok = raw.strip("'\"")
+        if tok == "--":
+            continue
+        if tok == "-":
+            saw_dash = True
+            continue
+        if tok.startswith("-"):
+            continue
+        if head in ("pushd",) and tok.startswith("+"):
+            return None
+        return tok
+    if head in ("cd", "chdir") and not saw_dash:
+        # A bare `cd` (or `cd -P`) goes to $HOME; `cd -` is OLDPWD, unknown.
+        return os.path.expanduser("~")
+    return None
+
+
+def _shell_cd_resolved(target: Optional[str], effective_cwd: str) -> Optional[str]:
+    """Resolve a `cd` target against the directory in force, or None.
+
+    Args:
+        target: The directory operand, or None.
+        effective_cwd: The directory in force before this `cd`.
+
+    Returns:
+        The realpath of the target, or None for an opaque target (`$VAR`,
+        backtick, glob, `-`, `+N`).
+    """
+    if target is None:
+        return None
+    t = target.strip().strip("'\"")
+    t = _shell_expand_home_refs(t)
+    if (not t or t.startswith("-") or t.startswith("+")
+            or "$" in t or "`" in t or "*" in t or "?" in t):
+        return None
+    expanded = os.path.expanduser(t)
+    return os.path.realpath(
+        expanded if os.path.isabs(expanded) else os.path.join(effective_cwd, expanded))
+
+
+def _shell_cd_target_allowed(target: str, effective_cwd: str, project_cwd: str,
+                             extra_roots: Optional[list]) -> bool:
+    """True when a `cd` target stays inside the project or a scratch root.
+
+    Args:
+        target: The directory operand.
+        effective_cwd: The directory in force before this `cd`.
+        project_cwd: The session's original working directory (realpath).
+        extra_roots: Additional allowed roots (the session scratch dir).
+
+    Returns:
+        True when the resolved target is inside the project or an extra root.
+    """
+    resolved = _shell_cd_resolved(target, effective_cwd)
+    if resolved is None:
+        return False
+    if _path_is_within(resolved, project_cwd):
+        return True
+    return any(_path_is_within(resolved, root) for root in extra_roots or [])
+
+
+def _shell_command_word_inside_cwd(word: str, cwd: str,
+                                   extra_roots: Optional[list]) -> bool:
+    """True when a path-like command word resolves inside the CWD.
+
+    A command with no operands earns CWD leniency only when it is a project
+    path (`./script.sh`, `build/run`), never for a bare `sh`/`bash`.
+
+    Args:
+        word: The node's command word.
+        cwd: Directory to resolve against.
+        extra_roots: Additional allowed roots.
+
+    Returns:
+        True for a path-like command word inside the CWD or an extra root.
+    """
+    w = word.strip().strip("'\"")
+    if not w or w.startswith("-"):
+        return False
+    if "/" not in w and "\\" not in w and "." not in w:
+        return False
+    if _shell_path_inside_cwd(w, cwd):
+        return True
+    return bool(extra_roots and _shell_token_inside_roots(w, extra_roots))
+
+
 def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
                                    extra_roots: Optional[list] = None) -> bool:
-    """Return True when every non-flag operand of the parsed nodes is inside CWD.
+    """Return True when every operand of the parsed nodes is inside CWD.
+
+    A node with no operand earns no leniency unless its command word is a
+    project path (`./script.sh`); this closes the vacuous `sh` / `curl | sh`
+    case. `cd`/`pushd` targets are followed: any target outside the project
+    (or `~`, `$VAR`, `-`, a glob) disables leniency for the rest of the line.
+    Wrappers, assignments, `xargs` and shell `-c` payloads never get leniency.
 
     Write-redirection targets count as operands: they are the destination the
     command will modify, so `python3 gen.py > /etc/config` must not borrow the
@@ -5142,20 +5254,41 @@ def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
     """
     if cwd is None:
         cwd = os.getcwd()
+    project_cwd = os.path.realpath(cwd)
+    effective_cwd = cwd
+    roots = [os.path.realpath(root) for root in extra_roots or []]
     for n in nodes:
         toks = n.get("tokens") if isinstance(n, dict) else n.tokens
         if not toks:
             continue
-        head = toks[0].strip("'\"") if toks[0] else ""
+        head = os.path.basename(toks[0].strip("'\"").lower())
         if head in _SHELL_CWD:
+            target = _shell_cd_target(toks)
+            resolved = _shell_cd_resolved(target, effective_cwd)
+            if resolved is None or not _shell_cd_target_allowed(
+                    target, effective_cwd, project_cwd, roots):
+                return False
+            if os.path.isdir(resolved):
+                effective_cwd = resolved
             continue
-        for tok in toks[1:]:
-            # Skip flags
-            if tok.startswith("-"):
+        # A wrapper or an assignment prefix hides the real command: no leniency.
+        effective_index = _shell_effective_index(toks)
+        if 0 < effective_index < len(toks):
+            return False
+        eff_head, eff_args = _shell_effective_command(toks)
+        if not eff_head or eff_head == "xargs":
+            return False
+        if eff_head in _SHELL_INTERPRETERS and _shell_c_payloads(eff_args):
+            return False
+        operands = [t for t in toks[1:] if not t.strip("'\"").startswith("-")]
+        if not operands:
+            if not _shell_command_word_inside_cwd(toks[0], effective_cwd, roots):
+                return False
+            continue
+        for tok in operands:
+            if _shell_path_inside_cwd(tok, effective_cwd):
                 continue
-            if _shell_path_inside_cwd(tok, cwd):
-                continue
-            if extra_roots and _shell_token_inside_roots(tok, extra_roots):
+            if roots and _shell_token_inside_roots(tok, roots):
                 continue
             return False
         targets = (n.get("redirect_targets") if isinstance(n, dict)
@@ -5163,53 +5296,86 @@ def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
         for tok in targets or []:
             if _shell_redirect_target_is_discardable(tok):
                 continue
-            if _shell_path_inside_cwd(tok, cwd):
+            if _shell_path_inside_cwd(tok, effective_cwd):
                 continue
-            if extra_roots and _shell_token_inside_roots(tok, extra_roots):
+            if roots and _shell_token_inside_roots(tok, roots):
                 continue
             return False
     return True
 
 # --- Home/root destructive guard (bypass-immune) ---
 def _shell_is_home_destructive(nodes: list) -> bool:
-    """Return True if any parsed node is an `rm` targeting ~ or the filesystem root.
+    """Return True if any parsed node deletes home/root or runs such a delete.
+
+    The command word is normalized through `_shell_effective_command()`, so a
+    wrapper (`sudo`, `env`, `nohup`, `command`, `exec`, `time`, `nice`,
+    `builtin`, `busybox`), a leading `VAR=value` assignment, or an absolute
+    path (`/bin/rm`) cannot hide the effective command. `find -delete` /
+    destructive `find -exec` and `xargs rm` after a home/root `find` count as
+    deletes too.
 
     Args:
         nodes: List of _ShellNode (or dict nodes) from _shell_breakdown.
     """
+    home_root_find = False
+    project_cwd = os.path.realpath(os.getcwd())
+    home = os.path.realpath(os.path.expanduser("~"))
+    temp = os.path.realpath(tempfile.gettempdir())
+    effective_cwd = os.getcwd()
+    outside_sensitive_cd = False
     for n in nodes:
         toks = n.get("tokens") if isinstance(n, dict) else n.tokens
         if not toks:
             continue
-        head = toks[0].strip("'\"").lower()
-        if head != "rm":
+        source = n.get("source") if isinstance(n, dict) else n.source
+        node_head = os.path.basename(toks[0].strip("'\"").lower())
+        if node_head in _SHELL_CWD:
+            target = _shell_cd_target(toks)
+            resolved = _shell_cd_resolved(target, effective_cwd)
+            outside_sensitive_cd = False
+            if resolved is not None:
+                if not _path_is_within(resolved, project_cwd):
+                    outside_sensitive_cd = (
+                        _shell_path_is_ancestor(resolved, project_cwd)
+                        or _shell_path_is_ancestor(resolved, home)
+                        or _path_is_within(resolved, home)
+                        or _path_is_within(resolved, temp))
+                if os.path.isdir(resolved):
+                    effective_cwd = resolved
             continue
-        for tok in toks[1:]:
-            low = tok.lower()
-            # Home markers
-            if "~" in tok or "$home" in low or "${home" in low:
-                return True
-            # Root filesystem markers
-            stripped = tok.strip("'\"")
-            if stripped in ("/", "/*", "/ *", "//", "///"):
-                return True
-            if stripped.startswith("/") and stripped.strip("/ ") in ("", "*"):
-                return True
-        # Also check source for folded home/root
-        src = n.get("source") if isinstance(n, dict) else n.source
-        if "~" in src or "$HOME" in src or "${HOME" in src:
-            # Verify it's rm with home operand, not echo
+        head, args = _shell_effective_command(toks)
+        # `env -S` has no effective head (the split string consumed it), so
+        # the sensitive-cd check must run before the empty-head skip.
+        if outside_sensitive_cd and _shell_env_split_payloads(toks):
+            return True
+        if not head:
+            continue
+        # A `cd` outside the project cannot be reasoned about with the
+        # project's relative operands: `cd / && rm -rf *` deletes root,
+        # `cd ~ && rm -rf notes` deletes home, `cd .. && rm -rf *` deletes
+        # the parent project. Treat a destructive node after such a `cd`
+        # as a hard delete.
+        if outside_sensitive_cd:
             if head == "rm":
                 return True
-        # Direct rm -rf / detection on source
-        if re.search(r'\brm\s+.*\s/+(\s|$|;|\||&)', src):
-            # Only hard-block when operand is exactly root or root glob, not /tmp etc.
-            if re.search(r'\brm\s+[^;|&]*\s/(?:\s|$|;|\||&|"|\\\')', src):
-                # Check that it's not /tmp, /home etc. — only bare /
-                # Use token check above for precision, fallback to root pattern
-                toks_src = [t.strip("'\"") for t in toks[1:] if not t.startswith("-")]
-                if "/" in toks_src or "/*" in toks_src:
+            if _shell_inline_code_command(head, args):
+                return True
+            if head == "xargs" and _shell_xargs_is_destructive(args):
+                return True
+            if head == "find" and _shell_find_args_destructive(args):
+                return True
+        if head == "rm":
+            if _shell_rm_home_destructive(args, source):
+                return True
+        elif head == "find":
+            if any(_shell_path_is_home_or_root(root)
+                   for root in _shell_find_roots(args)):
+                home_root_find = True
+                if _shell_find_args_destructive(args):
                     return True
+        elif head == "xargs":
+            if home_root_find and _shell_xargs_is_destructive(args):
+                return True
     return False
 
 
@@ -5218,9 +5384,35 @@ def _shell_is_home_destructive(nodes: list) -> bool:
 # `ask` that auto_confirm approved while `rm -rf ~` is a hard deny (M2).
 _SHELL_INTERPRETERS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash", "posh", "yash"})
 # Words that execute the rest of the line; their own options are skipped so
-# `sudo -u root bash -c …` and `env FOO=1 bash -c …` are seen.
-_SHELL_WRAPPERS = frozenset({"sudo", "doas", "env", "nohup", "command", "exec", "time", "nice", "stdbuf"})
-_SHELL_WRAPPER_VALUE_FLAGS = frozenset({"-u", "-g", "-p", "-C", "-U", "-r", "-t", "-n", "-o", "-e", "-i"})
+# `sudo -u root bash -c …` and `env FOO=1 bash -c …` are seen. `builtin`,
+# `timeout` and `busybox` are included because they can prefix the real
+# command (`builtin rm`, `timeout 10 rm`, `busybox sh -c …`).
+_SHELL_WRAPPERS = frozenset({
+    "sudo", "doas", "env", "nohup", "command", "exec", "time", "timeout",
+    "nice", "stdbuf", "builtin", "busybox",
+})
+# Options that take a separate value, per wrapper. A flat set treated
+# `sudo -n`/`sudo -i` as value flags and skipped the command word, which made
+# `sudo -n rm -rf ~` invisible to the home guard.
+_SHELL_WRAPPER_VALUE_FLAGS = {
+    "sudo": frozenset({
+        "-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from",
+        "-U", "--other-user", "-r", "--role", "-t", "--type", "-D", "--chdir",
+        "-R", "--chroot", "-T", "--command-timeout", "-h", "--host",
+        "-a",
+    }),
+    "doas": frozenset({"-u", "-C"}),
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+    "time": frozenset({"-f", "--format", "-o", "--output"}),
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "exec": frozenset({"-a"}),
+    "nohup": frozenset(),
+    "command": frozenset(),
+    "builtin": frozenset(),
+    "busybox": frozenset(),
+}
 _PYTHON_HEAD_RE = re.compile(r"^python(?:[0-9]+(?:\.[0-9]+)*)?$")
 # Bounded recursion: beyond this depth a conservative text check decides.
 _SHELL_NESTED_MAX_DEPTH = 6
@@ -5273,11 +5465,470 @@ def _shell_c_payloads(tokens: list) -> list:
     """
     payloads = []
     for index, token in enumerate(tokens):
-        if token == "-c" or (token.startswith("-") and not token.startswith("--")
-                             and len(token) > 1 and "c" in token[1:]):
-            if index + 1 < len(tokens) and not tokens[index + 1].startswith("-"):
+        flag = token.strip("'\"")
+        if flag == "-c" or (flag.startswith("-") and not flag.startswith("--")
+                            and len(flag) > 1 and "c" in flag[1:]):
+            if (index + 1 < len(tokens)
+                    and not tokens[index + 1].strip("'\"").startswith("-")):
                 payloads.append(_shell_unquote(tokens[index + 1]))
     return payloads
+
+
+# Leading shell assignments (`FOO=bar`, `A[0]=1`, `A+=1`). Bash allows them
+# before the command word; the home guard must look past them.
+_SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+
+
+def _shell_skip_options(tokens: list, index: int, value_flags: frozenset) -> int:
+    """Skip a wrapper's option words, consuming values for known flags.
+
+    Args:
+        tokens: Command word tokens.
+        index: Index of the first token after the wrapper word.
+        value_flags: Option spellings that take a separate value word.
+
+    Returns:
+        The index of the first non-option token.
+    """
+    total = len(tokens)
+    while index < total:
+        tok = tokens[index].strip("'\"")
+        if not tok.startswith("-"):
+            break
+        if tok == "--":
+            return index + 1
+        flag = tok.split("=", 1)[0]
+        index += 1
+        if "=" not in tok and flag in value_flags and index < total:
+            index += 1
+    return index
+
+
+def _shell_effective_index(tokens: list) -> int:
+    """Return the index of the command word after assignments and wrappers.
+
+    Handles `VAR=value`, `sudo -u root`, `env FOO=1`, `nohup`, `command`,
+    `exec -a name`, `time`, `timeout <duration>`, `nice -n`, `stdbuf`,
+    `builtin` and `busybox`. The home guard must see the *effective* command:
+    `sudo rm -rf ~` is `rm -rf ~`, and `find` stays `find` under a wrapper.
+
+    Args:
+        tokens: Command word tokens (quotes still attached).
+
+    Returns:
+        Index of the effective command word, or len(tokens) when none remains.
+    """
+    index = 0
+    total = len(tokens)
+    while index < total:
+        # Bash allows assignments before the command word and after a wrapper.
+        while index < total and _SHELL_ASSIGNMENT_RE.match(tokens[index].strip("'\"")):
+            index += 1
+        if index >= total:
+            return total
+        head = os.path.basename(tokens[index].strip("'\"")).lower()
+        if head not in _SHELL_WRAPPERS:
+            return index
+        index += 1
+        if head == "env":
+            # env [options] [VAR=value ...] command
+            while index < total:
+                tok = tokens[index].strip("'\"")
+                if tok.startswith("-"):
+                    if tok == "--":
+                        index += 1
+                        break
+                    flag = tok.split("=", 1)[0]
+                    index += 1
+                    if ("=" not in tok and flag in _SHELL_WRAPPER_VALUE_FLAGS["env"]
+                            and index < total):
+                        index += 1
+                    continue
+                if _SHELL_ASSIGNMENT_RE.match(tok):
+                    index += 1
+                    continue
+                break
+            continue
+        if head == "timeout":
+            index = _shell_skip_options(
+                tokens, index, _SHELL_WRAPPER_VALUE_FLAGS["timeout"])
+            if index < total:
+                index += 1  # DURATION
+            continue
+        index = _shell_skip_options(
+            tokens, index, _SHELL_WRAPPER_VALUE_FLAGS.get(head, frozenset()))
+    return total
+
+
+def _shell_effective_command(tokens: list) -> tuple:
+    """Return the effective command basename and its arguments.
+
+    Args:
+        tokens: Command word tokens.
+
+    Returns:
+        A pair `(head, args)`, or `("", [])` when no command word remains.
+    """
+    index = _shell_effective_index(tokens)
+    if index >= len(tokens):
+        return "", []
+    return os.path.basename(tokens[index].strip("'\"")).lower(), tokens[index + 1:]
+
+
+def _shell_env_split_payloads(tokens: list) -> list:
+    """Return the command strings passed to `env -S`/`--split-string`.
+
+    `env -S 'rm -rf ~'` is wrapper-level command execution: the value is a
+    full command line, so the home guard and the wrapper-approval rule must
+    see it. The helper locates `env` behind leading assignments/wrappers and
+    returns each split-string value, unquoted.
+
+    Args:
+        tokens: Command word tokens.
+
+    Returns:
+        The split-string payloads (normally zero or one).
+    """
+    index = 0
+    total = len(tokens)
+    while index < total:
+        while index < total and _SHELL_ASSIGNMENT_RE.match(tokens[index].strip("'\"")):
+            index += 1
+        if index >= total:
+            return []
+        head = os.path.basename(tokens[index].strip("'\"")).lower()
+        if head == "env":
+            break
+        if head not in _SHELL_WRAPPERS:
+            return []
+        index += 1
+        if head == "timeout":
+            index = _shell_skip_options(
+                tokens, index, _SHELL_WRAPPER_VALUE_FLAGS["timeout"])
+            if index < total:
+                index += 1  # DURATION
+            continue
+        index = _shell_skip_options(
+            tokens, index, _SHELL_WRAPPER_VALUE_FLAGS.get(head, frozenset()))
+    if index >= total:
+        return []
+    index += 1  # env
+    payloads = []
+    while index < total:
+        raw = tokens[index]
+        tok = raw.strip("'\"")
+        if tok == "--":
+            index += 1
+            continue
+        if tok in ("-S", "--split-string"):
+            if index + 1 < total:
+                first = _shell_unquote(tokens[index + 1])
+                payloads.append(" ".join([first] + tokens[index + 2:]))
+            return payloads
+        if raw.startswith("--split-string="):
+            first = _shell_unquote(raw.split("=", 1)[1])
+            payloads.append(" ".join([first] + tokens[index + 1:]))
+            return payloads
+        if raw.startswith("-S=") and len(raw) > 3:
+            first = _shell_unquote(raw[3:])
+            payloads.append(" ".join([first] + tokens[index + 1:]))
+            return payloads
+        if raw.startswith("-S") and len(raw) > 2:
+            first = _shell_unquote(raw[2:])
+            payloads.append(" ".join([first] + tokens[index + 1:]))
+            return payloads
+        if tok.startswith("-"):
+            flag = tok.split("=", 1)[0]
+            index += 1
+            if ("=" not in tok and flag in _SHELL_WRAPPER_VALUE_FLAGS["env"]
+                    and index < total):
+                index += 1
+            continue
+        if _SHELL_ASSIGNMENT_RE.match(tok):
+            index += 1
+            continue
+        # `env FOO=1 env -S …`, `env FOO=1 sudo env -S …`: the next command
+        # may itself be a wrapper carrying a split-string.
+        if os.path.basename(tok).lower() in _SHELL_WRAPPERS:
+            return _shell_env_split_payloads(tokens[index:])
+        break
+    return payloads
+
+
+def _shell_path_is_home_or_root(tok: str) -> bool:
+    """True when a token names the home directory or the filesystem root.
+
+    Args:
+        tok: A shell operand.
+
+    Returns:
+        True for `~`, `$HOME`, `${HOME}`, `/`, `/*`, `//`, and paths that
+        resolve to `/` or the current home (`/tmp/..`, `/home/<user>`).
+    """
+    t = tok.strip().strip("'\"")
+    if not t:
+        return False
+    low = t.lower()
+    if "~" in t or "$home" in low or "${home" in low:
+        return True
+    if t in ("/", "/*", "//", "///"):
+        return True
+    if t.startswith("/") and t.strip("/ ") in ("", "*"):
+        return True
+    try:
+        real = os.path.realpath(os.path.expanduser(t))
+        home = os.path.realpath(os.path.expanduser("~"))
+    except (OSError, ValueError):
+        return False
+    return real == "/" or real == home
+
+
+def _shell_path_is_ancestor(path: str, root: str) -> bool:
+    """True when `path` is `root` or an ancestor of it (realpaths compared).
+
+    Args:
+        path: The candidate ancestor.
+        root: The path to test.
+
+    Returns:
+        True when the realpath of `root` is under the realpath of `path`.
+    """
+    real_path = os.path.realpath(path)
+    try:
+        return (os.path.commonpath([real_path, os.path.realpath(root)])
+                == real_path)
+    except ValueError:
+        return False
+
+
+def _shell_find_roots(args: list) -> list:
+    """Return the starting paths of a `find` command.
+
+    Args:
+        args: Tokens after the `find` command word.
+
+    Returns:
+        The root operands before the expression; `["."]` when none was given
+        (find's own default).
+    """
+    index = 0
+    total = len(args)
+    while index < total:
+        tok = args[index].strip("'\"")
+        if tok in ("-L", "-H", "-P"):
+            index += 1
+            continue
+        if tok == "-D" and index + 1 < total:
+            index += 2
+            continue
+        if tok == "--":
+            index += 1
+            break
+        if tok.startswith("-O") and len(tok) > 2:
+            index += 1
+            continue
+        break
+    roots = []
+    while index < total:
+        tok = args[index].strip("'\"")
+        if tok in ("(", "!", ",") or tok.startswith("-"):
+            break
+        roots.append(tok)
+        index += 1
+    return roots or ["."]
+
+
+# `find -exec` actions that can destroy files; an interpreter is included
+# because its payload is arbitrary code (the nested `-c` guard also runs).
+_SHELL_DESTRUCTIVE_EXEC = frozenset({
+    "rm", "shred", "truncate", "dd", "mv", "chmod", "chown",
+})
+_SHELL_FIND_INTERPRETERS = frozenset(set(_SHELL_INTERPRETERS) | {
+    "perl", "ruby", "node", "nodejs", "php", "awk", "gawk", "mawk", "sed",
+})
+
+
+def _shell_find_args_destructive(args: list) -> bool:
+    """True when a `find` expression can delete files or run code.
+
+    Args:
+        args: Tokens after the `find` command word.
+
+    Returns:
+        True for `-delete` or an `-exec`-family action whose effective
+        command is destructive or an interpreter.
+    """
+    for index, raw in enumerate(args):
+        tok = raw.strip("'\"")
+        if tok == "-delete":
+            return True
+        if tok not in ("-exec", "-execdir", "-ok", "-okdir"):
+            continue
+        if index + 1 >= len(args):
+            continue
+        inner = args[index + 1:]
+        # `find ~ -exec env -S 'rm -rf ~'` hides the command behind a
+        # split-string; the payload is arbitrary code on a home/root tree.
+        if _shell_env_split_payloads(inner):
+            return True
+        head, inner_args = _shell_effective_command(inner)
+        if not head:
+            continue
+        if head in _SHELL_DESTRUCTIVE_EXEC:
+            return True
+        if head in _SHELL_FIND_INTERPRETERS or _PYTHON_HEAD_RE.match(head):
+            return True
+        if head == "xargs" and _shell_xargs_is_destructive(inner_args):
+            return True
+    return False
+
+
+_SHELL_XARGS_VALUE_FLAGS = frozenset({
+    "-n", "-I", "-P", "-L", "-s", "-a", "-E", "-e", "-d",
+    "--max-args", "--replace", "--max-procs", "--max-lines", "--max-chars",
+    "--arg-file", "--delimiter", "--eof",
+})
+
+
+def _shell_xargs_command_index(args: list) -> int:
+    """Return the index of the command `xargs` will run.
+
+    Args:
+        args: Tokens after the `xargs` command word.
+
+    Returns:
+        The command word index, or len(args) for the default `echo`.
+    """
+    index = 0
+    total = len(args)
+    while index < total:
+        tok = args[index].strip("'\"")
+        if tok == "--":
+            return index + 1
+        if not tok.startswith("-"):
+            return index
+        flag = tok.split("=", 1)[0]
+        index += 1
+        if "=" not in tok and flag in _SHELL_XARGS_VALUE_FLAGS and index < total:
+            index += 1
+    return index
+
+
+def _shell_xargs_is_destructive(args: list) -> bool:
+    """True when `xargs` would run a destructive command or an interpreter.
+
+    Args:
+        args: Tokens after the `xargs` command word.
+
+    Returns:
+        True for `xargs rm`, `xargs sh -c …`, `xargs env rm …`, etc.
+    """
+    index = _shell_xargs_command_index(args)
+    if index >= len(args):
+        return False
+    if _shell_env_split_payloads(args[index:]):
+        return True
+    head, _ = _shell_effective_command(args[index:])
+    if not head:
+        return False
+    return (head in _SHELL_DESTRUCTIVE_EXEC
+            or head in _SHELL_FIND_INTERPRETERS
+            or bool(_PYTHON_HEAD_RE.match(head)))
+
+
+def _shell_rm_home_destructive(args: list, source: str) -> bool:
+    """True when an effective `rm` deletes home or the filesystem root.
+
+    Args:
+        args: Tokens after the effective `rm`.
+        source: The node's original source text.
+
+    Returns:
+        True when an operand names or resolves to `~`, `$HOME` or `/`.
+    """
+    for tok in args:
+        if _shell_path_is_home_or_root(tok):
+            return True
+    # Historical source checks: the normalized pass folds `/home/<user>` to
+    # `~`, and a root glob can hide behind a source spelling the tokenizer
+    # folded. Only called when the effective command is `rm`.
+    if "~" in source or "$HOME" in source or "${HOME}" in source:
+        return True
+    if re.search(r'\brm\s+.*\s/+(\s|$|;|\||&)', source):
+        operands = [t.strip("'\"") for t in args if not t.startswith("-")]
+        if any(t in ("/", "/*") or _shell_path_is_home_or_root(t)
+               for t in operands):
+            return True
+    return False
+
+
+def _shell_inline_code_command(head: str, args: list) -> bool:
+    """True when an interpreter invocation can execute code.
+
+    Used after a `cd` into a sensitive directory: `bash -c …`, `python3 -c …`,
+    `python3 script.py`, `awk '…'` can act on the new cwd, while
+    `python3 --version` or `bash --version` cannot.
+
+    Args:
+        head: The effective command basename.
+        args: Tokens after the command word.
+
+    Returns:
+        True for an interpreter that will execute a program.
+    """
+    operands = [t.strip("'\"") for t in args
+                if not t.strip("'\"").startswith("-")]
+    if head in ("awk", "gawk", "mawk", "sed"):
+        return bool(operands)
+    if head in _SHELL_INTERPRETERS:
+        if _shell_c_payloads(args) or operands:
+            return True
+        return any(t.strip("'\"") in ("-", "-s") for t in args)
+    if _PYTHON_HEAD_RE.match(head):
+        if _shell_c_payloads(args) or operands:
+            return True
+        for t in args:
+            tok = t.strip("'\"")
+            if tok == "-" or tok == "-m" or (tok.startswith("-m") and len(tok) > 2):
+                return True
+        return False
+    if head in ("perl", "ruby", "node", "nodejs", "php"):
+        for t in args:
+            tok = t.strip("'\"")
+            if tok == "-" or (tok.startswith(("-e", "-c", "-r"))
+                              and not tok.startswith("--")):
+                return True
+        return bool(operands)
+    return False
+
+
+def _shell_wrapper_requires_approval(nodes: list) -> bool:
+    """True when a wrapper prefixes an actual command (`env sh -c …`).
+
+    `env *` used to be allow-listed, so `env bash -c 'curl … | sh'` never
+    reached the leniency check: the verdict was already `allow`. A wrapper
+    with a command after it must ask; a bare `env`/`time` (no command) stays
+    as the allow-list says.
+
+    Args:
+        nodes: List of _ShellNode (or dict nodes) from _shell_breakdown.
+
+    Returns:
+        True when a wrapper prefixes an actual command.
+    """
+    for n in nodes:
+        toks = n.get("tokens") if isinstance(n, dict) else n.tokens
+        if not toks:
+            continue
+        head = os.path.basename(toks[0].strip("'\"")).lower()
+        if head not in _SHELL_WRAPPERS:
+            continue
+        if _shell_env_split_payloads(toks):
+            return True
+        index = _shell_effective_index(toks)
+        if 0 < index < len(toks):
+            return True
+    return False
 
 
 def _shell_embedded_commands(tokens: list) -> list:
@@ -5295,40 +5946,18 @@ def _shell_embedded_commands(tokens: list) -> list:
     """
     if not tokens:
         return []
-    index = 0
-    total = len(tokens)
-    while index < total:
-        head = tokens[index].strip("'\"").rsplit("/", 1)[-1].lower()
-        if head not in _SHELL_WRAPPERS:
-            break
-        index += 1
-        if head == "env":
-            # `env VAR=value VAR2=value cmd …` (options are rare here)
-            while index < total and ("=" in tokens[index] or tokens[index].startswith("-")):
-                index += 1
-            continue
-        while index < total and tokens[index].startswith("-"):
-            flag = tokens[index].split("=", 1)[0]
-            index += 1
-            if flag in _SHELL_WRAPPER_VALUE_FLAGS and index < total:
-                index += 1
-    if index >= total:
-        return []
-    head = tokens[index].strip("'\"").rsplit("/", 1)[-1].lower()
+    commands = list(_shell_env_split_payloads(tokens))
+    index = _shell_effective_index(tokens)
+    if index >= len(tokens):
+        return commands
+    head = os.path.basename(tokens[index].strip("'\"")).lower()
     body = tokens[index + 1:]
-    if head == "busybox":
-        if not body:
-            return []
-        head = body[0].strip("'\"").rsplit("/", 1)[-1].lower()
-        body = body[1:]
     if head in _SHELL_INTERPRETERS:
-        return _shell_c_payloads(body)
-    if _PYTHON_HEAD_RE.match(head):
-        commands = []
+        commands.extend(_shell_c_payloads(body))
+    elif _PYTHON_HEAD_RE.match(head):
         for code in _shell_c_payloads(body):
             commands.extend(match.group(2) for match in _PY_SHELL_CALL_RE.finditer(code))
-        return commands
-    return []
+    return commands
 
 
 def _shell_text_home_destructive(text: str) -> bool:
@@ -5592,7 +6221,29 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
                     return {"approved": False,
                             "reason": f"[path ACL denied] {rp} — System file blocked "
                                       f"(sensitive virtual file); {ACL_DENIAL_HINT}"}
-                decision, rule = acl.evaluate(op, rp, explicit_only=True)
+                # Redirect targets are unambiguous writes: grade them with the
+                # full write policy, so the "writes outside the project stay
+                # deny" default applies (`echo x > ../outside` used to pass).
+                # Operands stay explicit-only (the command may read or write
+                # them, and the implicit outside read is `ask` by design).
+                decision, rule = acl.evaluate(
+                    op, rp, explicit_only=(op != "write"))
+                if rule is None and decision == "deny" and op == "write":
+                    # The default outside-CWD/$HOME write rule has no explicit
+                    # rule dict; it is still a denial for a redirect target.
+                    # An explicit `~`/`$HOME` target keeps the historical
+                    # shell behaviour (`echo x > ~/notes.txt` is allowed; only
+                    # the dotfile rule asks), but `~/../outside` still escapes
+                    # the home check and is denied.
+                    raw = tok.strip().strip("'\"")
+                    explicit_home = ("~" in raw or "$HOME" in raw
+                                     or "${HOME}" in raw)
+                    if explicit_home and _path_is_within(
+                            rp, os.path.expanduser("~")):
+                        continue
+                    rule = {"op": "write", "action": "deny", "kind": "default",
+                            "path": "outside the project and $HOME",
+                            "source": "default"}
                 if rule is None:
                     continue
                 if decision == "deny" and deny_info is None:
@@ -5602,7 +6253,8 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
     if deny_info:
         _, rp, rule, _op = deny_info
         acl.log_event("run_command", rp, "deny", rule)
-        shown = rule["path"] if rule.get("kind") in ("prefix", "temp_root") else "home dotfile"
+        shown = (rule["path"] if rule.get("kind") in ("prefix", "temp_root", "default")
+                 else "home dotfile")
         redirect = ""
         if rule.get("kind") == "temp_root":
             redirect = (f"; for temporary files use {_scratch_root()} "
@@ -5615,7 +6267,8 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
         granted = acl.prompt(op, rp, rule, tool="run_command", context=command)
         acl.log_event("run_command", rp, "allow" if granted else "deny", rule)
         if not granted:
-            shown = rule["path"] if rule.get("kind") in ("prefix", "temp_root") else "home dotfile"
+            shown = (rule["path"] if rule.get("kind") in ("prefix", "temp_root", "default")
+                     else "home dotfile")
             who = "denied by user" if sys.stdin.isatty() else "denied (no TTY to ask)"
             return {"approved": False,
                     "reason": f"[path ACL denied] {rp} — {who} "
@@ -5720,6 +6373,17 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
     blocked = _shell_hard_block(command, verdict)
     if blocked:
         return blocked
+
+    # A wrapper prefix hides the real command (`env bash -c …`, `sudo make`).
+    # `env *` is allow-listed, so `env sh -c id` never reached the leniency
+    # check: the verdict was already `allow`. A wrapper with a command after
+    # it must ask; a bare `env`/`time` stays as the allow-list says.
+    if verdict["effect"] == "allow" and _shell_wrapper_requires_approval(nodes):
+        verdict = dict(verdict)
+        verdict["effect"] = "ask"
+        verdict["details"] = list(verdict["details"]) + [{
+            "pattern": command.strip(), "action": "ask", "rule": "wrapper prefix",
+        }]
 
     # Apply the path ACL on automatic allow paths. Explicit user approval via
     # the shell prompt below already overrides it (the user said yes to the

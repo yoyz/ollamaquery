@@ -424,9 +424,18 @@ to building a local test server with the `Neumann-Labs/mcp-cpp` SDK.
 
 Trust boundaries at a glance; the sections above give the details.
 
-- **Shell gate.** Per-component allow/ask/deny, `rm ~/` / `rm /` hard-blocked
-  (bypass-immune), CWD leniency, and a path-ACL operand scan. The `s` and `a`
-  approval answers are **session-scoped**; nothing is written to disk.
+- **Shell gate.** Per-component allow/ask/deny, `rm ~/` / `rm /`,
+  home/root `find -delete` / destructive `find -exec` and home/root
+  `xargs rm` hard-blocked (bypass-immune, `auto_confirm` included),
+  effective-command normalization
+  (wrappers, `VAR=value`, `/bin/rm`), CWD leniency and a path-ACL operand scan.
+  Leniency only covers project paths: `sh` / `curl … | sh` ask, and a `cd`
+  outside the project disables it; a `cd` into home/root/tmp (or an ancestor)
+  followed by a delete is hard-denied. A wrapper with a command (`env sh -c …`)
+  asks even though `env *` is allow-listed. The `s` and `a` approval answers are
+  **session-scoped**; nothing is written to disk. Broader allow rules
+  (`find -exec`, `git -c`, `tar --checkpoint-action`, upload `curl`) remain
+  allow-listed: the gate is consent + audit, not a sandbox.
 - **`/agentic auto` is host-bash trust.** It auto-approves ask-level shell
   commands and skips destructive-tool confirmations. Home/root hard-denies and
   Path-ACL `ask` rules still apply, but the model can otherwise execute on the
