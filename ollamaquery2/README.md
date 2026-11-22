@@ -295,6 +295,11 @@ File tools (`read_file`, `write_file`, `edit_file`, `list_directory`) and
   variable expands to the empty string, so `echo x > $UNSET/tmp/x` is a
   `/tmp` write and is denied; a **defined** variable stays opaque (documented
   limit), and a single-quoted spelling is a literal name.
+- The shell gate follows `cd`/`pushd`/`popd`: a relative **write** target is
+  resolved against the directory the shell is actually in, so
+  `cd / && echo x > rel` is `/rel` (denied). A `cd` inside a pipeline, `&` or
+  `$(...)`/`(...)` stays in its subshell, and an opaque `cd $VAR` refuses
+  relative writes (fail-closed).
 
 Inspect and influence the policy with `/agentic acl`:
 

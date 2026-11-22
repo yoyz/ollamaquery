@@ -25,6 +25,7 @@ Covers:
 import contextlib
 import io
 import os
+import shlex
 import sys
 import tempfile
 import unittest
@@ -832,6 +833,155 @@ class TestShellUnsetVarExpansion(unittest.TestCase):
         self.assertEqual(m._shell_expand_unset_refs("$TMPDIR/out"),
                          "$TMPDIR/out")
         self.assertIsNone(m._shell_operand_realpath("$TMPDIR/out"))
+
+
+class TestShellEffectiveCwd(unittest.TestCase):
+    """H1: relative tokens resolve against the cwd the shell is actually in.
+
+    `cd / && echo x > rel` used to resolve `rel` against the process cwd and
+    allow it while bash writes `/rel`. Writes that are already graded (the
+    redirection targets) are the H1 surface; operand write targets (`cp`,
+    `touch`, `tee`) are H0, and a nested `-c` payload's relative paths are H3.
+    Pipelines/`&` and `$(...)`/`(...)` are separate contexts: a `cd` there
+    must not leak into the next node. An opaque `cd` (`$VAR`, `cd -`, a glob)
+    makes the directory unknown; relative writes after it are refused.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx)
+
+    def test_cd_out_then_relative_redirect_is_denied(self):
+        for cmd in ("cd / && echo x > rel.txt",
+                    "cd / && echo x > rel",
+                    "cd .. && echo x > rel.txt",
+                    "cd /var && echo x > rel.txt",
+                    "cd /; echo x > rel.txt"):
+            with self.subTest(cmd=cmd):
+                res = self._scan(cmd)
+                self.assertIsNotNone(res, cmd)
+                self.assertFalse(res["approved"], cmd)
+
+    def test_cd_out_then_cd_back_is_allowed(self):
+        cmd = f"cd /; cd {shlex.quote(os.getcwd())}; echo x > rel.txt"
+        self.assertIsNone(self._scan(cmd))
+
+    def test_pipeline_and_background_cd_do_not_leak(self):
+        # `cd / | echo …`, `cd / & echo …`: the echo runs in the parent cwd.
+        for cmd in ("cd / | echo x > rel.txt",
+                    "cd / |& echo x > rel.txt",
+                    "cd / & echo x > rel.txt"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self._scan(cmd))
+
+    def test_subshell_cd_writes_in_its_own_context(self):
+        # `(cd / && echo x > rel)` writes `/rel` inside the subshell; the
+        # group's own cwd follows its cd. `(cd /); echo x > rel` does not leak.
+        res = self._scan("(cd / && echo x > rel.txt)")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+        self.assertIsNone(self._scan("(cd /); echo x > rel.txt"))
+
+    def test_opaque_cd_refuses_a_relative_write(self):
+        for cmd in ("cd $UNSET && echo x > rel.txt",
+                    "cd $(echo /) && echo x > rel.txt"):
+            with self.subTest(cmd=cmd):
+                res = self._scan(cmd)
+                self.assertIsNotNone(res, cmd)
+                self.assertFalse(res["approved"], cmd)
+                self.assertIn("unresolved cd", res["reason"])
+
+    def test_subshell_opaque_cd_does_not_taint_the_outer(self):
+        for cmd in ("(cd $UNSET); echo x > rel.txt",
+                    "cd $UNSET | echo x > rel.txt"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self._scan(cmd))
+
+    def test_pushd_popd(self):
+        res = self._scan("pushd / && echo x > rel.txt")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+        self.assertIsNone(self._scan("pushd /; popd; echo x > rel.txt"))
+
+    def test_failed_cd_keeps_the_project_cwd(self):
+        # bash: a failed cd leaves the shell where it was, so the write is in
+        # the project.
+        name = "definitely-not-a-directory-aq-h1"
+        self.assertFalse(os.path.exists(name))
+        self.assertIsNone(self._scan(f"cd {name} && echo x > rel.txt"))
+
+    def test_cd_into_a_project_subdir(self):
+        sub = tempfile.mkdtemp(dir=os.getcwd())
+        try:
+            name = shlex.quote(os.path.basename(sub))
+            self.assertIsNone(self._scan(f"cd {name} && echo x > rel.txt"))
+            res = self._scan(f"cd {name} && echo x > ../../outside")
+            self.assertIsNotNone(res)
+            self.assertFalse(res["approved"])
+        finally:
+            os.rmdir(sub)
+
+    def test_reads_are_unchanged(self):
+        # H1 refuses relative *writes*; a read keeps the explicit-only scan.
+        self.assertIsNone(self._scan("cd / && cat rel.txt"))
+
+    def test_dev_null_stays_discardable_and_absolute_targets_are_graded(self):
+        self.assertIsNone(self._scan("cd / && echo x > /dev/null"))
+        res = self._scan("cd / && echo x > /etc/hosts")
+        self.assertIsNotNone(res)
+        self.assertFalse(res["approved"])
+
+    def test_gate_denies_even_with_auto_confirm(self):
+        self.ctx.auto_confirm = True
+        res = m.check_shell_approval("cd / && echo x > rel.txt", self.ctx)
+        self.assertFalse(res["approved"])
+
+    def test_effective_cwds_tracks_pipeline_groups_and_taint(self):
+        project = os.path.realpath(os.getcwd())
+        cases = {
+            "cd / && echo x": [project, "/"],
+            "cd / | echo x": [project, project],
+            "(cd /); echo x": [project, project],
+            "cd $UNSET && echo x": [project, None],
+            "cd . && echo x": [project, project],
+        }
+        for cmd, expected in cases.items():
+            with self.subTest(cmd=cmd):
+                nodes = m._shell_breakdown(cmd)
+                self.assertEqual(m._shell_effective_cwds(nodes), expected)
+
+    def test_operand_realpath_accepts_a_cwd(self):
+        # A bare operand (`git status foo`) is not a path; a write target is.
+        self.assertIsNone(m._shell_operand_realpath("rel", cwd="/"))
+        self.assertEqual(
+            m._shell_operand_realpath("rel", cwd="/", force_path=True), "/rel")
+        self.assertEqual(m._shell_operand_realpath("rel/x", cwd="/"), "/rel/x")
+        self.assertEqual(m._shell_operand_realpath("../x", cwd="/tmp"), "/x")
+
+    def test_relative_token_classifier(self):
+        self.assertTrue(m._shell_token_is_relative_path("rel/x"))
+        with patch.dict(os.environ, {"AQ_TEST_PATH": "/etc"}, clear=False):
+            self.assertTrue(m._shell_token_is_relative_path("$AQ_TEST_PATH/x"))
+        self.assertFalse(m._shell_token_is_relative_path("/abs/x"))
+        self.assertFalse(m._shell_token_is_relative_path("~/x"))
+        self.assertFalse(m._shell_token_is_relative_path("-f"))
+        self.assertFalse(m._shell_token_is_relative_path("http://host/x"))
+
+    def test_home_guard_is_group_scoped(self):
+        self.assertTrue(m._shell_is_home_destructive(
+            m._shell_breakdown("cd / && rm -rf *")))
+        # A pipeline cd dies with its subshell: the rm runs in the project.
+        self.assertFalse(m._shell_is_home_destructive(
+            m._shell_breakdown("cd / | rm -rf *")))
+        self.assertTrue(m._shell_is_home_destructive(
+            m._shell_breakdown("(cd / && rm -rf *)")))
+        # The subshell inherits the outer cwd `/`: this must still be caught.
+        self.assertTrue(m._shell_is_home_destructive(
+            m._shell_breakdown("cd /; (rm -rf *)")))
+        cmd = f"cd / ; cd {shlex.quote(os.getcwd())} ; rm -rf *"
+        self.assertFalse(m._shell_is_home_destructive(m._shell_breakdown(cmd)))
 
 
 class TestShellLineContinuationInWords(unittest.TestCase):

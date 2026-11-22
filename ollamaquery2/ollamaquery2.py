@@ -5034,9 +5034,12 @@ def _shell_tokenize(s: str) -> list:
 class _ShellNode:
     """A parsed shell command node with source, glob pattern, and arity tokens."""
 
-    __slots__ = ("source", "pattern", "tokens", "redirect_targets")
+    __slots__ = ("source", "pattern", "tokens", "redirect_targets",
+                 "separator", "group", "parent")
     def __init__(self, source: str, pattern: str, tokens: list,
-                 redirect_targets: Optional[list] = None) -> None:
+                 redirect_targets: Optional[list] = None,
+                 separator: str = "", group: int = 0,
+                 parent: int = 0) -> None:
         """Initialize a shell node.
 
         Args:
@@ -5048,11 +5051,21 @@ class _ShellNode:
                 out of `tokens` (they are not command arguments) but still
                 checked as operands, otherwise `echo x >> /etc/hosts` is an
                 `allow` node whose destination nobody inspects.
+            separator: Control operator that **followed** this node (`""` at
+                the end, `;`, `&&`, `||`, `|`, `&`, `|&`, a newline). `|`/`&`
+                run in a subshell, so a `cd` there must not affect the next
+                segment (H1).
+            group: 0 for the top-level shell, a fresh id for each `$(...)`/
+                `(...)` group. A subshell's `cd` only affects its group.
+            parent: Enclosing group id (0 at the top level).
         """
         self.source = source
         self.pattern = pattern
         self.tokens = tokens
         self.redirect_targets = redirect_targets or []
+        self.separator = separator
+        self.group = group
+        self.parent = parent
 
 
 def _shell_redirect_targets(tokens: list) -> list:
@@ -5106,42 +5119,59 @@ def _shell_arity_tokens(tokens: list) -> list:
         out.append(t.text)
     return out
 
-def _shell_breakdown(command: str) -> list:
+def _shell_breakdown(command: str, _state: Optional[list] = None,
+                     group: int = 0, parent: int = 0) -> list:
     """Split a shell command into _ShellNode segments at control operators.
+
+    Each node carries the operator that followed it (`separator`) and a group
+    id. Group 0 is the top-level shell; every `$(...)`/`(...)` gets a fresh
+    id and its `parent` group, so a subshell's `cd` can be followed without
+    leaking into the outer command (H1).
 
     Args:
         command: The raw command string.
+        _state: Internal one-slot counter for unique group ids.
+        group: Group id for the nodes of this command.
+        parent: Enclosing group id (0 at the top level).
 
     Returns:
         List of _ShellNode, recursively including $()/subshell inner segments.
     """
+    if _state is None:
+        _state = [0]
     tokens = _shell_tokenize(command)
     segments = []
+    separators = []
     current = []
     for t in tokens:
         if t.kind == _SHELL_CTRL:
             if current:
                 segments.append(current)
+                separators.append(t.text)  # operator after this segment
                 current = []
         else:
             current.append(t)
     if current:
         segments.append(current)
+        separators.append("")
     nodes = []
-    for seg in segments:
-        if len(seg) == 1 and seg[0].kind == _SHELL_WORD and seg[0].text.startswith(("(", "$(", "<(", ">(")):
-            for inner in seg[0].nested:
-                if inner.strip():
-                    nodes.extend(_shell_breakdown(inner))
-            continue
-        source = command[seg[0].start:seg[-1].end].strip()
-        tokens_ = _shell_arity_tokens(seg)
-        nodes.append(_ShellNode(source, source, tokens_, _shell_redirect_targets(seg)))
-        for t in seg:
-            if t.kind == _SHELL_WORD:
-                for inner in t.nested:
-                    if inner.strip():
-                        nodes.extend(_shell_breakdown(inner))
+    for seg, sep in zip(segments, separators):
+        nested_groups = []
+        if (len(seg) == 1 and seg[0].kind == _SHELL_WORD
+                and seg[0].text.startswith(("(", "$(", "<(", ">("))):
+            nested_groups = [inner for inner in seg[0].nested if inner.strip()]
+        else:
+            source = command[seg[0].start:seg[-1].end].strip()
+            tokens_ = _shell_arity_tokens(seg)
+            nodes.append(_ShellNode(source, source, tokens_,
+                                    _shell_redirect_targets(seg),
+                                    separator=sep, group=group, parent=parent))
+            for t in seg:
+                if t.kind == _SHELL_WORD:
+                    nested_groups.extend(inner for inner in t.nested if inner.strip())
+        for inner in nested_groups:
+            _state[0] += 1
+            nodes.extend(_shell_breakdown(inner, _state, _state[0], group))
     return nodes
 
 def _shell_from_config(permission: object) -> list:
@@ -5236,7 +5266,7 @@ def shell_check_command(command: str, config: object, approved: Optional[list] =
             break
         if rule["action"] == "ask":
             effect = "ask"
-    return {"command": command, "nodes": [{"source": n.source, "pattern": n.pattern, "tokens": n.tokens, "redirect_targets": n.redirect_targets} for n in nodes], "patterns": patterns, "always": always, "effect": effect, "details": details}
+    return {"command": command, "nodes": [{"source": n.source, "pattern": n.pattern, "tokens": n.tokens, "redirect_targets": n.redirect_targets, "separator": n.separator, "group": n.group, "parent": n.parent} for n in nodes], "patterns": patterns, "always": always, "effect": effect, "details": details}
 
 # --- CWD leniency helpers ---
 def _shell_path_inside_cwd(path_str: str, cwd: Optional[str] = None) -> bool:
@@ -5405,6 +5435,141 @@ def _shell_cd_target_allowed(target: str, effective_cwd: str, project_cwd: str,
     return any(_path_is_within(resolved, root) for root in extra_roots or [])
 
 
+def _shell_node_attr(node, name: str, default=None):
+    """Read one field from a `_ShellNode` or its dict form."""
+    if isinstance(node, dict):
+        return node.get(name, default)
+    return getattr(node, name, default)
+
+
+def _shell_apply_cd(head: str, tokens: list, current: Optional[str],
+                    stack: list) -> tuple:
+    """Return `(new_cwd, new_stack)` after a `cd`/`pushd`/`popd` node.
+
+    A failed `cd` (target missing or not a directory) leaves the directory
+    unchanged, as bash does. An opaque target (`$VAR`, `-`, glob, `+N`) or a
+    `popd` with an empty stack makes the directory unknown (`None`), so the
+    caller can refuse relative writes.
+
+    Args:
+        head: Effective command basename (`cd`, `chdir`, `pushd`, `popd`).
+        tokens: The node's command tokens.
+        current: Directory in force before this node, or None when unknown.
+        stack: The group's `pushd` stack.
+
+    Returns:
+        `(new_cwd, new_stack)`; `new_cwd is None` means "unknown".
+    """
+    if head == "popd":
+        if current is None or not stack:
+            return None, stack
+        return stack[-1], stack[:-1]
+    if current is None:
+        return None, stack
+    target = _shell_cd_target(tokens)
+    resolved = _shell_cd_resolved(target, current)
+    if resolved is None:
+        return None, stack
+    if not os.path.isdir(resolved):
+        return current, stack  # bash: a failed cd keeps the shell where it was
+    if head == "pushd":
+        return resolved, stack + [current]
+    return resolved, stack
+
+
+def _shell_effective_cwds(nodes: list, cwd: Optional[str] = None) -> list:
+    """Return the directory in force for each node (`None` = unknown).
+
+    The result is parallel to `nodes` and gives the cwd **before** the node,
+    so a `cd` target is resolved against the directory it actually ran in.
+    Shell semantics implemented here:
+
+    * `cd`/`chdir` change the directory; `pushd` also pushes the old one and
+      `popd` pops it. A failed `cd` leaves the directory unchanged.
+    * An opaque target (`$VAR`, `-`, a glob, `+N`) or a `popd` with an empty
+      stack makes the directory unknown; the caller refuses relative writes
+      after it (fail-closed).
+    * `|`, `|&` and `&` run in subshells: their `cd` does not affect the next
+      segment, so the whole pipeline uses the directory in force at its start.
+    * `$(...)`, `(...)`, `<(…)`, `>(…)` are separate groups: their `cd` only
+      affects the rest of the group, never the outer command.
+
+    Args:
+        nodes: List of _ShellNode (or their dict form from shell_check_command).
+        cwd: Starting directory (defaults to os.getcwd()).
+
+    Returns:
+        One entry per node: a realpath, or None when the directory is unknown.
+    """
+    start = os.path.realpath(cwd or os.getcwd())
+    state = {0: start}          # group id -> current cwd
+    stacks = {0: []}            # group id -> pushd stack
+    pipeline = {}               # group id -> cwd at the start of a pipeline
+    previous = {}               # group id -> separator after the previous node
+    out = []
+    for node in nodes:
+        gid = _shell_node_attr(node, "group", 0) or 0
+        parent = _shell_node_attr(node, "parent", 0) or 0
+        if gid not in state:
+            state[gid] = state.get(parent, start)
+            stacks[gid] = list(stacks.get(parent, []))
+        eff = state[gid]
+        sep = _shell_node_attr(node, "separator", "") or ""
+        prev = previous.get(gid, "")
+        in_pipeline = sep in ("|", "|&") or prev in ("|", "|&")
+        if in_pipeline:
+            if prev not in ("|", "|&"):
+                pipeline[gid] = eff  # first element of this pipeline
+            eff = pipeline[gid]
+        else:
+            pipeline.pop(gid, None)
+        out.append(eff)
+        tokens = _shell_node_attr(node, "tokens", []) or []
+        if not tokens:
+            previous[gid] = sep
+            continue
+        head = os.path.basename(tokens[0].strip("'\"").lower())
+        if head not in _SHELL_CWD:
+            previous[gid] = sep
+            continue
+        new_cwd, new_stack = _shell_apply_cd(head, tokens, eff, stacks[gid])
+        if not in_pipeline and sep != "&":
+            state[gid] = new_cwd
+            stacks[gid] = new_stack
+        # A pipeline/background cd dies with its subshell.
+        previous[gid] = sep
+    return out
+
+
+def _shell_cwd_is_sensitive(cwd: Optional[str], project: str, home: str,
+                            temp: str) -> bool:
+    """True when a cwd is unknown, home/root/temp, or an ancestor of these.
+
+    A destructive node is hard-denied when the directory it runs in cannot be
+    proven to be the project: `cd / && rm -rf *`, `(cd / && rm -rf *)` (the
+    subshell inherits `/`), `cd $VAR && rm …`, `cd ~`, `cd /tmp`, `cd ..`.
+    The check is on the **effective** cwd of the node, so a pipeline `cd`
+    (whose subshell dies) does not taint the next segment.
+
+    Args:
+        cwd: Effective cwd of the node, or None when unknown.
+        project: The session's project cwd (realpath).
+        home: The user's home (realpath).
+        temp: The shared temp root (realpath).
+
+    Returns:
+        True when a delete there must be refused.
+    """
+    if cwd is None:
+        return True
+    if _path_is_within(cwd, project):
+        return False
+    return (_shell_path_is_ancestor(cwd, project)
+            or _shell_path_is_ancestor(cwd, home)
+            or _path_is_within(cwd, home)
+            or _path_is_within(cwd, temp))
+
+
 def _shell_command_word_inside_cwd(word: str, cwd: str,
                                    extra_roots: Optional[list]) -> bool:
     """True when a path-like command word resolves inside the CWD.
@@ -5453,22 +5618,23 @@ def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
     if cwd is None:
         cwd = os.getcwd()
     project_cwd = os.path.realpath(cwd)
-    effective_cwd = cwd
     roots = [os.path.realpath(root) for root in extra_roots or []]
-    for n in nodes:
+    cwds = _shell_effective_cwds(nodes, cwd)
+    for n, eff in zip(nodes, cwds):
         toks = n.get("tokens") if isinstance(n, dict) else n.tokens
         if not toks:
             continue
         head = os.path.basename(toks[0].strip("'\"").lower())
         if head in _SHELL_CWD:
             target = _shell_cd_target(toks)
-            resolved = _shell_cd_resolved(target, effective_cwd)
-            if resolved is None or not _shell_cd_target_allowed(
-                    target, effective_cwd, project_cwd, roots):
+            if eff is None or not _shell_cd_target_allowed(
+                    target, eff, project_cwd, roots):
                 return False
-            if os.path.isdir(resolved):
-                effective_cwd = resolved
             continue
+        if eff is None or not (
+                _path_is_within(eff, project_cwd)
+                or any(_path_is_within(eff, root) for root in roots)):
+            return False
         # A wrapper or an assignment prefix hides the real command: no leniency.
         effective_index = _shell_effective_index(toks)
         if 0 < effective_index < len(toks):
@@ -5480,11 +5646,11 @@ def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
             return False
         operands = [t for t in toks[1:] if not t.strip("'\"").startswith("-")]
         if not operands:
-            if not _shell_command_word_inside_cwd(toks[0], effective_cwd, roots):
+            if not _shell_command_word_inside_cwd(toks[0], eff, roots):
                 return False
             continue
         for tok in operands:
-            if _shell_path_inside_cwd(tok, effective_cwd):
+            if _shell_path_inside_cwd(tok, eff):
                 continue
             if roots and _shell_token_inside_roots(tok, roots):
                 continue
@@ -5494,7 +5660,7 @@ def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
         for tok in targets or []:
             if _shell_redirect_target_is_discardable(tok):
                 continue
-            if _shell_path_inside_cwd(tok, effective_cwd):
+            if _shell_path_inside_cwd(tok, eff):
                 continue
             if roots and _shell_token_inside_roots(tok, roots):
                 continue
@@ -5519,41 +5685,28 @@ def _shell_is_home_destructive(nodes: list) -> bool:
     project_cwd = os.path.realpath(os.getcwd())
     home = os.path.realpath(os.path.expanduser("~"))
     temp = os.path.realpath(tempfile.gettempdir())
-    effective_cwd = os.getcwd()
-    outside_sensitive_cd = False
-    for n in nodes:
+    cwds = _shell_effective_cwds(nodes)
+    for n, eff in zip(nodes, cwds):
         toks = n.get("tokens") if isinstance(n, dict) else n.tokens
         if not toks:
             continue
         source = n.get("source") if isinstance(n, dict) else n.source
         node_head = os.path.basename(toks[0].strip("'\"").lower())
         if node_head in _SHELL_CWD:
-            target = _shell_cd_target(toks)
-            resolved = _shell_cd_resolved(target, effective_cwd)
-            outside_sensitive_cd = False
-            if resolved is not None:
-                if not _path_is_within(resolved, project_cwd):
-                    outside_sensitive_cd = (
-                        _shell_path_is_ancestor(resolved, project_cwd)
-                        or _shell_path_is_ancestor(resolved, home)
-                        or _path_is_within(resolved, home)
-                        or _path_is_within(resolved, temp))
-                if os.path.isdir(resolved):
-                    effective_cwd = resolved
             continue
         head, args = _shell_effective_command(toks)
+        sensitive = _shell_cwd_is_sensitive(eff, project_cwd, home, temp)
         # `env -S` has no effective head (the split string consumed it), so
         # the sensitive-cd check must run before the empty-head skip.
-        if outside_sensitive_cd and _shell_env_split_payloads(toks):
+        if sensitive and _shell_env_split_payloads(toks):
             return True
         if not head:
             continue
-        # A `cd` outside the project cannot be reasoned about with the
-        # project's relative operands: `cd / && rm -rf *` deletes root,
-        # `cd ~ && rm -rf notes` deletes home, `cd .. && rm -rf *` deletes
-        # the parent project. Treat a destructive node after such a `cd`
-        # as a hard delete.
-        if outside_sensitive_cd:
+        # A destructive node whose effective cwd is unknown, home, root or
+        # the shared temp area cannot be reasoned about with project-relative
+        # operands: `cd / && rm -rf *`, `(cd / && rm -rf *)` (the subshell
+        # inherits `/`), `cd $VAR && rm …`. Treat it as a hard delete.
+        if sensitive:
             if head == "rm":
                 return True
             if _shell_inline_code_command(head, args):
@@ -6375,11 +6528,18 @@ def _shell_expand_unset_refs(text: str) -> str:
     return "".join(out)
 
 
-def _shell_operand_realpath(tok: str) -> Optional[str]:
+def _shell_operand_realpath(tok: str, cwd: Optional[str] = None,
+                            force_path: bool = False) -> Optional[str]:
     """Best-effort resolve of a shell token to an absolute realpath.
 
     Args:
         tok: A command operand string.
+        cwd: Directory for relative tokens (defaults to `os.getcwd()`). The
+            shell scan passes the effective cwd from `_shell_effective_cwds`
+            so `cd / && echo x > rel` resolves `rel` against `/` (H1).
+        force_path: Treat a bare word as a file path. A redirect target is
+            always a path (`> rel`), while a bare operand (`git status foo`)
+            is not; the scan sets this for write targets.
 
     Returns:
         A realpath string, or None if the token is not a resolvable path
@@ -6404,9 +6564,10 @@ def _shell_operand_realpath(tok: str) -> Optional[str]:
     if "=" in t or "$" in t:
         return None  # assignments / env refs are not simple paths
     if not t.startswith("/"):
-        if "/" not in t and "." not in t and "*" not in t and "?" not in t and "~" not in t:
+        if (not force_path and "/" not in t and "." not in t
+                and "*" not in t and "?" not in t and "~" not in t):
             return None  # bare word arg, not a path
-        t = os.path.join(os.getcwd(), t)
+        t = os.path.join(cwd or os.getcwd(), t)
     try:
         return os.path.realpath(t)
     except Exception:
@@ -6436,7 +6597,36 @@ _SHELL_CODE_PROGRAMS = frozenset({
 _SHELL_CODE_CHARS = frozenset("()=;$`")
 
 
-def _shell_token_path_candidates(tok: str, program: str = "") -> list:
+def _shell_token_is_relative_path(tok: str) -> bool:
+    """True when a token looks like a relative file target.
+
+    Used only when the effective cwd is unknown (`_shell_effective_cwds`
+    returned None): a write to a relative target cannot be proven inside the
+    project, so `_shell_acl_scan` refuses it. Absolute spellings (`/x`, `~`),
+    flags, URLs and empty tokens are not relative targets. A defined `$VAR`
+    stays opaque, so a write to `$VAR/x` after an unknown `cd` is refused too
+    (fail-closed).
+
+    Args:
+        tok: A shell token (operand or redirect target).
+
+    Returns:
+        True for a token that would resolve against the cwd.
+    """
+    t = _shell_expand_unset_refs(_shell_expand_home_refs(tok.strip()))
+    t = t.lstrip("<>").strip().strip("'\"")
+    if not t or t.startswith("-"):
+        return False
+    if t.startswith(("/", "~")):
+        return False
+    if "://" in t:
+        return False
+    return True
+
+
+def _shell_token_path_candidates(tok: str, program: str = "",
+                                 cwd: Optional[str] = None,
+                                 force_path: bool = False) -> list:
     """Resolve one shell token to candidate realpaths for ACL scanning.
 
     Returns the whole-token resolution (when the token looks like a path), plus
@@ -6457,12 +6647,14 @@ def _shell_token_path_candidates(tok: str, program: str = "") -> list:
     Args:
         tok: A shell token (argument or command word).
         program: The node's command word, used to recognise interpreters.
+        cwd: Directory for relative tokens (the effective cwd from H1).
+        force_path: Treat a bare word as a file path (write targets).
 
     Returns:
         List of realpaths (may be empty).
     """
     out = []
-    rp = _shell_operand_realpath(tok)
+    rp = _shell_operand_realpath(tok, cwd, force_path=force_path)
     if rp:
         out.append(rp)
     prog = os.path.basename(program or "").lower()
@@ -6492,6 +6684,13 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
     applied (the shell gate already owns that). Sensitive virtual files
     (/proc/*/mem etc.) are hard-denied.
 
+    Relative tokens are resolved against the **effective** cwd from
+    `_shell_effective_cwds` (H1), not the process cwd: `cd / && echo x > rel`
+    writes `/rel` and is denied. When that resolver returns None (an opaque
+    `cd $VAR`, `cd -`, a glob, a failed `popd`), a relative **write** target
+    is refused outright because it cannot be proven inside the project;
+    relative reads keep the old behaviour (explicit-only, no new deny).
+
     Operands are scanned both as-is and, for code blobs (`python3 -c`,
     `sh -c`, `if=/etc/shadow`), by extracting absolute paths embedded inside
     them — otherwise `python3 -c "open('/etc/passwd')"` silently bypassed a
@@ -6514,7 +6713,9 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
         return None
     deny_info = None
     ask_info = None
-    for node in _shell_breakdown(command):
+    nodes = _shell_breakdown(command)
+    cwds = _shell_effective_cwds(nodes)
+    for node, eff in zip(nodes, cwds):
         toks = node.tokens
         if not toks:
             continue
@@ -6529,7 +6730,15 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext']) -> Optional[d
                    [(t, "write") for t in node.redirect_targets
                     if not _shell_redirect_target_is_discardable(t)])
         for tok, op in scanned:
-            for rp in _shell_token_path_candidates(tok, toks[0]):
+            if (eff is None and op == "write"
+                    and _shell_token_is_relative_path(tok)):
+                acl.log_event("run_command", tok.strip(), "deny", None)
+                return {"approved": False,
+                        "reason": "[path ACL denied] relative write after an "
+                                  "unresolved cd — the working directory is "
+                                  f"unknown; {ACL_DENIAL_HINT}"}
+            for rp in _shell_token_path_candidates(
+                    tok, toks[0], cwd=eff, force_path=(op == "write")):
                 if _is_blocked_system_file(rp):
                     acl.log_event("run_command", rp, "deny", None)
                     return {"approved": False,

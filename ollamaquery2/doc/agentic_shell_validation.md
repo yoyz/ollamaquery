@@ -177,6 +177,19 @@ Key faithful details:
     its relative ACL paths (and `$UNSET` inside the payload, where the inner
     shell expands it) are H3's job.
     `tests/test_acl.py::TestShellUnsetVarExpansion` (9).
+*   **Effective cwd for relative paths (H1, closed 2026-11-22).**
+    `cd / && echo x > rel` was allowed because `_shell_operand_realpath`
+    joined `os.getcwd()`; the redirect target is already graded `write`, but
+    it resolved against the process cwd. Nodes now carry the operator that
+    **follows** them and a group id; `_shell_effective_cwds` follows
+    `cd`/`pushd`/`popd` (a failed `cd` keeps the directory, as bash does),
+    treats `|`/`|&`/`&` as subshells (their `cd` does not affect the next
+    segment) and keeps `$(...)`/`(...)` groups separate. An opaque target
+    (`$VAR`, `-`, a glob) makes the directory unknown; a relative **write**
+    after it is refused (fail-closed). The same resolver drives
+    `_shell_all_operands_inside_cwd` and the home guard's sensitive-cwd check
+    (`_shell_cwd_is_sensitive`, which also catches a subshell inheriting `/`).
+    `tests/test_acl.py::TestShellEffectiveCwd` (16).
 *   **`-c` payloads are gated too (M2, closed 2026-11-19).** The guard used to
     read only the first-level tokens, so `bash -c "rm -rf ~"` was a plain `ask`
     that `auto_confirm` approved while a direct `rm -rf ~` is denied — a hole
