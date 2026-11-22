@@ -1314,6 +1314,85 @@ class TestShellNestedFindXargs(unittest.TestCase):
             self.assertNotIn("nested `-c`", res.get("message") or "", cmd)
 
 
+class TestShellExecdirCwd(unittest.TestCase):
+    """`find -execdir` does not inherit the cwd (H3 review P1).
+
+    `-exec` runs where `find` runs, but `-execdir`/`-okdir` run in the
+    directory of each matched file. With `-L` a symlink can point outside the
+    project, so a relative write in the payload escaped the ACL when the outer
+    cwd was inherited (`find -L link -execdir sh -c 'echo x > rel' \\;` wrote
+    outside). The cwd is statically unknowable, so a relative write there is
+    refused (fail-closed) and a destructive payload is hard-denied; an absolute
+    path is still graded normally.
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _scan(self, command):
+        return m._shell_acl_scan(command, self.ctx)
+
+    def test_relative_write_is_not_resolved_against_the_project(self):
+        for cmd in ("find -L . -execdir sh -c 'echo x > rel' \\;",
+                    "find . -execdir tee rel \\;",
+                    "find . -execdir sh -c 'cp a b' \\;"):
+            with self.subTest(cmd=cmd):
+                res = self._scan(cmd)
+                self.assertIsNotNone(res, cmd)
+                self.assertFalse(res["approved"], cmd)
+                self.assertIn("unresolved cd", res["reason"], cmd)
+
+    def test_gate_denies_with_auto_confirm(self):
+        self.ctx.auto_confirm = True
+        for cmd in ("find -L . -execdir sh -c 'echo x > rel' \\;",
+                    "find . -execdir tee rel \\;"):
+            with self.subTest(cmd=cmd):
+                res = m.check_shell_approval(cmd, self.ctx)
+                self.assertFalse(res["approved"], cmd)
+                self.assertEqual(res["effect"], "deny", cmd)
+
+    def test_destructive_payload_is_hard_denied(self):
+        for cmd in ("find -L . -execdir sh -c 'rm -rf *' \\;",
+                    "find . -execdir rm -f {} \\;",
+                    "find . -okdir rm -f {} \\;"):
+            with self.subTest(cmd=cmd):
+                res = m.check_shell_approval(cmd, self.ctx)
+                self.assertFalse(res["approved"], cmd)
+                self.assertEqual(res["effect"], "deny", cmd)
+                self.assertIn("BLOCKED (rejected)", res.get("message", ""), cmd)
+
+    def test_exec_keeps_the_inherited_cwd(self):
+        # Control: `-exec` runs where find runs, so a project write is allowed.
+        self.assertIsNone(self._scan("find . -exec sh -c 'echo x > rel' \\;"))
+
+    def test_symlink_to_the_outside_is_denied(self):
+        outside = tempfile.mkdtemp()
+        link_name = os.path.basename(tempfile.mkdtemp(dir=os.getcwd()))
+        os.rmdir(os.path.join(os.getcwd(), link_name))
+        link = os.path.join(os.getcwd(), link_name)
+        try:
+            os.symlink(outside, link)
+            # The symlink really points outside the project.
+            self.assertEqual(os.path.realpath(link), os.path.realpath(outside))
+            cmd = f"find -L {shlex.quote(link_name)} -execdir " \
+                  "sh -c 'echo x > rel' \\;"
+            self.ctx.auto_confirm = True
+            res = m.check_shell_approval(cmd, self.ctx)
+            self.assertFalse(res["approved"])
+            self.assertIn("unresolved cd", res.get("message", ""))
+        finally:
+            if os.path.islink(link):
+                os.unlink(link)
+            os.rmdir(outside)
+
+    def test_access_plan_marks_the_execdir_write_unknown(self):
+        plan = m._shell_access_plan("find . -execdir tee rel \\;")
+        self.assertIn(("write", None), {(e["op"], e["real"]) for e in plan})
+        self.assertNotIn(
+            ("write", os.path.realpath(os.path.join(os.getcwd(), "rel"))),
+            {(e["op"], e["real"]) for e in plan})
+
+
 class TestShellLineContinuationInWords(unittest.TestCase):
     """`\\`+newline is deleted before tokenizing, even inside a word (G2).
 

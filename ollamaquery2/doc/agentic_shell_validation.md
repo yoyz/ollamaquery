@@ -240,7 +240,17 @@ Key faithful details:
     a documented limit (absolute paths are still caught). The same traversal
     feeds `_shell_access_plan`, which emits `real=None` for a token resolved
     against an unknown cwd instead of inventing a project-relative path (A1).
-    `tests/test_acl.py::TestShellNestedPayloads` (9).
+    **`find -execdir`/`-okdir` do not inherit the outer cwd** (review P1,
+    2026-11-23): they run in the directory of each matched file, and with
+    `find -L` a symlink can point outside the project (live:
+    `find -L link -execdir sh -c 'touch rel'` wrote in the link target). The
+    payload's cwd is therefore marked `unknown`: a relative write is refused
+    (`find -L . -execdir sh -c 'echo x > rel'` → `unresolved cd`) and a
+    destructive payload is hard-denied (`-execdir rm -f {}` included — use
+    `-exec` or absolute paths if the directory is meant to be the project).
+    An absolute path is still graded normally. `-exec`/`-ok` keep the inherited
+    cwd. `tests/test_acl.py::TestShellNestedPayloads` (9),
+    `TestShellExecdirCwd` (6).
 *   Group nodes `( … )`, `$(…)`, `<(…)` contribute no own pattern, only nested
     nodes (`opencode_implementation_detail_shell_permission_parser.md:401`).
 
@@ -279,6 +289,10 @@ Guard `ollamaquery2.py:5307` `_shell_is_home_destructive`:
     a nested command**, so `find . -exec rm -rf ~ \;` and
     `find . -exec sh -c 'rm -rf ~' \;` are denied even though the root is the
     project (`find *` is allow-listed; the root alone is not the whole story).
+    `-execdir`/`-okdir` run in each matched file's directory, not the `find`
+    cwd; that directory is statically unknowable (`-L` follows symlinks), so a
+    destructive payload there is denied too (`find . -execdir rm -f {} \;`),
+    and the ACL refuses its relative writes.
 *   `xargs`: the command `xargs` will run is parsed as a nested command, so
     `xargs rm -rf ~` and `echo x | xargs sh -c 'rm -rf ~'` are denied whatever
     the pipeline feeds it. A destructive `xargs` after a home/root `find` stays
@@ -440,6 +454,7 @@ Extensible in-code; could be loaded from `~/.ollamaquery.d/shell_permissions.jso
 | `find ~ -delete`                     | `find ~ -delete`             | `deny`        | `deny` (hard)       | find delete         |
 | `find ~ -print0 \| xargs -0 rm -rf`  | `find …`, `xargs …`          | `deny`        | `deny` (hard)       | xargs after find    |
 | `find . -exec rm -rf ~ \;`           | `find . -exec rm -rf ~`      | `allow`       | `deny` (hard)       | `-exec` payload     |
+| `find -L link -execdir … > rel`      | `find -L link -execdir …`    | `allow`       | `deny` (ACL)        | unknowable cwd      |
 | `xargs rm -rf ~`                     | `xargs rm -rf ~`             | `ask`         | `deny` (hard)       | xargs payload       |
 | `bash -c 'cd / && echo x > rel'`     | `bash -c …`                  | `ask`         | `deny` (ACL, auto)  | H3 nested write     |
 | `cd / && rm -rf *`                   | `cd /`, `rm -rf *`           | `deny`        | `deny` (hard)       | cd escapes + delete |

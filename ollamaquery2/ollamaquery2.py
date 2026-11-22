@@ -5695,7 +5695,7 @@ def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
     return True
 
 # --- Home/root destructive guard (bypass-immune) ---
-def _shell_is_home_destructive(nodes: list) -> bool:
+def _shell_is_home_destructive(nodes: list, cwd: Optional[str] = None) -> bool:
     """Return True if any parsed node deletes home/root or runs such a delete.
 
     The command word is normalized through `_shell_effective_command()`, so a
@@ -5707,12 +5707,16 @@ def _shell_is_home_destructive(nodes: list) -> bool:
 
     Args:
         nodes: List of _ShellNode (or dict nodes) from _shell_breakdown.
+        cwd: Directory the nodes start in (None = process cwd). Passing
+            `_SHELL_CWD_UNKNOWN` (e.g. for a `find -execdir` payload, which
+            runs in each matched file's directory) makes every node's cwd
+            unknown, so a destructive command there is hard-denied.
     """
     home_root_find = False
     project_cwd = os.path.realpath(os.getcwd())
     home = os.path.realpath(os.path.expanduser("~"))
     temp = os.path.realpath(tempfile.gettempdir())
-    cwds = _shell_effective_cwds(nodes)
+    cwds = _shell_effective_cwds(nodes, cwd)
     for n, eff in zip(nodes, cwds):
         toks = n.get("tokens") if isinstance(n, dict) else n.tokens
         if not toks:
@@ -5794,6 +5798,12 @@ _SHELL_WRAPPER_VALUE_FLAGS = {
 _PYTHON_HEAD_RE = re.compile(r"^python(?:[0-9]+(?:\.[0-9]+)*)?$")
 # Bounded recursion: beyond this depth a conservative text check decides.
 _SHELL_NESTED_MAX_DEPTH = 6
+# Directory a nested payload runs in. `-c`/`env -S`/`find -exec` inherit the
+# outer cwd; `find -execdir`/`-okdir` run in the directory of each matched
+# file, which is statically unknowable (with `-L` a symlink can leave the
+# project), so a relative write there is refused.
+_SHELL_PAYLOAD_INHERIT_CWD = "inherit"
+_SHELL_PAYLOAD_UNKNOWN_CWD = "unknown"
 # `os.system("…")`, `os.popen("…")`, `subprocess.run("…", …)` — the shell
 # spelling inside a `python -c` payload. `subprocess.run(["rm", …])` (list form)
 # does not use a shell and does not expand `~`, so it is not a home-delete.
@@ -6310,7 +6320,7 @@ def _shell_wrapper_requires_approval(nodes: list) -> bool:
 
 
 def _shell_find_exec_commands(args: list) -> list:
-    """Return the command strings run by `find`'s `-exec`-family actions.
+    """Return `(directive, command)` pairs of `find`'s `-exec`-family actions.
 
     `find` is allow-listed, so its `-exec` payload is a command-execution
     channel: `find . -exec rm -rf ~ \\;` and
@@ -6319,15 +6329,22 @@ def _shell_find_exec_commands(args: list) -> list:
     home/root check). The action ends at the `;` or `+` terminator; everything
     before it is returned as one command line for the recursive gate.
 
+    The directive matters for the cwd: `-exec` runs where `find` runs, but
+    `-execdir`/`-okdir` run in the directory of each matched file (with `-L`
+    a symlink can point outside the project), so the caller must not inherit
+    the outer cwd for those.
+
     Args:
         args: Tokens after the effective `find` command word.
 
     Returns:
-        One command string per `-exec`/`-execdir`/`-ok`/`-okdir` action.
+        One `(directive, command)` pair per action, where `directive` is
+        `-exec`, `-execdir`, `-ok` or `-okdir`.
     """
     out = []
     for index, raw in enumerate(args):
-        if raw.strip("'\"") not in ("-exec", "-execdir", "-ok", "-okdir"):
+        directive = raw.strip("'\"")
+        if directive not in ("-exec", "-execdir", "-ok", "-okdir"):
             continue
         inner = []
         for candidate in args[index + 1:]:
@@ -6344,7 +6361,7 @@ def _shell_find_exec_commands(args: list) -> list:
                 break
             inner.append(candidate)
         if inner:
-            out.append(" ".join(inner))
+            out.append((directive, " ".join(inner)))
     return out
 
 
@@ -6368,6 +6385,13 @@ def _shell_xargs_command(args: list) -> list:
     return [" ".join(args[index:])]
 
 
+def _shell_merge_payload_cwd(outer: str, inner: str) -> str:
+    """Return the stricter of two nested-payload cwd modes."""
+    if outer == _SHELL_PAYLOAD_UNKNOWN_CWD or inner == _SHELL_PAYLOAD_UNKNOWN_CWD:
+        return _SHELL_PAYLOAD_UNKNOWN_CWD
+    return _SHELL_PAYLOAD_INHERIT_CWD
+
+
 def _shell_unwrap_nested_command(command: str) -> list:
     """Return the executable payload of a nested command string.
 
@@ -6384,46 +6408,58 @@ def _shell_unwrap_nested_command(command: str) -> list:
             command line).
 
     Returns:
-        The payloads to gate recursively, or `[command]` when it is not a
-        wrapper.
+        `(payload, cwd_mode)` pairs; a command with no embedded payload is
+        returned as `(command, inherit)`.
     """
     nested = []
     for node in _shell_breakdown(command):
         nested.extend(_shell_embedded_commands(node.tokens))
-    return nested or [command]
+    return nested or [(command, _SHELL_PAYLOAD_INHERIT_CWD)]
 
 
 def _shell_embedded_commands(tokens: list) -> list:
-    """Extract nested command strings from one shell command node.
+    """Extract `(command, cwd_mode)` pairs from one shell command node.
 
     Handles a leading wrapper (`sudo`, `env`, `nohup`, …), shell interpreters
     (`sh -c`, `bash -lc`, `busybox sh -c`), `python -c` payloads that call
     `os.system`/`os.popen`/`subprocess.*` with a string, `find -exec` actions
     (reduced to their own payload when the action is a wrapper) and the
-    command `xargs` will run.
+    command `xargs` will run. `cwd_mode` is `inherit` for a payload that runs
+    where the node runs, `unknown` for `find -execdir`/`-okdir` (it runs in
+    the directory of each matched file).
 
     Args:
         tokens: Word tokens of the command node.
 
     Returns:
-        Nested command strings to gate recursively (never the caller's own).
+        `(command, cwd_mode)` pairs to gate recursively (never the caller's
+        own command).
     """
     if not tokens:
         return []
-    commands = list(_shell_env_split_payloads(tokens))
+    commands = [(payload, _SHELL_PAYLOAD_INHERIT_CWD)
+                for payload in _shell_env_split_payloads(tokens)]
     index = _shell_effective_index(tokens)
     if index >= len(tokens):
         return commands
     head = os.path.basename(tokens[index].strip("'\"")).lower()
     body = tokens[index + 1:]
     if head in _SHELL_INTERPRETERS:
-        commands.extend(_shell_c_payloads(body))
+        commands.extend((payload, _SHELL_PAYLOAD_INHERIT_CWD)
+                        for payload in _shell_c_payloads(body))
     elif _PYTHON_HEAD_RE.match(head):
         for code in _shell_c_payloads(body):
-            commands.extend(match.group(2) for match in _PY_SHELL_CALL_RE.finditer(code))
+            commands.extend(
+                (match.group(2), _SHELL_PAYLOAD_INHERIT_CWD)
+                for match in _PY_SHELL_CALL_RE.finditer(code))
     elif head == "find":
-        for command in _shell_find_exec_commands(body):
-            commands.extend(_shell_unwrap_nested_command(command))
+        for directive, command in _shell_find_exec_commands(body):
+            action_mode = (_SHELL_PAYLOAD_UNKNOWN_CWD
+                           if directive in ("-execdir", "-okdir")
+                           else _SHELL_PAYLOAD_INHERIT_CWD)
+            for payload, payload_mode in _shell_unwrap_nested_command(command):
+                commands.append(
+                    (payload, _shell_merge_payload_cwd(action_mode, payload_mode)))
     elif head == "xargs":
         for command in _shell_xargs_command(body):
             commands.extend(_shell_unwrap_nested_command(command))
@@ -6470,21 +6506,29 @@ def _shell_text_nested_destructive(text: str) -> bool:
     return bool(_SHELL_INTERPRETER_TEXT_RE.search(text)) and _shell_text_home_destructive(text)
 
 
-def _shell_nested_home_hit(nodes: list, depth: int = 1) -> Optional[str]:
+def _shell_nested_home_hit(nodes: list, depth: int = 1,
+                           cwd: Optional[str] = None) -> Optional[str]:
     """Find a home/root-destructive command nested in a `-c` payload.
 
     Args:
         nodes: Parsed command nodes (`_ShellNode` or dict form).
         depth: Current recursion depth (bounded by _SHELL_NESTED_MAX_DEPTH).
+        cwd: Directory the payloads inherit (None = process cwd). A payload
+            marked `unknown` by `_shell_embedded_commands` (a `find -execdir`
+            action, which runs in the matched file's directory) starts with
+            `_SHELL_CWD_UNKNOWN`, so a destructive command there is hard-denied
+            rather than judged against the project.
 
     Returns:
         The offending nested command string, or None.
     """
     for node in nodes:
         tokens = node.get("tokens") if isinstance(node, dict) else node.tokens
-        for payload in _shell_embedded_commands(tokens or []):
+        for payload, mode in _shell_embedded_commands(tokens or []):
             if not payload.strip():
                 continue
+            payload_cwd = (_SHELL_CWD_UNKNOWN
+                           if mode == _SHELL_PAYLOAD_UNKNOWN_CWD else cwd)
             if _shell_text_nested_destructive(payload):
                 return payload
             if depth >= _SHELL_NESTED_MAX_DEPTH:
@@ -6492,15 +6536,16 @@ def _shell_nested_home_hit(nodes: list, depth: int = 1) -> Optional[str]:
                     return payload
                 continue
             inner = shell_check_command(payload, DEFAULT_SHELL_PERMISSION, _SHELL_SESSION_APPROVED)
-            if _shell_is_home_destructive(inner["nodes"]):
+            if _shell_is_home_destructive(inner["nodes"], cwd=payload_cwd):
                 return payload
             # Same normalization pass as the top-level guard: the resolved home
             # (`rm -rf /home/<user>`) must fold to `~` inside the payload too.
             inner_norm = shell_check_command(_shell_normalize_for_home(payload),
                                              DEFAULT_SHELL_PERMISSION, _SHELL_SESSION_APPROVED)
-            if _shell_is_home_destructive(inner_norm["nodes"]):
+            if _shell_is_home_destructive(inner_norm["nodes"], cwd=payload_cwd):
                 return payload
-            deeper = _shell_nested_home_hit(inner["nodes"], depth + 1)
+            deeper = _shell_nested_home_hit(inner["nodes"], depth + 1,
+                                            cwd=payload_cwd)
             if deeper:
                 return deeper
     return None
@@ -7153,10 +7198,12 @@ def _shell_access_plan(command: str, cwd: Optional[str] = None,
         if depth >= _SHELL_NESTED_MAX_DEPTH:
             return
         base = eff if eff is not None else _SHELL_CWD_UNKNOWN
-        for payload in _shell_embedded_commands(node.tokens):
+        for payload, mode in _shell_embedded_commands(node.tokens):
             if not payload.strip():
                 continue
-            for event in _shell_access_plan(payload, cwd=base,
+            payload_cwd = (_SHELL_CWD_UNKNOWN
+                           if mode == _SHELL_PAYLOAD_UNKNOWN_CWD else base)
+            for event in _shell_access_plan(payload, cwd=payload_cwd,
                                             tmpdir=tmpdir, depth=depth + 1):
                 key = (event["op"], event["real"], event["raw"])
                 if key in seen:
@@ -7337,11 +7384,17 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
         # in. Writes only: absolute reads are already covered above.
         if depth < _SHELL_NESTED_MAX_DEPTH:
             base = eff if eff is not None else _SHELL_CWD_UNKNOWN
-            for payload in _shell_embedded_commands(toks):
+            for payload, mode in _shell_embedded_commands(toks):
                 if not payload.strip():
                     continue
-                nested = _shell_acl_scan(payload, ctx, tmpdir=tmpdir, cwd=base,
-                                         depth=depth + 1, writes_only=True)
+                # `-execdir`/`-okdir` run in each matched file's directory; the
+                # outer cwd must not be inherited there (find -L can leave the
+                # project through a symlink).
+                payload_cwd = (_SHELL_CWD_UNKNOWN
+                               if mode == _SHELL_PAYLOAD_UNKNOWN_CWD else base)
+                nested = _shell_acl_scan(payload, ctx, tmpdir=tmpdir,
+                                         cwd=payload_cwd, depth=depth + 1,
+                                         writes_only=True)
                 if nested is not None:
                     return nested
     if deny_info:
@@ -7393,8 +7446,9 @@ def _shell_hard_block(command: str, verdict: dict) -> Optional[Dict]:
         shown = nested if len(nested) <= 200 else nested[:200] + "…"
         return {"approved": False, "effect": "deny",
                 "message": "BLOCKED (rejected): a nested `-c`/`find -exec`/`xargs` command "
-                           "deletes the home directory (~/ or $HOME) or the root filesystem, "
-                           f"which is never allowed: {shown}",
+                           "deletes the home directory (~/ or $HOME), the root filesystem, "
+                           "or runs a destructive command in a directory that cannot be "
+                           f"proven safe, which is never allowed: {shown}",
                 "verdict": verdict}
     # Also catch opencode deny (explicit rules) — include 'rejected' for compat with safety_blocklist test
     if verdict["effect"] == "deny":

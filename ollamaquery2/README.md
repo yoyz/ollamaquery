@@ -579,7 +579,10 @@ Trust boundaries at a glance; the sections above give the details.
   run are parsed, so `find . -exec rm -rf ~ \;` is a hard deny and a relative
   write inside `bash -c 'cd / && echo x > rel'` is denied by the path ACL (it
   resolves against the directory the payload actually runs in; an unknown
-  directory refuses the write). The inspection is bounded at 6 nesting levels,
+  directory refuses the write). `find -execdir`/`-okdir` run in each matched
+  file's directory, not the `find` cwd, so their relative writes are refused
+  (with `-L` a symlink can leave the project) and a destructive payload there
+  is a hard deny; `-exec` keeps the inherited cwd. The inspection is bounded at 6 nesting levels,
   so a relative write buried deeper is a documented limit (absolute paths are
   still seen); see `doc/agentic_shell_validation.md` §2.2. The `s` and `a`
   approval answers are **session-scoped**; nothing is written to disk. Broader
