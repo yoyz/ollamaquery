@@ -376,6 +376,73 @@ class TestResumeCompletion(_SessionDirCase):
         self.assertEqual(completer._complete_session_handles(""), first)
 
 
+class TestAgenticLogSessionLink(unittest.TestCase):
+    """A3: the JSONL log points at the session it belongs to."""
+
+    def test_stem_sanitizes_and_defaults(self):
+        self.assertEqual(m._agentic_log_stem(None), "no-session")
+        self.assertEqual(m._agentic_log_stem(""), "no-session")
+        self.assertEqual(m._agentic_log_stem("20261113_152947_reunion-acl"),
+                         "20261113_152947_reunion-acl")
+        self.assertEqual(m._agentic_log_stem("a/b c"), "a-b-c")
+        self.assertLessEqual(len(m._agentic_log_stem("x" * 200)),
+                             m.AGENTIC_LOG_SESSION_MAX_CHARS)
+
+    def test_logger_names_and_stamps_the_session(self):
+        with tempfile.TemporaryDirectory() as td, \
+                patch.dict(os.environ, {"HOME": td}, clear=False):
+            log = m.AgenticLogger(session_id="20261113_152947_reunion-acl")
+            try:
+                log.write(type="start", user_input="hi")
+            finally:
+                log.close()
+            self.assertTrue(os.path.basename(log.path).startswith(
+                "20261113_152947_reunion-acl_"))
+            with open(log.path, encoding="utf-8") as handle:
+                entry = json.loads(handle.readline())
+        self.assertEqual(entry["session_id"], "20261113_152947_reunion-acl")
+
+    def test_no_session_is_explicit(self):
+        with tempfile.TemporaryDirectory() as td, \
+                patch.dict(os.environ, {"HOME": td}, clear=False):
+            log = m.AgenticLogger()
+            try:
+                log.write(type="start")
+            finally:
+                log.close()
+            self.assertTrue(os.path.basename(log.path).startswith("no-session_"))
+            with open(log.path, encoding="utf-8") as handle:
+                entry = json.loads(handle.readline())
+        self.assertEqual(entry["session_id"], "no-session")
+
+    def test_rename_after_open_keeps_the_original_link(self):
+        with tempfile.TemporaryDirectory() as td, \
+                patch.dict(os.environ, {"HOME": td}, clear=False):
+            log = m.AgenticLogger(session_id="old-id")
+            try:
+                log.write(type="start")
+            finally:
+                log.close()
+            self.assertTrue(os.path.basename(log.path).startswith("old-id_"))
+            with open(log.path, encoding="utf-8") as handle:
+                entry = json.loads(handle.readline())
+        self.assertEqual(entry["session_id"], "old-id")
+
+    def test_logger_captures_the_active_session_id(self):
+        loop = object.__new__(m.ChatLoop)
+        loop.ctx = types.SimpleNamespace(agentic_logging=True,
+                                         agentic_log_retention_days=7)
+        loop.conversation = types.SimpleNamespace(active_id="abc")
+        with patch.object(m, "AgenticLogger") as logger_cls:
+            loop._agentic_logger()
+        logger_cls.assert_called_once_with(retention_days=7, session_id="abc")
+
+    def test_logger_off_returns_none(self):
+        loop = object.__new__(m.ChatLoop)
+        loop.ctx = types.SimpleNamespace(agentic_logging=False)
+        self.assertIsNone(loop._agentic_logger())
+
+
 class TestCommandRegistry(unittest.TestCase):
     """`/rename` is a first-class command; `/save`/`/resume` document names."""
 

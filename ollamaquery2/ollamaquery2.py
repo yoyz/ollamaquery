@@ -16008,6 +16008,27 @@ class ToolRegistry:
 
 DEFAULT_AGENTIC_LOG_RETENTION_DAYS = 7
 AGENTIC_LOG_RETENTION_ENV = "OLLAMAQUERY_AGENTIC_LOG_RETENTION_DAYS"
+AGENTIC_LOG_SESSION_MAX_CHARS = 64
+
+
+def _agentic_log_stem(session_id: Optional[str]) -> str:
+    """Return a filesystem-safe log stem for a session id.
+
+    Session ids are already slugs (`20261113_152947_reunion-acl`); this caps a
+    pathological name and keeps `no-session` for a free chat. The raw id is
+    still written to every entry, so the stem is only for the filename.
+
+    Args:
+        session_id: Active ConversationStore id, or None.
+
+    Returns:
+        A stem safe for a filename (never empty).
+    """
+    raw = (session_id or "").strip()
+    if not raw:
+        return "no-session"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-.")
+    return (safe[:AGENTIC_LOG_SESSION_MAX_CHARS] or "no-session")
 
 
 def _resolve_agentic_log_retention(explicit: Optional[int] = None) -> int:
@@ -16049,6 +16070,11 @@ class AgenticLogger:
     OLLAMAQUERY_AGENTIC_LOG_RETENTION_DAYS overrides it) on initialization to
     prevent unbounded disk growth.
 
+    The filename carries the session id (`<session_id>_<ts>.jsonl`, or
+    `no-session_<ts>.jsonl` for a free chat), and every entry carries
+    `session_id`, so a later `/rename` does not break the link: the id is the
+    one that was active when the log opened, not the current name.
+
     Logging is best-effort by contract: a full disk, an EIO or an
     unserializable payload disables the logger with one warning instead of
     raising into the ReAct loop, because losing the log must never abort a
@@ -16062,21 +16088,25 @@ class AgenticLogger:
 
     AGENTIC_LOG_RETENTION_DAYS = DEFAULT_AGENTIC_LOG_RETENTION_DAYS
 
-    def __init__(self, retention_days: Optional[int] = None) -> None:
+    def __init__(self, retention_days: Optional[int] = None,
+                 session_id: Optional[str] = None) -> None:
         """Open a fresh timestamped JSONL log after pruning old ones.
 
         Args:
             retention_days: Session override; None uses the env/default.
+            session_id: Active ConversationStore id, or None for a free chat.
+                Stored raw on every entry and made filesystem-safe in the name.
         """
         self.disabled = False
         self.file: Optional[IO] = None
         self.path = ""
+        self.session_id = (session_id or "").strip() or "no-session"
         self.retention_days = _resolve_agentic_log_retention(retention_days)
         log_dir = os.path.expanduser("~/.ollamaquery.d/agentic")
         _ensure_private_dir(log_dir)
         self._cleanup_old_logs(log_dir)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(log_dir, f"{timestamp}.jsonl")
+        path = os.path.join(log_dir, f"{_agentic_log_stem(self.session_id)}_{timestamp}.jsonl")
         try:
             self.file = _open_private(path, "w", encoding="utf-8")
         except OSError as e:
@@ -16123,6 +16153,8 @@ class AgenticLogger:
             return
         entry = dict(data)
         entry["timestamp"] = datetime.now().isoformat()
+        entry.setdefault("session_id",
+                         getattr(self, "session_id", "no-session"))
         try:
             self.file.write(json.dumps(entry, default=str) + "\n")
             self.file.flush()
@@ -26013,6 +26045,23 @@ class ChatLoop:
         """Describe the next request (mode, system, tools, token counts)."""
         return self._wire_view().snapshot()
 
+    def _agentic_logger(self) -> Optional['AgenticLogger']:
+        """Create the session log with the active ConversationStore id (A3).
+
+        The id is captured when the log opens: a later `/rename` or `/resume`
+        changes the store, not the file already being written, so the entries
+        keep pointing at the session the work actually happened in.
+
+        Returns:
+            An AgenticLogger, or None when `/agentic log` is off.
+        """
+        if not getattr(self.ctx, "agentic_logging", True):
+            return None
+        session_id = getattr(self._conversation(), "active_id", None)
+        return AgenticLogger(
+            retention_days=getattr(self.ctx, "agentic_log_retention_days", None),
+            session_id=session_id)
+
     def _init_agentic_query(self, final_content: str) -> Optional[tuple]:
         """Initialize messages, logger, and tool format for an agentic query.
 
@@ -26030,8 +26079,7 @@ class ChatLoop:
         if len(self.messages) > 1:
             messages.extend(self.messages[1:])
 
-        logger = (AgenticLogger(retention_days=getattr(self.ctx, "agentic_log_retention_days", None))
-                  if self.ctx.agentic_logging else None)
+        logger = self._agentic_logger()
         if logger:
             logger.write(type="start", user_input=final_content)
 

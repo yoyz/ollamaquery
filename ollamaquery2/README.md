@@ -695,8 +695,11 @@ Trust boundaries at a glance; the sections above give the details.
   can reach whatever the host can.
 - **On disk.** Sessions, readline history, agentic JSONL logs and spill files
   are created `0600` in `0700` directories. They can contain anything the model
-  or a `!` command saw, including secrets. Agentic logs are pruned after 7 days
-  by default (`/agentic logretention <days>`, or
+  or a `!` command saw, including secrets. Agentic logs are named
+  `<session_id>_<ts>.jsonl` (or `no-session_<ts>.jsonl`) and every entry carries
+  `session_id`, so a log points at the session it belongs to even after a
+  `/rename`; they are pruned after 7 days by default
+  (`/agentic logretention <days>`, or
   `OLLAMAQUERY_AGENTIC_LOG_RETENTION_DAYS`).
 - **Plan mode.** `/agentic plan` (strict) exposes inspection tools only, with
   no shell and every path confined to the CWD. `/agentic plan run` re-adds
