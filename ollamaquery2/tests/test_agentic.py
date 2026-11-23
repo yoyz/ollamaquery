@@ -9,6 +9,7 @@ import json
 import time
 import shlex
 import shutil
+import subprocess
 import tempfile
 import threading
 import contextlib
@@ -45,6 +46,33 @@ def _normalize_url(url):
     if not url.startswith(('http://', 'https://')):
         url = f"http://{url}"
     return url
+
+
+class _FakePopen:
+    """Minimal Popen stand-in for the bounded output reader.
+
+    The sandbox tests patch `subprocess.run` to record argv and answer the
+    probes; command execution now uses Popen so its output can be capped.
+    `_fake_popen_from_run` routes the Popen call through the same fake.
+    """
+
+    def __init__(self, result):
+        self.returncode = result.returncode
+        self.stdout = io.StringIO(result.stdout or "")
+        self.stderr = io.StringIO(result.stderr or "")
+        self.pid = 1 << 30  # no such process: a stray kill is a safe no-op
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        pass
+
+
+def _fake_popen_from_run(argv, **kwargs):
+    """Wrap the currently patched `subprocess.run` as a Popen-like object."""
+    return _FakePopen(subprocess.run(argv, **kwargs))
+
 
 def _try_ollama(url):
     """Check ollama at url, return (ok, model). Prefer gpt-oss:20b for E2E speed."""
@@ -1614,6 +1642,14 @@ class TestContainerSandboxConfig(unittest.TestCase):
     and the "wrong container" bugs live.
     """
 
+    def setUp(self):
+        # Command execution reads Popen; route it through the same fake
+        # `subprocess.run` each test installs.
+        patcher = patch("ollamaquery2.subprocess.Popen",
+                        side_effect=_fake_popen_from_run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _executor(self, **kwargs):
         """Build an Executor with an explicit runtime, ignoring the environment."""
         kwargs.setdefault("container_runtime", "podman")
@@ -1953,6 +1989,12 @@ class TestBwrapSandboxConfig(unittest.TestCase):
         self.home = tempfile.mkdtemp(prefix="bwrap-home-")
         self.cwd = os.path.realpath(os.getcwd())
         self.scratch = os.path.realpath(q._scratch_root())
+        # Command execution reads Popen; route it through the same fake
+        # `subprocess.run` each test installs.
+        patcher = patch("ollamaquery2.subprocess.Popen",
+                        side_effect=_fake_popen_from_run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)

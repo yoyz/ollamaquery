@@ -181,7 +181,7 @@ is the deeper tier: it re-adds `run_command`, which always asks for confirmation
 (bypass-immune), for shell-only inspection. In both tiers the model can only
 query, never modify.
 
-Safety features: destructive tool confirmation, path ACL (see below), shell approval gate, step timeout (default 300s), stuck detection, same-tool-loop abort (after 10 consecutive identical calls), and a rootless bwrap sandbox (default for agentic) or a container sandbox (podman/docker).
+Safety features: destructive tool confirmation, path ACL (see below), shell approval gate, bounded command output (2 MB per stream, then the process group is stopped), step timeout (default 300s), stuck detection, same-tool-loop abort (after 10 consecutive identical calls), and a rootless bwrap sandbox (default for agentic) or a container sandbox (podman/docker).
 
 #### Presets — the stance, not just a toggle
 
@@ -586,6 +586,12 @@ to building a local test server with the `Neumann-Labs/mcp-cpp` SDK.
 
 Trust boundaries at a glance; the sections above give the details.
 
+- **Bounded command output.** stdout and stderr are captured at **2 MB per
+  stream**; past that the process group is killed and the output carries a
+  truncation marker. The host executor, bwrap, the container runtime and `!`
+  share the collector, so a `yes`, a noisy build or a hostile command cannot
+  exhaust RAM before its timeout (measured: `yes a` stops in ~20 ms with
+  rc = SIGKILL and 2 MB captured).
 - **Shell gate.** Per-component allow/ask/deny, `rm ~/` / `rm /`,
   home/root `find -delete` and destructive `find -exec` / `xargs rm`
   hard-blocked (bypass-immune, `auto_confirm` included),

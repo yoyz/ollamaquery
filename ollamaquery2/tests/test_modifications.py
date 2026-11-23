@@ -2101,7 +2101,8 @@ class TestProcessInlineCommands(unittest.TestCase):
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, start_new_session=True, cwd=td)
             try:
-                _out, _err, _rc, timed_out = m._communicate_or_kill(proc, timeout=1)
+                _out, _err, _rc, timed_out, _truncated = m._communicate_or_kill(
+                    proc, timeout=1)
                 self.assertTrue(timed_out)
                 with open(os.path.join(td, "child.pid"), encoding="utf-8") as fh:
                     child_pid = int(fh.read().strip())
@@ -2116,6 +2117,123 @@ class TestProcessInlineCommands(unittest.TestCase):
                         os.kill(child_pid, signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
                         pass
+
+
+class TestBoundedCommandOutput(unittest.TestCase):
+    """Subprocess output is capped per stream and the group is stopped (0.5.1).
+
+    `proc.communicate()` used to buffer a whole stream before any cap: a
+    `yes`, a noisy build or a hostile command could exhaust RAM before its
+    timeout, on the host and in bwrap/container alike.
+    """
+
+    def _proc(self, code: str):
+        return subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True)
+
+    def test_stdout_is_capped_and_marked(self):
+        proc = self._proc("import sys; sys.stdout.write('o' * 5_000_000)")
+        out, err, _rc, timed_out, truncated = m._communicate_or_kill(
+            proc, timeout=10, limit=1000)
+        self.assertFalse(timed_out)
+        self.assertTrue(truncated)
+        self.assertTrue(out.startswith("o" * 1000))
+        self.assertIn("output truncated", out)
+        self.assertEqual(err, "")
+        self.assertLessEqual(
+            len(out), 1000 + len(m._command_truncation_marker(1000)))
+
+    def test_stderr_is_capped_and_marked(self):
+        proc = self._proc("import sys; sys.stderr.write('e' * 5_000_000)")
+        out, err, _rc, timed_out, truncated = m._communicate_or_kill(
+            proc, timeout=10, limit=1000)
+        self.assertFalse(timed_out)
+        self.assertTrue(truncated)
+        self.assertTrue(err.startswith("e" * 1000))
+        self.assertIn("output truncated", err)
+        self.assertEqual(out, "")
+
+    def test_small_output_is_untouched(self):
+        proc = self._proc("print('hello')")
+        out, err, rc, timed_out, truncated = m._communicate_or_kill(
+            proc, timeout=10, limit=1000)
+        self.assertFalse(timed_out)
+        self.assertFalse(truncated)
+        self.assertEqual(out, "hello\n")
+        self.assertEqual(err, "")
+        self.assertEqual(rc, 0)
+
+    def test_timeout_stays_empty_and_not_truncated(self):
+        proc = self._proc("import time; time.sleep(30)")
+        out, err, rc, timed_out, truncated = m._communicate_or_kill(
+            proc, timeout=1, limit=1000)
+        self.assertTrue(timed_out)
+        self.assertFalse(truncated)
+        self.assertEqual((out, err, rc), ("", "", -1))
+
+    @staticmethod
+    def _alive(pid):
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                fields = fh.read().rsplit(")", 1)[1].split()
+            return fields[0] != "Z"
+        except (OSError, IndexError):
+            return False
+
+    def test_background_writer_is_stopped_after_the_shell_exits(self):
+        """`sleep 30 &` must not outlive the command by holding the pipes."""
+        proc = self._proc(
+            "import subprocess\n"
+            "p = subprocess.Popen(['sleep', '30'])\n"
+            "print(p.pid, flush=True)")
+        out, _err, _rc, timed_out, _truncated = m._communicate_or_kill(
+            proc, timeout=10, limit=1000)
+        self.assertFalse(timed_out)
+        pid = int(out.strip())
+        deadline = time.time() + 3
+        while time.time() < deadline and self._alive(pid):
+            time.sleep(0.05)
+        self.assertFalse(self._alive(pid), f"background {pid} survived")
+
+    def test_executor_run_caps_a_yes_flood(self):
+        """The full host path stops at the ceiling instead of buffering it."""
+        allowed = {"approved": True, "effect": "allow", "message": None,
+                   "verdict": None}
+        with patch.object(m, "check_shell_approval", return_value=allowed):
+            result = m.Executor(mode="host").run("yes a", timeout=10)
+        self.assertTrue(result["truncated"])
+        self.assertNotEqual(result["returncode"], 0)
+        self.assertIn("output truncated", result["stdout"])
+        self.assertLessEqual(
+            len(result["stdout"]),
+            m.MAX_COMMAND_OUTPUT_CHARS + len(
+                m._command_truncation_marker(m.MAX_COMMAND_OUTPUT_CHARS)))
+
+    def test_inline_command_is_capped_too(self):
+        """`!` uses the same bounded collector (stderr merged into stdout)."""
+        allowed = {"approved": True, "effect": "allow", "message": None,
+                   "verdict": None}
+        sink = io.StringIO()
+        with patch.object(m, "check_shell_approval", return_value=allowed), \
+                contextlib.redirect_stdout(sink):
+            result = m.execute_os_command("yes a", timeout=10)
+        self.assertIn("output truncated", result)
+        self.assertLess(len(result), m.MAX_COMMAND_OUTPUT_CHARS + 5000)
+
+    def test_run_command_puts_the_note_in_the_head(self):
+        """The model must see the reason even though observations keep the head."""
+        class FakeExecutor:
+            def run(self, command, timeout):
+                return {"stdout": "x" * 100, "stderr": "", "returncode": -9,
+                        "truncated": True}
+
+        fake = types.SimpleNamespace(executor=FakeExecutor())
+        result = m._tool_handle_run_command(
+            fake, {"command": "yes a", "timeout": 10})
+        self.assertFalse(result["success"])
+        self.assertTrue(result["output"].startswith("[Output truncated"))
 
 
 class TestApiKeyFile(unittest.TestCase):

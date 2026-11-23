@@ -258,6 +258,13 @@ MAX_FILE_INCLUSION_SIZE = 5 * 1024 * 1024  # 5MB max for @file inclusions
 # for a marker / shown as diagnostics, so they get a small ceiling.
 MAX_URL_FETCH_BYTES = 16 * 1024 * 1024  # 16 MiB per fetched page
 MAX_PROBE_READ_BYTES = 256 * 1024      # startup probe body (marker search)
+# Per-stream ceiling for a subprocess (`run_command`, `!`, container, bwrap).
+# The observation cap protects the *context*; this bounds the *process*: a
+# `yes`, a hostile command or a noisy build must not fill RAM before its
+# timeout. Reading stops at the ceiling and the process group is killed.
+MAX_COMMAND_OUTPUT_CHARS = 2_000_000
+COMMAND_READ_CHUNK = 64 * 1024
+COMMAND_DRAIN_GRACE = 1.0  # seconds to let the pipes close after the direct child
 # Agentic container sandbox (see Executor). `--sandbox-*` flags override these;
 # the env vars remain for the old behaviour and for CI.
 DEFAULT_CONTAINER_RUNTIME = "podman"
@@ -8620,35 +8627,131 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         pass
 
 
+def _command_truncation_marker(limit: int) -> str:
+    """Return the stream marker appended when a command hits the output cap."""
+    return (f"\n... [output truncated at {limit} chars; "
+            f"the process group was stopped]")
+
+
+def _read_stream_capped(stream, limit: int, sink: list, truncated: dict,
+                        name: str, proc: subprocess.Popen) -> None:
+    """Drain one pipe into `sink`, capped at `limit`; kill the group past it.
+
+    Runs in a daemon thread (one per stream). The pipe is still drained after
+    the ceiling and after the kill, so a child blocked on a full pipe cannot
+    deadlock the wait; the loop ends at EOF once the group is gone.
+
+    Args:
+        stream: The pipe to read (`proc.stdout` or `proc.stderr`).
+        limit: Maximum characters stored for this stream.
+        sink: List collecting the stored chunks.
+        truncated: Per-stream flags shared with `_communicate_or_kill`.
+        name: "stdout" or "stderr", the key to set in `truncated`.
+        proc: The process whose group is killed when the cap is exceeded.
+    """
+    total = 0
+    try:
+        while True:
+            chunk = stream.read(COMMAND_READ_CHUNK)
+            if not chunk:
+                break
+            room = limit - total
+            if room > 0:
+                sink.append(chunk[:room])
+                total += min(len(chunk), room)
+            if len(chunk) > room:
+                truncated[name] = True
+                _kill_process_group(proc)
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
 def _communicate_or_kill(proc: subprocess.Popen, timeout: int,
-                         kill_grace: int = 5) -> tuple:
-    """Collect a Popen's output, killing its whole process group on timeout.
+                         kill_grace: int = 5,
+                         limit: int = MAX_COMMAND_OUTPUT_CHARS) -> tuple:
+    """Collect a Popen's output, capped per stream, killing its group.
 
     The child must have been started with `start_new_session=True`, so its pid
     is the process-group leader and `_kill_process_group` can reap the whole
     tree. `subprocess.run(..., timeout=...)` only kills the direct shell and
     leaves background grandchildren running.
 
+    Both pipes are read by daemon threads with a per-stream ceiling: a `yes`,
+    a hostile command or a noisy build is stopped at `limit` instead of being
+    buffered whole before the timeout. The captured prefix is returned with a
+    truncation marker.
+
     Args:
         proc: The Popen object to wait for.
         timeout: Seconds to wait for normal completion.
         kill_grace: Seconds to wait for the pipes to close after SIGKILL.
+        limit: Maximum characters stored per stream.
 
     Returns:
-        (stdout, stderr, returncode, timed_out). On timeout the streams are
-        empty, the return code is -1 and `timed_out` is True; the caller owns
-        the user-facing message.
+        (stdout, stderr, returncode, timed_out, truncated). On timeout the
+        streams are empty, the return code is -1 and `timed_out` is True; when
+        a stream exceeds `limit`, its prefix is returned with a marker and
+        `truncated` is True (the process group has been stopped). The caller
+        owns the user-facing message.
     """
+    out, err = [], []
+    truncated = {"stdout": False, "stderr": False}
+    # Capture the group id before the leader can be reaped: a background
+    # grandchild that inherits the pipes would otherwise outlive the command.
+    pgid = None
+    if hasattr(os, "getpgid") and hasattr(os, "killpg"):
+        try:
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            pgid = None
+    readers = []
+    for stream, sink, name in ((proc.stdout, out, "stdout"),
+                               (proc.stderr, err, "stderr")):
+        if stream is None:
+            continue
+        reader = threading.Thread(
+            target=_read_stream_capped,
+            args=(stream, limit, sink, truncated, name, proc),
+            daemon=True)
+        reader.start()
+        readers.append(reader)
+    timed_out = False
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        return stdout, stderr, proc.returncode, False
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        timed_out = True
         _kill_process_group(proc)
         try:
-            proc.communicate(timeout=kill_grace)
+            proc.wait(timeout=kill_grace)
         except subprocess.TimeoutExpired:
             pass
-        return "", "", -1, True
+    for reader in readers:
+        reader.join(timeout=COMMAND_DRAIN_GRACE)
+    if pgid is not None and any(reader.is_alive() for reader in readers):
+        # The direct child exited but a background process still holds the
+        # pipes (`bash -c 'sleep 300 &'`): stop the group so the command
+        # cannot leave a detached writer behind.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+        for reader in readers:
+            reader.join(timeout=kill_grace)
+    if timed_out:
+        return "", "", -1, True, False
+    stdout = "".join(out)
+    stderr = "".join(err)
+    if truncated["stdout"]:
+        stdout += _command_truncation_marker(limit)
+    if truncated["stderr"]:
+        stderr += _command_truncation_marker(limit)
+    return (stdout, stderr, proc.returncode, False,
+            bool(truncated["stdout"] or truncated["stderr"]))
 
 
 class Executor:
@@ -9197,13 +9300,18 @@ class Executor:
         try:
             if is_container:
                 args_list = shlex.split(command)
-                proc = subprocess.run(
+                proc = subprocess.Popen(
                     args_list, shell=False,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, timeout=timeout
+                    text=True, start_new_session=True
                 )
-                return {"stdout": proc.stdout, "stderr": proc.stderr,
-                        "returncode": proc.returncode}
+                stdout, stderr, returncode, timed_out, truncated = (
+                    _communicate_or_kill(proc, timeout))
+                if timed_out:
+                    return {"stdout": "", "stderr": f"Timed out after {timeout}s",
+                            "returncode": -1}
+                return {"stdout": stdout, "stderr": stderr,
+                        "returncode": returncode, "truncated": truncated}
             # Host mode: own session so a timeout kills the whole tree, not
             # just bash. `subprocess.run` cannot do that: it kills the direct
             # child and leaves background grandchildren running.
@@ -9215,11 +9323,13 @@ class Executor:
                 text=True, executable="/bin/bash", start_new_session=True,
                 env=env
             )
-            stdout, stderr, returncode, timed_out = _communicate_or_kill(proc, timeout)
+            stdout, stderr, returncode, timed_out, truncated = (
+                _communicate_or_kill(proc, timeout))
             if timed_out:
                 return {"stdout": "", "stderr": f"Timed out after {timeout}s",
                         "returncode": -1}
-            return {"stdout": stdout, "stderr": stderr, "returncode": returncode}
+            return {"stdout": stdout, "stderr": stderr,
+                    "returncode": returncode, "truncated": truncated}
         except subprocess.TimeoutExpired:
             return {"stdout": "", "stderr": f"Timed out after {timeout}s", "returncode": -1}
         except Exception as e:
@@ -11648,6 +11758,9 @@ def _tool_handle_run_python(self, args: dict) -> dict:
             except OSError:
                 pass
     output = result["stdout"]
+    if result.get("truncated"):
+        output = ("[Output truncated at the per-stream cap; the command was "
+                  "stopped.]\n" + output)
     if result["stderr"]:
         output += f"\n[stderr]\n{result['stderr']}"
     return {"success": result["returncode"] == 0, "output": output, "error": result["stderr"] or None}
@@ -11670,6 +11783,9 @@ def _tool_handle_run_command(self, args: dict) -> dict:
         return {"success": False, "output": "", "error": f"Invalid timeout: {cmd_timeout}. Timeout is in seconds (1-300). Use a value between 1 and 300."}
     result = self.executor.run(command, timeout=cmd_timeout)
     output = result["stdout"]
+    if result.get("truncated"):
+        output = ("[Output truncated at the per-stream cap; the command was "
+                  "stopped.]\n" + output)
     if result["stderr"]:
         output += f"\n[stderr]\n{result['stderr']}"
     return {"success": result["returncode"] == 0, "output": output, "error": result["stderr"] or None}
@@ -18621,7 +18737,8 @@ def execute_os_command(command: str, timeout: Optional[int] = None) -> str:
             executable="/bin/bash",
             start_new_session=True,
         )
-        raw_output, _stderr, _returncode, timed_out = _communicate_or_kill(process, timeout)
+        raw_output, _stderr, _returncode, timed_out, _truncated = (
+            _communicate_or_kill(process, timeout))
         raw_output = raw_output or ""
 
         if timed_out:

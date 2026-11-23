@@ -422,7 +422,9 @@ Call sites `ollamaquery2.py:6449,8617,15380`:
 ctx = CommandContext() if CommandContext._initialized else None
 res = check_shell_approval(command, ctx=ctx, executor_mode=self.mode)
 if not res["approved"]: return {"stderr": res["message"], "returncode": -1}
-subprocess.run(command, shell=True, executable="/bin/bash", ...)  # pipes/redirs work
+proc = subprocess.Popen(command, shell=True, executable="/bin/bash",
+                        start_new_session=True, ...)  # pipes/redirs work
+stdout, stderr, rc, timed_out, truncated = _communicate_or_kill(proc, timeout)
 
 # _tool_handle_run_command:8617  (operator ban removed)
 # Gate lives in Executor._run_shell; no duplicate check
@@ -430,11 +432,24 @@ subprocess.run(command, shell=True, executable="/bin/bash", ...)  # pipes/redirs
 # execute_os_command:15380  (! inline)
 gate = check_shell_approval(command, ctx=ctx, executor_mode="host")
 ...
-subprocess.run(command, shell=True, executable="/bin/bash", stdout=STDOUT)
+proc = subprocess.Popen(..., stderr=STDOUT, start_new_session=True)
+raw_output, _err, _rc, timed_out, _truncated = _communicate_or_kill(proc, timeout)
 ```
 
 `shell=True` is safe because the gate, not `shell=False`, is the boundary —
 the model both Hermes and opencode v2 use (`ollamaquery2_inline_approval_proposal.md:21`).
+
+**Output capture is bounded.** `_communicate_or_kill` reads stdout and stderr
+in `COMMAND_READ_CHUNK` (64 KiB) chunks through one daemon thread per stream
+and keeps at most `MAX_COMMAND_OUTPUT_CHARS` (2,000,000) characters per
+stream. Past that ceiling the reader stops storing, kills the process group
+(the child was started with `start_new_session=True`) and appends
+`... [output truncated at N chars; the process group was stopped]`. The same
+collector is used on the host, in bwrap, in container mode and for `!`; a
+`yes`, a hostile command or a noisy build can no longer exhaust RAM before
+its timeout. The later model-observation cap (~4k chars) is a separate
+context limit; the executor marker is prepended to `run_command`/`run_python`
+output so the head-keeping observation still shows the reason.
 
 ### 2.6 Default Permission Config
 
