@@ -6284,7 +6284,14 @@ class TestAgenticStatusDisplay(unittest.TestCase):
 
     def _render(self) -> str:
         loop = object.__new__(q.ChatLoop)
-        loop.ctx = q.CommandContext()
+        ctx = q.CommandContext()
+        ctx.agentic_mode = False
+        ctx.preset = "trusted"
+        ctx.auto_confirm = False
+        ctx.plan_mode = False
+        ctx.plan_run = False
+        ctx.agentic_tool_subset = None
+        loop.ctx = ctx
         loop.executor = q.Executor(mode="host")
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
@@ -6304,6 +6311,102 @@ class TestAgenticStatusDisplay(unittest.TestCase):
         self.assertEqual(len(rows), len(self.SETTINGS), out)
         columns = {ln.index("[") for ln in rows}
         self.assertEqual(len(columns), 1, "value brackets not aligned:\n" + "\n".join(rows))
+
+
+class TestAgenticStanceLine(unittest.TestCase):
+    """L2: the one-line axes projection in `/agentic status`."""
+
+    def _ctx(self, preset="trusted", auto=False, plan=False, plan_run=False,
+             subset=None):
+        ctx = q.CommandContext()
+        ctx.agentic_mode = False
+        ctx.preset = preset
+        ctx.auto_confirm = auto
+        ctx.plan_mode = plan
+        ctx.plan_run = plan_run
+        ctx.agentic_tool_subset = subset
+        return ctx
+
+    def test_off_idle_defaults(self):
+        line = q.agentic_stance_line(self._ctx(), "host")
+        for part in ("Agentic=off", "tools=all(15)", "paths=home",
+                     "shell=gate", "approve=ask", "sandbox=host"):
+            self.assertIn(part, line)
+
+    def test_work_bwrap_auto(self):
+        line = q.agentic_stance_line(
+            self._ctx("work", auto=True), "bwrap")
+        for part in ("tools=all(15)", "paths=home", "shell=bwrap",
+                     "approve=auto", "sandbox=bwrap"):
+            self.assertIn(part, line)
+
+    def test_read_plan_is_cwd_and_no_shell(self):
+        line = q.agentic_stance_line(
+            self._ctx("read", plan=True), "host")
+        for part in ("tools=9/15", "paths=cwd", "shell=off",
+                     "approve=plan", "sandbox=host"):
+            self.assertIn(part, line)
+
+    def test_plan_run_adds_the_shell_without_confining_paths(self):
+        line = q.agentic_stance_line(
+            self._ctx("read", plan=True, plan_run=True), "host")
+        for part in ("tools=10/15", "paths=home", "shell=gate",
+                     "approve=ask"):
+            self.assertIn(part, line)
+
+    def test_exec_is_cwd_and_bwrap(self):
+        line = q.agentic_stance_line(
+            self._ctx("exec", auto=True), "bwrap")
+        for part in ("tools=9/15", "paths=cwd", "shell=bwrap",
+                     "approve=auto", "sandbox=bwrap"):
+            self.assertIn(part, line)
+
+    def test_subset_reduces_tools_and_can_hide_the_shell(self):
+        line = q.agentic_stance_line(
+            self._ctx("work", subset={"read_file"}), "host")
+        for part in ("tools=1/15", "shell=off"):
+            self.assertIn(part, line)
+
+    def test_status_prints_the_axes_line(self):
+        loop = object.__new__(q.ChatLoop)
+        ctx = q.CommandContext()
+        ctx.agentic_mode = False
+        ctx.preset = "trusted"
+        ctx.auto_confirm = False
+        ctx.plan_mode = False
+        ctx.plan_run = False
+        ctx.agentic_tool_subset = None
+        loop.ctx = ctx
+        loop.executor = q.Executor(mode="host")
+        sink = io.StringIO()
+        with contextlib.redirect_stderr(sink):
+            loop._print_agentic_status()
+        out = sink.getvalue()
+        self.assertIn("Agentic=off", out)
+        self.assertIn("tools=all(15)", out)
+        self.assertIn("paths=home", out)
+        self.assertIn("shell=gate", out)
+        self.assertIn("approve=ask", out)
+        self.assertIn("sandbox=host", out)
+
+
+class TestAgenticFullAnnouncement(unittest.TestCase):
+    """L2: `full` is a display+approval preset, not a wider tool surface."""
+
+    def test_full_says_the_tool_surface_is_unchanged(self):
+        loop = object.__new__(q.ChatLoop)
+        loop.ctx = q.CommandContext()
+        loop.executor = q.Executor(mode="host")
+        sink = io.StringIO()
+        with patch.object(loop, "_apply_preset_state"), \
+             patch.object(loop, "_print_preset_status"), \
+             patch.object(loop, "_refresh_context_bar"), \
+             contextlib.redirect_stderr(sink):
+            loop._agentic_set_full()
+        out = sink.getvalue()
+        self.assertIn("same as /agentic on", out)
+        self.assertIn("auto-confirm is the only extra permission", out)
+        self.assertTrue(loop.ctx.auto_confirm)
 
 
 class TestAgenticPlanCommand(unittest.TestCase):
@@ -6702,6 +6805,21 @@ class TestCallStepFinalizesFeedback(unittest.TestCase):
             {"event": None, "close": None}, [])
         self.assertEqual(response, {"ok": True})
         self.assertEqual(finalized, [True])
+
+    def test_on_tool_call_is_forwarded_to_the_stream(self):
+        runner = self._runner()
+        seen = {}
+
+        def fake(*_args, **kwargs):
+            seen.update(kwargs)
+            return {"ok": True}
+
+        runner.call_with_timeout = fake
+        marker = object()
+        runner.call_step([], 5, [], {}, lambda *a: None, lambda: None,
+                         {"event": None, "close": None}, [],
+                         on_tool_call=marker)
+        self.assertIs(seen["on_tool_call"], marker)
 
 
 if __name__ == "__main__":

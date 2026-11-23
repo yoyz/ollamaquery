@@ -2815,6 +2815,31 @@ class TestStreamParserSeam(unittest.TestCase):
         # The stub was used: no socket was opened and the fake line was parsed.
         self.assertEqual(result[0], "from-stub")
 
+    def test_on_tool_call_receives_native_tool_names(self):
+        """The stream callback gets the name before the arguments finish."""
+        qh = self._make_query()
+        qh._iter_stream_lines = lambda response, backend: iter([
+            json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "x",
+                 "function": {"name": "write_file", "arguments": "{"}}]}}]}),
+            json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0,
+                 "function": {"arguments": '"file_path": "a"}'}}]}}]}),
+        ])
+
+        class FakeResponse:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *a):
+                return False
+
+        names = []
+        with patch.object(q, '_request_with_retry', return_value=FakeResponse()):
+            qh._aggregate_sync_stream(Request("http://x"), "llamacpp", 1, None,
+                                       on_tool_call=names.append)
+        self.assertEqual(names, ["write_file"])
+
     def test_parser_provider_is_not_a_bound_copy(self):
         """The parser's `iter_lines` provider is a lambda, not a captured method."""
         qh = self._make_query()

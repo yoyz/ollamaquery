@@ -204,7 +204,7 @@ backstop and the `Executor` cannot disagree.
 /agentic preset work            # the daily stance (first `/agentic on` selects it)
 /agentic plan                   # alias for the read preset
 /agentic plan run               # adds run_command on the HOST, confirmed per call
-/agentic full                   # alias for the trusted preset
+/agentic full                   # alias for trusted (display + approval; same tools as on)
 ```
 
 `/agentic auto` keeps its historical meaning (toggle auto-confirm); the preset
@@ -248,6 +248,21 @@ connects. `read` and `git` are list presets (`read_file,glob,grep,
 list_directory` / `git_inspect,read_file`). An empty surface is warned twice
 (at the command and at the next query). It restricts tools, not commands or
 paths: the shell gate and `/agentic acl` still own those.
+
+`/agentic status` projects the same state on one line:
+`Agentic=on  tools=all(15)  paths=home  shell=gate  approve=ask  sandbox=host`.
+It is derived from the effective surface, the preset/plan confinement and the
+actual executor, not from the nominal preset. `/agentic full` is a **display +
+approval preset**: it keeps the same tool surface as `/agentic on` and turns
+auto-confirm on, which the command now says explicitly; hard denies and
+Path-ACL `ask` rules still apply.
+
+While a tool call is being generated, its **name is announced as soon as it is
+known** — `[Tool call] write_file — generating arguments…` — so a long argument
+write is distinguishable from a stalled stream. Native models feed the notice
+from the tool-call delta; inline models are detected from the streamed
+`{"tool": "name"` JSON. It is printed once per step and the heartbeat dots
+continue after it.
 
 
 Each step's stream is also checked for **completeness**: a turn cut mid-generation

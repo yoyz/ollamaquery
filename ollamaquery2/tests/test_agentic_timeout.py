@@ -600,6 +600,32 @@ class TestStepFeedbackInIsolation(unittest.TestCase):
         feedback.finalize()
         self.assertTrue(feedback.cancelled)
 
+    def test_tool_call_is_announced_once(self):
+        feedback = m.StepFeedback(self.ctx, show_thinking=False)
+        feedback.announce_tool("write_file")
+        feedback.announce_tool("write_file")
+        out = self._stderr.getvalue()
+        self.assertEqual(out.count("write_file"), 1)
+        self.assertIn("[Tool call] write_file", out)
+        self.assertIn("generating arguments", out)
+        self.assertEqual(feedback.announced_tools, {"write_file"})
+
+    def test_inline_tool_name_is_announced_across_chunks(self):
+        feedback = m.StepFeedback(self.ctx, show_thinking=False)
+        feedback.feed("", '{"to', False)
+        feedback.feed("", 'ol": "write_file", "arguments": {', False)
+        out = self._stderr.getvalue()
+        self.assertEqual(out.count("write_file"), 1)
+        self.assertIn("generating arguments", out)
+
+    def test_announce_tool_closes_the_thinking_block_first(self):
+        feedback = m.StepFeedback(self.ctx, show_thinking=True)
+        feedback.feed("reasoning", "", False)
+        feedback.announce_tool("read_file")
+        out = self._stderr.getvalue()
+        self.assertIn("</", out)          # the open thinking span was closed
+        self.assertIn("[Tool call] read_file", out)
+
 
 class TestStepFeedbackProgress(unittest.TestCase):
     """Tool-call-only deltas count as generation activity; the watchdog tracks

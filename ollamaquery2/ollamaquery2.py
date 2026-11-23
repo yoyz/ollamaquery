@@ -10007,6 +10007,45 @@ def agentic_effective_names(ctx) -> Optional[set]:
     universe = set(AGENTIC_TOOL_DEFS) | set(subset or ())
     return agentic_effective_tools(ctx, universe)
 
+
+def agentic_stance_line(ctx, executor_mode: str = "host") -> str:
+    """One-line projection of the four axes for `/agentic status` (L2).
+
+    Display only, and derived from the same helpers the gate uses
+    (`agentic_effective_names`, `strict_path_confinement`), so the line cannot
+    describe a surface the tools do not enforce. `paths` has only the preset
+    values for now (`cwd`/`home`); the `any` axis is L3.
+
+    Args:
+        ctx: CommandContext (or None).
+        executor_mode: The active engine ("host"/"bwrap"/"container").
+
+    Returns:
+        `Agentic=on  tools=…  paths=…  shell=…  approve=…  sandbox=…`
+    """
+    state = "on" if getattr(ctx, "agentic_mode", False) else "off"
+    effective = agentic_effective_names(ctx)
+    total = len(AGENTIC_TOOL_DEFS)
+    if effective is None:
+        tools = f"all({total})"
+    else:
+        tools = f"{len(set(effective) & set(AGENTIC_TOOL_DEFS))}/{total}"
+    paths = "cwd" if strict_path_confinement(ctx) else "home"
+    if effective is not None and "run_command" not in effective:
+        shell = "off"
+    else:
+        shell = "gate" if executor_mode == "host" else executor_mode
+    if getattr(ctx, "plan_mode", False) and not getattr(ctx, "plan_run", False):
+        approve = "plan"
+    elif getattr(ctx, "plan_run", False):
+        approve = "ask"
+    elif getattr(ctx, "auto_confirm", False):
+        approve = "auto"
+    else:
+        approve = "ask"
+    return (f"Agentic={state}  tools={tools}  paths={paths}  "
+            f"shell={shell}  approve={approve}  sandbox={executor_mode}")
+
 # Kubernetes / OpenShift read-only consultation (kubernetes_cluster_query tool).
 # cluster_type auto: KUBECONFIG env var set → online; else omc configured
 # (binary + ~/.omc/omc.json) → offline; else online via default kubeconfig.
@@ -17208,7 +17247,8 @@ class StreamParser:
     def _aggregate_sync_stream(self, req: Request, backend: str, socket_timeout: float,
                                on_chunk: object, cancel: Optional[dict] = None,
                                tool_calls_out: Optional[list] = None,
-                               stream_info_out: Optional[dict] = None) -> tuple:
+                               stream_info_out: Optional[dict] = None,
+                               on_tool_call: object = None) -> tuple:
         """Read a streaming response and aggregate content/thinking/tools/usage.
 
         Args:
@@ -17227,6 +17267,9 @@ class StreamParser:
                 caller that gets `complete=False` must not treat the partial
                 text as a finished turn (that is how an announcement
                 ("I'll write the file now") became a final answer).
+            on_tool_call: Optional callback invoked with a tool name as soon as
+                a native tool-call delta carries one; used to label a long
+                argument generation before the step completes.
 
         Returns:
             (full_content, full_thinking, tool_calls, tool_call_index, usage),
@@ -17268,6 +17311,11 @@ class StreamParser:
                         full_content += content
                     if tcs:
                         self._accumulate_stream_tool_calls(tool_calls, tool_call_index, tcs)
+                        if on_tool_call:
+                            for tc in tcs:
+                                name = (tc.get("function") or {}).get("name") or ""
+                                if name:
+                                    on_tool_call(name)
                         if tool_calls_out is not None:
                             # By-ref view for timeout salvage: OpenAI-style
                             # deltas live in tool_call_index until the loop
@@ -17593,11 +17641,13 @@ class ModelQuery:
     def _aggregate_sync_stream(self, req: Request, backend: str, socket_timeout: float,
                                on_chunk: object, cancel: Optional[dict] = None,
                                tool_calls_out: Optional[list] = None,
-                               stream_info_out: Optional[dict] = None) -> tuple:
+                               stream_info_out: Optional[dict] = None,
+                               on_tool_call: object = None) -> tuple:
         """Aggregate a streaming response (door onto `StreamParser`)."""
         return self._stream_parser()._aggregate_sync_stream(
             req, backend, socket_timeout, on_chunk, cancel,
-            tool_calls_out=tool_calls_out, stream_info_out=stream_info_out)
+            tool_calls_out=tool_calls_out, stream_info_out=stream_info_out,
+            on_tool_call=on_tool_call)
 
     def calculate_stats(self, total_time: float, content: str, usage: Optional[dict] = None,
                         messages: Optional[list] = None, thought: str = "",
@@ -17772,6 +17822,7 @@ class ModelQuery:
         cancel = kwargs.pop("cancel", None)
         usage_out = kwargs.pop("usage_out", None)
         tool_calls_out = kwargs.pop("tool_calls_out", None)
+        on_tool_call = kwargs.pop("on_tool_call", None)
         backend = self.backend
 
         img_idx = self._last_user_message_index(messages) if images else -1
@@ -17789,7 +17840,8 @@ class ModelQuery:
         stream_info: dict = {}
         result = self._aggregate_sync_stream(req, backend, socket_timeout, on_chunk, cancel,
                                              tool_calls_out=tool_calls_out,
-                                             stream_info_out=stream_info)
+                                             stream_info_out=stream_info,
+                                             on_tool_call=on_tool_call)
         if isinstance(result, dict):  # error dict
             return result
         if result is None:  # cancelled
@@ -20505,6 +20557,11 @@ class AgenticTimeoutPolicy:
 # signals distinct: '.' = data flowing, IDLE_WAIT_MARK = waiting for data.
 IDLE_WAIT_MARK = "Zz"
 
+# Inline tool-call JSON (`{"tool": "write_file", ...}`) as streamed by
+# non-native models. Used only to announce the tool name before its (possibly
+# large) arguments finish; the real parser still decides what runs.
+_INLINE_TOOL_NAME_RE = re.compile(r'"tool"\s*:\s*"([A-Za-z_][A-Za-z0-9_-]*)"')
+
 
 class StepFeedback:
     """Live feedback + accumulated output for one agentic ReAct step."""
@@ -20545,6 +20602,10 @@ class StepFeedback:
         self._tok_acc = 0
         self._write_lock = threading.Lock()
         self._watchdog: Optional[threading.Thread] = None
+        # One `[Tool call] name` line per tool per step (native delta callback
+        # or inline JSON detection), so a long argument generation is labelled.
+        self.announced_tools = set()
+        self._inline_tail = ""
 
     # === Public API (what the ReAct loop consumes) ===
     def start(self) -> None:
@@ -20569,6 +20630,8 @@ class StepFeedback:
         # ~30 tok/s) as a stalled step and abort.
         self.last_activity = time.time()
         self._accumulate(thought, content)
+        if content:
+            self._notice_inline_tool(content)
         self._render(thought, content)
         # Token-driven dots are the liveness signal for thinking-off mode only.
         # With show_thinking the user already sees reasoning stream live; dots
@@ -20584,6 +20647,55 @@ class StepFeedback:
                     self.last_visible = time.time()
                     sys.stderr.write(".")
                     sys.stderr.flush()
+
+    def announce_tool(self, name: str) -> None:
+        """Announce a tool call as soon as its name streams (once per step).
+
+        The model can spend a long time writing a `write_file` argument before
+        the step completes; the heartbeat dots alone do not say what is being
+        generated. This prints one `[Tool call] name` line when the name first
+        appears — from a native tool-call delta (`on_tool_call`) or from inline
+        JSON (`_notice_inline_tool`).
+
+        Args:
+            name: Tool name carried by the delta/partial JSON.
+        """
+        name = (name or "").strip()
+        if self.cancelled or not name or name in self.announced_tools:
+            return
+        self.announced_tools.add(name)
+        detail = (" — generating arguments…"
+                  if name in ("write_file", "edit_file", "apply_patch", "patch")
+                  else "")
+        with self._write_lock:
+            # The notice is a line of its own: close an open thinking block or
+            # heartbeat run first, so it never lands inside `</thinking>` or
+            # after a row of dots.
+            if self.thinking_open:
+                sys.stderr.write(_thinking_close_tag())
+                self.thinking_open = False
+            if self.heartbeat_shown:
+                sys.stderr.write("\n")
+                self.heartbeat_shown = False
+            sys.stderr.write(colorize(f"[Tool call] {name}{detail}\n", 'info'))
+            sys.stderr.flush()
+            self.last_visible = time.time()
+
+    def _notice_inline_tool(self, content: str) -> None:
+        """Announce the tool name in streamed inline JSON, once per step.
+
+        Scans a small window (the previous tail + the start of this chunk) for
+        `"tool": "name"`; the full parser still runs after the step. Native
+        models use `announce_tool` through the `on_tool_call` callback instead.
+
+        Args:
+            content: Assistant text for this chunk.
+        """
+        window = self._inline_tail + content[:1024]
+        match = _INLINE_TOOL_NAME_RE.search(window)
+        if match:
+            self.announce_tool(match.group(1))
+        self._inline_tail = (self._inline_tail + content[-256:])[-256:]
 
     def finalize(self) -> None:
         """Close any open thinking block and stop further feedback output."""
@@ -21354,6 +21466,7 @@ class AgenticFinalizer:
                     reentry_messages, host.ctx.model,
                     stream_enabled=True,
                     on_chunk=feedback_r.feed,
+                    on_tool_call=feedback_r.announce_tool,
                     timeout=(getattr(host.ctx, 'agentic_step_timeout', 300) or 300) + 30,
                     context_size=host.ctx.context_size,
                     images=([] if host.ctx.supports_vision is False else host.ctx.current_images),
@@ -21623,7 +21736,8 @@ class AgenticRunner:
 
     def call_step(self, messages: list, step_timeout: int, images_to_send: list,
                   sync_kwargs: dict, on_chunk: object, finalize_step: object,
-                  step_cancel: dict, tool_calls_out: Optional[list] = None) -> tuple:
+                  step_cancel: dict, tool_calls_out: Optional[list] = None,
+                  on_tool_call: object = None) -> tuple:
         """Run one ReAct model call under a wall-clock timeout.
 
         Args:
@@ -21638,6 +21752,8 @@ class AgenticRunner:
                 in-flight generation's accumulated tool calls, so a timed-out
                 step can salvage a call that finished writing before the
                 deadline.
+            on_tool_call: Optional callback fed the tool name as soon as a
+                native delta carries it (labels a long argument generation).
 
         Returns:
             (response, step_start) where response is the sync-shaped dict, or
@@ -21652,6 +21768,7 @@ class AgenticRunner:
                 context_size=self.ctx.context_size,
                 images=images_to_send,
                 on_chunk=on_chunk,
+                on_tool_call=on_tool_call,
                 timeout=step_timeout + 30,
                 cancel=step_cancel,
                 tool_calls_out=tool_calls_out,
@@ -21968,7 +22085,8 @@ class AgenticRunner:
 
         response, step_start = self.call_step(
             state.messages, state.step_timeout, images_to_send, sync_kwargs,
-            feedback.feed, feedback.finalize, step_cancel, step_tool_calls)
+            feedback.feed, feedback.finalize, step_cancel, step_tool_calls,
+            on_tool_call=feedback.announce_tool)
 
         if response is None:
             # Abort the in-flight request FIRST, before any salvage /
@@ -25018,7 +25136,14 @@ class ChatLoop:
         print(colorize("[Verbose: ON]", 'info'), file=sys.stderr)
         print(colorize("[Show thinking: ON]", 'info'), file=sys.stderr)
         print(colorize("[Trace: ON]", 'info'), file=sys.stderr)
-        print(colorize("[Auto-confirm: ON]", 'info'), file=sys.stderr)
+        print(colorize(
+            "[Agentic full: display + approval preset — the tool surface is the "
+            "same as /agentic on; auto-confirm is the only extra permission]",
+            'warning'), file=sys.stderr)
+        print(colorize(
+            "[Auto-confirm: ON — ask-level shell commands and destructive tools "
+            "run without a prompt; hard denies and Path-ACL ask rules still apply]",
+            'warning'), file=sys.stderr)
         print(colorize("[Lazy tool extraction: ON]", 'info'), file=sys.stderr)
         self._print_preset_status()
         self._refresh_context_bar()
@@ -25739,6 +25864,7 @@ class ChatLoop:
         print("  Subcommands: on, off, full, auto, preset [read|exec|work|trusted], plan [on|off|run], sandbox [host|container|bwrap|status|reset|net shared|none|reset],", file=sys.stderr)
         print("               policy, tools [<list>|+n|-n|none|reset], verbose, thinking, trace, log, lazytool, iterations <N>, timeout <N>, heartbeattokens <N>,", file=sys.stderr)
         print("               compactthreshold <v>, logretention <days>, acl, scratch [path|list|clear], files [list|reset], status", file=sys.stderr)
+        print(colorize(agentic_stance_line(c, self.executor.mode), 'info'), file=sys.stderr)
         print(file=sys.stderr)
 
         plan_value = "off" if not c.plan_mode else ("run" if getattr(c, "plan_run", False) else "on")
