@@ -156,7 +156,7 @@ folded. Tab completion on `/resume ` offers every saved slug and id. The newest
 | `git_inspect`              | Read-only git inspection: `status`, `diff`, `diff_staged`, `diff_head`, `log` (any ref, path-scoped, renames followed), `show`, `blame -L` (fixed argv, no shell) |
 | `path_policy`              | Read-only: the session path map (allowed / needs confirmation / forbidden), or the verdict for one path — no filesystem access, no prompt |
 
-Subcommands: `/agentic on|off|full`, `preset [read|exec|work|trusted]`, `plan [on|off|run]`, `sandbox [host|container|bwrap|status|net shared|none|reset]`, `auto`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `files [list|reset]`, `iterations <N>`, `timeout <N>`, `logretention <days>`, `status`.
+Subcommands: `/agentic on|off|full`, `preset [read|exec|work|trusted]`, `plan [on|off|run]`, `sandbox [host|container|bwrap|status|net shared|none|reset]`, `policy`, `auto`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `files [list|reset]`, `iterations <N>`, `timeout <N>`, `logretention <days>`, `status`.
 
 The model is steered to use the **dedicated file tools** (`read_file`, `write_file`,
 `edit_file`, `grep`, `glob`, `list_directory`) instead of shell equivalents (`cat`,
@@ -227,6 +227,16 @@ write tools from the surface instead of pretending the mount protects them.
 `~/.kube/config` or a must-gather under `$HOME`, none of which the sandbox
 mounts) and can reach a cluster, so `exec` — which promises **no network** —
 does not offer it; use `read` to inspect a cluster.
+
+`/agentic policy` answers "what can it touch, right now?" in **effects** rather
+than names: one line per path and shell probe, with `allow` / `ask` / `deny` /
+`unavailable`. Every line is computed by the **same dry-run** the real gate uses
+(`_acl_soft_decision` for paths, `check_shell_approval(..., no_prompt=True)` for
+shell), so the screen cannot describe a policy the tools do not enforce. It
+never prompts, never logs and never touches the disk; `ask` means "the gate
+would ask", and `unavailable` names a tool the active preset removes. Under a
+sandbox it adds the two honest footnotes: file tools run in the harness, and
+shell writes outside the mounts fail.
 
 
 Each step's stream is also checked for **completeness**: a turn cut mid-generation

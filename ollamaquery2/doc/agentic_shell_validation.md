@@ -601,6 +601,28 @@ looking for the closing `"` (`` echo "`awk 'BEGIN{system("id")}'`" ``), and
 the hard home guard, the path ACL and the exec-option scan all see them.
 Single quotes stay literal (`echo '$(rm -rf ~)'` is `allow`).
 
+### 2.10 `/agentic policy` — the dry-run matrix
+
+`/agentic policy` prints one line per path and shell probe. The verdicts are
+not a second model of the policy: paths call `_acl_soft_decision` (the same
+function `_path_acl_decision` and `path_policy` use) and shell commands call
+`check_shell_approval(..., no_prompt=True)`, i.e. the full gate (home guard,
+opencode rules, CWD leniency, exec options, path ACL, auto-confirm) with the
+interactive prompt replaced by `effect=ask`. `no_prompt` also suppresses
+`PathAcl.log_event`, so opening the screen never fills `/agentic acl log`.
+
+`ask` is the prompt decision (not a denial): with `auto_confirm` on, a shell
+ask becomes allow, while Path-ACL ask rules stay bypass-immune. `unavailable`
+means the active preset removes the tool. Sandbox engines annotate shell rows
+`<engine> sandbox (gate skipped)` and the footer states that file tools run in
+the harness.
+
+Tests (`TestAgenticPolicy`, 9): path rows equal `_acl_soft_decision`; shell rows
+equal the no-prompt gate; the real non-TTY gate still denies an ask that the
+matrix reports as ask; the screen neither prompts, logs nor calls `input` in
+all four presets; `exec` shows `write_file` unavailable; strict plan shows
+`paths=cwd` and `shell=off`; `policy` is in the tab completion.
+
 ---
 
 ## 3. Notes on Borrowed Designs

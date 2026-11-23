@@ -2392,6 +2392,141 @@ class TestShellExecOptions(unittest.TestCase):
                 self.assertEqual(self._effect(command, ctx), "deny")
 
 
+class TestAgenticPolicy(unittest.TestCase):
+    """`/agentic policy` must describe the real gate, without touching it."""
+
+    def _ctx(self, preset="work", mode="host", auto=False, plan=False,
+             plan_run=False):
+        ctx = FakeCtx()
+        ctx.preset = preset
+        ctx.plan_mode = plan
+        ctx.plan_run = plan_run
+        ctx.auto_confirm = auto
+        ctx.executor = m.Executor(mode=mode)
+        return ctx
+
+    def _loop(self, ctx):
+        loop = object.__new__(m.ChatLoop)
+        loop.ctx = ctx
+        return loop
+
+    def test_path_rows_use_the_soft_decision(self):
+        ctx = self._ctx()
+        probes = [
+            ("read", "./src/main.c"),
+            ("read", "~/notes.txt"),
+            ("read", "~/.ssh/id_rsa"),
+            ("read", "/etc/hosts"),
+            ("read", "/proc/self/mem"),
+            ("write", "./out.txt"),
+            ("write", "/etc/hosts"),
+            ("write", "/tmp/x"),
+            ("write", os.path.join(m._scratch_root(), "x")),
+        ]
+        for op, raw in probes:
+            with self.subTest(op=op, path=raw):
+                expanded = os.path.expanduser(raw)
+                if not os.path.isabs(expanded):
+                    expanded = os.path.join(os.getcwd(), expanded)
+                real = os.path.realpath(expanded)
+                expected = m._acl_soft_decision(ctx, op, real, raw)[0]
+                verdict, _reason = m._policy_path_effect(ctx, op, raw)
+                self.assertEqual(verdict, expected)
+
+    def test_shell_rows_use_the_no_prompt_gate(self):
+        ctx = self._ctx()
+        for command in ("ls -la", "cat /etc/passwd", "rm -rf ~",
+                        "python3 x.py", "awk 'BEGIN{system(\"id\")}'"):
+            with self.subTest(command=command):
+                expected = m.check_shell_approval(
+                    command, ctx, no_prompt=True)["effect"]
+                verdict, _reason = m._policy_shell_effect(ctx, command)
+                self.assertEqual(verdict, expected)
+
+    def test_no_prompt_turns_a_would_be_prompt_into_ask(self):
+        ctx = self._ctx()
+        self.assertEqual(
+            m.check_shell_approval("cat /etc/passwd", ctx,
+                                   no_prompt=True)["effect"], "ask")
+        with patch.object(m.sys.stdin, "isatty", return_value=False):
+            self.assertEqual(
+                m.check_shell_approval("cat /etc/passwd", ctx)["effect"],
+                "deny")
+
+    def test_policy_never_prompts_logs_or_asks_input(self):
+        ctx = self._ctx()
+        loop = self._loop(ctx)
+        with patch.object(m.PathAcl, "prompt",
+                          side_effect=AssertionError("prompted")), \
+             patch.object(m.PathAcl, "log_event",
+                          side_effect=AssertionError("logged")), \
+             patch("ollamaquery2._shell_prompt_approval",
+                   side_effect=AssertionError("shell prompt")), \
+             patch("builtins.input", side_effect=AssertionError("input")):
+            for preset, mode, plan in (("work", "host", False),
+                                       ("read", "host", True),
+                                       ("exec", "bwrap", False),
+                                       ("trusted", "host", False)):
+                ctx = self._ctx(preset, mode=mode, auto=(preset == "trusted"),
+                                plan=plan)
+                loop.ctx = ctx
+                sink = io.StringIO()
+                with contextlib.redirect_stderr(sink):
+                    loop._handle_agentic_policy()
+                self.assertIn("[Policy]", sink.getvalue())
+
+    def test_work_matrix_shows_the_three_effects(self):
+        ctx = self._ctx("work")
+        loop = self._loop(ctx)
+        sink = io.StringIO()
+        with contextlib.redirect_stderr(sink):
+            loop._handle_agentic_policy()
+        out = sink.getvalue()
+        self.assertIn("preset=work", out)
+        self.assertIn("tools=all(15)", out)
+        self.assertIn("./src/main.c", out)
+        self.assertIn("/etc/hosts", out)
+        self.assertIn("rm -rf ~", out)
+        self.assertIn("allow", out)
+        self.assertIn("ask", out)
+        self.assertIn("deny", out)
+
+    def test_exec_marks_write_file_unavailable(self):
+        ctx = self._ctx("exec", mode="bwrap")
+        loop = self._loop(ctx)
+        sink = io.StringIO()
+        with contextlib.redirect_stderr(sink):
+            loop._handle_agentic_policy()
+        out = sink.getvalue()
+        self.assertIn("preset=exec", out)
+        self.assertIn("tools=9/15", out)
+        self.assertIn("write_file", out)
+        self.assertIn("unavailable", out)
+        self.assertIn("sandbox bounds shell commands only", out)
+
+    def test_plan_strict_confines_paths_and_hides_shell(self):
+        ctx = self._ctx("read", plan=True)
+        loop = self._loop(ctx)
+        sink = io.StringIO()
+        with contextlib.redirect_stderr(sink):
+            loop._handle_agentic_policy()
+        out = sink.getvalue()
+        self.assertIn("paths=cwd", out)
+        self.assertIn("shell=off", out)
+        self.assertIn("plan mode: CWD only", out)
+        self.assertIn("(any command)", out)
+
+    def test_policy_is_in_tab_completion(self):
+        self.assertIn("policy", m.AGENTIC_SUBCOMMANDS)
+
+    def test_dispatch_routes_to_policy(self):
+        loop = self._loop(self._ctx())
+        sink = io.StringIO()
+        with contextlib.redirect_stderr(sink):
+            self.assertFalse(loop.run_handle_agentic("/agentic policy"))
+        self.assertIn("[Policy]", sink.getvalue())
+
+
 def _loop():
     loop = object.__new__(m.ChatLoop)
     loop.ctx = FakeCtx()

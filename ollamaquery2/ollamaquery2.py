@@ -526,7 +526,7 @@ COMMANDS = {
         'aliases': ['/agentic'],
         'category': 'Settings',
         'description': 'Configure agentic mode and sub-options',
-        'usage': '/agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status|reset|net shared|none|reset]|verbose|thinking|trace|log|acl|iterations|timeout|status]',
+        'usage': '/agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status|reset|net shared|none|reset]|policy|verbose|thinking|trace|log|acl|iterations|timeout|status]',
         'handler': None
     },
     'listtool': {
@@ -8316,7 +8316,8 @@ def _shell_access_plan(command: str, cwd: Optional[str] = None,
 def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
                     tmpdir: Optional[str] = None, cwd: Optional[str] = None,
                     depth: int = 1,
-                    writes_only: bool = False) -> Optional[dict]:
+                    writes_only: bool = False,
+                    no_prompt: bool = False) -> Optional[dict]:
     """Scan command operands against PathAcl (run_command path awareness).
 
     Only *explicit* ACL rules trigger here — /proc, /sys, /etc, home dotfiles,
@@ -8362,9 +8363,13 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
         depth: Current recursion depth (bounded).
         writes_only: Grade only write targets (the nested pass; reads are
             already covered by the embedded-absolute-path scan).
+        no_prompt: Report an `ask` rule as `{"effect": "ask"}` instead of
+            prompting the user (the `/agentic policy` dry-run). Nothing is
+            logged or prompted in this mode.
 
     Returns:
-        None (no concern) or a dict {"approved": bool, "reason": str|None}.
+        None (no concern) or a dict {"approved": bool, "reason": str|None,
+        "effect"?: "ask"}.
     """
     acl = getattr(ctx, "path_acl", None) if ctx is not None else None
     if acl is None:
@@ -8390,7 +8395,8 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
         for tok, op in scanned:
             if (eff is None and op == "write"
                     and _shell_token_is_relative_path(tok, tmpdir=tmpdir)):
-                acl.log_event("run_command", tok.strip(), "deny", None)
+                if not no_prompt:
+                    acl.log_event("run_command", tok.strip(), "deny", None)
                 return {"approved": False,
                         "reason": "[path ACL denied] relative write after an "
                                   "unresolved cd — the working directory is "
@@ -8399,7 +8405,8 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
                     tok, toks[0], cwd=eff, force_path=(op == "write"),
                     tmpdir=tmpdir):
                 if _is_blocked_system_file(rp):
-                    acl.log_event("run_command", rp, "deny", None)
+                    if not no_prompt:
+                        acl.log_event("run_command", rp, "deny", None)
                     return {"approved": False,
                             "reason": f"[path ACL denied] {rp} — System file blocked "
                                       f"(sensitive virtual file); {ACL_DENIAL_HINT}"}
@@ -8446,12 +8453,13 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
                                if mode == _SHELL_PAYLOAD_UNKNOWN_CWD else base)
                 nested = _shell_acl_scan(payload, ctx, tmpdir=tmpdir,
                                          cwd=payload_cwd, depth=depth + 1,
-                                         writes_only=True)
+                                         writes_only=True, no_prompt=no_prompt)
                 if nested is not None:
                     return nested
     if deny_info:
         _, rp, rule, _op = deny_info
-        acl.log_event("run_command", rp, "deny", rule)
+        if not no_prompt:
+            acl.log_event("run_command", rp, "deny", rule)
         shown = (rule["path"] if rule.get("kind") in ("prefix", "temp_root", "default", "home_tools")
                  else "home dotfile")
         redirect = ""
@@ -8463,11 +8471,15 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
                           f"{rule['action']} {shown}{redirect}; {ACL_DENIAL_HINT}"}
     if ask_info:
         _, rp, rule, op = ask_info
+        shown = (rule["path"] if rule.get("kind") in ("prefix", "temp_root", "default", "home_tools")
+                 else "home dotfile")
+        if no_prompt:
+            return {"approved": False, "effect": "ask",
+                    "reason": f"[path ACL ask] {rp} — would confirm "
+                              f"(ask {shown}); {ACL_DENIAL_HINT}"}
         granted = acl.prompt(op, rp, rule, tool="run_command", context=command)
         acl.log_event("run_command", rp, "allow" if granted else "deny", rule)
         if not granted:
-            shown = (rule["path"] if rule.get("kind") in ("prefix", "temp_root", "default", "home_tools")
-                     else "home dotfile")
             who = "denied by user" if sys.stdin.isatty() else "denied (no TTY to ask)"
             return {"approved": False,
                     "reason": f"[path ACL denied] {rp} — {who} "
@@ -8551,7 +8563,7 @@ def _shell_prompt_approval(command: str, verdict: dict) -> Dict:
 
 
 def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, executor_mode: str = "host",
-                         tmpdir: Optional[str] = None) -> Dict:
+                         tmpdir: Optional[str] = None, no_prompt: bool = False) -> Dict:
     """Gate: home hard-deny → opencode breakdown → CWD leniency → prompt.
 
     Args:
@@ -8562,6 +8574,10 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
         tmpdir: Value of `$TMPDIR` for the scanner. Tool commands pass the
             session scratch; `!` passes the process value (it keeps the user's
             env). None leaves `$TMPDIR` opaque.
+        no_prompt: Dry-run mode for `/agentic policy`: return the gate's
+            verdict without asking anything. An ACL `ask` stays `effect=ask`
+            instead of being resolved, and the interactive prompt is not
+            reached.
 
     Returns:
         dict: {"approved": bool, "effect": str, "message": str|None, "verdict": dict}
@@ -8604,10 +8620,15 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
             # veto before any prompt: `find -exec sh -c 'cd / && echo x > rel'`
             # (H3) and `find -exec tee /etc/x` stay denials, not questions.
             acl_checked = True
-            res = _shell_acl_scan(command, ctx, tmpdir=tmpdir)
-            if res is not None and not res["approved"]:
-                return {"approved": False, "effect": "deny",
-                        "message": res["reason"], "verdict": verdict}
+            res = _shell_acl_scan(command, ctx, tmpdir=tmpdir,
+                                  no_prompt=no_prompt)
+            if res is not None:
+                if res.get("effect") == "ask":
+                    return {"approved": False, "effect": "ask",
+                            "message": res["reason"], "verdict": verdict}
+                if not res["approved"]:
+                    return {"approved": False, "effect": "deny",
+                            "message": res["reason"], "verdict": verdict}
             verdict = dict(verdict)
             verdict["effect"] = "ask"
             verdict["details"] = list(verdict["details"]) + [{
@@ -8621,9 +8642,15 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
     def _final_allow(**extra: dict) -> dict:
         """Final allow wrapper that applies the path-ACL operand scan."""
         if not acl_checked:
-            res = _shell_acl_scan(command, ctx, tmpdir=tmpdir)
-            if res is not None and not res["approved"]:
-                return {"approved": False, "effect": "deny", "message": res["reason"], "verdict": verdict}
+            res = _shell_acl_scan(command, ctx, tmpdir=tmpdir,
+                                  no_prompt=no_prompt)
+            if res is not None:
+                if res.get("effect") == "ask":
+                    return {"approved": False, "effect": "ask",
+                            "message": res["reason"], "verdict": verdict}
+                if not res["approved"]:
+                    return {"approved": False, "effect": "deny",
+                            "message": res["reason"], "verdict": verdict}
         return {"approved": True, "effect": "allow", "message": None, "verdict": verdict, **extra}
 
     if verdict["effect"] == "allow":
@@ -8635,6 +8662,10 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
     # Auto-confirm (yolo) respects home deny but allows ask
     if ctx is not None and getattr(ctx, "auto_confirm", False):
         return _final_allow(auto=True)
+    # Dry-run: name the prompt decision without asking anything.
+    if no_prompt:
+        return {"approved": False, "effect": "ask",
+                "message": "would prompt for approval", "verdict": verdict}
     # Interactive prompt (TTY required)
     if not sys.stdin.isatty():
         return {"approved": False, "effect": "ask", "message": "Approval required but no TTY — denied (use /agentic auto to allow)", "verdict": verdict}
@@ -11075,6 +11106,91 @@ def _path_acl_decision(ctx: Optional['CommandContext'], op: str, realpath: str, 
                         "(read+write, wiped at exit)")
         return "deny", f"{head} — {reason}{redirect}; {ACL_DENIAL_HINT}"
     return "allow", None
+
+
+def _policy_path_effect(ctx: Optional['CommandContext'], op: str,
+                        raw_path: str) -> tuple:
+    """Dry-run one path through the Path ACL, with no prompt/log/disk access.
+
+    `_acl_soft_decision` is the same definition `_path_acl_decision` (file
+    tools) and `path_policy` use; this wrapper only turns its tuple into a
+    short human-readable reason for `/agentic policy`.
+
+    Args:
+        ctx: CommandContext (or None).
+        op: "read" or "write".
+        raw_path: Path as the user/model would spell it (`~`, relative, ...).
+
+    Returns:
+        (decision, reason): decision is "allow"/"ask"/"deny"; `ask` means the
+        real gate would prompt (it is never silently approved by this call).
+    """
+    expanded = os.path.expanduser(raw_path)
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(os.getcwd(), expanded)
+    real = os.path.realpath(expanded)
+    decision, rule, _plan_strict, cause = _acl_soft_decision(ctx, op, real, raw_path)
+    if cause == "blocked":
+        return decision, "sensitive virtual file"
+    if cause == "plan":
+        return decision, "plan mode: CWD only"
+    if cause == "home_implicit":
+        return decision, "implicit $HOME read"
+    if rule is not None:
+        kind = rule.get("kind")
+        if kind == "home_dotfile":
+            return decision, "home dotfile"
+        if kind == "temp_root":
+            return decision, "temp root (use $TMPDIR)"
+        if kind in ("prefix", "default", "home_tools"):
+            if (rule.get("action") == "allow"
+                    and _path_is_within(real, _scratch_root())):
+                return decision, "session scratch"
+            return decision, f"{rule.get('action')} {rule.get('path', '')}".strip()
+    cwd = os.path.realpath(os.getcwd())
+    if _path_is_within(real, cwd):
+        return decision, "project"
+    if decision == "allow" and _path_is_within(real, os.path.expanduser("~")):
+        return decision, "explicit $HOME read"
+    return decision, "outside the project and $HOME"
+
+
+def _policy_shell_effect(ctx: Optional['CommandContext'], command: str,
+                         executor_mode: str = "host") -> tuple:
+    """Dry-run one shell command through the real gate, without prompting.
+
+    Calls `check_shell_approval(..., no_prompt=True)`, i.e. the same layers as
+    `run_command` (home guard, opencode rules, CWD leniency, exec options, path
+    ACL, auto-confirm) with the interactive prompt replaced by `effect=ask`.
+
+    Args:
+        ctx: CommandContext (or None).
+        command: The shell command to grade.
+        executor_mode: The active engine; bwrap/container skip the gate.
+
+    Returns:
+        (effect, reason): effect is "allow"/"ask"/"deny"; reason is short.
+    """
+    res = check_shell_approval(command, ctx=ctx, executor_mode=executor_mode,
+                               no_prompt=True)
+    effect = res.get("effect") or ("allow" if res.get("approved") else "deny")
+    message = res.get("message") or ""
+    if effect == "allow":
+        return effect, ""
+    if effect == "deny":
+        if "recursive delete" in message:
+            return effect, "home/root hard block"
+        if message.startswith("[path ACL denied]"):
+            tail = message.split("—", 1)[-1].split(";", 1)[0].strip()
+            return effect, tail
+        return effect, message.split(";", 1)[0]
+    if message.startswith("[path ACL ask]"):
+        return effect, message.split("(", 1)[-1].split(")", 1)[0]
+    verdict = res.get("verdict") or {}
+    asks = [d.get("rule", "") for d in verdict.get("details", [])
+            if d.get("action") == "ask"]
+    return effect, (asks[-1] if asks else "approval")
+
 
 def _tool_handle_read_file(self, args: dict) -> dict:
     """Read a file (with ACL gate + optional paging).
@@ -17902,7 +18018,7 @@ AGENTIC_SUBCOMMANDS = [
     'on', 'off', 'full', 'auto', 'preset', 'plan', 'sandbox', 'verbose',
     'thinking', 'trace', 'log', 'lazytool', 'iterations', 'timeout',
     'heartbeattokens', 'compactthreshold', 'logretention', 'acl', 'scratch',
-    'files', 'status',
+    'files', 'policy', 'status',
 ]
 AGENTIC_PLAN_ARGS = ['on', 'off', 'run']
 AGENTIC_ACL_ACTIONS = ['list', 'status', 'log', 'allow', 'ask', 'deny', 'remove', 'reset']
@@ -24351,10 +24467,12 @@ class ChatLoop:
             return self._handle_agentic_scratch(parts)
         if subcmd == "files":
             return self._handle_agentic_files(parts)
+        if subcmd == "policy":
+            return self._handle_agentic_policy()
         if subcmd == "plan":
             return self._agentic_toggle_plan(parts)
 
-        print(colorize("[Usage: /agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status|reset|net shared|none|reset]|verbose|thinking|trace|log|lazytool|acl|scratch [path|list|clear]|files [list|reset]|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|logretention <days>|status]]", 'warning'), file=sys.stderr)
+        print(colorize("[Usage: /agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status|reset|net shared|none|reset]|policy|verbose|thinking|trace|log|lazytool|acl|scratch [path|list|clear]|files [list|reset]|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|logretention <days>|status]]", 'warning'), file=sys.stderr)
         return False
 
     def _print_preset_list(self) -> bool:
@@ -24369,6 +24487,122 @@ class ChatLoop:
             "  aliases: plan=read, full=trusted; /agentic preset auto = trusted "
             "(the bare /agentic auto stays the auto-confirm toggle)",
             'muted'), file=sys.stderr)
+        print(file=sys.stderr)
+        return False
+
+    def _handle_agentic_policy(self) -> bool:
+        """Print the derived policy matrix (`/agentic policy`).
+
+        Every verdict comes from the same dry-run functions as the real gate:
+        `_acl_soft_decision` for paths (also used by the file tools and
+        `path_policy`) and `check_shell_approval(no_prompt=True)` for shell
+        commands. The screen therefore cannot describe a policy the tools do
+        not enforce, and it never prompts, logs or touches the disk.
+
+        Returns:
+            False to keep the chat loop running.
+        """
+        ctx = self.ctx
+        preset = resolve_preset(ctx)
+        executor = getattr(ctx, "executor", None)
+        mode = getattr(executor, "mode", "host")
+        active = agentic_active_tools(ctx)
+        all_tools = set(AGENTIC_TOOL_DEFS)
+        surface = all_tools if active is None else set(active)
+        cwd = os.path.realpath(os.getcwd())
+        scratch = os.path.realpath(_scratch_root())
+        plan_strict = strict_path_confinement(ctx)
+        label = "plan run" if preset.name == "read-run" else preset.name
+        tools_label = (f"all({len(all_tools)})" if active is None
+                       else f"{len(surface)}/{len(all_tools)}")
+        shell_label = ("off" if "run_command" not in surface
+                       else ("gate" if mode == "host" else mode))
+        print(colorize(f"\n[Policy] preset={label}  engine="
+                       f"{executor.describe() if executor is not None else 'host'}",
+                       'info'), file=sys.stderr)
+        print(colorize(
+            f"  tools={tools_label}  paths={'cwd' if plan_strict else 'home'}  "
+            f"shell={shell_label}  approve="
+            f"{'auto' if getattr(ctx, 'auto_confirm', False) else 'ask'}",
+            'muted'), file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"  {'KIND':<11} {'TARGET':<30} {'VERDICT':<11} REASON",
+              file=sys.stderr)
+        print("  " + "-" * 76, file=sys.stderr)
+
+        styles = {"allow": 'success', "ask": 'warning',
+                  "deny": 'error', "unavailable": 'muted'}
+
+        def emit(kind: str, target: str, verdict: str, reason: str) -> None:
+            shown = target if len(target) <= 30 else "…" + target[-29:]
+            print(f"  {kind:<11} {shown:<30} ", end="", file=sys.stderr)
+            print(colorize(f"{verdict:<11}", styles.get(verdict, 'muted')),
+                  end="", file=sys.stderr)
+            print(f" {reason}", file=sys.stderr)
+
+        path_rows = [
+            ("read_file", "./src/main.c", "read", os.path.join(cwd, "src", "main.c")),
+            ("read_file", "~/notes.txt", "read", "~/notes.txt"),
+            ("read_file", "~/.ssh/id_rsa", "read", "~/.ssh/id_rsa"),
+            ("read_file", "/etc/hosts", "read", "/etc/hosts"),
+            ("read_file", "/proc/self/mem", "read", "/proc/self/mem"),
+        ]
+        if "read_file" in surface:
+            for kind, display, op, raw in path_rows:
+                verdict, reason = _policy_path_effect(ctx, op, raw)
+                emit(kind, display, verdict, reason)
+        else:
+            emit("read_file", "(any path)", "unavailable",
+                 f"not in preset {label}")
+
+        write_rows = [
+            ("write_file", "./out.txt", "./out.txt"),
+            ("write_file", "/etc/hosts", "/etc/hosts"),
+            ("write_file", "/tmp/x", "/tmp/x"),
+            ("write_file", "$TMPDIR/x", os.path.join(scratch, "x")),
+        ]
+        if "write_file" not in surface:
+            emit("write_file", "(any path)", "unavailable",
+                 f"not in preset {label}")
+        else:
+            for kind, display, raw in write_rows:
+                verdict, reason = _policy_path_effect(ctx, "write", raw)
+                emit(kind, display, verdict, reason)
+
+        shell_rows = [
+            "ls -la",
+            "cat /etc/passwd",
+            "rm -rf ~",
+            "python3 x.py",
+            "awk 'BEGIN{system(\"id\")}'",
+            "curl https://example.com",
+        ]
+        if "run_command" not in surface:
+            emit("shell", "(any command)", "unavailable",
+                 f"not in preset {label}")
+        else:
+            for command in shell_rows:
+                verdict, reason = _policy_shell_effect(ctx, command, mode)
+                if mode != "host" and verdict == "allow":
+                    reason = f"{mode} sandbox (gate skipped)"
+                emit("shell", command, verdict, reason)
+
+        print(file=sys.stderr)
+        if mode != "host":
+            print(colorize(
+                "  note: read_file/write_file run in the harness — the sandbox "
+                "bounds shell commands only; shell writes outside the mounts "
+                "fail (EROFS) and the host $HOME is not mounted.", 'muted'),
+                file=sys.stderr)
+        if getattr(ctx, "plan_run", False):
+            print(colorize(
+                "  note: plan run confirms every run_command call, whatever "
+                "the gate verdicts above.", 'muted'), file=sys.stderr)
+        if getattr(ctx, "auto_confirm", False) and mode == "host":
+            print(colorize(
+                "  note: auto-confirm is ON — shell ask verdicts run without a "
+                "prompt; Path-ACL ask rules stay bypass-immune.", 'muted'),
+                file=sys.stderr)
         print(file=sys.stderr)
         return False
 
