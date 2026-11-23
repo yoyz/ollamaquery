@@ -474,10 +474,11 @@ This covers the omissions by construction (cherry-pick, revert, bisect run,
 submodule, worktree, fetch, hooks). For inspect/diff/log use the
 `git_inspect` tool, which forces `--no-textconv` and
 `core.fsmonitor=false`, or bwrap. No `npm ls`/`pip list`/`cargo metadata`/`go
-version` exception in this first pass; A1 will measure whether re-allowing
-them is worth it. `work`/`exec` (bwrap) skip the gate; `trusted`
-auto-approves the asks by design. The `git -C …` and versioned-prefix forms
-fall back to ask, which is the safe direction.
+version` exception in this first pass: A1 (`/agentic files`, §2.8) now
+records what was actually used, so a future exception can be justified by
+measured use rather than by guesswork. `work`/`exec` (bwrap) skip the gate;
+`trusted` auto-approves the asks by design. The `git -C …` and
+versioned-prefix forms fall back to ask, which is the safe direction.
 
 Extensible in-code; could be loaded from `~/.ollamaquery.d/shell_permissions.json` later.
 
@@ -511,6 +512,33 @@ Extensible in-code; could be loaded from `~/.ollamaquery.d/shell_permissions.jso
 | `cd / && rm -rf *`                   | `cd /`, `rm -rf *`           | `deny`        | `deny` (hard)       | cd escapes + delete |
 | `cd build && rm -rf *`               | `cd build`, `rm -rf *`       | `ask`→lenient | `allow`             | cd inside           |
 | `rm -rf /tmp/junk`                   | `rm -rf /tmp/junk`           | `ask`         | `ask` → yolo/prompt | soft, not hard      |
+
+### 2.8 Session access inventory (`/agentic files`, A1)
+
+`_shell_access_plan()` has two consumers: the policy grades its write events
+(`_shell_acl_scan`), and `SessionAccess` records the whole plan as the
+session's access inventory. The recorder runs from `ToolRegistry.execute()`,
+not from the gate, so commands are still observed when the gate is skipped
+(`work`/`exec` bwrap, container). File tools contribute their resolved path
+directly; `run_python` (inline code), MCP and other opaque tools are
+`unknown`.
+
+| Observation                   | Recorded as                   | Why                               |
+| ----------------------------- | ----------------------------- | --------------------------------- |
+| `cp a b`, `sed -i … f`        | read `a`/`f`, write `b`/`f`   | H0 table                          |
+| `cd / && echo x > rel`        | write `/rel`                  | H1 effective cwd                  |
+| `echo x > out.txt`            | write `out.txt`               | redirection target                |
+| `python3 -c "open('/x','w')"` | unknown `/x`                  | code decides                      |
+| refused command               | command `denied`, **no path** | never claim a write               |
+| container command             | command only (`[container]`)  | `/workspace/…` is not a host path |
+| successful `write_file` ×3    | one write row, `×3`           | dedupe by (op, path, status)      |
+
+`/agentic files` reads only the in-memory inventory, so it works with
+`/agentic log off`; `/agentic files reset` clears it. The same per-call
+summary is attached to the JSONL `type=result` entry as `access`. Limits are
+explicit: build scripts (`make`, `npm run`), `run_python` writes, paths hidden
+in variables and container paths are `unknown`/not listed — the inventory
+says "observed in the tool call", not "modified".
 
 ---
 

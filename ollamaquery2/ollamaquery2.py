@@ -2065,6 +2065,315 @@ def fetch_model_info_ollama(base_url: str, model_name: str) -> Dict:
         return {}
 
 
+# ============================================================================
+# ============= SESSION ACCESS INVENTORY (A1) ================================
+# ============================================================================
+
+
+def _session_access_shorten(text: object, limit: int = 300) -> str:
+    """Flatten and bound one display string for the inventory."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[:limit - 1] + "…"
+
+
+def _session_access_result_status(result: dict) -> str:
+    """Classify one tool result as ok / error / denied for the inventory.
+
+    `denied` is reserved for a refusal (shell gate, path ACL, preset/plan
+    backstop, user cancel). It is the label the report must show instead of
+    "write" when a command never ran.
+    """
+    if result.get("success"):
+        return "ok"
+    text = f"{result.get('error') or ''}\n{result.get('output') or ''}"
+    denied_markers = (
+        "BLOCKED (rejected)",
+        "Blocked by shell approval gate",
+        "Approval required but no TTY",
+        "Denied by user",
+        "Cancelled by user",
+        "Empty command",
+        "[path ACL denied]",
+        "Path traversal denied",
+        " is disabled in ",
+    )
+    if any(marker in text for marker in denied_markers):
+        return "denied"
+    return "error"
+
+
+def _session_access_path(raw: object, cwd: Optional[str]) -> str:
+    """Resolve a file-tool path argument the way the handler does.
+
+    `read_file` repairs a dropped leading slash on a system path
+    (`proc/self/cgroup` → `/proc/self/cgroup`), so the inventory applies the
+    same repair; otherwise the report would name a path the tool never read.
+    """
+    text = str(raw or "").strip() or "."
+    expanded = os.path.expanduser(text)
+    path = (expanded if os.path.isabs(expanded)
+            else os.path.join(cwd or os.getcwd(), expanded))
+    if not os.path.lexists(path) and not os.path.isabs(expanded):
+        stripped = text.lstrip("./")
+        if stripped.split("/", 1)[0] in SYSTEM_PATH_HINTS:
+            alternative = os.path.join(os.sep, stripped)
+            if os.path.lexists(alternative):
+                path = alternative
+    return os.path.realpath(path)
+
+
+def _session_access_canonical_args(tool_name: str, args: dict) -> dict:
+    """Apply TOOL_ARG_ALIASES to a copy so recording sees canonical keys."""
+    if tool_name not in TOOL_ARG_ALIASES:
+        return dict(args)
+    canonical = dict(args)
+    for name, aliases in TOOL_ARG_ALIASES[tool_name].items():
+        if name in canonical:
+            continue
+        for alias in aliases:
+            if alias in canonical:
+                canonical[name] = canonical[alias]
+                break
+    return canonical
+
+
+class SessionAccess:
+    """Session-scoped inventory of the paths and commands agentic tools used.
+
+    Two observers, one definition:
+
+    * `record_tool()` runs from `ToolRegistry.execute()` for every tool call,
+      so it also works where the shell gate is skipped (`work`/`exec` bwrap,
+      container). `run_command` is decomposed with `_shell_access_plan()` —
+      the very traversal the H0 policy grades — while a command whose code
+      decides its writes (`run_python`, MCP, arbitrary interpreters) is
+      labelled `unknown`.
+    * `ToolExecution.run_single()` copies the per-call summary into the JSONL
+      `type=result` entry as `access`, so the log and the in-memory view agree.
+
+    Honesty rules: `write` means an H0 write target, a write redirection or a
+    successful file-writing tool; a denied call records the command as
+    `denied` and contributes **no** path events ("observed in the command
+    line", never "modified"). Container commands record no paths at all
+    because `/workspace/...` is not a host path. Paths are deduplicated by
+    (op, path, status): three writes to the same file are one row with a
+    counter.
+    """
+
+    MAX_PATH_ROWS = 500
+    MAX_COMMAND_ROWS = 300
+    MAX_DISPLAY_CHARS = 300
+    MAX_JSONL_PATHS = 40
+
+    # Tool argument -> operation for tools whose paths are explicit.
+    FILE_PATHS = {
+        "read_file": (("file_path",), "read"),
+        "list_directory": (("path",), "read"),
+        "grep": (("path",), "read"),
+        "diff": (("file1", "file2"), "read"),
+        "write_file": (("file_path",), "write"),
+        "edit_file": (("file_path",), "write"),
+    }
+    # Tools that never touch the host filesystem, or whose input is not a path.
+    SKIP = frozenset({"fetch_url", "path_policy", "glob"})
+
+    def __init__(self) -> None:
+        """Create an empty inventory."""
+        self.paths = {}
+        self.commands = {}
+        self.dropped = 0
+
+    def reset(self) -> None:
+        """Clear every observation (used by `/agentic files reset`)."""
+        self.paths.clear()
+        self.commands.clear()
+        self.dropped = 0
+
+    def record_path(self, op: str, raw: object, real: Optional[str],
+                    via: str = "?", status: str = "ok") -> dict:
+        """Add one observed path event, deduplicated by op/path/status.
+
+        Args:
+            op: "read", "write" or "unknown".
+            raw: The token as written in the command / tool argument.
+            real: Its realpath, or None when the effective cwd is unknown.
+            via: The command head or tool that produced the observation.
+            status: "ok", "error" or "denied".
+
+        Returns:
+            A compact {"op", "path", "status"} summary for the JSONL entry.
+        """
+        raw_text = _session_access_shorten(raw, self.MAX_DISPLAY_CHARS)
+        shown = real or f"{raw_text} (cwd unknown)"
+        entry = self.paths.get((op, shown, status))
+        if entry is None:
+            if len(self.paths) >= self.MAX_PATH_ROWS:
+                self.dropped += 1
+                return {"op": op, "path": shown, "status": status}
+            entry = {"op": op, "path": shown, "raw": raw_text, "status": status,
+                     "count": 0, "via": via}
+            self.paths[(op, shown, status)] = entry
+        entry["count"] += 1
+        entry["via"] = via
+        return {"op": op, "path": shown, "status": status}
+
+    def record_command(self, command: str, status: str = "ok",
+                       tool: Optional[str] = None,
+                       sandbox: Optional[str] = None) -> dict:
+        """Add one command observation, deduplicated by command/status/mode."""
+        label = _session_access_shorten(command, self.MAX_DISPLAY_CHARS)
+        entry = self.commands.get((label, status, sandbox or ""))
+        if entry is None:
+            if len(self.commands) >= self.MAX_COMMAND_ROWS:
+                self.dropped += 1
+                return {"command": label, "status": status}
+            entry = {"command": label, "status": status, "tool": tool,
+                     "sandbox": sandbox, "count": 0}
+            self.commands[(label, status, sandbox or "")] = entry
+        entry["count"] += 1
+        return {"command": label, "status": status}
+
+    def record_tool(self, tool_name: str, args: dict, result: dict,
+                    executor_mode: str = "host", cwd: Optional[str] = None,
+                    tmpdir: Optional[str] = None) -> Optional[dict]:
+        """Record one tool call and return its JSONL `access` summary.
+
+        Args:
+            tool_name: Executed tool.
+            args: Tool arguments as the model sent them (aliases allowed).
+            result: {"success", "output", "error"} from the handler.
+            executor_mode: "host", "bwrap" or "container".
+            cwd: Effective starting directory (the process cwd in practice).
+            tmpdir: `$TMPDIR` handed to the command (the session scratch).
+
+        Returns:
+            {"status", "command"?, "sandbox"?, "paths"?} for the JSONL
+            `type=result` entry, or None when the call has nothing to report.
+        """
+        combined = f"{result.get('error') or ''}\n{result.get('output') or ''}"
+        if "run_command curl/wget GET auto-served" in combined:
+            return None  # no shell command ran: the builtin served a network GET
+        canonical = _session_access_canonical_args(tool_name, args)
+        status = _session_access_result_status(result)
+        sandbox = None if executor_mode == "host" else executor_mode
+        events = []
+        command = None
+        if tool_name == "run_command":
+            raw_command = canonical.get("command")
+            command = (raw_command.strip() if isinstance(raw_command, str)
+                       else str(raw_command or "")).strip() or "run_command"
+            self.record_command(command, status, tool=tool_name, sandbox=sandbox)
+            if (isinstance(raw_command, str) and status != "denied"
+                    and executor_mode != "container"):
+                for event in _shell_access_plan(command, cwd=cwd, tmpdir=tmpdir):
+                    events.append(self.record_path(
+                        event["op"], event["raw"], event["real"],
+                        via=event.get("via") or tool_name, status=status))
+        elif tool_name == "run_python":
+            target = canonical.get("file_path") or canonical.get("file")
+            command = f"python3 {target}" if target else "run_python (inline code)"
+            self.record_command(command, status, tool=tool_name, sandbox=sandbox)
+            if target and status != "denied" and executor_mode != "container":
+                events.append(self.record_path(
+                    "unknown", target, _session_access_path(target, cwd),
+                    via=tool_name, status=status))
+        elif tool_name in self.FILE_PATHS:
+            keys, op = self.FILE_PATHS[tool_name]
+            if status == "ok":
+                for key in keys:
+                    raw = canonical.get(key)
+                    if raw is None:
+                        if key != "path":
+                            continue
+                        raw = "."
+                    events.append(self.record_path(
+                        op, raw, _session_access_path(raw, cwd), via=tool_name))
+        elif tool_name == "patch":
+            if status == "ok":
+                target = canonical.get("target")
+                if target:
+                    targets = [target]
+                else:
+                    try:
+                        targets = [section["path"] for section in
+                                   _parse_patch_sections(str(canonical.get("diff") or ""))]
+                    except (KeyError, TypeError, ValueError):
+                        targets = []
+                for raw in targets:
+                    events.append(self.record_path(
+                        "write", raw, _session_access_path(raw, cwd), via=tool_name))
+        elif tool_name == "apply_patch":
+            if status == "ok":
+                try:
+                    sections = _parse_patch_sections(
+                        str(canonical.get("patch_text") or ""))
+                except (KeyError, TypeError, ValueError):
+                    sections = []
+                for section in sections:
+                    events.append(self.record_path(
+                        "write", section["path"],
+                        _session_access_path(section["path"], cwd), via=tool_name))
+        elif tool_name == "git_inspect":
+            action = str(canonical.get("action") or "status")
+            command = f"git_inspect {action}"
+            self.record_command(command, status, tool=tool_name, sandbox=sandbox)
+            raw = canonical.get("path")
+            if raw and status == "ok":
+                events.append(self.record_path(
+                    "read", raw, _session_access_path(raw, cwd), via=tool_name))
+        elif tool_name == "kubernetes_cluster_query":
+            verb = str(canonical.get("verb") or "get")
+            resource = str(canonical.get("resource") or "").strip()
+            command = f"cluster_query {verb} {resource}".strip()
+            self.record_command(command, status, tool=tool_name, sandbox=sandbox)
+        elif tool_name not in self.SKIP:
+            command = tool_name
+            self.record_command(command, status, tool=tool_name, sandbox=sandbox)
+        if command is None and not events:
+            return None
+        summary = {"status": status}
+        if command is not None:
+            summary["command"] = _session_access_shorten(command)
+        if sandbox:
+            summary["sandbox"] = sandbox
+        if events:
+            summary["paths"] = events[:self.MAX_JSONL_PATHS]
+            if len(events) > self.MAX_JSONL_PATHS:
+                summary["paths_dropped"] = len(events) - self.MAX_JSONL_PATHS
+        return summary
+
+    def status_lines(self) -> list:
+        """Render the inventory as report lines (used by `/agentic files`)."""
+        if not self.paths and not self.commands and not self.dropped:
+            return ["  nothing recorded yet this session — run an agentic tool "
+                    "(the inventory works with /agentic log off)"]
+        lines = []
+        for op, title in (("write", "Writes"), ("read", "Reads"),
+                          ("unknown", "Unknown direction")):
+            rows = sorted((row for (row_op, _path, _status), row in self.paths.items()
+                           if row_op == op),
+                          key=lambda row: (-row["count"], row["path"]))
+            if not rows:
+                continue
+            lines.append(f"  {title} ({len(rows)})")
+            for row in rows:
+                status = "" if row["status"] == "ok" else f" [{row['status']}]"
+                via = f"  ({row['via']})" if row.get("via") else ""
+                lines.append(f"    {row['path']}  ×{row['count']}{status}{via}")
+        if self.commands:
+            rows = sorted(self.commands.values(),
+                          key=lambda row: (-row["count"], row["command"]))
+            lines.append(f"  Commands ({len(rows)})")
+            for row in rows:
+                sandbox = f" [{row['sandbox']}]" if row.get("sandbox") else ""
+                lines.append(f"    {row['status']:<7} ×{row['count']}  "
+                             f"{row['command']}{sandbox}")
+        if self.dropped:
+            lines.append(f"  (+{self.dropped} observation(s) not stored: "
+                         f"inventory full)")
+        return lines
+
+
 class CommandContext:
     """Singleton that holds all shared state for the application.
 
@@ -2195,6 +2504,10 @@ class CommandContext:
 
         # Session-scoped path access policy (see /agentic acl)
         self.path_acl: PathAcl = PathAcl()
+
+        # Session-scoped inventory of what the agentic tools touched (A1).
+        # Independent of /agentic log: the in-memory view always works.
+        self.session_access: SessionAccess = SessionAccess()
 
         # MCP client (None unless a config was loaded; see --mcp-config)
         self.mcp_config: Optional[MCPConfig] = None
@@ -14956,7 +15269,42 @@ class ToolRegistry:
             return False
 
     def execute(self, tool_name: str, args: dict) -> dict:
-        """Dispatch a tool call to its handler with alias normalization + confirmation.
+        """Dispatch a tool call, then feed the session access inventory (A1).
+
+        The inventory is recorded here, not in the shell gate, so commands run
+        with the gate skipped (`work`/`exec` bwrap, container) are observed too.
+        The per-call summary is attached as a private `_access` key for the
+        JSONL `type=result` entry; callers that do not log it ignore the key.
+
+        Args:
+            tool_name: Name of the tool to execute.
+            args: Tool argument dict.
+
+        Returns:
+            {"success": bool, "output": str, "error": str|None}.
+        """
+        result = self._execute_tool(tool_name, args)
+        access = self._record_tool_access(tool_name, args, result)
+        if access is not None:
+            result["_access"] = access
+        return result
+
+    def _record_tool_access(self, tool_name: str, args: dict,
+                            result: dict) -> Optional[dict]:
+        """Feed one executed tool call to the session access inventory."""
+        access = getattr(self._ctx, "session_access", None) if self._ctx is not None else None
+        if access is None:
+            return None
+        # Only shell commands need $TMPDIR for `cd $TMPDIR` resolution; the
+        # other tools' inventory entries never use it.
+        tmpdir = _scratch_root() if tool_name == "run_command" else None
+        return access.record_tool(
+            tool_name, args, result,
+            executor_mode=getattr(self.executor, "mode", "host"),
+            cwd=os.getcwd(), tmpdir=tmpdir)
+
+    def _execute_tool(self, tool_name: str, args: dict) -> dict:
+        """Run a tool call with alias normalization and confirmation.
 
         Args:
             tool_name: Name of the tool to execute.
@@ -17137,16 +17485,19 @@ class ModelQuery:
 AGENTIC_SUBCOMMANDS = [
     'on', 'off', 'full', 'auto', 'preset', 'plan', 'sandbox', 'verbose',
     'thinking', 'trace', 'log', 'lazytool', 'iterations', 'timeout',
-    'heartbeattokens', 'compactthreshold', 'logretention', 'acl', 'scratch', 'status',
+    'heartbeattokens', 'compactthreshold', 'logretention', 'acl', 'scratch',
+    'files', 'status',
 ]
 AGENTIC_PLAN_ARGS = ['on', 'off', 'run']
 AGENTIC_ACL_ACTIONS = ['list', 'status', 'log', 'allow', 'ask', 'deny', 'remove', 'reset']
 AGENTIC_SCRATCH_ACTIONS = ['path', 'list', 'clear']
+AGENTIC_FILES_ACTIONS = ['list', 'reset']
 AGENTIC_PRESET_NAMES = ['read', 'exec', 'work', 'trusted', 'plan', 'full', 'auto', 'show']
 AGENTIC_SANDBOX_ARGS = ['host', 'container', 'bwrap', 'status', 'reset', 'net']
 AGENTIC_SANDBOX_NET_ARGS = ['shared', 'none', 'reset', 'status']
 AGENTIC_SECOND_LEVEL = {'plan': AGENTIC_PLAN_ARGS, 'acl': AGENTIC_ACL_ACTIONS,
                         'scratch': AGENTIC_SCRATCH_ACTIONS,
+                        'files': AGENTIC_FILES_ACTIONS,
                         'preset': AGENTIC_PRESET_NAMES,
                         'logretention': ['1', '7', '30', 'reset'],
                         'sandbox': AGENTIC_SANDBOX_ARGS}
@@ -19411,6 +19762,9 @@ class ToolExecution:
 
         t_start = time.time()
         result = self.tool_registry.execute(tool_name, tool_args)
+        # A1: the registry already fed ctx.session_access; keep the per-call
+        # summary for the JSONL entry and out of the observation.
+        access = result.pop("_access", None)
         elapsed = time.time() - t_start
         status = "OK" if result["success"] else "ERROR"
         print(colorize(f" → {status} ({elapsed:.1f}s)", 'info' if result["success"] else 'error'), file=sys.stderr)
@@ -19437,7 +19791,9 @@ class ToolExecution:
             print(colorize(f"[Trace] Result: {json.dumps({'success': result['success'], 'output': trace_out, 'error': result['error']}, default=str)}", 'muted'), file=sys.stderr)
 
         if self.ctx.agentic_logging and logger:
-            logger.write(type="result", iteration=iteration, tool_name=tool_name, tool_args=tool_args, result=result)
+            log_extra = {"access": access} if access is not None else {}
+            logger.write(type="result", iteration=iteration, tool_name=tool_name,
+                         tool_args=tool_args, result=result, **log_extra)
 
         cancelled = (not result["success"]) and "Cancelled" in (result.get("error") or "")
         return {"observation": f"[{tool_name}] {timed_observation}", "raw": observation,
@@ -23207,10 +23563,12 @@ class ChatLoop:
             return self._handle_agentic_acl(parts)
         if subcmd == "scratch":
             return self._handle_agentic_scratch(parts)
+        if subcmd == "files":
+            return self._handle_agentic_files(parts)
         if subcmd == "plan":
             return self._agentic_toggle_plan(parts)
 
-        print(colorize("[Usage: /agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status|reset|net shared|none|reset]|verbose|thinking|trace|log|lazytool|acl|scratch [path|list|clear]|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|logretention <days>|status]]", 'warning'), file=sys.stderr)
+        print(colorize("[Usage: /agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status|reset|net shared|none|reset]|verbose|thinking|trace|log|lazytool|acl|scratch [path|list|clear]|files [list|reset]|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|logretention <days>|status]]", 'warning'), file=sys.stderr)
         return False
 
     def _print_preset_list(self) -> bool:
@@ -23294,6 +23652,47 @@ class ChatLoop:
                   file=sys.stderr)
             return False
         print(colorize("[Usage: /agentic scratch [path|list|clear]]", 'warning'), file=sys.stderr)
+        return False
+
+    def _handle_agentic_files(self, parts: list) -> bool:
+        """Handle /agentic files [list|reset] — the session access inventory.
+
+        The inventory is fed by every executed tool call (see SessionAccess),
+        not by the shell gate, so it still reports what happened when the gate
+        is skipped (`work`/`exec` bwrap, container) and when JSONL logging is
+        off. A refused command appears as `denied` and contributes no path.
+
+        Args:
+            parts: Split /agentic args (parts[2] is the action or omitted).
+
+        Returns:
+            False to keep the chat loop running.
+        """
+        action = parts[2] if len(parts) > 2 else ""
+        access = getattr(self.ctx, "session_access", None)
+        if action == "reset":
+            if access is not None:
+                access.reset()
+            print(colorize("[Session access] inventory cleared", 'info'),
+                  file=sys.stderr)
+            return False
+        if action not in ("", "list", "status"):
+            print(colorize("[Usage: /agentic files [list|reset]]", 'warning'),
+                  file=sys.stderr)
+            return False
+        print(colorize(
+            "\n[Session access] paths and commands used by agentic tools this session",
+            'info'), file=sys.stderr)
+        lines = (access.status_lines() if access is not None
+                 else ["  nothing recorded yet this session"])
+        for line in lines:
+            print(line, file=sys.stderr)
+        print(colorize(
+            "  (observed in tool calls; writes are H0 targets, redirects or "
+            "successful file tools — container paths are not listed; bwrap "
+            "commands are marked [bwrap] and their /tmp is a sandbox tmpfs)",
+            'muted'), file=sys.stderr)
+        print(file=sys.stderr)
         return False
 
     # Named toggles (always toggle between on/off)
@@ -24099,7 +24498,7 @@ class ChatLoop:
         print(colorize("\n[Agentic Settings - Use /agentic <option> [value]]", 'info'), file=sys.stderr)
         print("  Subcommands: on, off, full, auto, preset [read|exec|work|trusted], plan [on|off|run], sandbox [host|container|bwrap|status|reset|net shared|none|reset],", file=sys.stderr)
         print("               verbose, thinking, trace, log, lazytool, iterations <N>, timeout <N>, heartbeattokens <N>,", file=sys.stderr)
-        print("               compactthreshold <v>, logretention <days>, acl, scratch [path|list|clear], status", file=sys.stderr)
+        print("               compactthreshold <v>, logretention <days>, acl, scratch [path|list|clear], files [list|reset], status", file=sys.stderr)
         print(file=sys.stderr)
 
         plan_value = "off" if not c.plan_mode else ("run" if getattr(c, "plan_run", False) else "on")

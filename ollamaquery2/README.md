@@ -156,7 +156,7 @@ folded. Tab completion on `/resume ` offers every saved slug and id. The newest
 | `git_inspect`              | Read-only git inspection: `status`, `diff`, `diff_staged`, `diff_head`, `log` (any ref, path-scoped, renames followed), `show`, `blame -L` (fixed argv, no shell) |
 | `path_policy`              | Read-only: the session path map (allowed / needs confirmation / forbidden), or the verdict for one path — no filesystem access, no prompt |
 
-Subcommands: `/agentic on|off|full`, `preset [read|exec|work|trusted]`, `plan [on|off|run]`, `sandbox [host|container|bwrap|status|net shared|none|reset]`, `auto`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `iterations <N>`, `timeout <N>`, `logretention <days>`, `status`.
+Subcommands: `/agentic on|off|full`, `preset [read|exec|work|trusted]`, `plan [on|off|run]`, `sandbox [host|container|bwrap|status|net shared|none|reset]`, `auto`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `files [list|reset]`, `iterations <N>`, `timeout <N>`, `logretention <days>`, `status`.
 
 The model is steered to use the **dedicated file tools** (`read_file`, `write_file`,
 `edit_file`, `grep`, `glob`, `list_directory`) instead of shell equivalents (`cat`,
@@ -316,10 +316,25 @@ Inspect and influence the policy with `/agentic acl`:
 /agentic acl remove /etc        # drop session rules for a path
 /agentic acl reset              # restore defaults
 /agentic scratch                # this session's writable temp dir (list|clear)
+/agentic files                  # paths + commands the tools touched this session
+/agentic files reset            # clear that inventory
 ```
 
 Defaults apply per session; `reset` restores them. Longest path prefix wins,
 and session rules override defaults.
+
+`/agentic files` is the session **access inventory**: distinct read/write/
+unknown paths and the commands that produced them, each with a counter and a
+status (`ok`/`error`/`denied`). It is fed by the executed tools, not by the
+shell gate, so it still reports in `work`/`exec` (bwrap) and with
+`/agentic log off`; the same per-call summary is stored in the JSONL
+`type=result` entry as `access`. A refused command is listed as `denied` and
+adds no write — only H0 write targets, write redirections and successful
+file-writing tools count as writes. Container commands list no paths because
+`/workspace/…` is not a host path. This is an **observation**, not a sandbox:
+`run_python` code, build scripts and paths hidden in variables stay `unknown`.
+The inventory is also how read exceptions are meant to be chosen: measure what
+was actually used before re-allowing a form.
 
 **Not covered by the Path ACL** — these rely on the older CWD-containment
 check plus the destructive-tool / shell approval gates instead:

@@ -4823,6 +4823,206 @@ class TestToolExecutionExtraction(unittest.TestCase):
         self.assertIs(first, loop._tool_exec())
 
 
+class TestSessionAccessInventory(unittest.TestCase):
+    """A1: `/agentic files` reports what the tools actually observed.
+
+    The inventory is fed from `ToolRegistry.execute` (not from the shell gate),
+    so it works with `/agentic log off` and in `work`/`exec` (bwrap) where the
+    gate is skipped. A refusal must read `denied`, never `write`.
+    """
+
+    def setUp(self):
+        self.ctx = q.CommandContext()
+        # CommandContext is a singleton: restore the flags this class flips,
+        # or the next test class inherits auto-confirm/logging.
+        self._saved_auto = self.ctx.auto_confirm
+        self._saved_logging = self.ctx.agentic_logging
+        self.addCleanup(self._restore_ctx)
+        self.ctx.auto_confirm = True
+        self.ctx.agentic_logging = False
+        self.ctx.session_access.reset()
+        self.scratch = tempfile.mkdtemp(prefix="a1_scratch_")
+        self.addCleanup(shutil.rmtree, self.scratch, True)
+
+    def _restore_ctx(self):
+        self.ctx.auto_confirm = self._saved_auto
+        self.ctx.agentic_logging = self._saved_logging
+        self.ctx.session_access.reset()
+
+    def _record_command(self, command, success=True, error=None, mode="host"):
+        """Feed one synthetic run_command result through the inventory."""
+        return self.ctx.session_access.record_tool(
+            "run_command", {"command": command},
+            {"success": success, "output": "", "error": error},
+            executor_mode=mode, cwd=os.getcwd(), tmpdir=self.scratch)
+
+    def _rows(self, op):
+        return [row for (row_op, _path, _status), row in
+                self.ctx.session_access.paths.items() if row_op == op]
+
+    def test_three_writes_to_one_file_are_one_row(self):
+        """The same file written three times is one path with a counter."""
+        registry = q.ToolRegistry(self.ctx)
+        with tempfile.TemporaryDirectory() as td:
+            old = os.getcwd()
+            os.chdir(td)
+            try:
+                for _ in range(3):
+                    result = registry.execute(
+                        "write_file", {"file_path": "out.txt", "content": "x"})
+                    self.assertTrue(result["success"])
+                    # The per-call summary is what run_single puts in the JSONL.
+                    self.assertEqual(result["_access"]["status"], "ok")
+            finally:
+                os.chdir(old)
+        rows = self._rows("write")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["count"], 3)
+        self.assertTrue(rows[0]["path"].endswith("/out.txt"))
+
+    def test_common_writers_map_to_read_and_write(self):
+        """`cp`, `sed -i` and `tar -cf` keep the H0 direction."""
+        cases = (
+            ("cp a.txt b.txt", {("write", "b.txt"), ("read", "a.txt")}),
+            ("sed -i 's/a/b/' f.txt", {("write", "f.txt"), ("read", "f.txt")}),
+            ("tar -cf out.tar f.txt", {("write", "out.tar"), ("read", "f.txt")}),
+        )
+        for command, expected in cases:
+            with self.subTest(command=command):
+                self.ctx.session_access.reset()
+                self._record_command(command)
+                got = {(row["op"], os.path.basename(row["path"]))
+                       for row in self.ctx.session_access.paths.values()}
+                self.assertEqual(got, expected)
+
+    def test_effective_cwd_is_used(self):
+        """`cd / && echo x > rel` is recorded as the /rel the shell wrote (H1)."""
+        self._record_command("cd / && echo x > rel")
+        self.assertEqual([row["path"] for row in self._rows("write")], ["/rel"])
+
+    def test_denied_command_is_denied_not_a_write(self):
+        """A refused command contributes no path — the report says denied."""
+        access = self._record_command(
+            "cp f /var/x", success=False,
+            error="BLOCKED (rejected): denied by permission rules")
+        self.assertEqual(access["status"], "denied")
+        self.assertEqual(self.ctx.session_access.paths, {})
+        rows = list(self.ctx.session_access.commands.values())
+        self.assertEqual([(row["command"], row["status"]) for row in rows],
+                         [("cp f /var/x", "denied")])
+
+    def test_real_gate_denial_is_denied_not_a_write(self):
+        """The real non-TTY gate refuses `git diff --ext-diff` (H6); no path is claimed."""
+        registry = q.ToolRegistry(self.ctx)
+        self.ctx.auto_confirm = False
+        with patch.object(q.ToolRegistry, "_confirm", return_value=True), \
+                patch("sys.stdin.isatty", return_value=False):
+            result = registry.execute(
+                "run_command", {"command": "git diff --ext-diff"})
+        self.assertFalse(result["success"])
+        access = result.pop("_access", None)
+        self.assertEqual(access["status"], "denied")
+        self.assertNotIn("paths", access)
+        self.assertEqual(self.ctx.session_access.paths, {})
+
+    def test_container_paths_are_not_host_paths(self):
+        """Container `/workspace/...` names must not be presented as host paths."""
+        access = self._record_command(
+            "cp /workspace/a /workspace/b", mode="container")
+        self.assertEqual(access["sandbox"], "container")
+        self.assertNotIn("paths", access)
+        self.assertEqual(self.ctx.session_access.paths, {})
+
+    def test_bwrap_commands_are_still_recorded(self):
+        """`work`/`exec` skip the gate; the inventory must not skip them."""
+        access = self._record_command("echo x > out.txt", mode="bwrap")
+        self.assertEqual(access["sandbox"], "bwrap")
+        self.assertTrue(any(row["op"] == "write" for row in access["paths"]))
+        self.assertTrue(self._rows("write"))
+
+    def test_run_python_is_unknown_not_write(self):
+        """Inline code decides its own writes: unknown, never `write`."""
+        access = self.ctx.session_access.record_tool(
+            "run_python", {"code": "open('x', 'w').write('y')"},
+            {"success": True, "output": "", "error": None},
+            cwd=os.getcwd(), tmpdir=self.scratch)
+        self.assertEqual(access["command"], "run_python (inline code)")
+        self.assertNotIn("paths", access)
+        self.assertEqual(self.ctx.session_access.paths, {})
+
+    def test_report_lists_paths_and_commands(self):
+        """The rendered report separates writes, reads and commands."""
+        self._record_command("cp a.txt b.txt")
+        text = "\n".join(self.ctx.session_access.status_lines())
+        self.assertIn("Writes (1)", text)
+        self.assertIn("Reads (1)", text)
+        self.assertIn("Commands (1)", text)
+        self.assertIn("×1", text)
+
+    def test_empty_and_logging_off_message_and_memory_source(self):
+        """An empty inventory is explicit and does not depend on JSONL logging."""
+        loop = object.__new__(q.ChatLoop)
+        loop.ctx = self.ctx
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop.run_handle_agentic("/agentic files")
+        self.assertIn("nothing recorded yet this session", err.getvalue())
+
+        # Logging stays off: the inventory is fed by tool execution, not the log.
+        self.assertFalse(self.ctx.agentic_logging)
+        self._record_command("echo hi")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loop.run_handle_agentic("/agentic files")
+        self.assertNotIn("nothing recorded yet this session", err.getvalue())
+        self.assertIn("echo hi", err.getvalue())
+
+    def test_reset_and_completion_surface(self):
+        """`reset` clears the memory; `files` completes its own actions."""
+        self._record_command("echo hi")
+        self.assertTrue(self.ctx.session_access.commands)
+        loop = object.__new__(q.ChatLoop)
+        loop.ctx = self.ctx
+        with contextlib.redirect_stderr(io.StringIO()):
+            loop.run_handle_agentic("/agentic files reset")
+        self.assertEqual(self.ctx.session_access.paths, {})
+        self.assertEqual(self.ctx.session_access.commands, {})
+        self.assertIn("files", q.AGENTIC_SUBCOMMANDS)
+        self.assertEqual(q.AGENTIC_SECOND_LEVEL["files"], ["list", "reset"])
+
+    def test_result_entry_carries_access(self):
+        """The JSONL `type=result` entry carries the same per-call summary."""
+        with tempfile.TemporaryDirectory() as home, \
+                tempfile.TemporaryDirectory() as td, \
+                patch.dict(os.environ, {"HOME": home}, clear=False):
+            old = os.getcwd()
+            os.chdir(td)
+            try:
+                registry = q.ToolRegistry(self.ctx)
+                execution = q.ToolExecution(self.ctx, registry,
+                                            q.ToolCallParser(self.ctx))
+                log = q.AgenticLogger()
+                try:
+                    self.ctx.agentic_logging = True
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        result = execution.run_single(
+                            "write_file",
+                            {"file_path": "a1.txt", "content": "x"},
+                            1, log, [])
+                    self.assertTrue(result["success"])
+                    # The private key is consumed, not leaked into observations.
+                    self.assertNotIn("_access", result)
+                finally:
+                    log.close()
+                with open(log.path, encoding="utf-8") as handle:
+                    entries = [json.loads(line) for line in handle if line.strip()]
+            finally:
+                os.chdir(old)
+        entry = [item for item in entries if item.get("type") == "result"][-1]
+        self.assertEqual(entry["access"]["status"], "ok")
+        self.assertTrue(entry["access"]["paths"][0]["path"].endswith("/a1.txt"))
+
+
 class TestAppendMessagesStampsTokens(unittest.TestCase):
     """Turns appended by the loop must carry `_tokens`.
 
