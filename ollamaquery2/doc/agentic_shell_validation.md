@@ -564,6 +564,43 @@ paths. Limits are explicit: build scripts (`make`, `npm run`) and paths
 hidden in variables remain invisible — the inventory says "observed in the
 tool call", not "modified".
 
+### 2.9 Code execution behind an allow-listed option
+
+`python3 x.py` and `env sh -c …` already ask (H6), but the same payload spelled
+through an allow-listed tool's option did not. `check_shell_approval` now
+applies `_shell_exec_option_requires_approval()` to every node before the
+leniency/auto/prompt decision, so these ask:
+
+| Command                                   | Option that runs code             |
+| ----------------------------------------- | --------------------------------- |
+| `awk 'BEGIN{system("id")}'`, `awk -f p`   | `system()`/pipe, program file     |
+| `sed '1e id'`, `sed -f p`, `s///e`         | `e` command, script file/flag     |
+| `tar -I p`, `--to-command`, `--use-compress-program` | compressor/action program |
+| `find . -exec python3 x.py {} \;`         | `-exec` payload (graded as typed) |
+| `sort --compress-program p`               | compressor program                |
+| `zip -T -TT 'cmd'`                        | test command (`--unzip-command`)  |
+| `gcc -fplugin=…`, `-wrapper`, `-specs`    | compiler plugin/wrapper           |
+| `curl -K file`                           | config file can set any option    |
+| `wget -e …` (attached or separate)       | `.wgetrc` command                 |
+
+Details that matter: the old-style tar cluster (`tar xIf prog archive`) is
+normalized like the write-target table; `find -exec` recurses into the payload
+so `-exec awk 'BEGIN{system(…)}'` asks too (bounded depth, fail-closed past
+it); and the option is an **ask, not a consent** — the path ACL runs first, so
+`find -exec sh -c 'cd / && echo x > rel'` and `find -exec tee /etc/x` stay
+**deny**, even with `auto_confirm`. Ordinary uses are unchanged
+(`find . -exec rm {} +`, `awk -F: '{print $1}'`, `gcc -o a.out a.c`,
+`zip -q`, `wget -q`).
+
+**Double-quoted substitutions (C1-adjacent).** `"$(…)"` and double-quoted
+backticks are executed by bash, but the tokenizer kept the quoted span opaque:
+`echo "$(rm -rf ~)"` was `allow` while `echo $(rm -rf ~)` was denied. The
+tokenizer now extracts the substitutions inside double quotes (as it already
+did for unquoted heredoc bodies), skips a substitution's own quotes while
+looking for the closing `"` (`` echo "`awk 'BEGIN{system("id")}'`" ``), and
+the hard home guard, the path ACL and the exec-option scan all see them.
+Single quotes stay literal (`echo '$(rm -rf ~)'` is `allow`).
+
 ---
 
 ## 3. Notes on Borrowed Designs

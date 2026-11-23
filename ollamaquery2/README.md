@@ -592,6 +592,15 @@ Trust boundaries at a glance; the sections above give the details.
   share the collector, so a `yes`, a noisy build or a hostile command cannot
   exhaust RAM before its timeout (measured: `yes a` stops in ~20 ms with
   rc = SIGKILL and 2 MB captured).
+- **Fetched URLs (SSRF).** `fetch_url` only reaches **globally routable**
+  addresses: the host is resolved once, every answer is graded (loopback,
+  RFC1918, link-local / cloud metadata, CGNAT, multicast, plus IPv4 hidden in
+  IPv6 — mapped, 6to4, Teredo, NAT64), the connection uses the graded address
+  (DNS rebinding cannot swap it), and every redirect hop is re-checked. The
+  curl fallback follows hops itself with `--resolve` pinning. Escape hatches:
+  `OLLAMAQUERY_FETCH_ALLOW_HOSTS=host,*.suffix,CIDR` and
+  `OLLAMAQUERY_FETCH_ALLOW_PRIVATE=1`. With an HTTP(S) proxy the proxy
+  connects: the URL is still checked, but its own egress rules decide.
 - **Shell gate.** Per-component allow/ask/deny, `rm ~/` / `rm /`,
   home/root `find -delete` and destructive `find -exec` / `xargs rm`
   hard-blocked (bypass-immune, `auto_confirm` included),
@@ -633,9 +642,16 @@ Trust boundaries at a glance; the sections above give the details.
   `git_inspect` tool (safe flags) or bwrap. bwrap skips the gate and
   `trusted` auto-confirms. The
   `s` and `a` approval answers are **session-scoped**; nothing is written to
-  disk. Broader allow rules (`git -c`, `tar --checkpoint-action`, upload
-  `curl`) remain allow-listed, and a `find -exec` with a harmless payload still
-  runs without a prompt: the gate is consent + audit, not a sandbox.
+  disk. **Options that run code ask:** `awk system()`/`-f`, `sed e`/`-f`,
+  `tar -I`/`--to-command` (old-style `tar xIf` included),
+  `sort --compress-program`, `zip -TT`, `gcc -fplugin`, `curl -K`,
+  `wget -e` and `find -exec …` payloads (graded as typed, recursively), with
+  no CWD leniency; the path ACL runs first, so
+  `find -exec sh -c 'cd / && echo x > rel'` stays a deny even with
+  `auto_confirm`. `"$(…)"` and double-quoted backticks are scanned like an
+  unquoted substitution. Broader allow rules still exist (upload `curl -d`,
+  arbitrary `find -exec` payloads that grade as allow), and the gate is
+  consent + audit, not a sandbox.
 - **`/agentic auto` is host-bash trust.** It auto-approves ask-level shell
   commands and skips destructive-tool confirmations. Home/root hard-denies and
   Path-ACL `ask` rules still apply, but the model can otherwise execute on the

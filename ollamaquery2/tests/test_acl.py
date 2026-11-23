@@ -2153,11 +2153,243 @@ class TestFetchUrlSchemeGuard(unittest.TestCase):
     def test_http_and_https_pass_the_guard(self):
         for url in ("http://example.com/x", "HTTPS://example.com/y"):
             with self.subTest(url=url):
-                with patch("ollamaquery2._request_with_retry",
+                # Allow-list the name so the test needs no DNS (offline box) and
+                # still exercises the scheme check + transport.
+                with patch.dict(os.environ,
+                                {m.FETCH_ALLOW_HOSTS_ENV: "example.com"}), \
+                     patch("ollamaquery2._request_with_retry",
                            side_effect=Exception("transport-reached")), \
                      patch("ollamaquery2._curl_fetch_text", return_value=("", False)):
                     text, tool = m.fetch_and_convert_url(url)
                 self.assertIn("transport-reached", text)
+
+
+class TestSSRFGuard(unittest.TestCase):
+    """fetch_url only reaches globally routable addresses (SSRF).
+
+    The three layers: URL-level check, a connect that uses the address it
+    graded (no second lookup, so DNS rebinding fails), and per-hop re-checks
+    for redirects on both transports.
+    """
+
+    def test_url_level_blocks_the_classics(self):
+        blocked = [
+            "http://127.0.0.1/", "http://localhost/", "http://127.1/",
+            "http://2130706433/", "http://0x7f.1/", "http://0177.0.0.1/",
+            "http://169.254.169.254/", "http://10.0.0.1/",
+            "http://100.64.0.1/", "http://192.0.0.1/", "http://0/",
+            "http://[::1]/", "http://[::ffff:127.0.0.1]/",
+            "http://[::ffff:169.254.169.254]/", "http://[2002:a9fe:a9fe::]/",
+            "http://[64:ff9b::7f00:1]/", "http://[64:ff9b::a9fe:a9fe]/",
+            "http://[::7f00:1]/", "http://example.com@127.0.0.1/",
+            "http://127.0.0.1\\@example.com/", "http://exa mple.com/",
+        ]
+        for url in blocked:
+            with self.subTest(url=url):
+                self.assertIsNotNone(m._ssrf_url_reason(url), url)
+
+    def test_public_addresses_and_schemes(self):
+        for url in ("http://8.8.8.8/", "https://8.8.8.8/",
+                    "http://[::ffff:8.8.8.8]/", "http://[64:ff9b::808:808]/"):
+            with self.subTest(url=url):
+                self.assertIsNone(m._ssrf_url_reason(url))
+        for url in ("file:///etc/passwd", "ftp://8.8.8.8/", "data:text/plain,x"):
+            with self.subTest(url=url):
+                self.assertIsNotNone(m._ssrf_url_reason(url))
+
+    def test_allow_list_and_guard_off(self):
+        with patch.dict(os.environ, {
+                m.FETCH_ALLOW_HOSTS_ENV: "intranet.corp,*.docs.corp,10.20.0.0/16"}):
+            self.assertIsNone(m._ssrf_url_reason("http://intranet.corp/"))
+            self.assertIsNone(m._ssrf_url_reason("http://a.docs.corp/"))
+            self.assertIsNone(m._ssrf_url_reason("http://10.20.1.2/"))
+            self.assertIsNotNone(m._ssrf_url_reason("http://10.21.1.2/"))
+        with patch.dict(os.environ, {m.FETCH_ALLOW_PRIVATE_ENV: "1"}):
+            self.assertIsNone(m._ssrf_url_reason("http://127.0.0.1/"))
+
+    def test_connect_uses_the_graded_address_and_never_relooks_up(self):
+        calls = []
+
+        class _Sock:
+            def __init__(self, *args):
+                self.connected = None
+
+            def settimeout(self, _timeout):
+                pass
+
+            def bind(self, _addr):
+                pass
+
+            def connect(self, addr):
+                self.connected = addr
+
+            def close(self):
+                pass
+
+        def _gai(host, port, *args, **kwargs):
+            calls.append((host, port))
+            return [(m.socket.AF_INET, m.socket.SOCK_STREAM, 6, "",
+                     ("93.184.216.34", port))]
+
+        socks = []
+
+        def _socket(*args):
+            sock = _Sock(*args)
+            socks.append(sock)
+            return sock
+
+        with patch.object(m.socket, "getaddrinfo", side_effect=_gai), \
+             patch.object(m.socket, "socket", side_effect=_socket):
+            m._ssrf_create_connection(("public.example", 80))
+        self.assertEqual(len(calls), 1)                       # resolved once
+        self.assertEqual(socks[0].connected, ("93.184.216.34", 80))
+
+    def test_connect_refuses_private_without_opening_a_socket(self):
+        def _gai(host, port, *args, **kwargs):
+            return [(m.socket.AF_INET, m.socket.SOCK_STREAM, 6, "",
+                     ("169.254.169.254", port))]
+
+        with patch.object(m.socket, "getaddrinfo", side_effect=_gai), \
+             patch.object(m.socket, "socket") as sock:
+            with self.assertRaises(m.SSRFBlocked):
+                m._ssrf_create_connection(("metadata.example", 80))
+        sock.assert_not_called()
+
+    def test_refusal_is_final_and_not_retried(self):
+        class _Opener:
+            def __init__(self):
+                self.calls = 0
+
+            def open(self, _req, timeout=None, **kwargs):
+                self.calls += 1
+                raise m.URLError(m.SSRFBlocked("blocked"))
+
+        opener = _Opener()
+        with self.assertRaises(m.URLError):
+            m._request_with_retry(m.Request("http://x/"), max_retries=3,
+                                  delay=0, opener=opener)
+        self.assertEqual(opener.calls, 1)
+
+    def test_redirect_to_a_private_target_is_refused(self):
+        handler = m._GuardedRedirectHandler()
+        req = m.Request("http://public.example/")
+        for target in ("http://169.254.169.254/", "http://127.0.0.1/",
+                       "http://[::1]/"):
+            with self.subTest(target=target):
+                with self.assertRaises(m.SSRFBlocked):
+                    handler.redirect_request(req, None, 302, "Found", {}, target)
+
+    def test_curl_refuses_a_blocked_hop_without_running_curl(self):
+        with patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
+             patch.object(m.subprocess, "Popen") as popen:
+            self.assertEqual(m._curl_fetch_text("http://127.0.0.1/"), ("", False))
+        popen.assert_not_called()
+
+    def test_fetch_reports_the_refusal_and_never_falls_back_to_curl(self):
+        with patch.object(m, "_curl_fetch_text") as curl:
+            text, tool = m.fetch_and_convert_url("http://127.0.0.1/")
+        self.assertEqual(tool, "None")
+        self.assertIn("SSRF", text)
+        curl.assert_not_called()
+
+
+class TestShellExecOptions(unittest.TestCase):
+    """Allow-listed tools must not hide code execution in an option.
+
+    `python3 x.py` and `env sh -c …` already ask; the same payload through
+    `awk system()`, `sed e`, `tar --to-command`/`-I`, `zip -TT`,
+    `gcc -fplugin`, `find -exec …` must ask too, without CWD leniency.
+    """
+
+    def _effect(self, command, ctx=None):
+        return m.check_shell_approval(command, ctx)["effect"]
+
+    def test_code_execution_options_ask(self):
+        commands = [
+            "awk 'BEGIN{system(\"id\")}' f",
+            "awk -f prog.awk f",
+            "awk -fprog.awk f",
+            "sed '1e id' f",
+            "sed 's/a/b/e' f",
+            "sed -f script.sed f",
+            "sed --file=script.sed f",
+            "sed '1e id' -- f --sandbox",
+            "awk -E prog.awk f",
+            "awk --exec=prog.awk f",
+            "tar --to-command=id -xf a.tar",
+            "tar -I /bin/echo -cf a.tar f",
+            "tar xIf /bin/echo a.tar",
+            "tar cIf /bin/echo a.tar f",
+            "sort --compress-program=id f",
+            "zip -T a.zip f",
+            "zip -T -TT 'touch x' a.zip f",
+            "gcc -fplugin=./evil.so a.c",
+            "wget -e robots=off http://x/",
+            "wget -erobots=off http://x/",
+            "find . -exec python3 x.py {} \\;",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self._effect(command), "ask")
+
+    def test_find_exec_nested_exec_options_ask(self):
+        commands = [
+            "find . -exec awk 'BEGIN{system(\"id\")}' {} \\;",
+            "find . -exec sed -f script.sed {} \\;",
+            "find . -exec tar --to-command=id -xf a.tar {} \\;",
+            "find . -exec sort --compress-program=id {} \\;",
+            "find . -exec curl -Kfile http://x/ {} \\;",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self._effect(command), "ask")
+
+    def test_ordinary_commands_are_unchanged(self):
+        commands = [
+            "find . -exec rm {} +",
+            "find . -name x -print",
+            "awk -F'|' '{print $2}' f",
+            "sed 's/a/b/' f",
+            "tar cf a.tar f",
+            "zip -q a.zip f",
+            "gcc -o a.out a.c",
+            "curl -s http://x/",
+            "wget -q http://x/",
+            "echo hi",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self._effect(command), "allow")
+
+    def test_double_quoted_substitutions_are_still_commands(self):
+        # `"$(...)"` is executed by bash; treating the quoted span as opaque
+        # hid `echo "$(rm -rf ~)"` from every scan.
+        self.assertEqual(
+            self._effect('echo "$(awk \'BEGIN{system("id")}\')"'), "ask")
+        # Backticks with their own quotes inside the double-quoted span must
+        # not end the outer quote early.
+        self.assertEqual(
+            self._effect('echo "`awk \'BEGIN{system("id")}\'`"'), "ask")
+        ctx = FakeCtx()
+        self.assertEqual(self._effect('echo "$(rm -rf ~)"', ctx), "deny")
+        self.assertEqual(self._effect('echo "$(cat /etc/passwd)"', ctx), "deny")
+        self.assertEqual(self._effect('echo "$(ls)"', ctx), "allow")
+
+    def test_acl_deny_wins_over_the_exec_option(self):
+        ctx = FakeCtx()
+        for command in (
+                "find . -exec sh -c 'cd / && echo x > rel' \\;",
+                "find . -exec tee /etc/x \\;",
+                "find . -execdir sh -c 'cd / && echo x > rel' {} \\;"):
+            with self.subTest(command=command):
+                self.assertEqual(self._effect(command, ctx), "deny")
+        # An explicit "yes to everything" must not turn a path denial into a
+        # free write either: the exec-option ask is not the user's consent.
+        ctx.auto_confirm = True
+        for command in ("find . -exec sh -c 'cd / && echo x > rel' \\;",
+                        "find . -exec tee /etc/x \\;"):
+            with self.subTest(command=command, auto=True):
+                self.assertEqual(self._effect(command, ctx), "deny")
 
 
 def _loop():

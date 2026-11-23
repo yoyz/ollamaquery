@@ -3471,7 +3471,8 @@ class TestBoundedNetworkReads(unittest.TestCase):
     def test_curl_fetch_text_uses_max_filesize(self):
         """--max-filesize stays as an early abort, but the read is what bounds."""
         fake = self._fake_curl(b"<html>ok</html>")
-        with patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
+        with patch.dict(os.environ, {m.FETCH_ALLOW_HOSTS_ENV: "x.example"}), \
+             patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
              patch.object(m.subprocess, "Popen", return_value=fake) as popen:
             text, truncated = m._curl_fetch_text("https://x.example", limit=1234)
         self.assertEqual((text, truncated), ("<html>ok</html>", False))
@@ -3487,7 +3488,8 @@ class TestBoundedNetworkReads(unittest.TestCase):
         was decompressed into capture_output — unbounded memory, limit ignored.
         """
         fake = self._fake_curl(b"x" * 5000)
-        with patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
+        with patch.dict(os.environ, {m.FETCH_ALLOW_HOSTS_ENV: "x.example"}), \
+             patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
              patch.object(m.subprocess, "Popen", return_value=fake):
             text, truncated = m._curl_fetch_text("https://x.example", limit=100)
         self.assertEqual(len(text), 100)
@@ -3537,8 +3539,12 @@ class TestBoundedNetworkReads(unittest.TestCase):
 
         threading.Thread(target=serve, daemon=True).start()
         try:
-            text, truncated = m._curl_fetch_text(
-                "http://127.0.0.1:%d/x" % srv.getsockname()[1], limit=limit, timeout=10)
+            # The SSRF guard is on by default; this test is about the transport
+            # bound, so allow the loopback test server explicitly.
+            with patch.dict(os.environ,
+                            {m.FETCH_ALLOW_HOSTS_ENV: "127.0.0.1"}):
+                text, truncated = m._curl_fetch_text(
+                    "http://127.0.0.1:%d/x" % srv.getsockname()[1], limit=limit, timeout=10)
         finally:
             srv.close()
         self.assertLessEqual(len(text), limit)
@@ -3547,13 +3553,15 @@ class TestBoundedNetworkReads(unittest.TestCase):
     def test_curl_fetch_text_empty_body_is_a_failure(self):
         """A declared Content-Length over the cap aborts before any body."""
         fake = self._fake_curl(b"", returncode=63)
-        with patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
+        with patch.dict(os.environ, {m.FETCH_ALLOW_HOSTS_ENV: "x.example"}), \
+             patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
              patch.object(m.subprocess, "Popen", return_value=fake):
             self.assertEqual(m._curl_fetch_text("https://x.example"), ("", False))
 
     def test_curl_fetch_text_nonzero_exit_without_prefix_is_a_failure(self):
         fake = self._fake_curl(b"", returncode=22)   # --fail: HTTP error
-        with patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
+        with patch.dict(os.environ, {m.FETCH_ALLOW_HOSTS_ENV: "x.example"}), \
+             patch.object(m.shutil, "which", return_value="/usr/bin/curl"), \
              patch.object(m.subprocess, "Popen", return_value=fake):
             self.assertEqual(m._curl_fetch_text("https://x.example"), ("", False))
 

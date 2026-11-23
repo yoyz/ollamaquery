@@ -37,13 +37,17 @@ import queue
 import difflib
 import unicodedata
 import fnmatch
+import http.client
+import ipaddress
 from datetime import datetime
 
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Optional, Dict, List, Union, Literal, TypedDict, IO
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse, urljoin
+from urllib.request import (Request, urlopen, build_opener, getproxies,
+                            proxy_bypass, HTTPHandler, HTTPSHandler,
+                            HTTPRedirectHandler)
 from urllib.error import HTTPError, URLError
 
 try:
@@ -921,7 +925,8 @@ def _is_definitive_network_failure(exc: BaseException) -> bool:
 
 
 def _request_with_retry(req: Request, max_retries: int = 3, delay: float = 1,
-                        timeout: float = 120, **kwargs: dict) -> object:
+                        timeout: float = 120, opener: Optional[object] = None,
+                        **kwargs: dict) -> object:
     """Open URL with retry on transient network errors.
 
     Retries on URLError, HTTPError (5xx only), ConnectionError, TimeoutError,
@@ -933,6 +938,8 @@ def _request_with_retry(req: Request, max_retries: int = 3, delay: float = 1,
         max_retries: Maximum number of attempts (default 3)
         delay: Seconds to wait between retries (default 1)
         timeout: Socket timeout in seconds for urlopen (default 120)
+        opener: Optional OpenerDirector; its `.open` replaces `urlopen`
+            (the fetch_url SSRF guard passes its guarded opener here).
         **kwargs: Additional arguments passed to urlopen (e.g. timeout)
 
     Returns:
@@ -945,8 +952,11 @@ def _request_with_retry(req: Request, max_retries: int = 3, delay: float = 1,
     max_retries = max(1, max_retries)
     for attempt in range(1, max_retries + 1):
         try:
-            return urlopen(req, timeout=timeout, **kwargs)
+            opener_open = opener.open if opener is not None else urlopen
+            return opener_open(req, timeout=timeout, **kwargs)
         except (URLError, HTTPError, ConnectionResetError, ConnectionError, TimeoutError, OSError) as e:
+            if _is_ssrf_refusal(e):
+                raise  # SSRF guard refusal: final, no retry, no noise
             client_error = isinstance(e, HTTPError) and e.code < 500
             definitive = _is_definitive_network_failure(e)
             # An HTTPError is a file-like response: closing it here keeps the
@@ -5145,13 +5155,30 @@ def _shell_scan_word(s: str, i: int) -> tuple:
                     continue
                 if s[k] == '"':
                     break
+                # A substitution inside double quotes is its own parsing
+                # context: `echo "`awk '{print "x"}'`"` must not end the
+                # outer quote at the inner `"`. Skip to its closing delimiter.
+                if s[k] == "`":
+                    end = s.find("`", k + 1)
+                    k = (end + 1) if end != -1 else n
+                    continue
+                if s[k:k + 2] == "$(":
+                    k = _shell_find_closing(s, k + 2, "(", ")") + 1
+                    continue
                 k += 1
             # Bash removes `\`+newline inside double quotes as well (line
             # continuation happens before parameter expansion). Keeping the two
             # characters made `"~/\\<NL>.bashrc"` resolve to a CWD-relative path
             # rather than the home dotfile it names (G2).
             seg = s[j:k + 1]
-            parts.append(seg.replace("\\\r\n", "").replace("\\\n", ""))
+            body = seg.replace("\\\r\n", "").replace("\\\n", "")
+            parts.append(body)
+            # Double quotes do NOT stop command substitution: bash runs
+            # `echo "$(rm -rf ~)"`. Treating the quoted span as opaque made the
+            # substitution invisible to every scan (home guard, ACL, exec
+            # options); extract it exactly like an unquoted heredoc body.
+            content = body[1:-1] if body.endswith('"') and len(body) >= 2 else body[1:]
+            nested.extend(_shell_heredoc_substitutions(content))
             j = k + 1
             continue
         if c == "\\":
@@ -6787,6 +6814,140 @@ def _shell_wrapper_requires_approval(nodes: list) -> bool:
         if 0 < index < len(toks):
             return True
     return False
+
+
+# Options that make an allow-listed tool run arbitrary code. `python3 x.py` and
+# `env sh -c …` already ask, so the same payload spelled through one of these
+# options must ask as well (`awk 'BEGIN{system("id")}'`, `sed 1e id`,
+# `tar --to-command=id`, `find -exec python3 x.py {} \;`). Heuristics lean to
+# asking: a false positive costs one prompt, a false negative is a free shell.
+_SED_EXEC_CMD_RE = re.compile(r"(?:^|[;{}\n!]|[0-9$/])\s*e(?:\s+\S|\s*$|\s*[;}])")
+_SED_EXEC_FLAG_RE = re.compile(r"s(.).*?(?<!\\)\1.*?(?<!\\)\1[gpiImM0-9w]*e")
+_AWK_EXEC_RE = re.compile(r"system\s*\(|\s\|\s|\|\s*getline|\|\s*[\"']|\|&")
+_TAR_EXEC_OPTIONS = ("--to-command", "--checkpoint-action", "--use-compress-program",
+                     "--rsh-command", "--info-script", "--new-volume-script")
+
+
+def _shell_short_cluster_has(tok: str, letters: str) -> bool:
+    """True for a short-option cluster (`-sK`) containing one of `letters`."""
+    return bool(re.fullmatch(r"-[A-Za-z]+", tok)) and any(c in tok[1:] for c in letters)
+
+
+def _shell_exec_option_reason(head: str, args: list, depth: int = 0) -> str:
+    """Name the code-execution option of an allow-listed command, if any.
+
+    Args:
+        head: Effective command basename.
+        args: Tokens after the command word.
+        depth: `find -exec` nesting depth (bounded; fail-closed past the limit).
+
+    Returns:
+        A short description of the option, or "" when there is none.
+    """
+    toks = [a.strip("'\"") for a in args]
+    if head == "find":
+        if depth >= _SHELL_NESTED_MAX_DEPTH:
+            return "find nesting is too deep to grade"
+        for directive, inner in _shell_find_exec_commands(args):
+            # `{}` stands for a matched file: grade the command as if it ran
+            # on a file of the project, exactly like the same command typed
+            # directly (`rm {}` would otherwise look like an outside operand).
+            verdict = shell_check_command(
+                inner.replace("{}", "./_match_"), DEFAULT_SHELL_PERMISSION,
+                _SHELL_SESSION_APPROVED)
+            if verdict["effect"] == "allow":
+                # The inner command may itself carry an exec option
+                # (`-exec awk 'BEGIN{system("id")}'`, `-exec sed -f x`,
+                # `-exec tar --to-command=…`): grade it like the same command
+                # typed directly, otherwise the outer `find *` stays allow.
+                nested = _shell_exec_option_requires_approval(
+                    verdict["nodes"], depth=depth + 1)
+                if nested:
+                    return (f"find {directive} runs a command with a "
+                            f"code-execution option: {nested}")
+                continue
+            if verdict["effect"] == "ask" and _shell_all_operands_inside_cwd(
+                    verdict["nodes"], extra_roots=[_scratch_root()]):
+                continue     # would get CWD leniency when typed directly
+            return f"find {directive} runs a command that needs approval"
+    elif head in ("sed", "gsed"):
+        # `--sandbox` is deliberately NOT treated as a safe marker: it can be
+        # an operand after `--` (`sed '1e id' -- f --sandbox`), and a false
+        # positive only costs one prompt.
+        for tok in toks:
+            # `-f script`/`-fscript`/`--file=script`: the script may carry `e`.
+            if tok == "-f" or tok == "--file" or tok.startswith("--file=") \
+                    or (tok.startswith("-f") and not tok.startswith("--")):
+                return "sed -f/--file runs a script that may use `e`"
+            if tok.startswith("-") and not tok.startswith("--"):
+                continue
+            if _SED_EXEC_CMD_RE.search(tok) or _SED_EXEC_FLAG_RE.search(tok):
+                return "sed `e` command/flag executes shell commands"
+    elif head in ("awk", "gawk", "mawk", "nawk"):
+        for tok in toks:
+            # `-f prog`, `-fprog`, `--file=prog` load a program file; gawk's
+            # `-E prog`/`--exec=prog` is the same door under another name.
+            if tok in ("-f", "--file", "-E", "--exec") \
+                    or tok.startswith("--file=") or tok.startswith("--exec=") \
+                    or (tok.startswith("-f") and not tok.startswith("--")):
+                return "awk program loaded from a file"
+            if _AWK_EXEC_RE.search(tok):
+                return "awk program runs commands (system()/pipe)"
+    elif head in ("tar", "gtar", "bsdtar"):
+        # GNU tar also accepts old-style clusters without the dash
+        # (`tar xIf prog archive`): the write-target table normalizes them, and
+        # this check must see the same spelling or `-I` runs a program.
+        first = toks[0] if toks else ""
+        if (first and not first.startswith("-")
+                and re.fullmatch(r"[A-Za-z]+", first)
+                and ("I" in first or "F" in first)):
+            return "tar -I/-F runs a program (old-style cluster)"
+        for tok in toks:
+            if tok.startswith(_TAR_EXEC_OPTIONS):
+                return f"tar {tok.split('=')[0]} runs a program"
+            if tok == "-I" or tok.startswith("-I") and not tok.startswith("--") or \
+                    _shell_short_cluster_has(tok, "IF"):
+                return "tar -I/-F runs a program"
+    elif head == "sort":
+        if any(t.startswith("--compress-program") for t in toks):
+            return "sort --compress-program runs a program"
+    elif head == "zip":
+        for tok in toks:
+            if tok.startswith("--unzip-command") or tok == "--test":
+                return "zip --unzip-command runs a program"
+            if (tok.startswith("-") and not tok.startswith("--")
+                    and "T" in tok[1:]):
+                return "zip -T/-TT runs a command to test the archive"
+    elif head in ("gcc", "g++", "cc", "c++", "clang", "clang++"):
+        for tok in toks:
+            if tok.startswith("-fplugin") or tok.startswith("-wrapper") \
+                    or tok.startswith("-specs"):
+                return "compiler plugin/wrapper option runs a program"
+    elif head == "curl":
+        for tok in toks:
+            if tok == "--config" or tok.startswith("--config=") \
+                    or _shell_short_cluster_has(tok, "K"):
+                return "curl config file can set any option (-o, -K, …)"
+    elif head == "wget":
+        for tok in toks:
+            if tok == "--execute" or tok.startswith("--execute=") \
+                    or (tok.startswith("-e") and not tok.startswith("--")) \
+                    or _shell_short_cluster_has(tok, "e"):
+                return "wget -e runs .wgetrc commands"
+    return ""
+
+
+def _shell_exec_option_requires_approval(nodes: list, depth: int = 0) -> str:
+    """Return the first code-execution-option reason among the nodes, or ""."""
+    for n in nodes:
+        toks = n.get("tokens") if isinstance(n, dict) else n.tokens
+        if not toks:
+            continue
+        head, args = _shell_effective_command(toks)
+        reason = _shell_exec_option_reason(head, args, depth=depth) if head else ""
+        if reason:
+            return reason
+    return ""
 
 
 def _shell_find_exec_commands(args: list) -> list:
@@ -8430,21 +8591,46 @@ def check_shell_approval(command: str, ctx: Optional['CommandContext'] = None, e
             "pattern": command.strip(), "action": "ask", "rule": "wrapper prefix",
         }]
 
+    # Allow-listed tools that run code through an option (`awk system()`,
+    # `sed e`, `tar --to-command`, `find -exec python3 …`): same policy as the
+    # interpreter itself — ask, and no CWD leniency (`python3 x.py` gets none).
+    exec_option = ""
+    acl_checked = False
+    if verdict["effect"] == "allow":
+        exec_option = _shell_exec_option_requires_approval(nodes)
+        if exec_option:
+            # The option turns an *automatic* allow into an ask; it is not the
+            # user's approval of the command. The path ACL therefore keeps its
+            # veto before any prompt: `find -exec sh -c 'cd / && echo x > rel'`
+            # (H3) and `find -exec tee /etc/x` stay denials, not questions.
+            acl_checked = True
+            res = _shell_acl_scan(command, ctx, tmpdir=tmpdir)
+            if res is not None and not res["approved"]:
+                return {"approved": False, "effect": "deny",
+                        "message": res["reason"], "verdict": verdict}
+            verdict = dict(verdict)
+            verdict["effect"] = "ask"
+            verdict["details"] = list(verdict["details"]) + [{
+                "pattern": command.strip(), "action": "ask",
+                "rule": f"code-execution option: {exec_option}",
+            }]
+
     # Apply the path ACL on automatic allow paths. Explicit user approval via
     # the shell prompt below already overrides it (the user said yes to the
     # exact command), so those returns are left untouched.
     def _final_allow(**extra: dict) -> dict:
         """Final allow wrapper that applies the path-ACL operand scan."""
-        res = _shell_acl_scan(command, ctx, tmpdir=tmpdir)
-        if res is not None and not res["approved"]:
-            return {"approved": False, "effect": "deny", "message": res["reason"], "verdict": verdict}
+        if not acl_checked:
+            res = _shell_acl_scan(command, ctx, tmpdir=tmpdir)
+            if res is not None and not res["approved"]:
+                return {"approved": False, "effect": "deny", "message": res["reason"], "verdict": verdict}
         return {"approved": True, "effect": "allow", "message": None, "verdict": verdict, **extra}
 
     if verdict["effect"] == "allow":
         return _final_allow()
     # effect == ask → check CWD leniency (and the disposable scratch dir)
-    if _shell_all_operands_inside_cwd(nodes, extra_roots=[_scratch_root()],
-                                      tmpdir=tmpdir):
+    if not exec_option and _shell_all_operands_inside_cwd(
+            nodes, extra_roots=[_scratch_root()], tmpdir=tmpdir):
         return _final_allow(cwd_leniency=True)
     # Auto-confirm (yolo) respects home deny but allows ask
     if ctx is not None and getattr(ctx, "auto_confirm", False):
@@ -18758,6 +18944,359 @@ def execute_os_command(command: str, timeout: Optional[int] = None) -> str:
     return f"\n[Command executed: `{command}`]\n```text\n{output.strip()}\n```\n"
 
 
+# ============================================================================
+# ============= FETCH SSRF GUARD =============================================
+# ============================================================================
+# `fetch_url` (and the harmless `curl`/`wget` GETs routed to it) fetches
+# whatever URL the model gives it — including one planted in a web page it
+# just read (prompt injection). A scheme check alone leaves loopback services,
+# the private ranges and the cloud metadata endpoint (169.254.169.254) one
+# GET away, with the response returned into the model context.
+#
+# Policy: only globally routable addresses are fetched. Three layers:
+#   1. `_ssrf_url_reason`  — refuses the URL up front with a clear message
+#      (also applied to every redirect hop).
+#   2. `_ssrf_create_connection` — resolves ONCE, vets every address, then
+#      connects to that vetted address, so DNS rebinding (public name at
+#      check time, 127.0.0.1 at connect time) cannot slip through.
+#   3. the curl fallback follows redirects itself (hop by hop) and pins the
+#      vetted address with `--resolve`; it never runs after a refusal.
+# Not touched: the backend calls to Ollama / llama.cpp / MaaS (often on
+# localhost), which do not go through fetch_and_convert_url.
+#
+# Escape hatches (environment, read at call time):
+#   OLLAMAQUERY_FETCH_ALLOW_HOSTS=intranet.corp,*.docs.corp,10.20.0.0/16
+#       hostnames (exact or `*.suffix`), IPs or CIDRs that may be fetched.
+#   OLLAMAQUERY_FETCH_ALLOW_PRIVATE=1   turns the guard off entirely.
+# When an HTTP(S) proxy applies to the URL, the proxy makes the connection:
+# only the URL-level checks (layer 1) can run locally.
+
+FETCH_ALLOW_HOSTS_ENV = "OLLAMAQUERY_FETCH_ALLOW_HOSTS"
+FETCH_ALLOW_PRIVATE_ENV = "OLLAMAQUERY_FETCH_ALLOW_PRIVATE"
+FETCH_MAX_REDIRECTS = 5
+# Well-known NAT64 prefix (`64:ff9b::/96`): a NAT64 gateway translates the
+# embedded IPv4 address, so `http://[64:ff9b::7f00:1]/` reaches 127.0.0.1 on an
+# IPv6-only network. `ipaddress` reports it as global, hence the explicit
+# decomposition below.
+SSRF_NAT64_NET = ipaddress.ip_network("64:ff9b::/96")
+# Deprecated IPv4-compatible form (`::7f00:1` = 127.0.0.1): no translation
+# prefix, but a few stacks still accept it and `ipaddress` calls it global.
+SSRF_IPV4_COMPAT_NET = ipaddress.ip_network("::/96")
+
+
+class SSRFBlocked(OSError):
+    """A fetch was refused by the SSRF guard (never retried, never curl-ed)."""
+
+
+def _ssrf_policy() -> tuple:
+    """Read the guard policy from the environment.
+
+    Returns:
+        (disabled, allowed_names, allowed_networks).
+    """
+    flag = os.environ.get(FETCH_ALLOW_PRIVATE_ENV, "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True, [], []
+    names, nets = [], []
+    for raw in os.environ.get(FETCH_ALLOW_HOSTS_ENV, "").split(","):
+        entry = raw.strip().lower()
+        if not entry:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            names.append(entry)
+    return False, names, nets
+
+
+def _ssrf_name_allowed(host: str, names: list) -> bool:
+    """True when a hostname matches an allow-list entry (exact or `*.suffix`)."""
+    return any(host == pat or (pat.startswith("*.") and host.endswith(pat[1:]))
+               for pat in names)
+
+
+def _ssrf_addr_reason(addr: str, nets: list) -> Optional[str]:
+    """Explain why a resolved address must not be fetched.
+
+    Args:
+        addr: Numeric address from getaddrinfo (an IPv6 zone id is ignored).
+        nets: Allow-listed networks.
+
+    Returns:
+        A short reason, or None when the address may be fetched.
+    """
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return f"unparseable address {addr!r}"
+    for net in nets:
+        if ip.version == net.version and ip in net:
+            return None
+    if ip.version == 6:
+        # IPv6 spellings that embed an IPv4 address would otherwise hide a
+        # loopback / metadata target: ::ffff:127.0.0.1, 2002:a9fe:a9fe::, Teredo,
+        # and a NAT64 address (`64:ff9b::7f00:1`) on an IPv6-only network.
+        embedded = ip.ipv4_mapped or ip.sixtofour
+        if embedded is None and ip.teredo:
+            embedded = ip.teredo[1]
+        if embedded is None and ip in SSRF_NAT64_NET:
+            embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        if embedded is None and ip in SSRF_IPV4_COMPAT_NET:
+            embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        if embedded is not None:
+            return _ssrf_addr_reason(str(embedded), nets)
+    if ip.is_global and not ip.is_multicast:
+        return None
+    if ip.is_loopback:
+        kind = "loopback"
+    elif ip.is_link_local:
+        kind = "link-local (cloud metadata range)"
+    elif ip.is_private:
+        kind = "private-network"
+    else:
+        kind = "non-public"
+    return f"{ip} is a {kind} address"
+
+
+def _ssrf_vet(host: str, port: int) -> tuple:
+    """Resolve and grade a host against the policy.
+
+    Returns:
+        (verdict, data): ("allow", None) guard off or host allow-listed;
+        ("block", reason); ("unresolved", None) DNS failed (the real request
+        reports it); ("ok", [addresses]) every resolved address is public.
+    """
+    disabled, names, nets = _ssrf_policy()
+    if disabled:
+        return "allow", None
+    h = (host or "").strip("[]").rstrip(".").lower()
+    if not h:
+        return "block", "the URL has no host"
+    if _ssrf_name_allowed(h, names):
+        return "allow", None
+    try:
+        infos = socket.getaddrinfo(h, port, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return "unresolved", None
+    addrs = []
+    for info in infos:
+        reason = _ssrf_addr_reason(info[4][0], nets)
+        if reason:            # one bad record is enough: mixed answers are a
+            return "block", reason   # classic rebinding trick
+        addrs.append(info[4][0])
+    return ("ok", addrs) if addrs else ("unresolved", None)
+
+
+def _ssrf_url_reason(url: str) -> Optional[str]:
+    """Why a URL must not be fetched (scheme, parser tricks, target address).
+
+    Returns:
+        A reason string, or None when the URL passes the URL-level checks.
+    """
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https") or not parsed.netloc:
+        return f"unsupported URL {url!r} — only http:// and https:// are allowed"
+    # Backslashes, spaces and control characters in the authority are parsed
+    # differently by urllib, curl and browsers (`http://a\@127.0.0.1/`): refuse.
+    if re.search(r"[\\\x00-\x20\x7f]", parsed.netloc):
+        return "the host part of the URL contains unsafe characters"
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        return "the URL has an invalid port"
+    verdict, data = _ssrf_vet(parsed.hostname or "", port)
+    return data if verdict == "block" else None
+
+
+def _ssrf_message(reason: str) -> str:
+    """Build the refusal message shown to the model and the user."""
+    return (f"blocked by the fetch SSRF guard: {reason}. Only public hosts are "
+            f"fetched; the user can allow an internal host with "
+            f"{FETCH_ALLOW_HOSTS_ENV}=host-or-CIDR[,…].")
+
+
+def _is_ssrf_refusal(exc: BaseException) -> bool:
+    """True when an exception (or the reason it wraps) is an SSRF refusal."""
+    return isinstance(exc, SSRFBlocked) or isinstance(
+        getattr(exc, "reason", None), SSRFBlocked)
+
+
+def _ssrf_proxy_in_use(url: str) -> bool:
+    """True when an environment proxy will carry this URL (it connects, not us)."""
+    parsed = urlparse(url)
+    try:
+        proxies = getproxies()
+        # `all_proxy` is the fallback urllib's ProxyHandler itself uses; an
+        # empty value is not a proxy (fall back to the guarded connection).
+        proxy = proxies.get(parsed.scheme.lower()) or proxies.get("all")
+        return bool(proxy) and not proxy_bypass(parsed.hostname or "")
+    except (OSError, ValueError, TypeError):
+        # Proxy lookup is environment/config parsing: a broken entry must not
+        # break the fetch. An internal defect must still surface.
+        return False
+
+
+def _ssrf_create_connection(address: tuple, timeout: object = socket._GLOBAL_DEFAULT_TIMEOUT,
+                            source_address: Optional[tuple] = None) -> socket.socket:
+    """`socket.create_connection` replacement that connects only to vetted addresses.
+
+    Resolution happens once here and the very address that was graded is the
+    one connected to: there is no second lookup an attacker could answer
+    differently (DNS rebinding).
+    """
+    host, port = address
+    disabled, names, nets = _ssrf_policy()
+    h = str(host).strip("[]").rstrip(".").lower()
+    if disabled or _ssrf_name_allowed(h, names):
+        return socket.create_connection(address, timeout, source_address)
+    refused = None
+    last_err = None
+    for af, socktype, proto, _canon, sockaddr in socket.getaddrinfo(
+            host, port, 0, socket.SOCK_STREAM):
+        reason = _ssrf_addr_reason(sockaddr[0], nets)
+        if reason:
+            refused = reason
+            continue
+        sock = socket.socket(af, socktype, proto)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            last_err = exc
+            sock.close()
+    if last_err is None and refused:
+        raise SSRFBlocked(_ssrf_message(refused))
+    raise last_err or OSError(f"no usable address for {host}")
+
+
+class _GuardedHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection that connects through `_ssrf_create_connection`."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = _ssrf_create_connection
+
+
+class _GuardedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection that connects through `_ssrf_create_connection`."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = _ssrf_create_connection
+
+
+class _GuardedHTTPHandler(HTTPHandler):
+    """urllib handler opening plain-HTTP connections through the guard."""
+
+    def http_open(self, req: Request) -> object:
+        return self.do_open(_GuardedHTTPConnection, req)
+
+
+class _GuardedHTTPSHandler(HTTPSHandler):
+    """urllib handler opening TLS connections through the guard."""
+
+    def https_open(self, req: Request) -> object:
+        return self.do_open(_GuardedHTTPSConnection, req, context=self._context)
+
+
+class _GuardedRedirectHandler(HTTPRedirectHandler):
+    """Re-checks every redirect target: a public page may 302 to 169.254.169.254."""
+
+    max_redirections = FETCH_MAX_REDIRECTS
+
+    def redirect_request(self, req: Request, fp: object, code: int, msg: str,
+                         headers: object, newurl: str) -> Optional[Request]:
+        reason = _ssrf_url_reason(newurl)
+        if reason:
+            raise SSRFBlocked(_ssrf_message(f"redirect to {newurl}: {reason}"))
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _ssrf_opener(url: str) -> object:
+    """Build the urllib opener for one fetch (guarded unless a proxy connects)."""
+    handlers = [_GuardedRedirectHandler()]
+    if not _ssrf_proxy_in_use(url):
+        handlers += [_GuardedHTTPHandler(), _GuardedHTTPSHandler()]
+    return build_opener(*handlers)
+
+
+def _curl_redirect_location(header_path: str) -> str:
+    """Return the `Location` of a 3xx response from a curl `-D` header dump."""
+    try:
+        with open(header_path, "rb") as fh:
+            raw = fh.read(65536).decode("latin-1")
+    except OSError:
+        return ""
+    blocks = [b for b in re.split(r"\r?\n\r?\n", raw.strip()) if b.strip()]
+    if not blocks:
+        return ""
+    lines = blocks[-1].splitlines()
+    status = re.match(r"HTTP/\S+\s+(\d{3})", lines[0])
+    if not status or status.group(1) not in ("301", "302", "303", "307", "308"):
+        return ""
+    for line in lines[1:]:
+        if line.lower().startswith("location:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _curl_once(url: str, timeout: int, limit: int, pin: str = "") -> tuple:
+    """Run ONE curl request (no redirect following).
+
+    Returns:
+        (raw_bytes, truncated, returncode, redirect_location).
+    """
+    ua = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+    hdr_fd, hdr_path = tempfile.mkstemp(prefix="oq_curl_hdr_")
+    os.close(hdr_fd)
+    try:
+        cmd = ["curl", "-s", "--compressed", "--fail", "--max-time", str(timeout),
+               "--max-filesize", str(limit), "--proto", "=http,https",
+               "--max-redirs", "0", "-D", hdr_path, "-A", ua]
+        if pin:
+            cmd += ["--resolve", pin]
+        cmd.append(url)
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+        except (OSError, ValueError):
+            return b"", False, -1, ""
+        try:
+            raw, truncated = _bounded_read(proc.stdout, limit)
+        except (OSError, ValueError):
+            raw, truncated = b"", False
+        finally:
+            try:
+                proc.stdout.close()
+            except (OSError, ValueError):
+                pass
+        if truncated:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            returncode = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            returncode = -1
+        return raw, truncated, returncode, _curl_redirect_location(hdr_path)
+    finally:
+        try:
+            os.unlink(hdr_path)
+        except OSError:
+            pass
+
+
 def _curl_fetch_text(url: str, timeout: int = 20,
                      limit: int = MAX_URL_FETCH_BYTES) -> tuple:
     """Fetch a URL via curl as a fallback when urllib is blocked.
@@ -18774,6 +19313,11 @@ def _curl_fetch_text(url: str, timeout: int = 20,
     2 000 000 limit). The authoritative bound is therefore a bounded read of
     curl's stdout: at most `limit + 1` bytes are pulled, then curl is killed.
 
+    SSRF guard: curl no longer follows redirects (`-L`). Each hop is followed
+    here, graded by `_ssrf_vet` first, and the vetted address is pinned with
+    `--resolve` so curl cannot resolve the name to something else. A refused
+    hop returns ("", False) like any failure — the caller reports the error.
+
     Args:
         url: The URL to fetch.
         timeout: Max seconds for curl.
@@ -18783,51 +19327,56 @@ def _curl_fetch_text(url: str, timeout: int = 20,
         (text, truncated): the decoded body (empty on failure) and whether it
         is a prefix of a larger body.
     """
-    parsed = urlparse(url)
-    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
-        return "", False
     if shutil.which("curl") is None:
         return "", False
-    ua = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-    try:
-        proc = subprocess.Popen(
-            ["curl", "-sL", "--compressed", "--fail", "--max-time", str(timeout),
-             "--max-filesize", str(limit), "-A", ua, url],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
-    except (OSError, ValueError):
-        return "", False
-    try:
-        raw, truncated = _bounded_read(proc.stdout, limit)
-    except (OSError, ValueError):
-        raw, truncated = b"", False
-    finally:
+    current = url
+    for _hop in range(FETCH_MAX_REDIRECTS + 1):
+        parsed = urlparse(current)
+        scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https") or not parsed.netloc:
+            return "", False
+        if re.search(r"[\\\x00-\x20\x7f]", parsed.netloc):
+            return "", False
         try:
-            proc.stdout.close()
-        except (OSError, ValueError):
-            pass
-    if truncated:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-    try:
-        returncode = proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        returncode = -1
-    text = raw.decode("utf-8", errors="replace")
-    if not text.strip():
-        return "", False
-    if truncated:
-        return text, True          # bounded prefix; caller appends the marker
-    if returncode != 0:
-        return "", False
-    return text, False
+            port = parsed.port or (443 if scheme == "https" else 80)
+        except ValueError:
+            return "", False
+        host = parsed.hostname or ""
+        verdict, data = _ssrf_vet(host, port)
+        proxied = _ssrf_proxy_in_use(current)
+        if verdict == "block" or (verdict == "unresolved" and not proxied):
+            return "", False
+        pin = ""
+        if verdict == "ok" and not proxied:
+            try:
+                ipaddress.ip_address(host.strip("[]"))
+            except ValueError:   # a name: pin the address we just graded
+                ordered = sorted(data, key=lambda a: ":" in a)   # IPv4 first
+                # curl matches --resolve against the IDNA form of the URL host.
+                try:
+                    pin_host = host.encode("idna").decode("ascii")
+                except UnicodeError:
+                    pin_host = host
+                pin_addr = ordered[0]
+                if ":" in pin_addr:          # IPv6 literal needs brackets
+                    pin_addr = f"[{pin_addr}]"
+                pin = f"{pin_host}:{port}:{pin_addr}"
+        raw, truncated, returncode, location = _curl_once(current, timeout, limit, pin)
+        if location:
+            # Follow like `-L` did, but hop by hop: the next target is vetted
+            # before curl is run again. A body on a 3xx (some servers send an
+            # HTML "Moved" page) is discarded, as curl -L would.
+            current = urljoin(current, location)
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        if not text.strip():
+            return "", False
+        if truncated:
+            return text, True          # bounded prefix; caller appends the marker
+        if returncode != 0:
+            return "", False
+        return text, False
+    return "", False
 
 
 def _strip_html_text(html: str) -> str:
@@ -18865,17 +19414,19 @@ def fetch_and_convert_url(url: str) -> tuple:
         a failed fetch so callers report success=False (never a misleading
         success with an empty body). Non-http(s) URLs (file://, ftp://,
         data:, bare paths) are rejected up front: urllib would otherwise
-        read a local file, turning fetch_url into a Path-ACL bypass.
+        read a local file, turning fetch_url into a Path-ACL bypass. Hosts
+        resolving to loopback/private/link-local addresses (and redirects to
+        them) are refused too — see the FETCH SSRF GUARD block.
     """
-    parsed = urlparse(url)
-    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
-        return (f"[Failed to fetch URL: unsupported URL {url!r} — only "
-                f"http:// and https:// are allowed]", "None")
+    reason = _ssrf_url_reason(url)
+    if reason:
+        return (f"[Failed to fetch URL: {_ssrf_message(reason)}]", "None")
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     err = ""
     try:
         req = Request(url, headers=headers)
-        with _request_with_retry(req, max_retries=1, timeout=15) as response:
+        with _request_with_retry(req, max_retries=1, timeout=15,
+                                 opener=_ssrf_opener(url)) as response:
             charset = response.info().get_content_charset() or 'utf-8'
             raw_body, truncated = _bounded_read(response, MAX_URL_FETCH_BYTES)
             html_content = raw_body.decode(charset, errors='ignore')
@@ -18886,6 +19437,10 @@ def fetch_and_convert_url(url: str) -> tuple:
             return text, "htmlstrip"
         err = "empty response body"
     except Exception as e:
+        if _is_ssrf_refusal(e):
+            # A refusal is final: never retry the same URL through curl.
+            return (f"[Failed to fetch URL: "
+                    f"{e if isinstance(e, SSRFBlocked) else e.reason}]", "None")
         err = str(e)
     # urllib blocked or empty — try curl (browser TLS/header fingerprint).
     html, curl_truncated = _curl_fetch_text(url, limit=MAX_URL_FETCH_BYTES)
