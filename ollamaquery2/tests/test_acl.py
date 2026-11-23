@@ -2516,6 +2516,19 @@ class TestAgenticPolicy(unittest.TestCase):
         self.assertIn("plan mode: CWD only", out)
         self.assertIn("(any command)", out)
 
+    def test_policy_reflects_the_session_subset(self):
+        ctx = self._ctx("work")
+        ctx.agentic_tool_subset = {"read_file"}
+        loop = self._loop(ctx)
+        sink = io.StringIO()
+        with contextlib.redirect_stderr(sink):
+            loop._handle_agentic_policy()
+        out = sink.getvalue()
+        self.assertIn("tools=1/15", out)
+        self.assertIn("write_file", out)
+        self.assertIn("(any command)", out)
+        self.assertIn("unavailable", out)
+
     def test_policy_is_in_tab_completion(self):
         self.assertIn("policy", m.AGENTIC_SUBCOMMANDS)
 
@@ -2525,6 +2538,165 @@ class TestAgenticPolicy(unittest.TestCase):
         with contextlib.redirect_stderr(sink):
             self.assertFalse(loop.run_handle_agentic("/agentic policy"))
         self.assertIn("[Policy]", sink.getvalue())
+
+
+class TestAgenticToolSubset(unittest.TestCase):
+    """`/agentic tools` restricts the surface; it can never widen the tier."""
+
+    def _ctx(self, preset="work", plan=False):
+        ctx = FakeCtx()
+        ctx.preset = preset
+        ctx.plan_mode = plan
+        ctx.plan_run = False
+        ctx.agentic_tool_subset = None
+        return ctx
+
+    def _loop(self, ctx):
+        loop = object.__new__(m.ChatLoop)
+        loop.ctx = ctx
+        loop.tool_registry = m.ToolRegistry(ctx=ctx, executor=m.Executor(mode="host"))
+        return loop
+
+    def _run(self, loop, *args):
+        sink = io.StringIO()
+        with contextlib.redirect_stderr(sink):
+            loop._handle_agentic_tools(["/agentic", "tools", *args])
+        return sink.getvalue()
+
+    def test_plus_without_a_list_is_a_noop_with_hint(self):
+        ctx = self._ctx()
+        loop = self._loop(ctx)
+        out = self._run(loop, "+fetch_url")
+        self.assertIsNone(ctx.agentic_tool_subset)
+        self.assertIn("already available", out)
+        self.assertIn("none then +fetch_url", out)
+
+    def test_minus_without_a_list_materializes_the_tier(self):
+        ctx = self._ctx()
+        loop = self._loop(ctx)
+        out = self._run(loop, "-write_file")
+        self.assertEqual(ctx.agentic_tool_subset,
+                         set(m.AGENTIC_TOOL_DEFS) - {"write_file"})
+        self.assertIn("materialized", out)
+
+    def test_explicit_list_replaces_the_subset(self):
+        ctx = self._ctx()
+        loop = self._loop(ctx)
+        self._run(loop, "read_file,glob")
+        self.assertEqual(ctx.agentic_tool_subset, {"read_file", "glob"})
+        self._run(loop, "read_file")
+        self.assertEqual(ctx.agentic_tool_subset, {"read_file"})
+
+    def test_none_and_reset(self):
+        ctx = self._ctx()
+        loop = self._loop(ctx)
+        self._run(loop, "none")
+        self.assertEqual(ctx.agentic_tool_subset, set())
+        self._run(loop, "reset")
+        self.assertIsNone(ctx.agentic_tool_subset)
+
+    def test_unknown_name_is_rejected_with_suggestions(self):
+        ctx = self._ctx()
+        loop = self._loop(ctx)
+        out = self._run(loop, "read_fil")
+        self.assertIsNone(ctx.agentic_tool_subset)
+        self.assertIn("unknown tool 'read_fil'", out)
+        self.assertIn("read_file", out)
+
+    def test_name_outside_the_tier_is_stored_and_reported(self):
+        ctx = self._ctx(preset="read", plan=True)
+        loop = self._loop(ctx)
+        out = self._run(loop, "read_file,run_command")
+        self.assertEqual(ctx.agentic_tool_subset, {"read_file", "run_command"})
+        self.assertIn("inactive", out)
+        self.assertIn("run_command", out)
+        self.assertEqual(m.agentic_effective_names(ctx), {"read_file"})
+
+    def test_a_subset_never_reopens_a_hidden_tool(self):
+        ctx = self._ctx(preset="exec")
+        loop = self._loop(ctx)
+        self._run(loop, "write_file")
+        self.assertEqual(ctx.agentic_tool_subset, {"write_file"})
+        self.assertEqual(m.agentic_effective_names(ctx), set())
+        self.assertEqual(loop.tool_registry._plan_allowed_tools(), {})
+
+    def test_backstop_names_the_session_subset(self):
+        ctx = self._ctx()
+        loop = self._loop(ctx)
+        self._run(loop, "read_file")
+        result = loop.tool_registry.execute(
+            "write_file", {"file_path": "x.txt", "content": "x"})
+        self.assertFalse(result["success"])
+        self.assertIn("session tool subset", result["error"])
+        self.assertIn("read_file", result["error"])
+
+    def test_work_subset_limits_prompt_and_native_schema(self):
+        ctx = self._ctx()
+        loop = self._loop(ctx)
+        self._run(loop, "read_file,fetch_url")
+        visible = set(loop.tool_registry._plan_allowed_tools())
+        self.assertEqual(visible, {"read_file", "fetch_url"})
+        spec = {entry["function"]["name"]
+                for entry in loop.tool_registry.openai_tools_spec()}
+        self.assertEqual(spec, visible)
+        block = loop.tool_registry.get_system_prompt_block()
+        self.assertIn("### read_file", block)
+        self.assertNotIn("### write_file", block)
+
+    def test_plan_intersection_hides_the_out_of_tier_name(self):
+        ctx = self._ctx(preset="read", plan=True)
+        loop = self._loop(ctx)
+        self._run(loop, "read_file,run_command")
+        self.assertEqual(set(loop.tool_registry._plan_allowed_tools()),
+                         {"read_file"})
+
+    def test_pending_mcp_name_is_accepted(self):
+        ctx = self._ctx()
+        loop = self._loop(ctx)
+        out = self._run(loop, "k8s__list_pods")
+        self.assertEqual(ctx.agentic_tool_subset, {"k8s__list_pods"})
+        self.assertIn("effective (1)", out)
+        self.assertEqual(m.agentic_effective_names(ctx), {"k8s__list_pods"})
+
+    def test_presets_read_and_git_are_lists(self):
+        ctx = self._ctx()
+        loop = self._loop(ctx)
+        self._run(loop, "read")
+        self.assertEqual(ctx.agentic_tool_subset,
+                         {"read_file", "glob", "grep", "list_directory"})
+        self._run(loop, "git")
+        self.assertEqual(ctx.agentic_tool_subset, {"git_inspect", "read_file"})
+
+    def test_empty_surface_warns_at_query_start(self):
+        ctx = self._ctx()
+        loop = self._loop(ctx)
+        self._run(loop, "none")
+
+        class _Runner:
+            def __init__(self):
+                self.called = False
+
+            def run(self, _host, _input):
+                self.called = True
+
+        runner = _Runner()
+        loop._agentic_runner = lambda: runner
+        sink = io.StringIO()
+        with contextlib.redirect_stderr(sink):
+            loop.run_agentic_query("do something")
+        self.assertIn("tool surface is empty", sink.getvalue())
+        self.assertTrue(runner.called)
+
+    def test_tools_is_in_completion_and_dispatch(self):
+        self.assertIn("tools", m.AGENTIC_SUBCOMMANDS)
+        self.assertIn("none", m.AGENTIC_SECOND_LEVEL["tools"])
+        self.assertIn("reset", m.AGENTIC_SECOND_LEVEL["tools"])
+        ctx = self._ctx()
+        loop = self._loop(ctx)
+        sink = io.StringIO()
+        with contextlib.redirect_stderr(sink):
+            self.assertFalse(loop.run_handle_agentic("/agentic tools none"))
+        self.assertEqual(ctx.agentic_tool_subset, set())
 
 
 def _loop():

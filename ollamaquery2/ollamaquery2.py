@@ -526,7 +526,7 @@ COMMANDS = {
         'aliases': ['/agentic'],
         'category': 'Settings',
         'description': 'Configure agentic mode and sub-options',
-        'usage': '/agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status|reset|net shared|none|reset]|policy|verbose|thinking|trace|log|acl|iterations|timeout|status]',
+        'usage': '/agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status|reset|net shared|none|reset]|policy|tools [<list>|+n|-n|none|reset]|verbose|thinking|trace|log|acl|iterations|timeout|status]',
         'handler': None
     },
     'listtool': {
@@ -2625,6 +2625,10 @@ class CommandContext:
         self.lazy_tool: bool = True  # Enabled by default: many models embed tool calls after thinking/preamble
         self.plan_mode: bool = False  # Read-only planning mode (restricts tools + prompts)
         self.plan_run: bool = False  # Plan tier: True = `/agentic plan run` (allows run_command w/ confirm)
+        # Session-only tool subset (`/agentic tools`): None = no restriction,
+        # set() = no tool, otherwise the tier ∩ subset is the visible surface.
+        # Presets never touch it; `/agentic off` keeps it.
+        self.agentic_tool_subset: Optional[set] = None
         self.supports_vision: Optional[bool] = None  # None = unknown (treated as capable)
 
         # Context window tracking
@@ -9961,6 +9965,48 @@ def agentic_active_tools(ctx) -> Optional[set]:
     # would make `net none` a lie.
     return set(preset.tools)
 
+
+def agentic_effective_tools(ctx, definitions=None) -> Optional[set]:
+    """Effective surface: preset/plan tier ∩ session tool subset.
+
+    `agentic_active_tools` owns the preset/tier axis; `ctx.agentic_tool_subset`
+    is the user's session subset (`/agentic tools`). The intersection can only
+    reduce the surface — a subset never reopens a tool the preset hides — and
+    `None` (no restriction on either axis) keeps the cheap "all visible" path.
+
+    Args:
+        ctx: CommandContext (or None).
+        definitions: Definitions whose keys are the universe to filter
+            (`AGENTIC_TOOL_DEFS` by default; the caller passes the merged MCP
+            catalog when it has one).
+
+    Returns:
+        The set of allowed names, or None when every definition is visible.
+    """
+    subset = getattr(ctx, "agentic_tool_subset", None) if ctx is not None else None
+    active = agentic_active_tools(ctx)
+    if active is None and subset is None:
+        return None
+    names = set(definitions if definitions is not None else AGENTIC_TOOL_DEFS)
+    if active is not None:
+        names &= set(active)
+    if subset is not None:
+        names &= set(subset)
+    return names
+
+
+def agentic_effective_names(ctx) -> Optional[set]:
+    """Effective surface including subset-only MCP names (status/query warning).
+
+    `agentic_effective_tools` filters against `AGENTIC_TOOL_DEFS`; a pending
+    MCP name lives only in the subset until its server connects. This wrapper
+    adds the subset to the universe so a list made of MCP names is not reported
+    as empty.
+    """
+    subset = getattr(ctx, "agentic_tool_subset", None) if ctx is not None else None
+    universe = set(AGENTIC_TOOL_DEFS) | set(subset or ())
+    return agentic_effective_tools(ctx, universe)
+
 # Kubernetes / OpenShift read-only consultation (kubernetes_cluster_query tool).
 # cluster_type auto: KUBECONFIG env var set → online; else omc configured
 # (binary + ~/.omc/omc.json) → offline; else online via default kubeconfig.
@@ -15612,7 +15658,7 @@ class ToolRegistry:
                 print(colorize(f"[MCP] tool catalog unavailable: {exc}", 'warning'),
                       file=sys.stderr)
         if self._ctx:
-            allowed = agentic_active_tools(self._ctx)
+            allowed = agentic_effective_tools(self._ctx, definitions)
             if allowed is not None:
                 return {name: defn for name, defn in definitions.items()
                         if name in allowed}
@@ -15860,9 +15906,20 @@ class ToolRegistry:
         # a hidden tool leaks through the surface filter), deny it here. Defense
         # in depth — the prompt and tool schema already hide these tools.
         if self._ctx:
-            allowed = agentic_active_tools(self._ctx)
+            # Include the called name in the universe so an MCP tool that is in
+            # the session subset is not denied just because it does not live in
+            # AGENTIC_TOOL_DEFS.
+            allowed = agentic_effective_tools(
+                self._ctx, set(AGENTIC_TOOL_DEFS) | {tool_name})
             if allowed is not None and tool_name not in allowed:
-                if getattr(self._ctx, "plan_mode", False) or \
+                subset = getattr(self._ctx, "agentic_tool_subset", None)
+                preset_allowed = agentic_active_tools(self._ctx)
+                if (subset is not None
+                        and (preset_allowed is None
+                             or tool_name in preset_allowed)):
+                    label = ("the session tool subset (use /agentic tools "
+                             "reset to widen it)")
+                elif getattr(self._ctx, "plan_mode", False) or \
                         getattr(self._ctx, "preset", "") == "read":
                     label = "read-only plan mode"
                 elif getattr(self._ctx, "preset", "") == "exec":
@@ -18018,18 +18075,20 @@ AGENTIC_SUBCOMMANDS = [
     'on', 'off', 'full', 'auto', 'preset', 'plan', 'sandbox', 'verbose',
     'thinking', 'trace', 'log', 'lazytool', 'iterations', 'timeout',
     'heartbeattokens', 'compactthreshold', 'logretention', 'acl', 'scratch',
-    'files', 'policy', 'status',
+    'files', 'policy', 'tools', 'status',
 ]
 AGENTIC_PLAN_ARGS = ['on', 'off', 'run']
 AGENTIC_ACL_ACTIONS = ['list', 'status', 'log', 'allow', 'ask', 'deny', 'remove', 'reset']
 AGENTIC_SCRATCH_ACTIONS = ['path', 'list', 'clear']
 AGENTIC_FILES_ACTIONS = ['list', 'reset']
+AGENTIC_TOOL_ACTIONS = ['list', 'status', 'none', 'reset', 'read', 'git'] + sorted(AGENTIC_TOOL_DEFS)
 AGENTIC_PRESET_NAMES = ['read', 'exec', 'work', 'trusted', 'plan', 'full', 'auto', 'show']
 AGENTIC_SANDBOX_ARGS = ['host', 'container', 'bwrap', 'status', 'reset', 'net']
 AGENTIC_SANDBOX_NET_ARGS = ['shared', 'none', 'reset', 'status']
 AGENTIC_SECOND_LEVEL = {'plan': AGENTIC_PLAN_ARGS, 'acl': AGENTIC_ACL_ACTIONS,
                         'scratch': AGENTIC_SCRATCH_ACTIONS,
                         'files': AGENTIC_FILES_ACTIONS,
+                        'tools': AGENTIC_TOOL_ACTIONS,
                         'preset': AGENTIC_PRESET_NAMES,
                         'logretention': ['1', '7', '30', 'reset'],
                         'sandbox': AGENTIC_SANDBOX_ARGS}
@@ -24469,10 +24528,12 @@ class ChatLoop:
             return self._handle_agentic_files(parts)
         if subcmd == "policy":
             return self._handle_agentic_policy()
+        if subcmd == "tools":
+            return self._handle_agentic_tools(parts)
         if subcmd == "plan":
             return self._agentic_toggle_plan(parts)
 
-        print(colorize("[Usage: /agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status|reset|net shared|none|reset]|policy|verbose|thinking|trace|log|lazytool|acl|scratch [path|list|clear]|files [list|reset]|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|logretention <days>|status]]", 'warning'), file=sys.stderr)
+        print(colorize("[Usage: /agentic [on|off|full|auto|preset [read|exec|work|trusted]|plan [on|off|run]|sandbox [host|container|bwrap|status|reset|net shared|none|reset]|policy|tools [<list>|+n|-n|none|reset]|verbose|thinking|trace|log|lazytool|acl|scratch [path|list|clear]|files [list|reset]|iterations <N>|timeout <N>|heartbeattokens <N>|compactthreshold <v>|logretention <days>|status]]", 'warning'), file=sys.stderr)
         return False
 
     def _print_preset_list(self) -> bool:
@@ -24506,15 +24567,15 @@ class ChatLoop:
         preset = resolve_preset(ctx)
         executor = getattr(ctx, "executor", None)
         mode = getattr(executor, "mode", "host")
-        active = agentic_active_tools(ctx)
+        effective = agentic_effective_names(ctx)
         all_tools = set(AGENTIC_TOOL_DEFS)
-        surface = all_tools if active is None else set(active)
+        surface = all_tools if effective is None else set(effective)
         cwd = os.path.realpath(os.getcwd())
         scratch = os.path.realpath(_scratch_root())
         plan_strict = strict_path_confinement(ctx)
         label = "plan run" if preset.name == "read-run" else preset.name
-        tools_label = (f"all({len(all_tools)})" if active is None
-                       else f"{len(surface)}/{len(all_tools)}")
+        tools_label = (f"all({len(all_tools)})" if effective is None
+                       else f"{len(surface & all_tools)}/{len(all_tools)}")
         shell_label = ("off" if "run_command" not in surface
                        else ("gate" if mode == "host" else mode))
         print(colorize(f"\n[Policy] preset={label}  engine="
@@ -24724,6 +24785,133 @@ class ChatLoop:
         "log":      ("agentic_logging",      "Logging"),
         "lazytool": ("lazy_tool",            "Lazy tool extraction"),
     }
+
+    # Named subsets are sugar for a list, not a mode: `/agentic tools read`
+    # stores exactly these names, and a later preset change still cannot reopen
+    # a tool the tier hides.
+    _AGENTIC_TOOL_PRESETS = {
+        "read": ("read_file", "glob", "grep", "list_directory"),
+        "git": ("git_inspect", "read_file"),
+    }
+
+    def _agentic_tool_name_ok(self, name: str) -> bool:
+        """Validate one subset name; suggest the closest real tool on a typo."""
+        if name in AGENTIC_TOOL_DEFS or "__" in name:
+            # `prefix__tool` is a pending MCP name: it stays in the list even
+            # before its server connects (the intersection lets it in later).
+            return True
+        matches = difflib.get_close_matches(name, sorted(AGENTIC_TOOL_DEFS), n=3)
+        hint = f" — did you mean {', '.join(matches)}?" if matches else ""
+        print(colorize(f"[Tool subset] unknown tool '{name}'{hint}", 'warning'),
+              file=sys.stderr)
+        return False
+
+    def _print_agentic_tools(self) -> None:
+        """Print the subset state, the effective surface and the usage."""
+        ctx = self.ctx
+        preset = resolve_preset(ctx)
+        tier = agentic_active_tools(ctx)
+        tier_names = set(AGENTIC_TOOL_DEFS) if tier is None else set(tier)
+        subset = getattr(ctx, "agentic_tool_subset", None)
+        effective = agentic_effective_names(ctx)
+        effective_names = tier_names if effective is None else set(effective)
+        tier_label = (f"all({len(tier_names)})" if tier is None
+                      else f"{len(tier_names)}/{len(AGENTIC_TOOL_DEFS)}")
+        subset_label = ("tier (unrestricted)" if subset is None
+                        else (", ".join(sorted(subset)) if subset else "none"))
+        print(colorize(f"\n[Agentic tools] preset={preset.name}  tier={tier_label}  "
+                       f"subset={subset_label}", 'info'), file=sys.stderr)
+        if effective is None:
+            print(f"  effective: all({len(tier_names)})", file=sys.stderr)
+        else:
+            shown = ", ".join(sorted(effective_names)) if effective_names else "(none)"
+            print(f"  effective ({len(effective_names)}): {shown}", file=sys.stderr)
+        if tier is not None and subset:
+            inactive = sorted(set(subset) - tier_names)
+            if inactive:
+                print(colorize(
+                    f"  inactive (not in this tier): {', '.join(inactive)} — "
+                    f"/agentic full or /agentic plan run may activate them",
+                    'warning'), file=sys.stderr)
+        if not effective_names:
+            print(colorize(
+                "  WARNING: the tool surface is empty — no tool calls are "
+                "possible this session. /agentic tools reset restores the tier.",
+                'error'), file=sys.stderr)
+        print(colorize(
+            "  restricts which tools, not which commands nor which paths "
+            "(see the shell gate and /agentic acl).", 'muted'), file=sys.stderr)
+        print(colorize(
+            "  /agentic tools <name[,name]> | +name | -name | none | reset "
+            "(presets: read, git)", 'muted'), file=sys.stderr)
+        print(file=sys.stderr)
+
+    def _handle_agentic_tools(self, parts: list) -> bool:
+        """Handle /agentic tools [<list>|+name|-name|none|reset]."""
+        ctx = self.ctx
+        subset = getattr(ctx, "agentic_tool_subset", None)
+        tier = agentic_active_tools(ctx)
+        tier_names = set(AGENTIC_TOOL_DEFS) if tier is None else set(tier)
+        arg = " ".join(parts[2:]) if len(parts) > 2 else ""
+        if not arg or arg in ("list", "status"):
+            self._print_agentic_tools()
+            return False
+        if arg == "none":
+            ctx.agentic_tool_subset = set()
+            print(colorize("[Tool subset] none — no agentic tool is available "
+                           "this session.", 'warning'), file=sys.stderr)
+            self._print_agentic_tools()
+            return False
+        if arg == "reset":
+            ctx.agentic_tool_subset = None
+            print(colorize("[Tool subset] reset — back to the preset/tier "
+                           "surface.", 'info'), file=sys.stderr)
+            self._print_agentic_tools()
+            return False
+        if arg in self._AGENTIC_TOOL_PRESETS:
+            ctx.agentic_tool_subset = set(self._AGENTIC_TOOL_PRESETS[arg])
+            print(colorize(f"[Tool subset] preset '{arg}' — this is a list, "
+                           f"not a mode; a later preset still intersects it.",
+                           'info'), file=sys.stderr)
+            self._print_agentic_tools()
+            return False
+        tokens = [t.strip() for t in arg.split(",") if t.strip()]
+        if len(tokens) == 1 and tokens[0][:1] in "+-":
+            sign, name = tokens[0][0], tokens[0][1:]
+            if not name:
+                print(colorize("[Usage: /agentic tools +<name> | -<name>]",
+                               'warning'), file=sys.stderr)
+                return False
+            if not self._agentic_tool_name_ok(name):
+                return False
+            if sign == "+":
+                if subset is None:
+                    print(colorize(
+                        f"[Tool subset] {name} is already available (tier: "
+                        f"{'all' if tier is None else 'current'}) — use "
+                        f"/agentic tools none then +{name} to start a "
+                        f"restricted list.", 'info'), file=sys.stderr)
+                    return False
+                ctx.agentic_tool_subset = set(subset) | {name}
+            else:
+                if subset is None:
+                    ctx.agentic_tool_subset = set(tier_names) - {name}
+                    print(colorize(
+                        f"[Tool subset] materialized from the tier minus {name}; "
+                        f"tools connected later (MCP) are not in the list.",
+                        'info'), file=sys.stderr)
+                else:
+                    ctx.agentic_tool_subset = set(subset) - {name}
+            self._print_agentic_tools()
+            return False
+        names = set()
+        for name in tokens:
+            if not self._agentic_tool_name_ok(name):
+                return False
+            names.add(name)
+        ctx.agentic_tool_subset = names
+        self._print_agentic_tools()
+        return False
 
     def _agentic_toggle_on_off(self, target: bool) -> bool:
         """Turn agentic mode explicitly on or off, swapping the system prompt."""
@@ -25517,7 +25705,7 @@ class ChatLoop:
         c = self.ctx
         print(colorize("\n[Agentic Settings - Use /agentic <option> [value]]", 'info'), file=sys.stderr)
         print("  Subcommands: on, off, full, auto, preset [read|exec|work|trusted], plan [on|off|run], sandbox [host|container|bwrap|status|reset|net shared|none|reset],", file=sys.stderr)
-        print("               verbose, thinking, trace, log, lazytool, iterations <N>, timeout <N>, heartbeattokens <N>,", file=sys.stderr)
+        print("               policy, tools [<list>|+n|-n|none|reset], verbose, thinking, trace, log, lazytool, iterations <N>, timeout <N>, heartbeattokens <N>,", file=sys.stderr)
         print("               compactthreshold <v>, logretention <days>, acl, scratch [path|list|clear], files [list|reset], status", file=sys.stderr)
         print(file=sys.stderr)
 
@@ -25525,6 +25713,8 @@ class ChatLoop:
         settings = [
             ("agentic",    "Master toggle",             str(c.agentic_mode).lower()),
             ("preset",     "Stance: intent + surface + approval + mounts", resolve_preset(c).name),
+            ("tools",      "Session tool subset (all = tier; see /agentic tools)",
+             "all" if getattr(c, "agentic_tool_subset", None) is None else "custom"),
             ("plan",       "Read-only planner (on=query/CWD-confined, run=+shell)", plan_value),
             ("auto",       "Skip destructive tool confirmation", str(c.auto_confirm).lower()),
             ("sandbox",    f"Run tool subprocesses in {self.executor.describe()}", self.executor.mode),
@@ -25998,6 +26188,12 @@ class ChatLoop:
 
     def run_agentic_query(self, full_input: str) -> None:
         """ReAct loop: query model, parse tool calls, execute tools, stream final answer."""
+        surface = agentic_effective_names(self.ctx)
+        if surface is not None and not surface:
+            print(colorize(
+                "[Agentic] tool surface is empty — no tool calls are possible "
+                "this query; /agentic tools reset widens it.", 'warning'),
+                file=sys.stderr)
         self._agentic_runner().run(self, full_input)
 
     def run_handle_spawnshell(self, full_input: str) -> Optional[bool]:

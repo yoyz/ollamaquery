@@ -156,7 +156,7 @@ folded. Tab completion on `/resume ` offers every saved slug and id. The newest
 | `git_inspect`              | Read-only git inspection: `status`, `diff`, `diff_staged`, `diff_head`, `log` (any ref, path-scoped, renames followed), `show`, `blame -L` (fixed argv, no shell) |
 | `path_policy`              | Read-only: the session path map (allowed / needs confirmation / forbidden), or the verdict for one path — no filesystem access, no prompt |
 
-Subcommands: `/agentic on|off|full`, `preset [read|exec|work|trusted]`, `plan [on|off|run]`, `sandbox [host|container|bwrap|status|net shared|none|reset]`, `policy`, `auto`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `files [list|reset]`, `iterations <N>`, `timeout <N>`, `logretention <days>`, `status`.
+Subcommands: `/agentic on|off|full`, `preset [read|exec|work|trusted]`, `plan [on|off|run]`, `sandbox [host|container|bwrap|status|net shared|none|reset]`, `policy`, `tools [<list>|+n|-n|none|reset]`, `auto`, `verbose`, `thinking`, `trace`, `log`, `lazytool`, `acl`, `scratch [path|list|clear]`, `files [list|reset]`, `iterations <N>`, `timeout <N>`, `logretention <days>`, `status`.
 
 The model is steered to use the **dedicated file tools** (`read_file`, `write_file`,
 `edit_file`, `grep`, `glob`, `list_directory`) instead of shell equivalents (`cat`,
@@ -237,6 +237,17 @@ never prompts, never logs and never touches the disk; `ask` means "the gate
 would ask", and `unavailable` names a tool the active preset removes. Under a
 sandbox it adds the two honest footnotes: file tools run in the harness, and
 shell writes outside the mounts fail.
+
+`/agentic tools` restricts **which** tools are visible, without changing the
+preset: `/agentic tools read_file,glob`, `+fetch_url`, `-write_file`, `none`,
+`reset`. The subset is intersected with the active tier/preset — it can only
+reduce, never reopen a tool the preset hides — works in and out of plan mode,
+survives `/agentic off`, and is session-only. Unknown names are rejected with
+suggestions; an MCP name (`prefix__tool`) may be queued before its server
+connects. `read` and `git` are list presets (`read_file,glob,grep,
+list_directory` / `git_inspect,read_file`). An empty surface is warned twice
+(at the command and at the next query). It restricts tools, not commands or
+paths: the shell gate and `/agentic acl` still own those.
 
 
 Each step's stream is also checked for **completeness**: a turn cut mid-generation

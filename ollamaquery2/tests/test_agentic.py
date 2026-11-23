@@ -6277,8 +6277,8 @@ class TestAgenticStatusDisplay(unittest.TestCase):
     """`/agentic` status table: every setting listed, value brackets aligned."""
 
     SETTINGS = (
-        "agentic", "preset", "plan", "auto", "sandbox", "verbose", "thinking",
-        "trace", "log", "lazytool", "iterations", "timeout",
+        "agentic", "preset", "tools", "plan", "auto", "sandbox", "verbose",
+        "thinking", "trace", "log", "lazytool", "iterations", "timeout",
         "heartbeattokens", "compactthreshold", "logretention",
     )
 
