@@ -207,9 +207,17 @@ Key faithful details:
     `zstd` operands, `rsync` destination, `pip --target`/`--prefix`, `cargo
     --target-dir` (default `target`), `go build -o`, and `make -C` (default
     cwd). They resolve against the effective cwd (H1), so `cd /var/lib && npm
-    install` is denied and the project form stays allowed. The same traversal
-    produces `_shell_access_plan` (read/write/unknown events) for A1's session
-    inventory. **Residual, host-mode by design:** a command that executes
+    install` is denied and the project form stays allowed. GNU tar's old
+    option word (`tar xPf`, `tar xCf /var/lib a.tar`) is normalized to the
+    dashed form before grading (`-P` is the filesystem root; `-x` defaults to
+    the cwd), so the no-dash syntax cannot bypass the `-C`/`-P` checks.
+    **User installs ask:** `pip install --user` (and `pip3`) grades
+    `~/.local`, `cargo install`/`uninstall` grades `--root` or `~/.cargo`, and
+    `go install` grades `~/go/bin`; `~/go`/`~/bin` are new `home_tools` ask
+    rules that yield to the session CWD (a project under `~/go` keeps access).
+    `cargo install --list` and the project forms stay reads/allowed. The same
+    traversal produces `_shell_access_plan` (read/write/unknown events) for
+    A1's session inventory. **Residual, host-mode by design:** a command that executes
     arbitrary code (`python script.py`, `node script.js`, `make` recipes,
     `npm run`, cargo build scripts, `pip install` without `--target`) writes
     wherever its code decides; no static table can see that. Those need
@@ -218,7 +226,7 @@ Key faithful details:
     scratch, and the scanner resolves `$TMPDIR` with a per-command context (the
     process value for `!`); the scratch is wiped at exit.
     `tests/test_acl.py::TestShellWriteTargets` (7),
-    `TestShellCommonWriters` (7), `TestShellTmpdir` (6),
+    `TestShellCommonWriters` (11), `TestShellTmpdir` (6),
     `TestExecutor.test_host_command_gets_tmpdir_scratch`.
 *   **`-c` payloads are gated too (M2, closed 2026-11-19; extended 2026-11-23).**
     The guard used to read only the first-level tokens, so `bash -c "rm -rf ~"`

@@ -1341,6 +1341,11 @@ class TestShellCommonWriters(unittest.TestCase):
             (("tar", ["-xf", "a.tar", "-C", "/var/lib/x"]), ["/var/lib/x"]),
             (("tar", ["-xPf", "a.tar"]), ["/"]),
             (("tar", ["-cf", "out.tar", "."]), ["out.tar"]),
+            # GNU tar old option word (no leading dash).
+            (("tar", ["xPf", "a.tar"]), ["/"]),
+            (("tar", ["xCf", "/var/lib/x", "a.tar"]), ["/var/lib/x"]),
+            (("tar", ["cvf", "out.tar", "."]), ["out.tar"]),
+            (("tar", ["tvf", "a.tar"]), []),
             (("awk", ["-i", "inplace", "{print}", "f"]), ["f"]),
             (("perl", ["-pi", "-e", "s/x/y/", "f"]), ["f"]),
             (("patch", ["-d", "/var/lib", "-i", "f"]), ["/var/lib"]),
@@ -1356,6 +1361,8 @@ class TestShellCommonWriters(unittest.TestCase):
              ["/var/lib"]),
             (("cargo", ["build"]), ["target"]),
             (("go", ["build", "-o", "/var/lib/x", "."]), ["/var/lib/x"]),
+            (("go", ["build", "."]), ["."]),
+            (("pip", ["download", "-d", "/var/lib/x", "pkg"]), ["/var/lib/x"]),
             (("make", ["-C", "/var/lib"]), ["/var/lib"]),
             (("git", ["clone", "https://x", "/var/lib/x"]),
              ["/var/lib/x"]),
@@ -1383,6 +1390,8 @@ class TestShellCommonWriters(unittest.TestCase):
                     "git -C /var/lib/repo stash",
                     "tar -xf a.tar -C /var/lib/tarout",
                     "tar -xP -f a.tar",
+                    "tar xPf a.tar",
+                    "tar xCf /var/lib/tarout a.tar",
                     "sort -o /var/lib/sorted.txt input",
                     "awk -i inplace '{print}' /var/lib/awkfile",
                     "patch -d /var/lib -p0 -i f.patch",
@@ -1393,6 +1402,7 @@ class TestShellCommonWriters(unittest.TestCase):
                     "gzip /var/lib/file",
                     "rsync -a src/ /var/lib/rsync/",
                     "pip install --target /var/lib/pip pkg",
+                    "pip download -d /var/lib/pip pkg",
                     "cargo build --target-dir /var/lib/cargo",
                     "go build -o /var/lib/go/bin .",
                     "make -C /var/lib"):
@@ -1406,6 +1416,8 @@ class TestShellCommonWriters(unittest.TestCase):
                     "git checkout main",
                     "tar -xf a.tar",
                     "tar -cf out.tar .",
+                    "tar xf a.tar",
+                    "tar cvf out.tar .",
                     "sort -o out.txt input",
                     "awk -i inplace '{print}' f",
                     "patch -p1 -i f.patch",
@@ -1414,8 +1426,10 @@ class TestShellCommonWriters(unittest.TestCase):
                     "gzip f",
                     "rsync -a src/ dest/",
                     "pip install --target ./vendor pkg",
+                    "pip download -d ./dist pkg",
                     "cargo build",
                     "go build -o bin/app .",
+                    "go build .",
                     "make",
                     "perl -pi -e 's/x/y/' f"):
             with self.subTest(cmd=cmd):
@@ -1425,6 +1439,7 @@ class TestShellCommonWriters(unittest.TestCase):
         # `/var/lib` exists, so `cd` succeeds and the write is outside.
         self.assertIsNotNone(self._scan("cd /var/lib && npm install"))
         self.assertIsNotNone(self._scan("cd /var/lib && make"))
+        self.assertIsNotNone(self._scan("cd /var/lib && go build ."))
         # A nonexistent target makes the `cd` fail, as bash does.
         self.assertIsNone(self._scan("cd /nonexistent-aq-dir && npm install"))
 
@@ -1437,6 +1452,51 @@ class TestShellCommonWriters(unittest.TestCase):
                 res = m.check_shell_approval(cmd, self.ctx)
                 self.assertFalse(res["approved"], cmd)
                 self.assertEqual(res["effect"], "deny", cmd)
+
+    def test_user_installs_are_graded(self):
+        # `pip --user` and `cargo install` land in home dotfiles; `go install`
+        # lands in ~/go, covered by the home_tools ask rule. All three must
+        # ask (non-TTY denies), not silently allow.
+        with patch.object(m.PathAcl, "prompt", return_value=False):
+            for cmd in ("pip install --user pkg",
+                        "cargo install ripgrep",
+                        "go install example.com/cmd@latest"):
+                with self.subTest(cmd=cmd):
+                    res = self._scan(cmd)
+                    self.assertIsNotNone(res, cmd)
+                    self.assertFalse(res["approved"], cmd)
+
+    def test_user_install_targets(self):
+        home = os.path.realpath(os.path.expanduser("~"))
+        for cmd, target in (
+                ("pip install --user pkg", os.path.join(home, ".local")),
+                ("cargo install ripgrep", os.path.join(home, ".cargo")),
+                ("go install example.com/cmd@latest",
+                 os.path.join(home, "go", "bin"))):
+            with self.subTest(cmd=cmd):
+                plan = m._shell_access_plan(cmd)
+                self.assertIn((target, "write"),
+                              {(e["real"], e["op"]) for e in plan}, cmd)
+
+    def test_user_install_project_forms_stay_allowed(self):
+        self.assertIsNone(self._scan(
+            "pip install --user --target ./vendor pkg"))
+        self.assertIsNone(self._scan("cargo install --list"))
+        self.assertIsNone(self._scan("go build -o bin/app ."))
+        self.assertIsNone(self._scan("cargo build"))
+
+    def test_home_tool_dir_asks_but_yields_to_cwd(self):
+        acl = self.ctx.path_acl
+        go = os.path.join(os.path.expanduser("~"), "go")
+        self.assertEqual(
+            acl.evaluate("write", os.path.realpath(os.path.join(go, "bin", "x")))[0],
+            "ask")
+        with patch("os.getcwd", return_value=os.path.join(go, "src", "proj")):
+            self.assertEqual(
+                acl.evaluate(
+                    "write",
+                    os.path.realpath(os.path.join(go, "src", "proj", "out")))[0],
+                "allow")
 
     def test_read_only_forms_are_not_writes(self):
         for cmd in ("tar -tf out.tar",

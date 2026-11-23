@@ -6892,7 +6892,7 @@ _SHELL_WRITE_HEADS = (_SHELL_WRITE_ALL | _SHELL_WRITE_LAST
                       | {"sed", "dd", "tar", "find", "git", "curl", "wget",
                          "sort", "awk", "perl", "patch", "npm", "pnpm",
                          "yarn", "unzip", "gzip", "bzip2", "xz", "zstd",
-                         "rsync", "pip", "cargo", "go", "make"})
+                         "rsync", "pip", "pip3", "cargo", "go", "make"})
 _SHELL_READ_VERBS = frozenset({
     "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg",
     "wc", "stat", "file", "sha1sum", "sha224sum", "sha256sum", "sha384sum",
@@ -7000,8 +7000,39 @@ def _shell_grep_files(args: list) -> list:
     return operands
 
 
+# GNU tar's old option word (`tar xCf dir archive`) is a cluster of letters
+# with no dash; options that take a value consume the following argv elements,
+# not the rest of the word (unlike the dashed `-xCf`, where `C` takes `f`).
+_SHELL_TAR_VALUE_LETTERS = frozenset("bCfFgHIKLNTVX")
+
+
+def _shell_tar_normalize_old_style(args: list) -> list:
+    """Expand GNU tar's old option word into equivalent dashed arguments.
+
+    `tar xCf dir archive` becomes `-x -C dir -f archive`, so the regular short
+    option parser sees the same values. A first word that starts with `-` or is
+    not letters-only is left untouched.
+    """
+    if not args:
+        return args
+    first = args[0].strip("'\"")
+    if not first or first.startswith("-") or not re.fullmatch(r"[A-Za-z]+", first):
+        return args
+    out = []
+    pos = 1
+    for ch in first:
+        out.append("-" + ch)
+        if ch in _SHELL_TAR_VALUE_LETTERS:
+            if pos < len(args):
+                out.append(args[pos])
+                pos += 1
+    out.extend(args[pos:])
+    return out
+
+
 def _shell_tar_write_targets(args: list) -> list:
     """Return the archive/extraction target of a `tar` command."""
+    args = _shell_tar_normalize_old_style(args)
     create = False
     extract = False
     absolute = False
@@ -7011,7 +7042,7 @@ def _shell_tar_write_targets(args: list) -> list:
     while i < len(args):
         a = args[i].strip("'\"")
         if a in ("--create", "--append", "--update", "--concatenate",
-                 "--catenate"):
+                 "--catenate", "--delete"):
             create = True
             i += 1
             continue
@@ -7478,28 +7509,46 @@ def _shell_write_targets(head: str, args: list) -> list:
         return _shell_compress_write_targets(args)
     if head == "rsync":
         return _shell_rsync_write_targets(args)
-    if head == "pip":
+    if head in ("pip", "pip3"):
         target = _shell_option_value(args, ("-t", "--target", "--prefix",
-                                            "--root"))
-        return [target] if target else []
-    if head == "cargo":
-        target = _shell_option_value(args, ("--target-dir",))
+                                            "--root", "-d", "--dest",
+                                            "-w", "--wheel-dir"))
         if target:
             return [target]
         operands = _shell_operands(args)
         sub = operands[0].strip("'\"") if operands else ""
+        if (sub == "install"
+                and any(a.strip("'\"") == "--user" for a in args)):
+            return ["~/.local"]
+        return []
+    if head == "cargo":
+        target = _shell_option_value(args, ("--target-dir",))
+        if target:
+            return [target]
+        operands = _shell_operands(args, frozenset({
+            "--color", "-C", "--manifest-path", "--target", "--jobs", "-j",
+            "--features", "-F", "--profile", "--config", "-Z", "--root",
+        }))
+        sub = operands[0].strip("'\"") if operands else ""
+        if sub in ("install", "uninstall"):
+            if any(a.strip("'\"") == "--list" for a in args):
+                return []
+            root = _shell_option_value(args, ("--root",))
+            return [root] if root else ["~/.cargo"]
         if sub in ("build", "b", "check", "c", "run", "r", "test", "t",
-                   "bench", "doc", "clean", "update", "fetch", "add",
-                   "remove", "rm"):
+                   "bench", "doc", "clean"):
             return ["target"]
+        if sub in ("update", "fetch", "add", "remove", "rm"):
+            return ["."]
         return []
     if head == "go":
         operands = _shell_operands(args)
         sub = operands[0].strip("'\"") if operands else ""
         if sub == "build":
             target = _shell_option_value(args, ("-o",))
-            if target:
-                return [target]
+            return [target] if target else ["."]
+        if sub == "install":
+            return ["~/go/bin"]
         return []
     if head == "make":
         if any(a.strip("'\"") in ("-n", "--just-print", "--dry-run",
@@ -7772,7 +7821,7 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
     if deny_info:
         _, rp, rule, _op = deny_info
         acl.log_event("run_command", rp, "deny", rule)
-        shown = (rule["path"] if rule.get("kind") in ("prefix", "temp_root", "default")
+        shown = (rule["path"] if rule.get("kind") in ("prefix", "temp_root", "default", "home_tools")
                  else "home dotfile")
         redirect = ""
         if rule.get("kind") == "temp_root":
@@ -7786,7 +7835,7 @@ def _shell_acl_scan(command: str, ctx: Optional['CommandContext'],
         granted = acl.prompt(op, rp, rule, tool="run_command", context=command)
         acl.log_event("run_command", rp, "allow" if granted else "deny", rule)
         if not granted:
-            shown = (rule["path"] if rule.get("kind") in ("prefix", "temp_root", "default")
+            shown = (rule["path"] if rule.get("kind") in ("prefix", "temp_root", "default", "home_tools")
                      else "home dotfile")
             who = "denied by user" if sys.stdin.isatty() else "denied (no TTY to ask)"
             return {"approved": False,
@@ -9780,7 +9829,8 @@ class PathAcl:
 
     Default policy (steering-first): CWD + $HOME reads allowed; the shared temp
     area is denied except this session's scratch dir (`/tmp/ollamaquery/pid-N`,
-    read+write, wiped at exit); home dotfiles, /proc, /sys, /etc are `ask`
+    read+write, wiped at exit); home dotfiles, user tool dirs (`~/go`, `~/bin`,
+    for `go install` and user scripts), /proc, /sys, /etc are `ask`
     (reminder prompt); a read anywhere else is `ask` (confirmed once, then a
     session allow rule); a write anywhere else is denied. Reads are deliberately
     `ask` rather than `deny`: the gate is a consent + audit layer, not a
@@ -9818,6 +9868,15 @@ class PathAcl:
         for op in ("read", "write"):
             self.rules.append({"op": op, "action": "ask", "kind": "home_dotfile",
                                "path": home, "source": "default"})
+        # User tool install roots (`go install`, scripts in ~/bin) are user
+        # writes, not project ones: ask instead of allowing silently. They
+        # yield to the session CWD, so a project that lives under ~/go or
+        # ~/bin is not locked out.
+        for root in ("~/go", "~/bin"):
+            self.rules.append({"op": "write", "action": "ask",
+                               "kind": "home_tools",
+                               "path": os.path.realpath(os.path.expanduser(root)),
+                               "source": "default"})
 
     def add(self, op: str, action: str, path: str, source: str = "session") -> None:
         """Add/replace a prefix rule for `path` (read|write|any).
@@ -9890,6 +9949,12 @@ class PathAcl:
                 if not _is_home_dotfile(realpath):
                     continue
                 key = (1 if rule["source"] == "session" else 0, len(rule["path"]) + 1)
+            elif rule.get("kind") == "home_tools":
+                if not _path_is_within(realpath, rule["path"]):
+                    continue
+                if _path_is_within(realpath, cwd_real):
+                    continue  # a project under ~/go or ~/bin keeps CWD access
+                key = (1 if rule["source"] == "session" else 0, len(rule["path"]))
             else:
                 continue
             if best_key is None or key > best_key:
@@ -9975,8 +10040,8 @@ class PathAcl:
             f"allowed : {cwd} (cwd, read+write); {home} (read, when asked as ~/... "
             f"or an absolute path); {_scratch_root()} (session scratch, read+write, "
             "wiped at exit)",
-            "ask     : $HOME dotfiles, /proc, /sys, /etc — one confirmation each; if the user "
-            "declines, stop and say what you needed",
+            "ask     : $HOME dotfiles, user tool dirs (~/go, ~/bin), /proc, /sys, /etc — "
+            "one confirmation each; if the user declines, stop and say what you needed",
             f"denied  : writes outside the allowed roots; the shared temp area {TEMP_ROOT} "
             "(everywhere except the scratch dir); /proc/*/mem, /proc/*/environ, "
             "/proc/*/kcore, /proc/*/fd/*",
@@ -10054,6 +10119,9 @@ class PathAcl:
             print(colorize(f"  rule: {rule['action']} {rule['path']}", 'muted'), file=sys.stderr)
         elif rule and rule.get("kind") == "home_dotfile":
             print(colorize("  rule: ask home dotfile", 'muted'), file=sys.stderr)
+        elif rule and rule.get("kind") == "home_tools":
+            print(colorize(f"  rule: ask user tool directory {_shorten_home(rule['path'])}",
+                           'muted'), file=sys.stderr)
         else:
             print(colorize("  rule: outside the project and $HOME", 'muted'), file=sys.stderr)
         try:

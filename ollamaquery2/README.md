@@ -590,10 +590,15 @@ Trust boundaries at a glance; the sections above give the details.
   `patch -d`, `npm`/`yarn`/`pnpm --prefix`, `unzip -d`, `gzip`, `rsync`,
   `pip --target`, `cargo --target-dir`, `go -o`, `make -C`), so
   `git clone … /var/lib/x` or `cd /var/lib && npm install` hit the same write
-  deny as `cp f /var/lib/x`. **Arbitrary script/build execution** (`python
-  script.py`, `node script.js`, `make` recipes, `npm run`, cargo build
-  scripts) can still write wherever its code decides — use bwrap (`work`/
-  `exec`) or the explicit `trusted` stance; see `TODO_security.md` H6. The
+  deny as `cp f /var/lib/x`. GNU tar's old no-dash options (`tar xPf`,
+  `tar xCf /var/lib …`) are normalized before grading. **User installs ask:**
+  `pip install --user` (`~/.local`), `cargo install` (`~/.cargo`/`--root`) and
+  `go install` (`~/go/bin`, via the `~/go` and `~/bin` `home_tools` rules,
+  which yield to the session CWD). **Arbitrary script/build execution**
+  (`python script.py`, `node script.js`, `make` recipes, `npm run`, cargo
+  build scripts) can still write wherever its code decides — use bwrap
+  (`work`/`exec`) or the explicit `trusted` stance; see `TODO_security.md`
+  H6. The
   `s` and `a` approval answers are **session-scoped**; nothing is written to
   disk. Broader allow rules (`git -c`, `tar --checkpoint-action`, upload
   `curl`) remain allow-listed, and a `find -exec` with a harmless payload still
