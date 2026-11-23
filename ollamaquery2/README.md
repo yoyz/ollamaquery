@@ -324,17 +324,22 @@ Defaults apply per session; `reset` restores them. Longest path prefix wins,
 and session rules override defaults.
 
 `/agentic files` is the session **access inventory**: distinct read/write/
-unknown paths and the commands that produced them, each with a counter and a
-status (`ok`/`error`/`denied`). It is fed by the executed tools, not by the
-shell gate, so it still reports in `work`/`exec` (bwrap) and with
-`/agentic log off`; the same per-call summary is stored in the JSONL
+unknown paths and the commands/tool calls that produced them, each with a
+counter and a status (`ok`/`error`/`denied`). It is fed by the executed
+tools, not by the shell gate, so it still reports in `work`/`exec` (bwrap)
+and with `/agentic log off`; the same per-call summary is stored in the JSONL
 `type=result` entry as `access`. A refused command is listed as `denied` and
 adds no write — only H0 write targets, write redirections and successful
-file-writing tools count as writes. Container commands list no paths because
-`/workspace/…` is not a host path. This is an **observation**, not a sandbox:
-`run_python` code, build scripts and paths hidden in variables stay `unknown`.
-The inventory is also how read exceptions are meant to be chosen: measure what
-was actually used before re-allowing a form.
+file-writing tools count as writes; a failed or refused **file tool** is
+still listed as a tool call (it never disappears). **bwrap observations are
+tagged `[bwrap]`**: they are paths as seen inside the sandbox, never host
+paths (its `/tmp` is a tmpfs and `~` is a private sandbox HOME; `~/x` is
+shown raw rather than as the host home). Container commands list no paths at
+all because `/workspace/…` is not a host path. Opaque calls (`run_python`
+inline code, MCP tools) are marked `[writes unknown]`. This is an
+**observation**, not a sandbox: build scripts and paths hidden in variables
+also stay invisible. The inventory is how read exceptions are meant to be
+chosen: measure what was actually used before re-allowing a form.
 
 **Not covered by the Path ACL** — these rely on the older CWD-containment
 check plus the destructive-tool / shell approval gates instead:

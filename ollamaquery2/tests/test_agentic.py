@@ -4857,7 +4857,7 @@ class TestSessionAccessInventory(unittest.TestCase):
             executor_mode=mode, cwd=os.getcwd(), tmpdir=self.scratch)
 
     def _rows(self, op):
-        return [row for (row_op, _path, _status), row in
+        return [row for (row_op, _path, _status, _sandbox), row in
                 self.ctx.session_access.paths.items() if row_op == op]
 
     def test_three_writes_to_one_file_are_one_row(self):
@@ -4939,16 +4939,78 @@ class TestSessionAccessInventory(unittest.TestCase):
         self.assertEqual(access["sandbox"], "bwrap")
         self.assertTrue(any(row["op"] == "write" for row in access["paths"]))
         self.assertTrue(self._rows("write"))
+        text = "\n".join(self.ctx.session_access.status_lines())
+        self.assertIn("[bwrap]", text)
 
-    def test_run_python_is_unknown_not_write(self):
-        """Inline code decides its own writes: unknown, never `write`."""
+    def test_bwrap_paths_are_not_host_paths(self):
+        """`/tmp/a` inside bwrap is the sandbox tmpfs, not the host's /tmp/a."""
+        access = self._record_command("echo x > /tmp/a", mode="bwrap")
+        write = self._rows("write")[0]
+        self.assertEqual(write["sandbox"], "bwrap")
+        self.assertEqual(access["paths"][0]["sandbox"], "bwrap")
+        text = "\n".join(self.ctx.session_access.status_lines())
+        self.assertIn("[bwrap] /tmp/a", text)
+
+    def test_bwrap_home_is_shown_raw(self):
+        """bwrap HOME is private; the host `~` expansion must not be printed."""
+        self._record_command("echo x > ~/a", mode="bwrap")
+        text = "\n".join(self.ctx.session_access.status_lines())
+        self.assertIn("[bwrap] ~/a", text)
+        self.assertNotIn(os.path.realpath(os.path.expanduser("~/a")), text)
+
+    def test_run_python_is_opaque_not_unknown_path(self):
+        """Inline code decides its own writes; the call says writes unknown."""
         access = self.ctx.session_access.record_tool(
             "run_python", {"code": "open('x', 'w').write('y')"},
             {"success": True, "output": "", "error": None},
             cwd=os.getcwd(), tmpdir=self.scratch)
         self.assertEqual(access["command"], "run_python (inline code)")
+        self.assertTrue(access["opaque"])
         self.assertNotIn("paths", access)
         self.assertEqual(self.ctx.session_access.paths, {})
+        text = "\n".join(self.ctx.session_access.status_lines())
+        self.assertIn("run_python (inline code) [writes unknown]", text)
+
+    def test_failed_write_file_leaves_a_trace(self):
+        """A refused file tool must not disappear from the audit."""
+        registry = q.ToolRegistry(self.ctx)
+        result = registry.execute(
+            "write_file", {"file_path": "/etc/a1-never-written", "content": "x"})
+        self.assertFalse(result["success"])
+        access = result.pop("_access", None)
+        self.assertEqual(access["status"], "denied")
+        self.assertEqual(access["command"], "write_file /etc/a1-never-written")
+        self.assertEqual(self.ctx.session_access.paths, {})
+        self.assertIn("write_file /etc/a1-never-written",
+                      "\n".join(self.ctx.session_access.status_lines()))
+
+    def test_failed_read_file_leaves_a_trace(self):
+        """A missing file is a call with status error, not a silent no-op."""
+        registry = q.ToolRegistry(self.ctx)
+        result = registry.execute(
+            "read_file", {"file_path": "definitely-missing-a1.txt"})
+        self.assertFalse(result["success"])
+        access = result.pop("_access", None)
+        self.assertEqual(access["status"], "error")
+        self.assertEqual(access["command"], "read_file definitely-missing-a1.txt")
+        self.assertEqual(self.ctx.session_access.paths, {})
+
+    def test_glob_records_its_search(self):
+        """`glob` reads a tree; the report names the search root and the pattern."""
+        registry = q.ToolRegistry(self.ctx)
+        with tempfile.TemporaryDirectory() as td:
+            old = os.getcwd()
+            os.chdir(td)
+            try:
+                open("a.txt", "w").close()
+                result = registry.execute("glob", {"pattern": "**/*.txt"})
+                self.assertTrue(result["success"])
+                access = result.pop("_access", None)
+                self.assertEqual(access["command"], "glob **/*.txt")
+                reads = [row["path"] for row in self._rows("read")]
+                self.assertIn(os.path.realpath(td), reads)
+            finally:
+                os.chdir(old)
 
     def test_report_lists_paths_and_commands(self):
         """The rendered report separates writes, reads and commands."""
@@ -4956,7 +5018,7 @@ class TestSessionAccessInventory(unittest.TestCase):
         text = "\n".join(self.ctx.session_access.status_lines())
         self.assertIn("Writes (1)", text)
         self.assertIn("Reads (1)", text)
-        self.assertIn("Commands (1)", text)
+        self.assertIn("Commands / tool calls (1)", text)
         self.assertIn("×1", text)
 
     def test_empty_and_logging_off_message_and_memory_source(self):

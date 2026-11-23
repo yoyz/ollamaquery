@@ -523,22 +523,31 @@ not from the gate, so commands are still observed when the gate is skipped
 directly; `run_python` (inline code), MCP and other opaque tools are
 `unknown`.
 
-| Observation                   | Recorded as                   | Why                               |
-| ----------------------------- | ----------------------------- | --------------------------------- |
-| `cp a b`, `sed -i … f`        | read `a`/`f`, write `b`/`f`   | H0 table                          |
-| `cd / && echo x > rel`        | write `/rel`                  | H1 effective cwd                  |
-| `echo x > out.txt`            | write `out.txt`               | redirection target                |
-| `python3 -c "open('/x','w')"` | unknown `/x`                  | code decides                      |
-| refused command               | command `denied`, **no path** | never claim a write               |
-| container command             | command only (`[container]`)  | `/workspace/…` is not a host path |
-| successful `write_file` ×3    | one write row, `×3`           | dedupe by (op, path, status)      |
+| Observation                   | Recorded as                  | Why                               |
+| ----------------------------- | ---------------------------- | --------------------------------- |
+| `cp a b`, `sed -i … f`        | read `a`/`f`, write `b`/`f`  | H0 table                          |
+| `cd / && echo x > rel`        | write `/rel`                 | H1 effective cwd                  |
+| `echo x > out.txt`            | write `out.txt`              | redirection target                |
+| `python3 -c "open('/x','w')"` | unknown `/x`                 | code decides                      |
+| bwrap `echo x > /tmp/a`       | `[bwrap] /tmp/a`             | sandbox tmpfs, not host           |
+| bwrap `echo x > ~/a`          | `[bwrap] ~/a` (raw)          | private sandbox HOME              |
+| container command             | command only (`[container]`) | `/workspace/…` is not a host path |
+| `glob src/**/*.py`            | call + read of `src`         | search root is visible            |
+| `run_python` inline           | call `[writes unknown]`      | opaque code                       |
+| failed `write_file`           | tool call, status, no path   | refusal never claims a write      |
+| successful `write_file` ×3    | one write row, `×3`          | dedupe by (op, path, status)      |
 
 `/agentic files` reads only the in-memory inventory, so it works with
 `/agentic log off`; `/agentic files reset` clears it. The same per-call
-summary is attached to the JSONL `type=result` entry as `access`. Limits are
-explicit: build scripts (`make`, `npm run`), `run_python` writes, paths hidden
-in variables and container paths are `unknown`/not listed — the inventory
-says "observed in the tool call", not "modified".
+summary is attached to the JSONL `type=result` entry as `access`. Every call
+leaves a trace: a failed or refused file tool appears as a tool call with its
+status even though no path is claimed, `glob` names its search root, and
+`run_python`/MCP are marked `[writes unknown]`. bwrap rows are tagged
+`[bwrap]` and are never presented as host paths (the sandbox `/tmp` is a
+tmpfs; `~` is a private HOME, so it is shown raw); container commands list no
+paths. Limits are explicit: build scripts (`make`, `npm run`) and paths
+hidden in variables remain invisible — the inventory says "observed in the
+tool call", not "modified".
 
 ---
 

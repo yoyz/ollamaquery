@@ -2137,6 +2137,56 @@ def _session_access_canonical_args(tool_name: str, args: dict) -> dict:
     return canonical
 
 
+def _session_access_tool_label(tool_name: str, args: dict) -> str:
+    """One-line label for a tool call that produced no path row.
+
+    Used for failures and for tools whose input is not a concrete path
+    (`glob`, `apply_patch`), so the audit never loses a call just because it
+    was refused, errored, or touched no visible file.
+    """
+    if tool_name in ("read_file", "write_file", "edit_file"):
+        return f"{tool_name} {args.get('file_path') or '?'}"
+    if tool_name == "list_directory":
+        return f"list_directory {args.get('path') or '.'}"
+    if tool_name == "grep":
+        return f"grep {args.get('pattern') or '?'} {args.get('path') or '.'}"
+    if tool_name == "diff":
+        return f"diff {args.get('file1') or '?'} {args.get('file2') or '?'}"
+    if tool_name == "glob":
+        return f"glob {args.get('pattern') or '?'}"
+    if tool_name == "patch":
+        return f"patch {args.get('target') or '(diff)'}"
+    if tool_name == "apply_patch":
+        return "apply_patch"
+    return tool_name
+
+
+def _session_access_glob_base(pattern: object) -> str:
+    """Return the static directory a glob pattern starts from ("." if none)."""
+    text = str(pattern or "").strip()
+    if not text:
+        return "."
+    static = []
+    for part in text.split("/"):
+        if any(character in part for character in "*?["):
+            break
+        static.append(part)
+    return "/".join(static) or "."
+
+
+def _session_access_bwrap_display(raw: object) -> Optional[str]:
+    """Show the raw token for a bwrap `~` reference.
+
+    bwrap gives the sandbox a private HOME, but `_shell_access_plan` expands
+    `~` with the host's. The host path is therefore not the path the sandbox
+    used; the raw token (`~/a`, `$HOME/a`) is the honest observation.
+    """
+    text = str(raw or "").lstrip("'\"")
+    if text.startswith("~") or text.startswith("$HOME") or text.startswith("${HOME}"):
+        return str(raw)
+    return None
+
+
 class SessionAccess:
     """Session-scoped inventory of the paths and commands agentic tools used.
 
@@ -2174,8 +2224,8 @@ class SessionAccess:
         "write_file": (("file_path",), "write"),
         "edit_file": (("file_path",), "write"),
     }
-    # Tools that never touch the host filesystem, or whose input is not a path.
-    SKIP = frozenset({"fetch_url", "path_policy", "glob"})
+    # Tools with no filesystem effect to report (network / a dry-run policy).
+    SKIP = frozenset({"fetch_url", "path_policy"})
 
     def __init__(self) -> None:
         """Create an empty inventory."""
@@ -2190,7 +2240,9 @@ class SessionAccess:
         self.dropped = 0
 
     def record_path(self, op: str, raw: object, real: Optional[str],
-                    via: str = "?", status: str = "ok") -> dict:
+                    via: str = "?", status: str = "ok",
+                    sandbox: Optional[str] = None,
+                    display: Optional[str] = None) -> dict:
         """Add one observed path event, deduplicated by op/path/status.
 
         Args:
@@ -2199,39 +2251,65 @@ class SessionAccess:
             real: Its realpath, or None when the effective cwd is unknown.
             via: The command head or tool that produced the observation.
             status: "ok", "error" or "denied".
+            sandbox: "bwrap" when the observation comes from the sandbox
+                (its paths are not host paths); None for host/Harness.
+            display: Optional display override (the raw `~` token for bwrap).
 
         Returns:
             A compact {"op", "path", "status"} summary for the JSONL entry.
         """
         raw_text = _session_access_shorten(raw, self.MAX_DISPLAY_CHARS)
-        shown = real or f"{raw_text} (cwd unknown)"
-        entry = self.paths.get((op, shown, status))
+        shown = display or real or f"{raw_text} (cwd unknown)"
+        entry = self.paths.get((op, shown, status, sandbox or ""))
         if entry is None:
             if len(self.paths) >= self.MAX_PATH_ROWS:
                 self.dropped += 1
-                return {"op": op, "path": shown, "status": status}
+                summary = {"op": op, "path": shown, "status": status}
+                if sandbox:
+                    summary["sandbox"] = sandbox
+                return summary
             entry = {"op": op, "path": shown, "raw": raw_text, "status": status,
-                     "count": 0, "via": via}
-            self.paths[(op, shown, status)] = entry
+                     "sandbox": sandbox, "count": 0, "via": via}
+            self.paths[(op, shown, status, sandbox or "")] = entry
         entry["count"] += 1
         entry["via"] = via
-        return {"op": op, "path": shown, "status": status}
+        summary = {"op": op, "path": shown, "status": status}
+        if sandbox:
+            summary["sandbox"] = sandbox
+        return summary
 
     def record_command(self, command: str, status: str = "ok",
                        tool: Optional[str] = None,
-                       sandbox: Optional[str] = None) -> dict:
-        """Add one command observation, deduplicated by command/status/mode."""
+                       sandbox: Optional[str] = None,
+                       opaque: bool = False) -> dict:
+        """Add one command observation, deduplicated by command/status/mode.
+
+        Args:
+            command: The command line or tool-call label.
+            status: "ok", "error" or "denied".
+            tool: The tool that produced it.
+            sandbox: "bwrap"/"container" when the command ran there.
+            opaque: True when the code/tool decides its own writes
+                (`run_python`, MCP); the report says "writes unknown".
+        """
         label = _session_access_shorten(command, self.MAX_DISPLAY_CHARS)
         entry = self.commands.get((label, status, sandbox or ""))
         if entry is None:
             if len(self.commands) >= self.MAX_COMMAND_ROWS:
                 self.dropped += 1
-                return {"command": label, "status": status}
+                summary = {"command": label, "status": status}
+                if opaque:
+                    summary["opaque"] = True
+                return summary
             entry = {"command": label, "status": status, "tool": tool,
-                     "sandbox": sandbox, "count": 0}
+                     "sandbox": sandbox, "opaque": bool(opaque), "count": 0}
             self.commands[(label, status, sandbox or "")] = entry
         entry["count"] += 1
-        return {"command": label, "status": status}
+        entry["opaque"] = entry.get("opaque", False) or bool(opaque)
+        summary = {"command": label, "status": status}
+        if entry["opaque"]:
+            summary["opaque"] = True
+        return summary
 
     def record_tool(self, tool_name: str, args: dict, result: dict,
                     executor_mode: str = "host", cwd: Optional[str] = None,
@@ -2258,6 +2336,18 @@ class SessionAccess:
         sandbox = None if executor_mode == "host" else executor_mode
         events = []
         command = None
+        opaque = False
+
+        def add_path(op: str, raw: object, real: Optional[str],
+                     sandbox_tag: Optional[str],
+                     via: Optional[str] = None) -> None:
+            """Record one path, tagging bwrap observations and their `~` tokens."""
+            display = (_session_access_bwrap_display(raw)
+                       if sandbox_tag == "bwrap" else None)
+            events.append(self.record_path(
+                op, raw, real, via=via or tool_name, status=status,
+                sandbox=sandbox_tag, display=display))
+
         if tool_name == "run_command":
             raw_command = canonical.get("command")
             command = (raw_command.strip() if isinstance(raw_command, str)
@@ -2266,17 +2356,18 @@ class SessionAccess:
             if (isinstance(raw_command, str) and status != "denied"
                     and executor_mode != "container"):
                 for event in _shell_access_plan(command, cwd=cwd, tmpdir=tmpdir):
-                    events.append(self.record_path(
-                        event["op"], event["raw"], event["real"],
-                        via=event.get("via") or tool_name, status=status))
+                    add_path(event["op"], event["raw"], event["real"], sandbox,
+                             via=event.get("via"))
         elif tool_name == "run_python":
             target = canonical.get("file_path") or canonical.get("file")
             command = f"python3 {target}" if target else "run_python (inline code)"
-            self.record_command(command, status, tool=tool_name, sandbox=sandbox)
+            # Inline code decides its own writes; keep that visible even when
+            # there is no path to name.
+            opaque = True
+            self.record_command(command, status, tool=tool_name,
+                                sandbox=sandbox, opaque=True)
             if target and status != "denied" and executor_mode != "container":
-                events.append(self.record_path(
-                    "unknown", target, _session_access_path(target, cwd),
-                    via=tool_name, status=status))
+                add_path("unknown", target, _session_access_path(target, cwd), sandbox)
         elif tool_name in self.FILE_PATHS:
             keys, op = self.FILE_PATHS[tool_name]
             if status == "ok":
@@ -2286,10 +2377,21 @@ class SessionAccess:
                         if key != "path":
                             continue
                         raw = "."
-                    events.append(self.record_path(
-                        op, raw, _session_access_path(raw, cwd), via=tool_name))
+                    add_path(op, raw, _session_access_path(raw, cwd), None)
+            if not events:
+                # A refused/failed file tool leaves no path, but it must not
+                # disappear: record the call itself with its status.
+                command = _session_access_tool_label(tool_name, canonical)
+                self.record_command(command, status, tool=tool_name)
+        elif tool_name == "glob":
+            pattern = str(canonical.get("pattern") or "").strip()
+            command = _session_access_tool_label("glob", canonical)
+            self.record_command(command, status, tool=tool_name)
+            if status == "ok" and pattern:
+                base = _session_access_glob_base(pattern)
+                add_path("read", base, _session_access_path(base, cwd), None)
         elif tool_name == "patch":
-            if status == "ok":
+            if status == "ok" and executor_mode != "container":
                 target = canonical.get("target")
                 if target:
                     targets = [target]
@@ -2300,8 +2402,10 @@ class SessionAccess:
                     except (KeyError, TypeError, ValueError):
                         targets = []
                 for raw in targets:
-                    events.append(self.record_path(
-                        "write", raw, _session_access_path(raw, cwd), via=tool_name))
+                    add_path("write", raw, _session_access_path(raw, cwd), sandbox)
+            if not events:
+                command = _session_access_tool_label("patch", canonical)
+                self.record_command(command, status, tool=tool_name, sandbox=sandbox)
         elif tool_name == "apply_patch":
             if status == "ok":
                 try:
@@ -2310,30 +2414,37 @@ class SessionAccess:
                 except (KeyError, TypeError, ValueError):
                     sections = []
                 for section in sections:
-                    events.append(self.record_path(
-                        "write", section["path"],
-                        _session_access_path(section["path"], cwd), via=tool_name))
+                    add_path("write", section["path"],
+                             _session_access_path(section["path"], cwd), None)
+            if not events:
+                command = _session_access_tool_label("apply_patch", canonical)
+                self.record_command(command, status, tool=tool_name)
         elif tool_name == "git_inspect":
             action = str(canonical.get("action") or "status")
             command = f"git_inspect {action}"
-            self.record_command(command, status, tool=tool_name, sandbox=sandbox)
+            # git_inspect runs in the harness, not through the executor.
+            self.record_command(command, status, tool=tool_name)
             raw = canonical.get("path")
             if raw and status == "ok":
-                events.append(self.record_path(
-                    "read", raw, _session_access_path(raw, cwd), via=tool_name))
+                add_path("read", raw, _session_access_path(raw, cwd), None)
         elif tool_name == "kubernetes_cluster_query":
             verb = str(canonical.get("verb") or "get")
             resource = str(canonical.get("resource") or "").strip()
             command = f"cluster_query {verb} {resource}".strip()
-            self.record_command(command, status, tool=tool_name, sandbox=sandbox)
+            # The cluster tool runs in the harness, not through the executor.
+            self.record_command(command, status, tool=tool_name)
         elif tool_name not in self.SKIP:
             command = tool_name
-            self.record_command(command, status, tool=tool_name, sandbox=sandbox)
+            opaque = tool_name not in AGENTIC_TOOL_DEFS
+            self.record_command(command, status, tool=tool_name,
+                                sandbox=sandbox, opaque=opaque)
         if command is None and not events:
             return None
         summary = {"status": status}
         if command is not None:
             summary["command"] = _session_access_shorten(command)
+        if opaque:
+            summary["opaque"] = True
         if sandbox:
             summary["sandbox"] = sandbox
         if events:
@@ -2350,8 +2461,8 @@ class SessionAccess:
         lines = []
         for op, title in (("write", "Writes"), ("read", "Reads"),
                           ("unknown", "Unknown direction")):
-            rows = sorted((row for (row_op, _path, _status), row in self.paths.items()
-                           if row_op == op),
+            rows = sorted((row for (row_op, _path, _status, _sandbox), row
+                           in self.paths.items() if row_op == op),
                           key=lambda row: (-row["count"], row["path"]))
             if not rows:
                 continue
@@ -2359,15 +2470,18 @@ class SessionAccess:
             for row in rows:
                 status = "" if row["status"] == "ok" else f" [{row['status']}]"
                 via = f"  ({row['via']})" if row.get("via") else ""
-                lines.append(f"    {row['path']}  ×{row['count']}{status}{via}")
+                sandbox = f"[{row['sandbox']}] " if row.get("sandbox") else ""
+                lines.append(f"    {sandbox}{row['path']}  "
+                             f"×{row['count']}{status}{via}")
         if self.commands:
             rows = sorted(self.commands.values(),
                           key=lambda row: (-row["count"], row["command"]))
-            lines.append(f"  Commands ({len(rows)})")
+            lines.append(f"  Commands / tool calls ({len(rows)})")
             for row in rows:
                 sandbox = f" [{row['sandbox']}]" if row.get("sandbox") else ""
+                opaque = " [writes unknown]" if row.get("opaque") else ""
                 lines.append(f"    {row['status']:<7} ×{row['count']}  "
-                             f"{row['command']}{sandbox}")
+                             f"{row['command']}{sandbox}{opaque}")
         if self.dropped:
             lines.append(f"  (+{self.dropped} observation(s) not stored: "
                          f"inventory full)")
@@ -23689,9 +23803,9 @@ class ChatLoop:
             print(line, file=sys.stderr)
         print(colorize(
             "  (observed in tool calls; writes are H0 targets, redirects or "
-            "successful file tools — container paths are not listed; bwrap "
-            "commands are marked [bwrap] and their /tmp is a sandbox tmpfs)",
-            'muted'), file=sys.stderr)
+            "successful file tools — [bwrap] paths are as seen inside the "
+            "sandbox, not host paths; [writes unknown] = opaque code/tool; "
+            "container paths are not listed)", 'muted'), file=sys.stderr)
         print(file=sys.stderr)
         return False
 
