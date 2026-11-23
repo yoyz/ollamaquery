@@ -598,7 +598,12 @@ Trust boundaries at a glance; the sections above give the details.
   (`python script.py`, `node script.js`, `make` recipes, `npm run`, cargo
   build scripts) can still write wherever its code decides — use bwrap
   (`work`/`exec`) or the explicit `trusted` stance; see `TODO_security.md`
-  H6. The
+  H6. **Host code launchers ask:** `python`/`python3`, `node`/`nodejs`,
+  `java`, `javac`, `make`, `npm`, `pip`/`pip3`, `cargo`, `go` and `git` are
+  `ask` (CWD leniency does not apply), with only the narrow Git read forms
+  (`status`, `log`, `diff`, `show`, `ls-files`, `grep`, `rev-parse`,
+  `tag -l`, `branch -a`, `remote -v`, `config --get`) allowed; bwrap skips the
+  gate and `trusted` auto-confirms. The
   `s` and `a` approval answers are **session-scoped**; nothing is written to
   disk. Broader allow rules (`git -c`, `tar --checkpoint-action`, upload
   `curl`) remain allow-listed, and a `find -exec` with a harmless payload still

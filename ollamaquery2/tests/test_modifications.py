@@ -2071,7 +2071,13 @@ class TestProcessInlineCommands(unittest.TestCase):
     def test_execute_os_command_timeout_returns_the_marker(self):
         """A timed-out `!` command still returns the user-facing marker."""
         script = "import time; time.sleep(2)"
-        result = m.execute_os_command(f"python3 -c {json.dumps(script)}", timeout=1)
+        # H6 makes `python3` ask in the host gate; this test is about the
+        # timeout path, not the approval policy.
+        allowed = {"approved": True, "effect": "allow", "message": None,
+                   "verdict": None}
+        with patch.object(m, "check_shell_approval", return_value=allowed):
+            result = m.execute_os_command(
+                f"python3 -c {json.dumps(script)}", timeout=1)
         self.assertIn("Time limit exceeded", result)
 
     def test_communicate_or_kill_reaps_grandchildren(self):

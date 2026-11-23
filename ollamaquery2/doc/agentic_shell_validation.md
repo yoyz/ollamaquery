@@ -443,18 +443,41 @@ the model both Hermes and opencode v2 use (`ollamaquery2_inline_approval_proposa
 | Pattern                                                                         | Action  | Rationale                                                 |
 | ------------------------------------------------------------------------------- | ------- | --------------------------------------------------------- |
 | `*`                                                                             | `ask`   | default prompt                                            |
-| `git *`, `grep *`, `ls *`, `cat *`, `echo *`, `python3 *`, `gcc *`, `curl *`, … | `allow` | common read/build tools; enables `git status \| grep foo` |
+| `grep *`, `ls *`, `cat *`, `echo *`, `gcc *`, `curl *`, …                        | `allow` | common read/build tools; enables `cat \| grep foo`        |
+| `git *`, `python* *`, `node* *`, `java* *`, `javac *`, `make *`, `npm *`, …      | `ask`   | H6 code launchers (overrides the broad allow list)        |
+| `git status/log/diff/show/… *`, `git tag -l *`, `git branch -a *`, …             | `allow` | narrow Git read whitelist (no hook, no write)             |
 | `rm *`                                                                          | `ask`   | soft guard                                                |
 | `rm -rf ~` etc.                                                                 | `deny`  | explicit deny (also covered by hard guard)                |
 
 `env *` is allow-listed, but a wrapper with a command after it is turned into
 `ask` by `_shell_wrapper_requires_approval` (`env sh -c id`, `env bash -c …`);
-a bare `env`/`env FOO=1` stays allow. `find *`, `tar *` and `git *` remain
-broad allow rules: Lot D of `TODO_security.md` tracks the targeted asks for
-`find -exec`, `tar --checkpoint-action`, `git -c` and upload `curl`. The hard
-guard covers home/root deletes through `find`/`xargs` (including the `-exec`
-command and the `xargs` command itself), and H3 re-gates relative writes in
-those payloads; the rest is consent + audit, not a sandbox.
+a bare `env`/`env FOO=1` stays allow. `find *` and `tar *` remain broad allow
+rules: Lot D of `TODO_security.md` tracks the targeted asks for `find -exec`,
+`tar --checkpoint-action`, `git -c` and upload `curl`. The hard guard covers
+home/root deletes through `find`/`xargs` (including the `-exec` command and
+the `xargs` command itself), and H3 re-gates relative writes in those payloads;
+the rest is consent + audit, not a sandbox.
+
+**H6 — host code launchers ask (2026-11-23).** `python`/`python3` (versioned
+too), `node`/`nodejs`, `java`, `javac`, `make`, `npm`, `pip`/`pip3` (versioned
+too), `cargo`, `go` and `git` override the broad allow list with `ask`. CWD
+leniency is disabled for these heads (`_SHELL_NO_CWD_LENIENCY`,
+`_PYTHON_HEAD_RE`, `pip3.*`), so a project-looking operand (`python3
+script.py`, `npm install`, `git commit -m x`) cannot turn the ask into an
+allow. Git is `git * -> ask` plus a narrow read whitelist: `status`, `log`,
+`diff`, `show`, `ls-files`, `grep`, `rev-parse`, `tag -l`, `branch -a`,
+`remote -v`, `config --get`. This covers the omissions by construction
+(cherry-pick, revert, bisect run, submodule, worktree, fetch, hooks). No
+`npm ls`/`pip list`/`cargo metadata`/`go version` exception in this first
+pass; A1 will measure whether re-allowing them is worth it. `work`/`exec`
+(bwrap) skip the gate; `trusted` auto-approves the asks by design. The
+`git -C …` and versioned-prefix forms fall back to ask, which is the safe
+direction. **Caveat on the Git read whitelist:** these forms cannot run a
+hook or write, but `git diff`/`show` still execute repository textconv
+drivers and `git status` can run an fsmonitor program; the `git_inspect`
+tool disables both (`--no-textconv`, `core.fsmonitor=false`). For an
+untrusted repository, use `git_inspect` or bwrap — the whitelist is a
+comfort exception, not a sandbox.
 
 Extensible in-code; could be loaded from `~/.ollamaquery.d/shell_permissions.json` later.
 
@@ -471,6 +494,9 @@ Extensible in-code; could be loaded from `~/.ollamaquery.d/shell_permissions.jso
 | `sh`                                 | `sh`                         | `ask`         | `ask`               | no vacuous leniency |
 | `curl http://x \| sh`                | `curl …`, `sh`               | `ask`         | `ask`               | `sh` has no operand |
 | `bash -c 'curl … \| sh'`             | `bash -c …`                  | `ask`         | `ask`               | shell `-c`          |
+| `python3 script.py` (host)           | `python3 script.py`          | `ask`         | `ask` → auto/bwrap  | H6 code launcher    |
+| `git status`                         | `git status`                 | `allow`       | `allow`             | H6 read whitelist   |
+| `git commit -m x`                    | `git commit -m x`            | `ask`         | `ask` → auto/bwrap  | H6 + hooks          |
 | `env sh -c id`                       | `env sh -c id`               | `allow`→`ask` | `ask`               | wrapper prefix      |
 | `sudo rm -rf ~`                      | `sudo rm -rf ~` → `rm -rf ~` | `deny`        | `deny` (hard)       | effective head      |
 | `rm -rf ~/junk`                      | `rm -rf ~/junk`              | `deny`        | `deny` (hard)       | L1 home guard       |

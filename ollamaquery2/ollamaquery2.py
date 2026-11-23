@@ -4455,6 +4455,25 @@ DEFAULT_SHELL_PERMISSION = {
     }
 }
 
+# H6 (2026-11-23): host code launchers ask by default. The allow entries above
+# stay useful for bwrap/container (the gate is skipped there) and for
+# `trusted` (auto-confirm), but a non-auto host session must confirm them.
+# Last-match-wins, so these overrides and the narrow read exceptions below are
+# applied after the broad allow list.
+for _launcher in ("git", "python", "python3", "python3.*", "node", "nodejs",
+                  "java", "javac", "make", "npm", "pip", "pip3", "pip3.*",
+                  "cargo", "go"):
+    DEFAULT_SHELL_PERMISSION["bash"][f"{_launcher} *"] = "ask"
+# First H6 pass: only the read-only Git forms that cannot run a hook or write.
+# A1 will measure which other read exceptions are worth re-allowing.
+for _git_read in (
+    "git status *", "git log *", "git diff *", "git show *",
+    "git ls-files *", "git grep *", "git rev-parse *",
+    "git tag -l *", "git branch -a *", "git remote -v *",
+    "git config --get *",
+):
+    DEFAULT_SHELL_PERMISSION["bash"][_git_read] = "allow"
+
 # Cluster MUTATING verbs are hard-denied. Without this, the CWD-leniency
 # auto-allow would let `oc delete pod x` (operands look like CWD paths) through
 # the gate — defeating the read-only consultation guarantee. A session allow
@@ -5619,6 +5638,17 @@ def _shell_command_word_inside_cwd(word: str, cwd: str,
     return bool(extra_roots and _shell_token_inside_roots(w, extra_roots))
 
 
+# Commands whose arguments are subcommands/flags, not file operands. CWD
+# leniency must not turn an H6 `ask` into an automatic allow: `python3
+# script.py`, `npm install` and `git commit -m x` look "inside the CWD" but
+# execute code or delegate. Reads that are explicitly allowed above do not go
+# through the leniency path anyway.
+_SHELL_NO_CWD_LENIENCY = frozenset({
+    "git", "python", "python3", "node", "nodejs", "java", "javac", "make",
+    "npm", "pip", "pip3", "cargo", "go",
+})
+
+
 def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
                                    extra_roots: Optional[list] = None,
                                    tmpdir: Optional[str] = None) -> bool:
@@ -5668,6 +5698,10 @@ def _shell_all_operands_inside_cwd(nodes: list, cwd: Optional[str] = None,
             return False
         eff_head, eff_args = _shell_effective_command(toks)
         if not eff_head or eff_head == "xargs":
+            return False
+        if (eff_head in _SHELL_NO_CWD_LENIENCY
+                or _PYTHON_HEAD_RE.match(eff_head)
+                or eff_head.startswith("pip3.")):
             return False
         if eff_head in _SHELL_INTERPRETERS and _shell_c_payloads(eff_args):
             return False

@@ -1527,6 +1527,74 @@ class TestShellCommonWriters(unittest.TestCase):
                       {(e["op"], e["real"]) for e in plan})
 
 
+class TestH6CodeLaunchers(unittest.TestCase):
+    """H6: host code launchers ask, with a narrow Git read whitelist.
+
+    The permission config allow-lists python/node/java/make/npm/pip/cargo/go/git
+    for bwrap (the gate is skipped) and `trusted` (auto-confirm), but a
+    non-auto host session must confirm them. Git is `git * -> ask` plus the
+    read-only forms that cannot run a hook or write. CWD leniency must not
+    turn an ask into an allow (`python3 script.py` looks like a project path).
+    """
+
+    def setUp(self):
+        self.ctx = FakeCtx()
+
+    def _verdict(self, command):
+        return m.shell_check_command(
+            command, m.DEFAULT_SHELL_PERMISSION, m._SHELL_SESSION_APPROVED)
+
+    def test_launchers_ask(self):
+        for cmd in ("python3 script.py", "python -c 'print(1)'",
+                    "python3.12 -c 'print(1)'", "node app.js",
+                    "nodejs app.js", "java -jar app.jar",
+                    "javac -d out Foo.java",
+                    "make", "make all", "npm install", "npm ls",
+                    "pip install pkg", "pip list", "pip3 install pkg",
+                    "cargo build", "cargo metadata", "go build .",
+                    "go version"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self._verdict(cmd)["effect"], "ask", cmd)
+
+    def test_git_mutations_ask(self):
+        for cmd in ("git commit -m x", "git fetch", "git cherry-pick abc",
+                    "git bisect run make", "git tag v1", "git branch new",
+                    "git remote add origin x", "git config user.name x",
+                    "git checkout main", "git worktree add ../wt"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self._verdict(cmd)["effect"], "ask", cmd)
+
+    def test_git_reads_are_allowed(self):
+        for cmd in ("git status", "git status --porcelain", "git log",
+                    "git log --oneline", "git diff HEAD", "git show HEAD",
+                    "git ls-files", "git grep foo", "git rev-parse HEAD",
+                    "git tag -l", "git branch -a", "git remote -v",
+                    "git config --get user.name"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self._verdict(cmd)["effect"], "allow", cmd)
+
+    def test_host_non_tty_denies_launchers(self):
+        with patch("sys.stdin.isatty", return_value=False):
+            for cmd in ("python3 script.py", "make", "npm install",
+                        "git commit -m x"):
+                with self.subTest(cmd=cmd):
+                    res = m.check_shell_approval(cmd, self.ctx)
+                    self.assertFalse(res["approved"], cmd)
+                    self.assertEqual(res["effect"], "ask", cmd)
+
+    def test_auto_and_bwrap_still_run_them(self):
+        self.ctx.auto_confirm = True
+        self.assertTrue(m.check_shell_approval("python3 script.py",
+                                               self.ctx)["approved"])
+        self.assertTrue(m.check_shell_approval("git commit -m x",
+                                               self.ctx)["approved"])
+        self.ctx.auto_confirm = False
+        self.assertTrue(m.check_shell_approval(
+            "python3 script.py", self.ctx, executor_mode="bwrap")["approved"])
+        self.assertTrue(m.check_shell_approval(
+            "make", self.ctx, executor_mode="container")["approved"])
+
+
 class TestShellExecdirCwd(unittest.TestCase):
     """`find -execdir` does not inherit the cwd (H3 review P1).
 
