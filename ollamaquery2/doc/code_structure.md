@@ -1,6 +1,6 @@
 # Code Structure — ollamaquery2.py
 
-Snapshot: **2026-11-23**, `__version__ = "0.5.1"`, **27 053 lines**.
+Snapshot: **2026-11-23**, `__version__ = "0.5.2"`, **27 725 lines**.
 Regenerated from the section markers (`# ============= …`) and an AST pass, not
 patched by hand — see §8. Numbers drift; regenerate rather than trust a diff.
 
@@ -27,9 +27,14 @@ patched by hand — see §8. Numbers drift; regenerate rather than trust a diff.
 > gate (`_shell_access_plan`, effective cwd, TMPDIR, nested payloads, host
 > code launchers), `SessionAccess`/`/agentic files` (A1), A2 retention and
 > `--api-key-file` — so every range below the shell gate shifted once more.
-> **§3 was regenerated from the AST for 0.5.1**; §2 and §4 still carry the
-> older ranges and need the section-marker pass (the names and descriptions
-> remain accurate).
+> The `0.5.2` pass (2026-11-23) is the 0.5.1 review batch: bounded
+> subprocess output (`_communicate_or_kill`, 2 MB per stream, group kill) and
+> the `fetch_url` SSRF guard (URL / connection / redirect layers, guarded
+> opener) plus the shell-gate code-execution options
+> (`_shell_exec_option_reason`) and double-quoted substitutions — net
+> **+672 lines** over 0.5.1. **§3 was regenerated from the AST for 0.5.2**;
+> §2 and §4 still carry the older ranges and need the section-marker pass
+> (the names and descriptions remain accurate).
 
 > Historical note: the previous revision of this file described a ~4 300-line
 > version and placed `ChatLoop` at lines 2109–2737. That document was stale by
@@ -103,41 +108,41 @@ The file is partitioned by three-line banner comments. Ranges below are
 Class-body AST spans (`end_lineno − lineno + 1`); `defs` counts class-level
 functions including property accessors.
 
-| Class                           | Lines       | Size | Defs | Role                                                                                    |
-| ------------------------------- | ----------- | ---- | ---- | --------------------------------------------------------------------------------------- |
-| `CommandContext`                | 2491–3066   | 576  | 25   | State singleton: connection, session, token counting, stats, agentic flags, `path_acl`  |
-| `SessionAccess`                 | 2190–2488   | 299  | 6    | Session access inventory (A1): paths/commands, bwrap tag, JSONL `access`                |
-| `SessionManager`                | 3936–4166   | 231  | 12   | Save/list/resolve/load sessions; names are slots, ids are stable                        |
-| `Executor`                      | 8654–9226   | 573  | 20   | Host/container command runner (gate-aware; `exec` reuses a running container)           |
-| `PathAcl`                       | 10277–10604 | 328  | 10   | Session-scoped allow/ask/deny policy (read/write, longest-prefix, ask is bypass-immune) |
-| `MCPServerConfig` / `MCPConfig` | 13578–13630 | 53   | 2    | Parsed MCP configuration                                                                |
-| `MCPToolEntry`                  | 14091–14143 | 53   | 4    | One catalog entry + plan-eligibility predicates                                         |
-| `StdioMCPTransport`             | 14368–14511 | 144  | 10   | argv, no shell, own process group, stderr tail, framed writes                           |
-| `InMemoryMCPTransport`          | 14514–14564 | 51   | 7    | Test transport                                                                          |
-| `MCPConnection`                 | 14569–14719 | 151  | 7    | Reader thread, id→Event multiplexer, cancellation on timeout                            |
-| `MCPClient`                     | 14737–14879 | 143  | 8    | initialize → initialized → paginated `tools/list` → `tools/call`                        |
-| `MCPManager`                    | 14884–15117 | 234  | 19   | Lazy/eager startup, catalog aggregation, routing, policy sets                           |
-| `ToolRegistry`                  | 15119–15527 | 409  | 14   | Dispatch, aliases, confirmation, plan surface, prompt block                             |
-| `AgenticLogger`                 | 15569–15671 | 103  | 5    | JSONL session log, retention, fail-soft                                                 |
-| `DebugManager`                  | 15678–15762 | 85   | 6    | Per-category debug levels                                                               |
-| `RequestBuilder`                | 15806–16161 | 356  | 13   | Outbound payload shaping (backend is an explicit argument)                              |
-| `StatsCalculator`               | 16167–16409 | 243  | 6    | Timings, token split, stats line                                                        |
-| `StreamParser`                  | 16415–16785 | 371  | 9    | Chunk shapes + sync aggregation (late-bound line provider)                              |
-| `ModelQuery`                    | 16839–17591 | 753  | 39   | Transport, retries, display, doors onto the three collaborators                         |
-| `ChatCompleter`                 | 17651–17951 | 301  | 12   | Tab completion (commands, paths, models, subcommands, MCP servers, session handles)     |
-| `CoreHTMLStripper`              | 18785–18861 | 77   | 6    | stdlib HTMLParser subclass for `/curl` and `fetch_url`                                  |
-| `ToolCallParser`                | 19067–19294 | 228  | 9    | Strict/lazy tool-call extraction                                                        |
-| `TimeoutEvent`                  | 19321–19337 | 17   | 0    | Frozen facts of one timed-out step                                                      |
-| `AgenticTimeoutPolicy`          | 19340–19604 | 265  | 8    | 3-state escalation + nudge + ceiling                                                    |
-| `StepFeedback`                  | 19630–19830 | 201  | 8    | Per-step streaming feedback                                                             |
-| `ToolExecution`                 | 19845–20144 | 300  | 9    | Tool run, observation cap, same-tool guard, message append                              |
-| `AgenticFinalizer`              | 20150–20533 | 384  | 8    | Post-loop phase + bounded streaming re-entry                                            |
-| `ReActState`                    | 20550–20592 | 43   | 1    | One query's mutable state (replaces nine threaded locals)                               |
-| `AgenticRunner`                 | 20595–21491 | 897  | 25   | The step loop                                                                           |
-| `WireView`                      | 21497–21981 | 485  | 19   | Outbound request accounting + `/promptshow`                                             |
-| `ConversationStore`             | 21988–22458 | 471  | 21   | Messages, session binding, compaction                                                   |
-| `ChatLoop`                      | 22465–25449 | 2985 | 126  | Command dispatch, query paths, doors onto every collaborator                            |
-
+| Class                            | Lines       | Size | Defs | Role                                                                                        |
+| -------------------------------- | ----------- | ---- | ---- | ------------------------------------------------------------------------------------------- |
+| `CommandContext`                 | 2508–3083   | 576  | 25   | State singleton: connection, session, token counting, stats, agentic flags, `path_acl`      |
+| `SessionAccess`                  | 2207–2505   | 299  | 6    | Session access inventory (A1): paths/commands, bwrap tag, JSONL `access`                    |
+| `SessionManager`                 | 3953–4183   | 231  | 12   | Save/list/resolve/load sessions; names are slots, ids are stable                            |
+| `Executor`                       | 8943–9522   | 580  | 20   | Host/container/bwrap runner (gate-aware; bounded output; `exec` reuses a running container) |
+| `PathAcl`                        | 10573–10900 | 328  | 10   | Session-scoped allow/ask/deny policy (read/write, longest-prefix, ask is bypass-immune)     |
+| `MCPServerConfig / MCPConfig`    | 13880–13945 | 66   | 4    | Parsed MCP configuration                                                                    |
+| `MCPToolEntry`                   | 14393–14445 | 53   | 4    | One catalog entry + plan-eligibility predicates                                             |
+| `StdioMCPTransport`              | 14670–14813 | 144  | 10   | argv, no shell, own process group, stderr tail, framed writes                               |
+| `InMemoryMCPTransport`           | 14816–14866 | 51   | 7    | Test transport                                                                              |
+| `MCPConnection`                  | 14871–15021 | 151  | 7    | Reader thread, id→Event multiplexer, cancellation on timeout                                |
+| `MCPClient`                      | 15039–15181 | 143  | 8    | initialize → initialized → paginated `tools/list` → `tools/call`                            |
+| `MCPManager`                     | 15186–15419 | 234  | 19   | Lazy/eager startup, catalog aggregation, routing, policy sets                               |
+| `ToolRegistry`                   | 15421–15829 | 409  | 14   | Dispatch, aliases, confirmation, plan surface, prompt block                                 |
+| `AgenticLogger`                  | 15871–15973 | 103  | 5    | JSONL session log, retention, fail-soft                                                     |
+| `DebugManager`                   | 15980–16064 | 85   | 6    | Per-category debug levels                                                                   |
+| `RequestBuilder`                 | 16108–16463 | 356  | 13   | Outbound payload shaping (backend is an explicit argument)                                  |
+| `StatsCalculator`                | 16469–16711 | 243  | 6    | Timings, token split, stats line                                                            |
+| `StreamParser`                   | 16717–17087 | 371  | 9    | Chunk shapes + sync aggregation (late-bound line provider)                                  |
+| `ModelQuery`                     | 17141–17893 | 753  | 39   | Transport, retries, display, doors onto the three collaborators                             |
+| `ChatCompleter`                  | 17953–18253 | 301  | 12   | Tab completion (commands, paths, models, subcommands, MCP servers, session handles)         |
+| `SSRFBlocked + guarded handlers` | 18987–19217 | 231  | 6    | fetch_url guard: refusal type, guarded HTTP(S) connection/handler, per-hop redirects        |
+| `CoreHTMLStripper`               | 19457–19533 | 77   | 6    | stdlib HTMLParser subclass for `/curl` and `fetch_url`                                      |
+| `ToolCallParser`                 | 19739–19966 | 228  | 9    | Strict/lazy tool-call extraction                                                            |
+| `TimeoutEvent`                   | 19993–20009 | 17   | 0    | Frozen facts of one timed-out step                                                          |
+| `AgenticTimeoutPolicy`           | 20012–20276 | 265  | 8    | 3-state escalation + nudge + ceiling                                                        |
+| `StepFeedback`                   | 20302–20502 | 201  | 8    | Per-step streaming feedback                                                                 |
+| `ToolExecution`                  | 20517–20816 | 300  | 9    | Tool run, observation cap, same-tool guard, message append                                  |
+| `AgenticFinalizer`               | 20822–21205 | 384  | 8    | Post-loop phase + bounded streaming re-entry                                                |
+| `ReActState`                     | 21222–21264 | 43   | 1    | One query's mutable state (replaces nine threaded locals)                                   |
+| `AgenticRunner`                  | 21267–22163 | 897  | 25   | The step loop                                                                               |
+| `WireView`                       | 22169–22653 | 485  | 19   | Outbound request accounting + `/promptshow`                                                 |
+| `ConversationStore`              | 22660–23130 | 471  | 21   | Messages, session binding, compaction                                                       |
+| `ChatLoop`                       | 23137–26121 | 2985 | 126  | Command dispatch, query paths, doors onto every collaborator                                |
 ## 4. Architecture
 
 ```

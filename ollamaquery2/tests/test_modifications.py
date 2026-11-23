@@ -2120,7 +2120,7 @@ class TestProcessInlineCommands(unittest.TestCase):
 
 
 class TestBoundedCommandOutput(unittest.TestCase):
-    """Subprocess output is capped per stream and the group is stopped (0.5.1).
+    """Subprocess output is capped per stream and the group is stopped (0.5.2).
 
     `proc.communicate()` used to buffer a whole stream before any cap: a
     `yes`, a noisy build or a hostile command could exhaust RAM before its
