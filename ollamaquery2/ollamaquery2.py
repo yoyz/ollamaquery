@@ -4464,13 +4464,15 @@ for _launcher in ("git", "python", "python3", "python3.*", "node", "nodejs",
                   "java", "javac", "make", "npm", "pip", "pip3", "pip3.*",
                   "cargo", "go"):
     DEFAULT_SHELL_PERMISSION["bash"][f"{_launcher} *"] = "ask"
-# First H6 pass: only the read-only Git forms that cannot run a hook or write.
-# A1 will measure which other read exceptions are worth re-allowing.
+# First H6 pass: only simple metadata reads. `status`/`log`/`diff`/`show`/
+# `grep` are deliberately absent: `--ext-diff`/`--textconv` can execute a
+# repository-supplied helper, and `status` can run an fsmonitor. Use the
+# `git_inspect` tool (it forces --no-textconv / core.fsmonitor=false) or bwrap
+# for untrusted repositories. A1 will measure whether other reads are worth
+# re-allowing.
 for _git_read in (
-    "git status *", "git log *", "git diff *", "git show *",
-    "git ls-files *", "git grep *", "git rev-parse *",
-    "git tag -l *", "git branch -a *", "git remote -v *",
-    "git config --get *",
+    "git rev-parse *", "git ls-files *", "git tag -l *",
+    "git branch -a *", "git remote -v *", "git config --get *",
 ):
     DEFAULT_SHELL_PERMISSION["bash"][_git_read] = "allow"
 

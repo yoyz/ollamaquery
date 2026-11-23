@@ -600,10 +600,12 @@ Trust boundaries at a glance; the sections above give the details.
   (`work`/`exec`) or the explicit `trusted` stance; see `TODO_security.md`
   H6. **Host code launchers ask:** `python`/`python3`, `node`/`nodejs`,
   `java`, `javac`, `make`, `npm`, `pip`/`pip3`, `cargo`, `go` and `git` are
-  `ask` (CWD leniency does not apply), with only the narrow Git read forms
-  (`status`, `log`, `diff`, `show`, `ls-files`, `grep`, `rev-parse`,
-  `tag -l`, `branch -a`, `remote -v`, `config --get`) allowed; bwrap skips the
-  gate and `trusted` auto-confirms. The
+  `ask` (CWD leniency does not apply), with only metadata Git reads
+  (`rev-parse`, `ls-files`, `tag -l`, `branch -a`, `remote -v`,
+  `config --get`) allowed. `status`/`log`/`diff`/`show`/`grep` are ask because
+  `--ext-diff`/`--textconv` can execute repository helpers; use the
+  `git_inspect` tool (safe flags) or bwrap. bwrap skips the gate and
+  `trusted` auto-confirms. The
   `s` and `a` approval answers are **session-scoped**; nothing is written to
   disk. Broader allow rules (`git -c`, `tar --checkpoint-action`, upload
   `curl`) remain allow-listed, and a `find -exec` with a harmless payload still

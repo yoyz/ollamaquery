@@ -1560,15 +1560,24 @@ class TestH6CodeLaunchers(unittest.TestCase):
         for cmd in ("git commit -m x", "git fetch", "git cherry-pick abc",
                     "git bisect run make", "git tag v1", "git branch new",
                     "git remote add origin x", "git config user.name x",
-                    "git checkout main", "git worktree add ../wt"):
+                    "git checkout main", "git worktree add ../wt",
+                    # Removed from the whitelist: they can run repo helpers.
+                    "git status", "git log", "git diff HEAD", "git show HEAD",
+                    "git grep foo"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self._verdict(cmd)["effect"], "ask", cmd)
+
+    def test_git_external_diff_ask(self):
+        """`--ext-diff`/`--textconv` execute repository-supplied helpers."""
+        for cmd in ("git diff --ext-diff",
+                    "git show --ext-diff HEAD",
+                    "git diff --textconv"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(self._verdict(cmd)["effect"], "ask", cmd)
 
     def test_git_reads_are_allowed(self):
-        for cmd in ("git status", "git status --porcelain", "git log",
-                    "git log --oneline", "git diff HEAD", "git show HEAD",
-                    "git ls-files", "git grep foo", "git rev-parse HEAD",
-                    "git tag -l", "git branch -a", "git remote -v",
+        for cmd in ("git ls-files", "git rev-parse HEAD", "git tag -l",
+                    "git branch -a", "git remote -v",
                     "git config --get user.name"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(self._verdict(cmd)["effect"], "allow", cmd)
